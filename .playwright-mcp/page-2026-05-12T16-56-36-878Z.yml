@@ -1,0 +1,13 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]: 得分 0
+    - generic [ref=e5]: 最高分 0
+  - generic [ref=e6]:
+    - generic:
+      - heading "🐍 贪吃蛇" [level=2]
+      - paragraph: 按 空格键 开始游戏
+    - generic [ref=e9]:
+      - heading "游戏结束" [level=2] [ref=e10]
+      - generic [ref=e11]: "得分: 0"
+      - button "重新开始" [ref=e12] [cursor=pointer]
+  - generic [ref=e8]: ↑ ↓ ← → 控制方向 | Space 暂停/继续

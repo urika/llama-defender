@@ -1,0 +1,46 @@
+- generic [active] [ref=e1]:
+  - heading "Chess AI" [level=1] [ref=e2]
+  - generic [ref=e3]: Your turn
+  - generic [ref=e5]:
+    - generic [ref=e208] [cursor=pointer]: ♜
+    - generic [ref=e210] [cursor=pointer]: ♞
+    - generic [ref=e212] [cursor=pointer]: ♝
+    - generic [ref=e214] [cursor=pointer]: ♛
+    - generic [ref=e216] [cursor=pointer]: ♚
+    - generic [ref=e218] [cursor=pointer]: ♝
+    - generic [ref=e220] [cursor=pointer]: ♞
+    - generic [ref=e222] [cursor=pointer]: ♜
+    - generic [ref=e224] [cursor=pointer]: ♟
+    - generic [ref=e226] [cursor=pointer]: ♟
+    - generic [ref=e228] [cursor=pointer]: ♟
+    - generic [ref=e230] [cursor=pointer]: ♟
+    - generic [ref=e232] [cursor=pointer]: ♟
+    - generic [ref=e234] [cursor=pointer]: ♟
+    - generic [ref=e236] [cursor=pointer]: ♟
+    - generic [ref=e238] [cursor=pointer]: ♟
+    - generic [ref=e272] [cursor=pointer]: ♙
+    - generic [ref=e274] [cursor=pointer]: ♙
+    - generic [ref=e276] [cursor=pointer]: ♙
+    - generic [ref=e278] [cursor=pointer]: ♙
+    - generic [ref=e280] [cursor=pointer]: ♙
+    - generic [ref=e282] [cursor=pointer]: ♙
+    - generic [ref=e284] [cursor=pointer]: ♙
+    - generic [ref=e286] [cursor=pointer]: ♙
+    - generic [ref=e288] [cursor=pointer]: ♖
+    - generic [ref=e290] [cursor=pointer]: ♘
+    - generic [ref=e292] [cursor=pointer]: ♗
+    - generic [ref=e294] [cursor=pointer]: ♕
+    - generic [ref=e296] [cursor=pointer]: ♔
+    - generic [ref=e298] [cursor=pointer]: ♗
+    - generic [ref=e300] [cursor=pointer]: ♘
+    - generic [ref=e302] [cursor=pointer]: ♖
+  - generic [ref=e102]:
+    - generic [ref=e104]: White captured
+    - generic [ref=e106]: Black captured
+  - generic [ref=e107]:
+    - button "New Game" [ref=e108] [cursor=pointer]
+    - button "Undo" [disabled] [ref=e109]
+    - combobox [ref=e110] [cursor=pointer]:
+      - option "Easy"
+      - option "Medium" [selected]
+      - option "Hard"
