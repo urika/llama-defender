@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Playwright MCP temp files
+.playwright-mcp/
+
+# Active config symlink (machine-local)
+configs/active.conf
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
