@@ -8,21 +8,56 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 LLAMA_BASE = os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8081/v1")
-MODEL_NAME = "mlx-community/Qwen3.6-35B-A3B-4bit"
+LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "sk-1234")
+# Backend type: "local" (llama-server/rapid-mlx) or "cloud" (DeepSeek/OpenAI)
+BACKEND_TYPE = os.environ.get("BACKEND_TYPE", "")
+if not BACKEND_TYPE:
+    # Auto-detect from URL
+    if "deepseek" in LLAMA_BASE.lower() or "openai" in LLAMA_BASE.lower() or "api." in LLAMA_BASE.lower():
+        BACKEND_TYPE = "cloud"
+    else:
+        BACKEND_TYPE = "local"
+IS_CLOUD = BACKEND_TYPE == "cloud"
+
+# ---------------------------------------------------------------------------
+# Concurrency control: backend-aware request serialization
+# llama-server on Metal single-GPU suffers from time-slicing with -np > 1,
+# so it defaults to 1 (serialized). rapid-mlx handles 2-4 concurrent requests
+# well, so its config sets this higher.
+# Cloud APIs handle concurrency natively, so we allow more.
+# ---------------------------------------------------------------------------
+PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", "4" if IS_CLOUD else "1"))
+_llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
+MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-v4-pro" if IS_CLOUD else "mlx-community/Qwen3.6-35B-A3B-4bit")
 
 # ---------------------------------------------------------------------------
 # Tool-result clearing: proxy-side context management
-# Mimics Anthropic's clear_tool_uses_20250919 without API support.
+# Defaults are tied to BACKEND_TYPE:
+#   - Cloud APIs (DeepSeek/OpenAI): disabled by default (1M+ token context)
+#   - Local backends (llama-server/rapid-mlx): enabled by default (limited VRAM)
+# Override via env vars: PROXY_CLEAR_ENABLED, PROXY_CLEAR_THRESHOLD, PROXY_TOOL_KEEP
 # ---------------------------------------------------------------------------
-PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", "true").lower() in ("1", "true", "yes")
-PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", "30000"))  # chars, not tokens
-PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", "5"))  # keep last N tool_use/tool_result pairs
+PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", "30000" if IS_CLOUD else "15000"))  # chars, not tokens
+PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", "10" if IS_CLOUD else "2"))  # keep last N tool_use/tool_result pairs
 CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Context-limit truncation: proxy-side message dropping when total context
+# exceeds backend capacity. Complements tool-result clearing by dropping
+# entire old messages (not just tool payloads).
+# Defaults tied to BACKEND_TYPE (disabled for cloud, enabled for local).
+# ---------------------------------------------------------------------------
+PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000"))  # chars heuristic
+PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))  # keep first N messages (system context + skills)
+PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))  # keep last N messages
 MODEL_ALIASES = [
     "claude-3-5-sonnet-20241022",
     "claude-3-opus-20240229",
@@ -448,6 +483,77 @@ def clear_old_tool_results(messages):
     }
 
 
+def truncate_messages_if_needed(messages):
+    """
+    Proxy-side message truncation when total context exceeds backend capacity.
+    Drops entire old messages (starting after the head-keep window) until the
+    rough character count falls below PROXY_CTX_CHARS_LIMIT.
+    Preserves the first PROXY_CTX_KEEP_HEAD messages (usually system context +
+    skills) and the last PROXY_CTX_KEEP_TAIL messages (recent conversation).
+    Operates on Anthropic-format messages in-place.
+    Returns (messages, stats_dict).
+    """
+    if not PROXY_CTX_LIMIT_ENABLED:
+        return messages, {"enabled": False}
+
+    total_chars = _estimate_message_chars(messages)
+    if total_chars < PROXY_CTX_CHARS_LIMIT:
+        return messages, {
+            "enabled": True,
+            "skipped": True,
+            "reason": "below_limit",
+            "chars": total_chars,
+        }
+
+    n = len(messages)
+    if n <= PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL:
+        # Not enough messages to safely drop anything
+        return messages, {
+            "enabled": True,
+            "skipped": True,
+            "reason": "too_few_messages",
+            "count": n,
+            "chars": total_chars,
+        }
+
+    # Indices we must preserve: head [0, keep_head) + tail [n-keep_tail, n)
+    preserved = set(range(PROXY_CTX_KEEP_HEAD))
+    preserved.update(range(n - PROXY_CTX_KEEP_TAIL, n))
+
+    # Build a list of deletable indices in order (oldest first)
+    deletable = [i for i in range(PROXY_CTX_KEEP_HEAD, n - PROXY_CTX_KEEP_TAIL)]
+
+    dropped_count = 0
+    dropped_chars = 0
+    current_chars = total_chars
+
+    for idx in deletable:
+        if idx in preserved:
+            continue
+        msg = messages[idx]
+        msg_chars = _estimate_message_chars([msg])
+        current_chars -= msg_chars
+        dropped_count += 1
+        dropped_chars += msg_chars
+        # Mark as dropped (replace with lightweight sentinel)
+        messages[idx] = None
+        if current_chars < PROXY_CTX_CHARS_LIMIT:
+            break
+
+    # Compact the list: remove None entries
+    messages = [m for m in messages if m is not None]
+
+    return messages, {
+        "enabled": True,
+        "truncated": True,
+        "dropped_messages": dropped_count,
+        "dropped_chars": dropped_chars,
+        "chars_before": total_chars,
+        "chars_after": current_chars,
+        "limit": PROXY_CTX_CHARS_LIMIT,
+    }
+
+
 def convert_anthropic_messages_to_openai(messages):
     """Convert Anthropic message format to OpenAI message format."""
     openai_messages = []
@@ -602,6 +708,324 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
     }
 
 
+# ---------------------------------------------------------------------------
+# Status page: system monitoring dashboard
+# ---------------------------------------------------------------------------
+import subprocess
+import time
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_PATH = os.path.join(_SCRIPT_DIR, "logs", "llama-server.log")
+_PID_PATH = os.path.join(_SCRIPT_DIR, "llama-server.pid")
+
+
+def _run(cmd, timeout=3):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout).strip()
+    except Exception:
+        return ""
+
+
+def _get_process_info(pattern, name, fallback_port=None):
+    """Return dict with pid, rss_mb, cpu, elapsed for a process matching pattern."""
+    # Try pgrep first
+    pid = _run(f"pgrep -f '{pattern}' | head -1")
+    # Fallback: detect by listening port (for proxy itself)
+    # Use -sTCP:LISTEN to only match the listening process, not client connections
+    if not pid and fallback_port:
+        pid = _run(f"lsof -i :{fallback_port} -sTCP:LISTEN -t | head -1")
+    if not pid:
+        return {"running": False, "name": name}
+    info = _run(f"ps -o pid=,rss=,pcpu=,etime= -p {pid}")
+    parts = info.split()
+    if len(parts) >= 4:
+        rss_kb = int(parts[1])
+        return {
+            "running": True,
+            "name": name,
+            "pid": parts[0],
+            "rss_mb": f"{rss_kb / 1024:.1f}",
+            "cpu": parts[2],
+            "elapsed": parts[3],
+        }
+    return {"running": False, "name": name}
+
+
+def _get_system_memory():
+    out = _run("vm_stat")
+    data = {}
+    page_size = 16384
+    for line in out.splitlines():
+        if "Pages free:" in line:
+            data["free_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages wired down:" in line:
+            data["wired_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages active:" in line:
+            data["active_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages inactive:" in line:
+            data["inactive_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages stored in compressor:" in line:
+            data["compress_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+    total = 48.0
+    used = total - data.get("free_gb", 0)
+    data["total_gb"] = total
+    data["used_gb"] = used
+    data["used_pct"] = f"{used/total*100:.1f}"
+    return data
+
+
+def _read_log_tail(path, max_bytes=200000):
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes), 0)
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _get_log_stats():
+    """Count recent OOMs, forced cache clears, and requests from log tail.
+    Requests get accurate timestamps from proxy logs [REQ_SUMMARY].
+    OOM/CacheClear have no timestamp (backend logs don't include wall-clock time).
+    For cloud backends, OOM/cache-clear metrics are not available."""
+    backend_tail = _read_log_tail(_LOG_PATH, 200000) if not IS_CLOUD else ""
+    proxy_log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
+    proxy_tail = _read_log_tail(proxy_log_path, 100000)
+
+    # --- Extract request events from proxy logs ([HH:MM:SS] [REQ_SUMMARY] chars=X tools=Y) ---
+    proxy_req_events = []
+    for line in proxy_tail.splitlines()[-40:]:
+        m = re.search(r'\[(\d{2}:\d{2}:\d{2})\].*\[REQ_SUMMARY\].*chars=(\d+).*tools=(\d+)', line)
+        if m:
+            proxy_req_events.append((m.group(1), m.group(2), m.group(3)))
+
+    # --- Build recent events list ---
+    events = []
+    req_idx = 0
+    if not IS_CLOUD:
+        for line in backend_tail.splitlines()[-40:]:
+            if "Insufficient Memory" in line:
+                events.append(("—", "🔴 OOM", line.split(":")[-1].strip()[-80:]))
+            elif "forced cache clear" in line:
+                events.append(("—", "🟡 CacheClear", line.split(":")[-1].strip()[-80:]))
+            elif "[REQUEST]" in line and "total_chars=" in line:
+                m = re.search(r"total_chars=(\d+).*?tools=(\d+)", line)
+                if m:
+                    ts = proxy_req_events[req_idx][0] if req_idx < len(proxy_req_events) else "—"
+                    events.append((ts, "📨 Request", f"{m.group(1)} chars, {m.group(2)} tools"))
+                    req_idx += 1
+    events = events[-12:]
+
+    # --- Detailed lists for modal popup ---
+    if IS_CLOUD:
+        oom_details = []
+        clear_details = []
+    else:
+        oom_details = [("—", line.split(":")[-1].strip()[-120:])
+                       for line in backend_tail.splitlines() if "Insufficient Memory" in line]
+        clear_details = [("—", line.split(":")[-1].strip()[-120:])
+                         for line in backend_tail.splitlines() if "forced cache clear" in line]
+    req_details = [(ts, f"{chars} chars, {tools} tools") for ts, chars, tools in proxy_req_events]
+
+    return {
+        "ooms": len(oom_details),
+        "clears": len(clear_details),
+        "requests": len(req_details),
+        "last_events": events,
+        "oom_details": oom_details[-20:],
+        "clear_details": clear_details[-20:],
+        "req_details": req_details[-20:],
+    }
+
+
+def _build_status_html():
+    backend_info = _get_process_info("rapid-mlx|llama-server", "Backend")
+    proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
+    mem = _get_system_memory()
+    log = _get_log_stats()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    backend_color = "#2ecc71" if backend_info.get("running") else "#e74c3c"
+    proxy_color = "#2ecc71" if proxy_info.get("running") else "#e74c3c"
+    mem_warn = float(mem.get("used_pct", 0)) > 90
+    mem_color = "#e74c3c" if mem_warn else "#2ecc71"
+
+    # Cloud-backend status card (no PID/memory/uptime)
+    if IS_CLOUD:
+        backend_card = f"""<div class="card">
+    <h2>Backend</h2>
+    <div class="row"><span class="label">Type</span><span class="value">Cloud API ({BACKEND_TYPE})</span></div>
+    <div class="row"><span class="label">Endpoint</span><span class="value">{LLAMA_BASE}</span></div>
+    <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
+    <div class="row"><span class="label">API Key</span><span class="value">{LLAMA_API_KEY[:8]}****</span></div>
+  </div>"""
+    else:
+        backend_card = f"""<div class="card">
+    <h2>Backend</h2>
+    <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{backend_color}"></span>{"Running" if backend_info.get("running") else "Stopped"}</span></div>
+    <div class="row"><span class="label">Name</span><span class="value">{backend_info.get("name", "N/A")}</span></div>
+    <div class="row"><span class="label">PID</span><span class="value">{backend_info.get("pid", "N/A")}</span></div>
+    <div class="row"><span class="label">Memory</span><span class="value">{backend_info.get("rss_mb", "N/A")} MB</span></div>
+    <div class="row"><span class="label">CPU</span><span class="value">{backend_info.get("cpu", "N/A")}%</span></div>
+    <div class="row"><span class="label">Uptime</span><span class="value">{backend_info.get("elapsed", "N/A")}</span></div>
+  </div>"""
+
+    # Conditional log-stat rows (avoid backslashes inside f-strings)
+    oom_row = ""
+    cache_row = ""
+    if not IS_CLOUD:
+        oom_row = '<div class="row"><span class="label">OOM Crashes</span><span class="value oom clickable" onclick="showModal(' + "'oom', '🔴 OOM Crashes Detail')" + f'">{log["ooms"]}</span></div>'
+        cache_row = '<div class="row"><span class="label">Forced Cache Clear</span><span class="value clear clickable" onclick="showModal(' + "'clear', '🟡 Forced Cache Clear Detail')" + f'">{log["clears"]}</span></div>'
+
+    events_html = ""
+    for ts, evt_type, evt_msg in log["last_events"]:
+        ts_display = f'<span class="evt-ts">{ts}</span>' if ts != "—" else '<span class="evt-ts" style="color:#666">—</span>'
+        events_html += f'<div class="evt">{ts_display} <span class="evt-tag">{evt_type}</span> {evt_msg}</div>'
+    if not events_html:
+        events_html = '<div class="evt">No recent events</div>'
+
+    # JSON data for modal popups
+    import json as _json
+    modal_data = _json.dumps({
+        "oom": log.get("oom_details", []),
+        "clear": log.get("clear_details", []),
+        "request": log.get("req_details", []),
+    })
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>Local LLM Stack Status</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
+  h1 {{ font-size: 20px; margin-bottom: 4px; }}
+  .ts {{ color: #888; font-size: 12px; margin-bottom: 20px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
+  .card {{ background: #16213e; border-radius: 10px; padding: 16px; }}
+  .card h2 {{ font-size: 14px; margin: 0 0 12px 0; color: #a0a0c0; text-transform: uppercase; letter-spacing: 1px; }}
+  .row {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #2a2a4a; font-size: 13px; }}
+  .row:last-child {{ border-bottom: none; }}
+  .label {{ color: #888; }}
+  .value {{ font-weight: 600; }}
+  .status-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }}
+  .mem-bar {{ height: 10px; background: #2a2a4a; border-radius: 5px; margin-top: 8px; overflow: hidden; }}
+  .mem-fill {{ height: 100%; border-radius: 5px; transition: width 0.5s; }}
+  .evt {{ font-size: 12px; padding: 4px 0; border-bottom: 1px solid #2a2a4a; color: #ccc; }}
+  .evt:last-child {{ border-bottom: none; }}
+  .evt-tag {{ display: inline-block; min-width: 80px; font-weight: 600; font-size: 11px; }}
+  .evt-ts {{ display: inline-block; min-width: 60px; font-family: monospace; font-size: 11px; color: #888; margin-right: 4px; }}
+  .oom {{ color: #e74c3c; }}
+  .clear {{ color: #f39c12; }}
+  .req {{ color: #3498db; }}
+  .clickable {{ cursor: pointer; text-decoration: underline; }}
+  .clickable:hover {{ opacity: 0.8; }}
+  .footer {{ margin-top: 20px; font-size: 11px; color: #666; text-align: center; }}
+  .modal {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.75); z-index: 100; justify-content: center; align-items: center; }}
+  .modal-content {{ background: #16213e; border-radius: 10px; padding: 20px; max-width: 800px; width: 90%; max-height: 80vh; overflow-y: auto; border: 1px solid #2a2a4a; }}
+  .close-btn {{ float: right; font-size: 24px; cursor: pointer; color: #888; line-height: 1; }}
+  .close-btn:hover {{ color: #fff; }}
+  .modal-row {{ padding: 8px 0; border-bottom: 1px solid #2a2a4a; font-size: 12px; color: #ccc; display: flex; gap: 12px; }}
+  .modal-row:last-child {{ border-bottom: none; }}
+  .modal-time {{ color: #888; font-family: monospace; min-width: 60px; flex-shrink: 0; }}
+  .modal-msg {{ word-break: break-word; }}
+</style>
+</head>
+<body>
+<h1>🖥️ Local LLM Stack Status</h1>
+<div class="ts">Updated: {now} &nbsp;•&nbsp; Auto-refresh every 5s</div>
+
+<div class="grid">
+  {backend_card}
+
+  <div class="card">
+    <h2>Proxy</h2>
+    <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{proxy_color}"></span>{"Running" if proxy_info.get("running") else "Stopped"}</span></div>
+    <div class="row"><span class="label">Name</span><span class="value">{proxy_info.get("name", "N/A")}</span></div>
+    <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
+    <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
+    <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
+    <div class="row"><span class="label">Backend</span><span class="value">{LLAMA_BASE}</span></div>
+  </div>
+
+  <div class="card">
+    <h2>System Memory</h2>
+    <div class="row"><span class="label">Total</span><span class="value">{mem.get("total_gb", 48):.0f} GB</span></div>
+    <div class="row"><span class="label">Used</span><span class="value" style="color:{mem_color}">{mem.get("used_gb", 0):.1f} GB ({mem.get("used_pct", "0")}%)</span></div>
+    <div class="row"><span class="label">Free</span><span class="value">{mem.get("free_gb", 0):.2f} GB</span></div>
+    <div class="row"><span class="label">Wired</span><span class="value">{mem.get("wired_gb", 0):.1f} GB</span></div>
+    <div class="row"><span class="label">Active</span><span class="value">{mem.get("active_gb", 0):.1f} GB</span></div>
+    <div class="row"><span class="label">Inactive</span><span class="value">{mem.get("inactive_gb", 0):.1f} GB</span></div>
+    <div class="row"><span class="label">Compressed</span><span class="value">{mem.get("compress_gb", 0):.1f} GB</span></div>
+    <div class="mem-bar"><div class="mem-fill" style="width:{mem.get("used_pct", 0)}%;background:{mem_color}"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>Log Stats (recent tail)</h2>
+    {oom_row}
+    {cache_row}
+    <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
+    <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={PROXY_MAX_CONCURRENT}</span></div>
+    <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Recent Events</h2>
+    {events_html}
+  </div>
+</div>
+
+<div class="footer">Open http://127.0.0.1:4000/status in your browser</div>
+
+<!-- Modal -->
+<div id="modal" class="modal" onclick="closeModal(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <span class="close-btn" onclick="closeModal()">&times;</span>
+    <h3 id="modal-title" style="margin-top:0;color:#a0a0c0;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Detail</h3>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+var eventData = {modal_data};
+function showModal(type, title) {{
+  document.getElementById('modal-title').innerText = title;
+  var body = document.getElementById('modal-body');
+  body.innerHTML = '';
+  var items = eventData[type] || [];
+  if (items.length === 0) {{
+    body.innerHTML = '<div class="modal-row">No events found</div>';
+  }} else {{
+    items.forEach(function(item) {{
+      var row = document.createElement('div');
+      row.className = 'modal-row';
+      var ts = item[0] || '—';
+      var msg = item[1] || '';
+      row.innerHTML = '<span class="modal-time">' + ts + '</span><span class="modal-msg">' + msg + '</span>';
+      body.appendChild(row);
+    }});
+  }}
+  document.getElementById('modal').style.display = 'flex';
+}}
+function closeModal(e) {{
+  if (!e || e.target.id === 'modal') {{
+    document.getElementById('modal').style.display = 'none';
+  }}
+}}
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') closeModal();
+}});
+</script>
+</body>
+</html>"""
+    return html
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -620,6 +1044,13 @@ class Handler(BaseHTTPRequestHandler):
             models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "anthropic"}
                       for name in MODEL_ALIASES]
             self._respond_json({"object": "list", "data": models})
+        elif self.path == "/status":
+            html = _build_status_html()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
         else:
             self._respond_json({"detail": "Not found"}, 404)
 
@@ -646,6 +1077,11 @@ class Handler(BaseHTTPRequestHandler):
         log(f"  Body: {json.dumps(parsed, ensure_ascii=False)[:1500]}")
 
         if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
+            # Log request summary with timestamp for status page tracking
+            msgs = parsed.get("messages", [])
+            total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
+            tools = parsed.get("tools", [])
+            log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
             self._handle_messages(parsed)
         else:
             log(f"  -> 404 (unknown path)")
@@ -661,8 +1097,52 @@ class Handler(BaseHTTPRequestHandler):
         raw_messages, clear_stats = clear_old_tool_results(raw_messages)
         if clear_stats.get("cleared"):
             log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, {clear_stats['cleared_chars']:,} chars freed (kept last {clear_stats['kept']})")
+        elif not clear_stats.get("enabled"):
+            log(f"  -> Tool clearing: disabled ({BACKEND_TYPE} backend)")
         elif clear_stats.get("enabled") and not clear_stats.get("skipped"):
             log(f"  -> Tool clearing: active (threshold={PROXY_CLEAR_THRESHOLD}, keep={PROXY_TOOL_KEEP})")
+
+        # Normalize system-reminder date to stabilize prefix for KV cache hits
+        if raw_messages and raw_messages[0].get("role") == "user":
+            content = raw_messages[0].get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        # Replace dynamic date with fixed placeholder to stabilize prefix
+                        new_text = re.sub(r"Today's date is \d{4}/\d{2}/\d{2}\.", "Today's date is DATE_PLACEHOLDER.", text)
+                        if new_text != text:
+                            block["text"] = new_text
+                            log(f"  -> Standardized date in msg0 block")
+            else:
+                new_content = re.sub(r"Today's date is \d{4}/\d{2}/\d{2}\.", "Today's date is DATE_PLACEHOLDER.", str(content))
+                if new_content != content:
+                    raw_messages[0]["content"] = new_content
+                    log(f"  -> Standardized date in msg0")
+
+        # Proxy-side message truncation when total context exceeds backend limit
+        raw_messages, trunc_stats = truncate_messages_if_needed(raw_messages)
+        if trunc_stats.get("truncated"):
+            log(f"  -> Context truncation: {trunc_stats['dropped_messages']} messages dropped, {trunc_stats['dropped_chars']:,} chars removed ({trunc_stats['chars_before']:,} -> {trunc_stats['chars_after']:,})")
+        elif not trunc_stats.get("enabled"):
+            log(f"  -> Context truncation: disabled ({BACKEND_TYPE} backend)")
+
+        # Debug: compute hashes of first two messages to diagnose cache misses
+        if raw_messages:
+            def _msg_hash(m):
+                import hashlib
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+                elif not isinstance(c, str):
+                    c = str(c)
+                return hashlib.md5((m.get("role", "") + ":" + c).encode()).hexdigest()[:8]
+            h0 = _msg_hash(raw_messages[0]) if len(raw_messages) > 0 else "none"
+            h1 = _msg_hash(raw_messages[1]) if len(raw_messages) > 1 else "none"
+            log(f"  -> Msg hashes: msg0={h0}, msg1={h1}, total_msgs={len(raw_messages)}")
+
+        if trunc_stats.get("enabled") and not trunc_stats.get("skipped") and not trunc_stats.get("truncated"):
+            log(f"  -> Context truncation: active (limit={PROXY_CTX_CHARS_LIMIT:,} chars, keep_head={PROXY_CTX_KEEP_HEAD}, keep_tail={PROXY_CTX_KEEP_TAIL})")
 
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)
@@ -701,24 +1181,28 @@ class Handler(BaseHTTPRequestHandler):
 
         log(f"  -> Forwarding to {LLAMA_BASE}/chat/completions")
         try:
-            req = urllib.request.Request(
-                f"{LLAMA_BASE}/chat/completions",
-                data=json.dumps(openai_body).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Authorization": "Bearer sk-1234"},
-                method="POST"
-            )
-            resp = urllib.request.urlopen(req, timeout=300)
-            log(f"  <- llama-server status: {resp.status}")
+            with _llama_lock:
+                req = urllib.request.Request(
+                    f"{LLAMA_BASE}/chat/completions",
+                    data=json.dumps(openai_body).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLAMA_API_KEY}"},
+                    method="POST"
+                )
+                if IS_CLOUD:
+                    resp = urllib.request.urlopen(req, timeout=300)
+                else:
+                    with _llama_lock:
+                        resp = urllib.request.urlopen(req, timeout=300)
+                log(f"  <- llama-server status: {resp.status}")
+                if is_stream:
+                    self._handle_streaming_response(resp, body)
+                else:
+                    self._handle_non_streaming_response(resp, body)
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8")
             log(f"  <- llama-server error: {e.code} - {err[:500]}")
             self._respond_json({"error": {"message": err}}, e.code)
             return
-
-        if is_stream:
-            self._handle_streaming_response(resp, body)
-        else:
-            self._handle_non_streaming_response(resp, body)
 
     def _handle_non_streaming_response(self, resp, anthropic_body):
         openai_resp = json.loads(resp.read().decode("utf-8"))
@@ -805,11 +1289,15 @@ class Handler(BaseHTTPRequestHandler):
             if choice.get("finish_reason"):
                 stream_finish_reason = choice["finish_reason"]
 
-            # Extract usage from llama-server timings (last chunk usually has this)
+            # Extract usage from llama-server timings or OpenAI/DeepSeek usage field
             timings = chunk.get("timings")
             if timings:
                 input_tokens = timings.get("prompt_n", input_tokens)
                 output_tokens = timings.get("predicted_n", output_tokens)
+            usage = chunk.get("usage")
+            if usage:
+                input_tokens = usage.get("prompt_tokens", input_tokens)
+                output_tokens = usage.get("completion_tokens", output_tokens)
 
             # Handle tool_calls in streaming
             tc_delta = delta.get("tool_calls")
@@ -936,8 +1424,15 @@ def main():
     port = int(os.environ.get("PORT", "4000"))
     host = os.environ.get("HOST", "127.0.0.1")
     log(f"=== Starting Anthropic proxy on http://{host}:{port} ===")
-    log(f"Forwarding to {LLAMA_BASE}")
-    HTTPServer((host, port), Handler).serve_forever()
+    log(f"Backend type: {BACKEND_TYPE}")
+    log(f"Forwarding to: {LLAMA_BASE}")
+    log(f"Model: {MODEL_NAME}")
+    log(f"Concurrency: {PROXY_MAX_CONCURRENT}")
+    log(f"Tool clearing: {'enabled (threshold=' + str(PROXY_CLEAR_THRESHOLD) + ', keep=' + str(PROXY_TOOL_KEEP) + ')' if PROXY_CLEAR_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
+    log(f"Context limit: {'enabled (limit=' + str(PROXY_CTX_CHARS_LIMIT) + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
+    if IS_CLOUD:
+        log(f"Cloud API mode — no local backend required")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 if __name__ == "__main__":
     main()

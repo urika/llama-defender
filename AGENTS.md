@@ -14,14 +14,21 @@ inference orchestration layer that wraps external backend binaries
 (`llama-server` or `rapid-mlx`) and exposes an Anthropic-compatible API via a
 Python proxy.
 
-Primary use-case: running **Qwen3.6-35B-A3B** (and occasionally Qwen3.5-9B) on
-Apple Silicon (MacBook Pro M5 Pro, 48 GB unified memory) for agentic coding
-workflows, specifically with Claude Code.
+Primary use-case: running **Qwen3.6-35B-A3B via Rapid-MLX** (and occasionally
+Qwen3.6-27B-MTP via llama-server) on Apple Silicon (MacBook Pro M5 Pro,
+48 GB unified memory) for agentic coding workflows, specifically with Claude Code.
+
+**Proxy dual-mode**: the same proxy can also forward requests to cloud APIs
+(DeepSeek, OpenAI) without any local backend, enabling A/B comparison between
+local and cloud models. Claude Code always connects to `127.0.0.1:4000`;
+backend switching is done entirely at the proxy layer — **never modify Claude Code
+configuration directly**.
 
 ### High-level data flow
 
 ```
-Client (Anthropic SDK) → anthropic_proxy.py:4000 → llama-server/rapid-mlx:8081 → GGUF/MLX model
+Local mode:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → llama-server/rapid-mlx:8081 → GGUF/MLX model
+Cloud mode:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek/OpenAI API → cloud model
 ```
 
 The proxy translates Anthropic Messages API requests into OpenAI chat-completion
@@ -36,9 +43,9 @@ Anthropic format (including streaming SSE events).
 |-----------|------------|
 | Service manager | Bash 4+ (`manage.sh`) |
 | API proxy | Python 3 (stdlib only: `http.server`, `urllib.request`, `json`, `re`) |
-| Backend option 1 | `llama-server` binary from upstream llama.cpp (GGUF) |
-| Backend option 2 | `rapid-mlx` binary (MLX framework, Apple-optimized) |
-| Chat template | Custom Jinja2 template (`qwen35-template.jinja`) |
+| Backend option 1 (local) | `llama-server` binary from upstream llama.cpp (GGUF) |
+| Backend option 2 (local) | `rapid-mlx` binary (MLX framework, Apple-optimized) |
+| Backend option 3 (cloud) | DeepSeek API (`deepseek-v4-pro`) or OpenAI API |
 | OS target | macOS with Metal (Apple Silicon) |
 
 **No build tools** (no `pyproject.toml`, `package.json`, `Cargo.toml`, `Makefile`,
@@ -52,13 +59,19 @@ etc.). The project is a collection of runnable scripts and configuration files.
 .
 ├── manage.sh                  # Main service manager (bash)
 ├── anthropic_proxy.py         # Anthropic→OpenAI proxy (python3)
-├── qwen35-template.jinja      # Chat template for Qwen3.5/3.6
 ├── configs/
 │   ├── active.conf            # Symlink to the currently active config
-│   ├── qwen3.6-35b.conf       # llama-server + Qwen3.6-35B-A3B (GGUF)
-│   ├── qwen3.5-9b.conf        # llama-server + Qwen3.5-9B (GGUF)
-│   ├── qwen3.5-9b-coding.conf # llama-server + Qwen3.5-9B higher precision
+│   ├── deepseek-chat.conf     # Cloud proxy → DeepSeek API (no local backend)
+│   ├── qwen3.6-27b-mtp.conf   # llama-server + Qwen3.6-27B-MTP (GGUF)
 │   └── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
+├── tools/
+│   ├── bench_mtp.py           # MTP model performance benchmark
+│   ├── test_proxy_fallback.py # Unit tests for proxy fallback logic
+│   ├── e2e_tools_fallback.sh  # End-to-end proxy tool-call test
+│   ├── logview.sh             # Unified log viewer
+│   ├── sysmon.sh              # System monitoring (memory, CPU, disk)
+│   ├── modelmon.sh            # Model service monitoring
+│   └── memcheck.sh            # Detailed memory analysis
 ├── BENCHMARK.md               # Performance test report (Chinese)
 └── CLAUDE.md                  # Legacy agent guide (keep in sync)
 ```
@@ -66,6 +79,7 @@ etc.). The project is a collection of runnable scripts and configuration files.
 ### Runtime artifacts (not in git)
 
 - `llama-server.pid` — PID file written by `manage.sh`
+- `anthropic_proxy.pid` — Proxy PID file written by `manage.sh`
 - `logs/llama-server.log` — Combined stdout/stderr log of the backend process
 - `logs/anthropic_proxy.log` — Proxy request/response log
 - `/tmp/anthropic_request_body.json` — Last proxy request body (debug)
@@ -77,11 +91,13 @@ etc.). The project is a collection of runnable scripts and configuration files.
 ### Commands
 
 ```bash
-./manage.sh start              # Start backend with current active config
+./manage.sh start              # Start backend + proxy with current active config (local)
+./manage.sh start-cloud        # Start proxy only, forwarding to cloud API (DeepSeek/OpenAI)
 ./manage.sh stop               # Graceful stop (fallback to kill -9)
-./manage.sh status             # PID, memory, API health, current model
+./manage.sh status             # PID, memory, API health, current model, proxy status
 ./manage.sh restart            # Stop + start
-./manage.sh logs [N]           # Tail last N lines (default 50)
+./manage.sh logs [N]           # Tail last N lines of backend log (default 50)
+./manage.sh proxy-logs [N]     # Tail last N lines of proxy log (default 50)
 ./manage.sh list               # List all available configs
 ./manage.sh switch <name>      # Symlink active.conf to <name>.conf
 ./manage.sh current            # Show current config details
@@ -98,7 +114,7 @@ Key environment variables (with defaults):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLAMA_BACKEND` | `llama-server` | Backend: `llama-server` or `rapid-mlx` |
-| `LLAMA_MODEL` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_XS` | Model path or HuggingFace ID |
+| `LLAMA_MODEL` | `mlx-community/Qwen3.6-35B-A3B-4bit` | Model path or HuggingFace ID |
 | `LLAMA_PORT` | `8081` | Backend listen port |
 | `LLAMA_HOST` | `127.0.0.1` | Backend bind address |
 | `LLAMA_CTX` | `131072` | Context length (llama-server only) |
@@ -113,8 +129,18 @@ Key environment variables (with defaults):
 | `LLAMA_TOP_K` | `20` | Top-k sampling |
 | `LLAMA_PRESENCE_PENALTY` | `0.0` | Presence penalty (llama-server only) |
 | `LLAMA_MIN_P` | `0.0` | Min-p sampling (llama-server only) |
-| `LLAMA_THINKING` | `false` | Enable Qwen thinking mode |
+| `LLAMA_THINKING` | `false` | Enable Qwen thinking mode (`false`/`true`/``) |
 | `LLAMA_EXTRA_ARGS` | `--jinja --flash-attn on --fit on` | Extra CLI flags |
+
+Cloud API specific variables (used when `BACKEND_TYPE=cloud`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMA_BASE_URL` | `https://api.deepseek.com/v1` | Cloud API base URL |
+| `LLAMA_API_KEY` | (none) | **Real** API key for cloud service (not a dummy token) |
+| `MODEL_NAME` | `deepseek-v4-pro` | Cloud model identifier |
+| `BACKEND_TYPE` | (auto-detected) | `local` or `cloud`; auto-detected from `LLAMA_BASE_URL` |
+| `PROXY_MAX_CONCURRENT` | `4` (cloud) / `1` (local) | Max concurrent requests |
 
 Rapid-MLX specific variables:
 
@@ -125,6 +151,7 @@ Rapid-MLX specific variables:
 | `RAPID_MLX_ENABLE_PREFIX_CACHE` | `true` | Enable prefix cache |
 | `RAPID_MLX_KV_QUANTIZATION` | `false` | Enable KV quantization |
 | `RAPID_MLX_KV_QUANT_BITS` | `8` | KV quant bits |
+| `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags |
 
 Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 `CONFIG_MEMORY`) used by `manage.sh list` for human-readable display.
@@ -134,8 +161,11 @@ Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 1. Checks if service is already running (reads PID file, falls back to `pgrep`).
 2. Checks port availability with `lsof`.
 3. Launches backend via `nohup … >> llama-server.log 2>&1 &`.
-4. Polls `http://host:port/v1/models` for up to 60 seconds to confirm readiness.
-5. Writes PID to `llama-server.pid`.
+4. Polls `http://host:port/v1/models` for up to 60 seconds to confirm readiness
+   (with download-progress detection for HuggingFace models).
+5. Writes backend PID to `llama-server.pid`.
+6. Starts `anthropic_proxy.py` if not already running, writes PID to
+   `anthropic_proxy.pid`.
 
 ---
 
@@ -151,6 +181,33 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 The proxy listens on `HOST:PORT` (default `127.0.0.1:4000`) and forwards to
 `LLAMA_BASE_URL` (default `http://127.0.0.1:8081/v1`).
+
+### Dual-mode design (local vs cloud)
+
+The proxy automatically detects whether it is running in **local** or **cloud**
+mode based on `LLAMA_BASE_URL`:
+
+| Aspect | Local mode | Cloud mode |
+|--------|-----------|------------|
+| Detection | `LLAMA_BASE_URL` lacks `deepseek`, `openai`, or `api.` | `LLAMA_BASE_URL` contains `deepseek`, `openai`, or `api.` |
+| `BACKEND_TYPE` | `local` | `cloud` |
+| Backend process | `llama-server` or `rapid-mlx` on `:8081` | None (external API) |
+| `LLAMA_API_KEY` | Dummy token (`sk-1234`) for backend compatibility | **Real API key** (required) |
+| `MODEL_NAME` | Auto-set to local model (e.g., `mlx-community/Qwen3.6-35B-A3B-4bit`) | Auto-set to cloud model (e.g., `deepseek-v4-pro`) |
+| `PROXY_MAX_CONCURRENT` | Default `1` (prevents OOM on 48GB) | Default `4` (cloud handles concurrency) |
+| Concurrency control | `threading.Semaphore` around local backend | `threading.Semaphore` around cloud API |
+| Token counting | Uses `timings.prompt_n` / `predicted_n` (llama-server) or `usage.*` | Uses `usage.prompt_tokens` / `completion_tokens` (OpenAI/DeepSeek) |
+| Tool clearing | **Enabled** by default (threshold=15K, keep=2) | **Disabled** by default (1M+ token context) |
+| Context limit | **Enabled** by default (limit=180K chars) | **Disabled** by default |
+| Status page | Shows PID, memory, cache stats | Shows endpoint, model, masked API key |
+
+**Key principle**: Claude Code always connects to `http://127.0.0.1:4000`.
+Switching between local and cloud models is done by:
+1. `./manage.sh switch <config>` (change `active.conf` symlink)
+2. `./manage.sh restart` (or `./manage.sh start-cloud` for cloud)
+
+**Never modify Claude Code configuration** (`~/.claude/settings.local.json`,
+`ANTHROPIC_BASE_URL`, etc.) directly. The proxy is the single point of control.
 
 ### Supported endpoints
 
@@ -183,9 +240,13 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_CLEAR_ENABLED` | `true` | Enable tool-result clearing |
-| `PROXY_CLEAR_THRESHOLD` | `30000` | Character threshold to trigger clearing |
-| `PROXY_TOOL_KEEP` | `5` | Number of recent tool_result pairs to preserve |
+| `PROXY_CLEAR_ENABLED` | `false` (cloud) / `true` (local) | Enable tool-result clearing. **Auto-disabled for cloud backends** (1M+ token context) |
+| `PROXY_CLEAR_THRESHOLD` | `30000` (cloud) / `15000` (local) | Character threshold to trigger clearing |
+| `PROXY_TOOL_KEEP` | `10` (cloud) / `2` (local) | Number of recent tool_result pairs to preserve |
+| `PROXY_CONTENT_TOOLS_FALLBACK` | `true` | Enable `<tools>` content-text extraction |
+| `PROXY_MAX_CONCURRENT` | `4` (cloud) / `1` (local) | Max concurrent requests forwarded to backend |
+| `PROXY_CTX_LIMIT_ENABLED` | `false` (cloud) / `true` (local) | Enable message truncation when context exceeds limit |
+| `PROXY_CTX_CHARS_LIMIT` | `500000` (cloud) / `180000` (local) | Character limit for context truncation |
 
 ### Special handling
 
@@ -193,46 +254,43 @@ Environment variables:
   XML-style tool calls instead of JSON (llama.cpp issue #21495). The proxy tries
   JSON → embedded JSON → XML extraction → heuristic fallback.
 - **Content-text tool extraction** (`_extract_content_tool_calls` and
-  `_StreamingToolsExtractor`): Qwen2.5-Coder-32B under Q4_K_M quantization
-  emits `<tools>\n{"name":..., "arguments":{...}}\n</tools>` as plain content
+  `_StreamingToolsExtractor`): some Qwen models under Q4_K_M quantization
+  emit `<tools>\n{"name":..., "arguments":{...}}\n</tools>` as plain content
   text instead of populating the `tool_calls` array. The proxy scans content
   text in both the non-streaming converter and a streaming state machine,
   parses the JSON body, and synthesises Anthropic `tool_use` blocks. Structured
-  `tool_calls` always take precedence. Env-var gate:
-  `PROXY_CONTENT_TOOLS_FALLBACK` (default `true`).
+  `tool_calls` always take precedence.
 - **Reasoning content**: Qwen3.6's `reasoning_content` field is extracted; if
   regular `content` is empty, reasoning text is used as the response body.
 - **Model aliases**: Clients can request `claude-3-5-sonnet-20241022`,
   `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`, etc.; all map to
-  the local model.
+  the active model (local or cloud). When using DeepSeek's Anthropic-compatible
+  endpoint, `claude-opus` maps to `deepseek-v4-pro` and `claude-haiku`/`sonnet`
+  map to `deepseek-v4-flash`.
 - **Tool IDs**: Some backends omit `tool_call_id` in streaming; the proxy
   generates synthetic IDs (`call_<hex>`) to satisfy Anthropic SDK requirements.
 
 ---
 
-## Chat Template (`qwen35-template.jinja`)
+## Tools Directory (`tools/`)
 
-A custom Jinja2 chat template used by `llama-server --jinja`. Supports:
-
-- Multi-modal content (image, video) with `vision_start`/`vision_end` tokens.
-- Tool definition injection in system prompt.
-- XML-style tool call formatting (`<tool_call>`, `<function=…>`, `<parameter=…>`).
-- Tool response wrapping (`<tool_response>`).
-- Reasoning tag extraction (`<think>` / `</think>`).
-- Deferred tool patterns (Claude Code multi-step tool workflows).
-- `enable_thinking` flag controlled via `LLAMA_THINKING`.
-
-The template is **strict** — it raises Jinja exceptions for invalid message
-structures (system message not first, system message containing images, missing
-user query, unexpected roles, etc.).
+| Script | Purpose | How to run |
+|--------|---------|------------|
+| `bench_mtp.py` | MTP model performance benchmark | `python3 tools/bench_mtp.py --quick` |
+| `test_proxy_fallback.py` | Unit tests for proxy tool-call fallback | `python3 tools/test_proxy_fallback.py` |
+| `e2e_tools_fallback.sh` | End-to-end proxy tool-call test | `bash tools/e2e_tools_fallback.sh` (needs running backend) |
+| `logview.sh` | Unified log viewer | `./tools/logview.sh backend 100` |
+| `sysmon.sh` | System monitoring | `./tools/sysmon.sh` |
+| `modelmon.sh` | Model service monitoring | `./tools/modelmon.sh` |
+| `memcheck.sh` | Detailed memory analysis | `./tools/memcheck.sh` |
 
 ---
 
 ## Code Style Guidelines
 
-### Bash (`manage.sh`)
+### Bash (`manage.sh`, `tools/*.sh`)
 
-- `set -euo pipefail` at the top of the script.
+- `set -euo pipefail` at the top of every script.
 - Functions prefixed with underscore are private/internal (e.g., `_load_config`).
 - Public commands use `cmd_` prefix (e.g., `cmd_start`).
 - Use `[[ ]]` for all conditionals.
@@ -240,12 +298,12 @@ user query, unexpected roles, etc.).
 - Color-coded output: `info`, `warn`, `error` helper functions.
 - Comments and user-facing output are in **Chinese**.
 
-### Python (`anthropic_proxy.py`)
+### Python (`anthropic_proxy.py`, `tools/*.py`)
 
 - Standard library **only** — do not add third-party dependencies.
 - Top-level constants (`LLAMA_BASE`, `MODEL_NAME`, `MODEL_ALIASES`).
 - Helper functions at module level, no classes except `Handler`.
-- `log()` writes to stdout and `/tmp/anthropic_proxy.log`.
+- `log()` writes to stdout and `/tmp/anthropic_proxy.log` (or `PROXY_LOG_PATH`).
 - Keep the proxy stateless; all request state lives in `Handler` instances.
 
 ### Config files (`configs/*.conf`)
@@ -259,17 +317,43 @@ user query, unexpected roles, etc.).
 
 ## Testing Strategy
 
-There is **no automated test suite** in this repository. Validation is manual:
+### Unit tests
+
+`tools/test_proxy_fallback.py` contains `unittest` tests for:
+- `_extract_content_tool_calls` (non-streaming `<tools>` fallback)
+- `_StreamingToolsExtractor` (streaming state machine)
+- `convert_openai_response_to_anthropic` (full response conversion)
+
+Run with:
+```bash
+python3 tools/test_proxy_fallback.py
+# or
+python3 -m unittest discover -s tools -p 'test_*.py' -v
+```
+
+### End-to-end tests
+
+`tools/e2e_tools_fallback.sh` hits the live proxy (requires backend + proxy
+running) and validates:
+1. Non-streaming tool call returns correct `tool_use` block
+2. Streaming tool call emits correct SSE event sequence
+3. Plain chat without tools still works
+
+Run with:
+```bash
+bash tools/e2e_tools_fallback.sh
+```
+
+### Manual validation
 
 1. **Backend health**: `./manage.sh status` checks process + API endpoint.
 2. **Proxy health**: `curl http://127.0.0.1:4000/v1/models`.
 3. **End-to-end**: Send an Anthropic-format request through the proxy and verify
    response format and content.
-4. **Benchmarking**: Custom scripts (historically placed in `/tmp/`) measure
-   throughput, TTFT, and concurrency behavior. See `BENCHMARK.md` for results.
+4. **Benchmarking**: `python3 tools/bench_mtp.py --quick` measures MTP throughput.
 
-When modifying `anthropic_proxy.py`, test both streaming and non-streaming
-paths, with and without tool calls.
+When modifying `anthropic_proxy.py`, run **both** unit tests and e2e tests,
+for both streaming and non-streaming paths, with and without tool calls.
 
 When modifying `manage.sh`, test `start`, `stop`, `restart`, `switch`, and
 `status` for both backends.
@@ -283,13 +367,24 @@ This is a **single-machine, single-user** setup. Deployment steps:
 1. Ensure `llama-server` (from upstream llama.cpp) or `rapid-mlx` is installed
    and on `$PATH`.
 2. Select config: `./manage.sh switch <config_name>`.
-3. Start backend: `./manage.sh start`.
-4. Start proxy (in another terminal or via `screen`/`tmux`):
-   `python3 anthropic_proxy.py`.
-5. Point client SDK to `http://127.0.0.1:4000`.
+3. Start backend + proxy: `./manage.sh start`.
+4. Point client SDK to `http://127.0.0.1:4000`.
 
 No containerization, no CI/CD, no package management. Both backend and proxy
-run as foreground/detached processes managed manually.
+run as detached processes managed by `manage.sh`.
+
+### Building llama-server from source (for MTP support)
+
+Brew's `llama-server` lacks MTP support. Build from source:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+cmake /tmp/llama.cpp -B /tmp/llama.cpp/build -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=OFF
+cmake --build /tmp/llama.cpp/build --config Release -j --target llama-server
+# Binary: /tmp/llama.cpp/build/bin/llama-server
+```
+
+Set `LLAMA_SERVER_BIN` env var or update `tools/bench_mtp.py`'s constant.
 
 ---
 
@@ -300,15 +395,43 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
 1. **Rapid-MLX ignores `max_tokens`** (v0.6.30) — requests may generate far more
    tokens than requested. Workaround: use `llama-server` when token limits matter.
 2. **llama.cpp poor Qwen3.5-9B performance** — Gated DeltaNet architecture has
-   incomplete Metal support; only ~17 tok/s. Use Rapid-MLX for this model.
+   incomplete Metal support; only ~17 tok/s. This model config has been removed;
+   use Rapid-MLX or Qwen3.6-27B-MTP instead.
 3. **KV cache restore errors** — `state_seq_set_data` errors appear in
    `llama-server.log`; non-fatal but indicate compatibility quirks with Qwen3.x.
-4. **llama-server poor concurrency** — Metal single-GPU time-slicing is
-   inefficient; 2+ concurrent requests cause severe latency spikes. Rapid-MLX
-   handles 2–4 concurrent requests much better.
-5. **Proxy `MODEL_NAME` hard-coding** — When switching backend, you must also
-   update `MODEL_NAME` in `anthropic_proxy.py` to match the backend's model
-   identifier (see `BENCHMARK.md` § "代理层 MODEL_NAME 切换").
+4. **Concurrency limits on Apple Silicon** — Metal single-GPU time-slicing is
+   inefficient; 2+ concurrent requests cause severe latency spikes on llama-server.
+   Rapid-MLX handles multiple concurrent small requests well, but **two concurrent
+   large-context (>38K tokens) requests on Rapid-MLX will reliably OOM** on 48GB
+   unified memory. The proxy uses `PROXY_MAX_CONCURRENT` via a `threading.Semaphore`
+   to control forwarding: `1` for llama-server configs, and **`1` for rapid-mlx-35b**
+   (was `4`, reduced after repeated `[METAL] Insufficient Memory` crashes).
+5. **Rapid-MLX OOM on 48GB unified memory** — `allocation_limit` (set via
+   `--gpu-memory-utilization`) is a **soft target**, not a hard wall. Prefill-phase
+   activations + KV cache + prefix cache can overshoot by 20–40% (e.g. limit=28GB,
+   actual peaks at 33–39GB). Known crash signature: `[METAL] Command buffer
+   execution failed: Insufficient Memory`. Prefix cache accumulating to 6GB+
+   drastically increases risk. Mitigation: `PROXY_MAX_CONCURRENT=1`,
+   `--gpu-memory-utilization 0.60` (allocation_limit ≈24GB), keep
+   `--cache-memory-percent 0.30` with memory-aware cache enabled. The
+   `forced cache clear` triggered at 30GB does not prevent the crash.
+6. **Proxy `MODEL_NAME` auto-detection** — `MODEL_NAME` is now automatically
+   set based on `BACKEND_TYPE` (local: `mlx-community/Qwen3.6-35B-A3B-4bit`,
+   cloud: `deepseek-v4-pro`). Manual override via `MODEL_NAME` env var is still
+   supported for edge cases.
+7. **MTP requires source-built llama-server** — Brew version lacks
+   `--spec-type draft-mtp`. Use config `qwen3.6-27b-mtp` with a manually built
+   binary (the `qwen3.6-35b-mtp` config has been removed).
+8. **Cloud API cost risk** — DeepSeek `deepseek-v4-pro` charges per token.
+   A typical agentic coding task with 56K tokens/request × 20 requests costs
+   approximately ¥1–3. Monitor usage via proxy logs (`REQ_SUMMARY` lines).
+9. **Cloud mode observability loss** — When using cloud APIs, the proxy loses
+   visibility into: exact TTFT (network latency overlay), memory pressure,
+   prefix cache effectiveness, and forced cache clears. Only request size,
+   tool-call frequency, and message structure remain observable.
+10. **`deepseek-chat` deprecation** — DeepSeek's `deepseek-chat` and
+    `deepseek-reasoner` model names will be deprecated on 2026-07-24. Use
+    `deepseek-v4-pro` and `deepseek-v4-flash` instead.
 
 ---
 
@@ -318,22 +441,28 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
   Both bind to `127.0.0.1` by default, but any local process can access them.
 - **No input validation** beyond JSON parsing in the proxy. Maliciously crafted
   Anthropic requests may propagate to the backend unchecked.
-- **Log files** (`llama-server.log`, `/tmp/anthropic_proxy.log`) may contain
-  prompt data. They are world-readable on typical `/tmp` setups.
+- **Log files** (`llama-server.log`, `anthropic_proxy.log`, `/tmp/anthropic_proxy.log`)
+  may contain prompt data. They are world-readable on typical `/tmp` setups.
 - **No HTTPS** — all traffic is plain HTTP on localhost.
 - **Do not expose ports to the public internet** without an authentication layer.
-- The proxy uses a dummy bearer token (`sk-1234`) when forwarding to the backend;
-  this is for backend compatibility, not security.
+- The proxy uses a dummy bearer token (`sk-1234`) when forwarding to a **local**
+  backend; this is for backend compatibility, not security.
+- In **cloud mode**, the proxy forwards the **real `LLAMA_API_KEY`** to the cloud
+  API provider. Ensure `LLAMA_API_KEY` is properly protected (e.g., via env vars,
+  not hard-coded in config files checked into git).
 
 ---
 
 ## Agent Checklist When Editing
 
-- [ ] If you change backend startup flags in `manage.sh`, test `start` and `status`.
-- [ ] If you modify `anthropic_proxy.py`, test both streaming and non-streaming
-      requests, and verify tool-call XML fallback still works.
+- [ ] If you change backend startup flags in `manage.sh`, test `start`, `stop`,
+      `restart`, and `status` for both `llama-server` and `rapid-mlx` backends.
+      Also test `start-cloud` and cloud-mode `status`.
+- [ ] If you modify `anthropic_proxy.py`, run `python3 tools/test_proxy_fallback.py`
+      and `bash tools/e2e_tools_fallback.sh` (with proxy + backend running).
+      Test both local and cloud modes.
 - [ ] If you add a new config variable, add it to the defaults in `manage.sh` and
       document it in `CLAUDE.md` and this file.
-- [ ] If you modify `qwen35-template.jinja`, test with `llama-server --jinja` and
-      verify tool/reasoning/vision paths.
+- [ ] When adding a new backend type (cloud API provider), ensure `BACKEND_TYPE`
+      auto-detection in `anthropic_proxy.py` covers its URL pattern.
 - [ ] Keep `CLAUDE.md` and `AGENTS.md` in sync when architectural changes happen.

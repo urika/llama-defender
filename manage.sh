@@ -39,7 +39,7 @@ _load_config
 # 默认配置
 # ============================================================
 : "${LLAMA_BACKEND:=llama-server}"
-: "${LLAMA_MODEL:=unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_XS}"
+: "${LLAMA_MODEL:=mlx-community/Qwen3.6-35B-A3B-4bit}"
 : "${LLAMA_PORT:=8081}"
 : "${LLAMA_HOST:=127.0.0.1}"
 : "${LLAMA_CTX:=131072}"
@@ -63,6 +63,9 @@ _load_config
 : "${RAPID_MLX_ENABLE_PREFIX_CACHE:=true}"
 : "${RAPID_MLX_KV_QUANTIZATION:=false}"
 : "${RAPID_MLX_KV_QUANT_BITS:=8}"
+
+# 代理并发控制
+: "${PROXY_MAX_CONCURRENT:=1}"
 
 # ============================================================
 # 颜色输出
@@ -432,14 +435,24 @@ _start_proxy() {
 
     _check_port "$PROXY_PORT" || return 1
 
+    # 使用配置中的 LLAMA_BASE_URL 如果有的话，否则用本地
+    local base_url="${LLAMA_BASE_URL:-http://$LLAMA_HOST:$LLAMA_PORT/v1}"
+
     info "启动 anthropic_proxy.py..."
     info "  地址: $PROXY_HOST:$PROXY_PORT"
-    info "  后端: http://$LLAMA_HOST:$LLAMA_PORT/v1"
+    info "  后端: $base_url"
 
-    LLAMA_BASE_URL="http://$LLAMA_HOST:$LLAMA_PORT/v1" \
+    LLAMA_BASE_URL="$base_url" \
+    LLAMA_API_KEY="${LLAMA_API_KEY:-sk-1234}" \
+    MODEL_NAME="${MODEL_NAME:-}" \
     PORT="$PROXY_PORT" \
     HOST="$PROXY_HOST" \
     PROXY_LOG_PATH="$PROXY_LOGFILE" \
+    PROXY_MAX_CONCURRENT="${PROXY_MAX_CONCURRENT:-1}" \
+    PROXY_CLEAR_ENABLED="${PROXY_CLEAR_ENABLED:-true}" \
+    PROXY_CLEAR_THRESHOLD="${PROXY_CLEAR_THRESHOLD:-30000}" \
+    PROXY_TOOL_KEEP="${PROXY_TOOL_KEEP:-5}" \
+    PROXY_CONTENT_TOOLS_FALLBACK="${PROXY_CONTENT_TOOLS_FALLBACK:-true}" \
     nohup python3 "$SCRIPT_DIR/anthropic_proxy.py" >> "$PROXY_LOGFILE" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PROXY_PIDFILE"
@@ -512,6 +525,11 @@ cmd_start() {
         rapid-mlx)
             _start_rapid_mlx || true
             ;;
+        cloud|deepseek-cloud|openai-cloud)
+            # 云模式：直接启动代理，不启动本地后端
+            _start_proxy
+            return $?
+            ;;
         llama-server|*)
             _start_llama_server || true
             ;;
@@ -522,6 +540,62 @@ cmd_start() {
         _start_proxy
     else
         error "后端进程未运行，跳过代理启动"
+        return 1
+    fi
+}
+
+# ============================================================
+# 启动云端代理（DeepSeek / OpenAI 等）
+# ============================================================
+cmd_start_cloud() {
+    # 检查 API Key
+    if [[ -z "${LLAMA_API_KEY:-}" ]]; then
+        error "未设置 LLAMA_API_KEY，无法启动云端模式"
+        error "请先设置环境变量: export LLAMA_API_KEY=\"sk-你的Key\""
+        info ""
+        info "DeepSeek 注册地址: https://platform.deepseek.com/"
+        return 1
+    fi
+
+    # 检查是否已设置云 API URL
+    if [[ -z "${LLAMA_BASE_URL:-}" ]]; then
+        warn "未设置 LLAMA_BASE_URL，使用默认 DeepSeek: https://api.deepseek.com/v1"
+        LLAMA_BASE_URL="https://api.deepseek.com/v1"
+    fi
+
+    # 检查 URL 是否为云 API
+    if [[ ! "$LLAMA_BASE_URL" =~ (deepseek|openai|api\.) ]]; then
+        warn "LLAMA_BASE_URL 看起来不像云 API: $LLAMA_BASE_URL"
+        warn "确认后继续启动 (3秒)..."
+        sleep 3
+    fi
+
+    info "启动云端代理模式..."
+    info "  后端 URL:   $LLAMA_BASE_URL"
+    info "  模型:       ${MODEL_NAME:-deepseek-chat}"
+    info "  API Key:    ${LLAMA_API_KEY:0:8}****"
+    info "  并发:       ${PROXY_MAX_CONCURRENT:-4}"
+
+    # 停止可能运行的本地后端（避免端口冲突）
+    if _get_pid >/dev/null 2>&1; then
+        warn "检测到本地后端在运行，先停止..."
+        cmd_stop || true
+        sleep 1
+    fi
+
+    # 启动代理（不启动本地后端）
+    if _start_proxy; then
+        info ""
+        info "✅ 云端代理已启动"
+        info ""
+        info "Claude Code 配置命令:"
+        info "  export ANTHROPIC_BASE_URL=http://$PROXY_HOST:$PROXY_PORT"
+        info "  export ANTHROPIC_AUTH_TOKEN=sk-any"
+        info "  cd /your/project && claude"
+        info ""
+        info "状态页面: http://$PROXY_HOST:$PROXY_PORT/status"
+    else
+        error "云端代理启动失败"
         return 1
     fi
 }
@@ -577,46 +651,65 @@ cmd_stop() {
 # 查询状态
 # ============================================================
 cmd_status() {
-    local pid backend
-    if ! pid=$(_get_pid 2>/dev/null); then
-        echo "状态: ${RED}未运行${NC}"
-        echo "  PID 文件: $PIDFILE"
-        echo "  日志文件: $LOGFILE"
-        echo "  当前配置: ${CYAN}$(_current_config_name)${NC}"
-        return 1
+    local pid backend is_cloud=false
+
+    # 检测是否为云模式
+    if [[ -n "${LLAMA_BASE_URL:-}" ]] && [[ "$LLAMA_BASE_URL" =~ (deepseek|openai|api\.) ]]; then
+        is_cloud=true
     fi
 
-    backend=$(_current_backend 2>/dev/null || echo "unknown")
-
-    echo "状态: ${GREEN}运行中${NC}"
-    echo "  后端:     ${CYAN}$backend${NC}"
-    echo "  配置:     ${CYAN}$(_current_config_name)${NC}"
-    echo "  PID:      $pid"
-
-    local proc_info
-    proc_info=$(ps -p "$pid" -o rss=,etime=,pcpu= 2>/dev/null | awk '{printf "  内存: %.1f GB\n  运行时间: %s\n  CPU: %s%%", $1/1024/1024, $2, $3}')
-    echo "$proc_info"
-
-    local api_status
-    if curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
-        api_status="${GREEN}正常${NC}"
+    if [[ "$is_cloud" == "true" ]]; then
+        echo "状态: ${GREEN}云端模式${NC}"
+        echo "  后端类型: ${CYAN}云端 API${NC}"
+        echo "  API 端点: $LLAMA_BASE_URL"
+        echo "  模型:     ${MODEL_NAME:-deepseek-chat}"
+        if [[ -n "${LLAMA_API_KEY:-}" ]]; then
+            echo "  API Key:  ${LLAMA_API_KEY:0:8}****"
+        fi
+        echo ""
     else
-        api_status="${RED}无响应${NC}"
+        # 本地模式：检查后端进程
+        if ! pid=$(_get_pid 2>/dev/null); then
+            echo "状态: ${RED}未运行${NC}"
+            echo "  PID 文件: $PIDFILE"
+            echo "  日志文件: $LOGFILE"
+            echo "  当前配置: ${CYAN}$(_current_config_name)${NC}"
+            return 1
+        fi
+
+        backend=$(_current_backend 2>/dev/null || echo "unknown")
+
+        echo "状态: ${GREEN}运行中${NC}"
+        echo "  后端:     ${CYAN}$backend${NC}"
+        echo "  配置:     ${CYAN}$(_current_config_name)${NC}"
+        echo "  PID:      $pid"
+
+        local proc_info
+        proc_info=$(ps -p "$pid" -o rss=,etime=,pcpu= 2>/dev/null | awk '{printf "  内存: %.1f GB\n  运行时间: %s\n  CPU: %s%%", $1/1024/1024, $2, $3}')
+        echo "$proc_info"
+
+        local api_status
+        if curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
+            api_status="${GREEN}正常${NC}"
+        else
+            api_status="${RED}无响应${NC}"
+        fi
+        echo "  API ($LLAMA_HOST:$LLAMA_PORT): $api_status"
+
+        local model_info
+        model_info=$(curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('models',[{}])[0].get('model','?'))" 2>/dev/null || echo "?")
+        echo "  模型:     $model_info"
+
+        if [[ -f "$LOGFILE" ]]; then
+            local last_log
+            last_log=$(tail -n 1 "$LOGFILE" 2>/dev/null | cut -c1-80)
+            echo "  最新日志: $last_log"
+        fi
+        echo ""
     fi
-    echo "  API ($LLAMA_HOST:$LLAMA_PORT): $api_status"
 
-    local model_info
-    model_info=$(curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" 2>/dev/null | \
-        python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('models',[{}])[0].get('model','?'))" 2>/dev/null || echo "?")
-    echo "  模型:     $model_info"
-
-    if [[ -f "$LOGFILE" ]]; then
-        local last_log
-        last_log=$(tail -n 1 "$LOGFILE" 2>/dev/null | cut -c1-80)
-        echo "  最新日志: $last_log"
-    fi
-
-    # 代理状态
+    # 代理状态（通用）
     local proxy_pid proxy_status
     if proxy_pid=$(_get_proxy_pid 2>/dev/null); then
         if curl -s --max-time 3 "http://$PROXY_HOST:$PROXY_PORT/v1/models" >/dev/null 2>&1; then
@@ -624,13 +717,11 @@ cmd_status() {
         else
             proxy_status="${YELLOW}无响应${NC}"
         fi
-        echo ""
         echo "代理 (anthropic_proxy.py):"
         echo "  状态:     $proxy_status"
         echo "  PID:      $proxy_pid"
         echo "  地址:     http://$PROXY_HOST:$PROXY_PORT"
     else
-        echo ""
         echo "代理 (anthropic_proxy.py): ${RED}未运行${NC}"
     fi
 }
@@ -794,6 +885,7 @@ llama.cpp / Rapid-MLX 服务管理脚本
 
 服务命令:
   start                启动后端和代理（根据当前配置）
+  start-cloud          启动云端代理（DeepSeek/OpenAI，无需本地后端）
   stop                 停止后端和代理
   status               查询后端和代理状态
   restart              重启后端和代理
@@ -816,6 +908,7 @@ llama.cpp / Rapid-MLX 服务管理脚本
   ./manage.sh list                    # 查看所有配置
   ./manage.sh switch rapid-mlx-35b    # 切换到 Rapid-MLX
   ./manage.sh start                   # 用当前配置启动
+  ./manage.sh start-cloud             # 启动云端代理（DeepSeek）
   ./manage.sh restart                 # 重启（应用新配置）
   ./manage.sh status                  # 查看运行状态
 
@@ -829,6 +922,9 @@ main() {
     case "${1:-help}" in
         start)
             cmd_start
+            ;;
+        start-cloud)
+            cmd_start_cloud
             ;;
         stop)
             cmd_stop

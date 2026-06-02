@@ -20,3 +20,12 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+
+# Runtime artifacts
+*.pid
+
+# Model files (large binaries)
+models/
+
+# Kimi export files
+kimi-export-*.md
