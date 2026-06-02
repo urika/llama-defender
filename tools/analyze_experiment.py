@@ -81,6 +81,12 @@ def summarize(data, label):
     chars_list = [r["chars"] for r in reqs]
     tools_list = [r["tools"] for r in reqs]
 
+    # 计算请求大小增长趋势
+    growth_list = []
+    for i in range(1, len(chars_list)):
+        growth_list.append(chars_list[i] - chars_list[i-1])
+    avg_growth = round(sum(growth_list) / len(growth_list)) if growth_list else 0
+
     result = {
         "total_requests": len(reqs),
         "total_chars": sum(chars_list),
@@ -88,7 +94,9 @@ def summarize(data, label):
         "max_chars": max(chars_list),
         "min_chars": min(chars_list),
         "avg_tools": round(sum(tools_list) / len(tools_list), 1),
+        "req_size_growth": avg_growth,
         "tool_clears": len(data["clears"]),
+        "cleared_chars_total": sum(c["chars"] for c in data["clears"]),
         "truncations": len(data["truncs"]),
         "errors": len(data["errors"]),
         "tool_freq": dict(data["tools"].most_common(10)),
@@ -99,15 +107,21 @@ def summarize(data, label):
     print(f"  平均请求大小:    {result['avg_chars']} chars")
     print(f"  最大请求:        {result['max_chars']:,}")
     print(f"  最小请求:        {result['min_chars']:,}")
+    print(f"  平均增长/轮:     {result['req_size_growth']:,} chars")
     print(f"  平均工具数:      {result['avg_tools']}")
 
     if data["clears"]:
         avg_clear = sum(c["chars"] for c in data["clears"]) // len(data["clears"])
         print(f"  工具清理次数:    {result['tool_clears']}")
+        print(f"  累计清理字符:    {result['cleared_chars_total']:,} chars")
         print(f"  平均清理:        {avg_clear} chars")
+    else:
+        print(f"  工具清理:        未触发")
 
     if data["truncs"]:
         print(f"  上下文截断次数:  {result['truncations']}")
+    else:
+        print(f"  上下文截断:      未触发")
 
     if data["streams"]:
         avg_text = sum(s["text"] for s in data["streams"]) // len(data["streams"])
@@ -147,7 +161,11 @@ def compare(a_data, b_data):
 
     a_clears = len(a_data["clears"])
     b_clears = len(b_data["clears"])
-    print(f"  工具清理:        A={a_clears}  B={b_clears}  差异={b_clears - a_clears:+d}")
+    print(f"  工具清理次数:    A={a_clears}  B={b_clears}  差异={b_clears - a_clears:+d}")
+
+    a_cleared = sum(c["chars"] for c in a_data["clears"])
+    b_cleared = sum(c["chars"] for c in b_data["clears"])
+    print(f"  累计清理字符:    A={a_cleared:,}  B={b_cleared:,}  差异={b_cleared - a_cleared:+d}")
 
     a_errors = len(a_data["errors"])
     b_errors = len(b_data["errors"])
@@ -169,11 +187,21 @@ def generate_report(a_analysis, b_analysis, a_log, b_log, report_path):
         f.write("| 指标 | A 组 | B 组 | 差异 |\n")
         f.write("|------|------|------|------|\n")
 
-        for key in ["total_requests", "total_chars", "avg_chars", "max_chars", "tool_clears", "errors"]:
+        report_keys = [
+            ("total_requests", "总请求数"),
+            ("avg_chars", "平均请求大小(chars)"),
+            ("max_chars", "最大请求(chars)"),
+            ("req_size_growth", "平均每轮增长(chars)"),
+            ("tool_clears", "工具清理次数"),
+            ("cleared_chars_total", "累计清理字符"),
+            ("truncations", "上下文截断次数"),
+            ("errors", "错误数"),
+        ]
+        for key, label in report_keys:
             a_val = a_analysis.get(key, 0)
             b_val = b_analysis.get(key, 0)
             diff = b_val - a_val
-            f.write(f"| {key} | {a_val} | {b_val} | {diff:+} |\n")
+            f.write(f"| {label} | {a_val} | {b_val} | {diff:+} |\n")
 
         f.write("\n## 原始日志\n\n")
         f.write(f"- A 组: `{a_log}`\n")

@@ -39,14 +39,48 @@ cmd_prepare() {
     fi
     local ts; ts=$(date +%Y%m%d-%H%M%S)
     local exp_id="${group}-${ts}"
+
+    # A/B 组 clearing 配置（两组都用 Cloud 模式，唯一变量是 clearing）
+    local clear_enabled=""
+    local clear_threshold=""
+    local tool_keep=""
+    local ctx_limit=""
+    local ctx_limit_val=""
+    if [[ "$group" == "A" ]]; then
+        # A 组: 强制开启 clearing（模拟本地模式的约束）
+        clear_enabled="true"
+        clear_threshold="15000"
+        tool_keep="2"
+        ctx_limit="true"
+        ctx_limit_val="180000"
+        info "A 组配置: Cloud + clearing 开启 (threshold=$clear_threshold, keep=$tool_keep)"
+    else
+        # B 组: 使用云模式默认值（clearing 关闭）
+        clear_enabled="false"
+        clear_threshold="30000"
+        tool_keep="10"
+        ctx_limit="false"
+        ctx_limit_val="500000"
+        info "B 组配置: Cloud + clearing 关闭 (1M token 上下文)"
+    fi
+
     info "准备实验环境: 组=$group, 任务='$task'"
     cat > "$META_FILE" << EOF
-{"group":"$group","task":"$task","exp_id":"$exp_id","prepare_time":"$ts","status":"prepared"}
+{"group":"$group","task":"$task","exp_id":"$exp_id","prepare_time":"$ts","status":"prepared","clearing_enabled":"$clear_enabled","clearing_threshold":"$clear_threshold","tool_keep":"$tool_keep","ctx_limit_enabled":"$ctx_limit","ctx_limit":"$ctx_limit_val"}
 EOF
     > /tmp/anthropic_proxy.log 2>/dev/null || true
     > "$PROJECT_DIR/logs/anthropic_proxy.log" 2>/dev/null || true
     date +%s > "$EXPERIMENT_DIR/${exp_id}.start_time"
     info "实验 ID: $exp_id"
+    info ""
+    info "启动代理命令:"
+    info "  cd $PROJECT_DIR"
+    if [[ "$group" == "A" ]]; then
+        info "  PROXY_CLEAR_ENABLED=true PROXY_CLEAR_THRESHOLD=15000 PROXY_TOOL_KEEP=2 PROXY_CTX_LIMIT_ENABLED=true PROXY_CTX_CHARS_LIMIT=180000 LLAMA_BASE_URL=https://api.deepseek.com/v1 LLAMA_API_KEY=sk-... python3 anthropic_proxy.py"
+    else
+        info "  LLAMA_BASE_URL=https://api.deepseek.com/v1 LLAMA_API_KEY=sk-... python3 anthropic_proxy.py"
+    fi
+    info ""
     info "下一步: 执行 Claude Code 任务，完成后运行: $0 collect --group $group"
 }
 
