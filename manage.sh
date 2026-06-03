@@ -408,6 +408,8 @@ _start_rapid_mlx() {
 
     if [[ "$RAPID_MLX_ENABLE_PREFIX_CACHE" == "true" ]]; then
         args+=(--enable-prefix-cache)
+    else
+        args+=(--disable-prefix-cache)
     fi
 
     if [[ "$RAPID_MLX_KV_QUANTIZATION" == "true" ]]; then
@@ -451,7 +453,7 @@ _start_proxy() {
 
     LLAMA_BASE_URL="$base_url" \
     LLAMA_API_KEY="${LLAMA_API_KEY:-sk-1234}" \
-    MODEL_NAME="${MODEL_NAME:-}" \
+    MODEL_NAME="${MODEL_NAME:-$LLAMA_MODEL}" \
     PORT="$PROXY_PORT" \
     HOST="$PROXY_HOST" \
     PROXY_LOG_PATH="$PROXY_LOGFILE" \
@@ -461,6 +463,8 @@ _start_proxy() {
     PROXY_TOOL_KEEP="${PROXY_TOOL_KEEP:-5}" \
     PROXY_CTX_LIMIT_ENABLED="${PROXY_CTX_LIMIT_ENABLED:-true}" \
     PROXY_CTX_CHARS_LIMIT="${PROXY_CTX_CHARS_LIMIT:-350000}" \
+    PROXY_CTX_TRUNCATE_STRATEGY="${PROXY_CTX_TRUNCATE_STRATEGY:-char}" \
+    PROXY_CTX_KEEP_ROUNDS="${PROXY_CTX_KEEP_ROUNDS:-10}" \
     PROXY_CONTENT_TOOLS_FALLBACK="${PROXY_CONTENT_TOOLS_FALLBACK:-true}" \
     nohup python3 "$SCRIPT_DIR/anthropic_proxy.py" >> "$PROXY_LOGFILE" 2>&1 &
     local new_pid=$!

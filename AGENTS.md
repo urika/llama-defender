@@ -246,7 +246,12 @@ Environment variables:
 | `PROXY_CONTENT_TOOLS_FALLBACK` | `true` | Enable `<tools>` content-text extraction |
 | `PROXY_MAX_CONCURRENT` | `4` (cloud) / `1` (local) | Max concurrent requests forwarded to backend |
 | `PROXY_CTX_LIMIT_ENABLED` | `false` (cloud) / `true` (local) | Enable message truncation when context exceeds limit |
-| `PROXY_CTX_CHARS_LIMIT` | `500000` (cloud) / `180000` (local) | Character limit for context truncation |
+| `PROXY_CTX_CHARS_LIMIT` | `500000` (cloud) / `180000` (local) | Character limit for context truncation (char strategy) |
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `char` | Truncation strategy: `char` = threshold-based, `rounds` = keep last N assistant rounds with token budget |
+| `PROXY_CTX_KEEP_ROUNDS` | `10` | Max number of recent assistant rounds to preserve (rounds strategy) |
+| `PROXY_CTX_TOKEN_BUDGET` | `30000` | Prompt tokens budget上限 (rounds strategy), triggers dynamic round reduction |
+| `PROXY_CTX_TOKEN_RATIO` | `1.3` | Chars-to-tokens estimation ratio for budget calculation |
+| `PROXY_CTX_KEEP_ROUNDS_DYNAMIC` | `true` | Dynamically adjust keep_rounds based on total message count |
 
 ### Special handling
 

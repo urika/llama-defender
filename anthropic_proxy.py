@@ -13,6 +13,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 LLAMA_BASE = os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8081/v1")
 LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "sk-1234")
 # Backend type: "local" (llama-server/rapid-mlx) or "cloud" (DeepSeek/OpenAI)
@@ -58,6 +60,10 @@ PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", "false" if I
 PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000"))  # chars heuristic
 PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))  # keep first N messages (system context + skills)
 PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))  # keep last N messages
+PROXY_CTX_TRUNCATE_STRATEGY = os.environ.get("PROXY_CTX_TRUNCATE_STRATEGY", "char")
+PROXY_CTX_KEEP_ROUNDS = int(os.environ.get("PROXY_CTX_KEEP_ROUNDS", "10"))
+PROXY_CTX_TOKEN_BUDGET = int(os.environ.get("PROXY_CTX_TOKEN_BUDGET", "30000"))
+PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "1.3"))
 # ---------------------------------------------------------------------------
 # Structured request logging: JSON Lines to logs/proxy_requests.jsonl
 # ---------------------------------------------------------------------------
@@ -166,10 +172,25 @@ def _extract_xml_tool_name(raw: str) -> str:
     return ""
 
 
+def _coerce_booleans(obj):
+    """Recursively coerce stringified booleans ('True'/'False'/'true'/'false') to bool."""
+    if isinstance(obj, dict):
+        return {k: _coerce_booleans(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_coerce_booleans(v) for v in obj]
+    if isinstance(obj, str):
+        if obj.lower() == "true":
+            return True
+        if obj.lower() == "false":
+            return False
+    return obj
+
+
 def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     """
     Parse tool arguments from backend response.
     Falls back from JSON -> XML extraction -> empty dict.
+    Stringified booleans are coerced to real bools to satisfy client validation.
     """
     raw = raw.strip() if raw else ""
     if not raw:
@@ -179,7 +200,7 @@ def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            return parsed
+            return _coerce_booleans(parsed)
         return {}
     except json.JSONDecodeError:
         pass
@@ -191,7 +212,7 @@ def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
         try:
             parsed = json.loads(raw[brace_start:brace_end + 1])
             if isinstance(parsed, dict):
-                return parsed
+                return _coerce_booleans(parsed)
         except json.JSONDecodeError:
             pass
 
@@ -199,7 +220,7 @@ def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     xml_params = _extract_xml_params(raw)
     if xml_params:
         log(f"  [XML_FALLBACK] extracted {len(xml_params)} params from XML for tool={tool_name_hint}")
-        return xml_params
+        return _coerce_booleans(xml_params)
 
     # 4. Last resort: treat the whole string as a single "command" or "query" param
     # based on common tool patterns
@@ -534,21 +555,132 @@ def clear_old_tool_results(messages):
 
 def truncate_messages_if_needed(messages):
     """
-    Proxy-side message truncation when total context exceeds backend capacity.
-    Drops entire old messages (starting after the head-keep window) until the
-    rough character count falls below PROXY_CTX_CHARS_LIMIT.
-    Preserves the first PROXY_CTX_KEEP_HEAD messages (usually system context +
-    skills) and the last PROXY_CTX_KEEP_TAIL messages (recent conversation).
+    Proxy-side message truncation with dual strategy support.
+
+    Strategy 'char' (default): drop old messages until total chars fall below
+    PROXY_CTX_CHARS_LIMIT. Preserves head + tail window.
+
+    Strategy 'rounds': keep only the most recent N assistant rounds,
+    replacing dropped messages with a lightweight placeholder.
     Operates on Anthropic-format messages in-place.
     Returns (messages, stats_dict).
     """
-    if not PROXY_CTX_LIMIT_ENABLED:
+    if not PROXY_CTX_LIMIT_ENABLED and PROXY_CTX_TRUNCATE_STRATEGY != "rounds":
         return messages, {"enabled": False}
 
+    # ---------- rounds strategy ----------
+    if PROXY_CTX_TRUNCATE_STRATEGY == "rounds":
+        # Token budget check: skip if already within budget
+        estimated_tokens = _estimate_message_chars(messages) * PROXY_CTX_TOKEN_RATIO
+        if estimated_tokens <= PROXY_CTX_TOKEN_BUDGET and len(messages) <= PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_ROUNDS * 3:
+            return messages, {
+                "enabled": True, "strategy": "rounds", "skipped": True,
+                "reason": "below_budget",
+                "estimated_tokens": int(estimated_tokens),
+                "budget": PROXY_CTX_TOKEN_BUDGET,
+            }
+
+        # Try keep_rounds, then decrement until within budget or min_rounds
+        min_rounds = 2
+        for rounds in range(PROXY_CTX_KEEP_ROUNDS, min_rounds - 1, -1):
+            result, stats = _apply_rounds_truncation(messages, rounds)
+            if not stats.get("truncated"):
+                return result, stats
+            result_tokens = _estimate_message_chars(result) * PROXY_CTX_TOKEN_RATIO
+            if result_tokens <= PROXY_CTX_TOKEN_BUDGET or rounds == min_rounds:
+                stats["estimated_tokens"] = int(result_tokens)
+                stats["budget"] = PROXY_CTX_TOKEN_BUDGET
+                stats["actual_keep_rounds"] = rounds
+                return result, stats
+
+        return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "no_reduction"}
+
+
+def _apply_rounds_truncation(messages, keep_rounds):
+    head = messages[:PROXY_CTX_KEEP_HEAD]
+
+    tail = []
+    assistant_count = 0
+    for msg in reversed(messages):
+        tail.insert(0, msg)
+        if msg.get("role") == "assistant":
+            assistant_count += 1
+        if assistant_count >= keep_rounds:
+            break
+
+    dropped_count = len(messages) - len(head) - len(tail)
+    if dropped_count <= 0:
+        return messages, {"enabled": True, "strategy": "rounds", "skipped": True}
+
+    dropped = messages[PROXY_CTX_KEEP_HEAD : len(messages) - len(tail)]
+
+    tool_count = 0
+    for m in dropped:
+        if m.get("role") == "assistant":
+            content = m.get("content", [])
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        tool_count += 1
+            elif isinstance(content, dict) and content.get("type") == "tool_use":
+                tool_count += 1
+
+    file_mentions = set()
+    for m in dropped:
+        if m.get("role") == "assistant":
+            content = m.get("content", [])
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        args = ""
+                        fn = b.get("function") or {}
+                        if isinstance(fn, dict):
+                            args = fn.get("arguments", "")
+                        if not args:
+                            args = b.get("input", "")
+                        if isinstance(args, dict):
+                            args = json.dumps(args)
+                        if isinstance(args, str):
+                            for pat in [r'"path":\s*"([^"]+)"', r'"file":\s*"([^"]+)"',
+                                        r'"filePath":\s*"([^"]+)"', r'"directory":\s*"([^"]+)"']:
+                                file_mentions.update(re.findall(pat, args))
+
+    file_info = f" Files previously accessed: {', '.join(sorted(file_mentions)[:10])}." if file_mentions else ""
+    summary_text = (
+        f"[Context folded: {dropped_count} earlier messages omitted. "
+        f"Previous work included {tool_count} tool interactions."
+        f"{file_info} "
+        f"Retaining last {keep_rounds} conversation rounds.]"
+    )
+
+    if tail and tail[0].get("role") == "user":
+        tail_content = tail[0].get("content", [])
+        summary_block = {"type": "text", "text": summary_text}
+        if isinstance(tail_content, list):
+            tail[0]["content"] = [summary_block] + tail_content
+        else:
+            tail[0]["content"] = [summary_block, {"type": "text", "text": str(tail_content)}]
+        result = head + tail
+    else:
+        summary = {"role": "user", "content": [{"type": "text", "text": summary_text}]}
+        result = head + [summary] + tail
+
+    return result, {
+        "enabled": True,
+        "strategy": "rounds",
+        "truncated": True,
+        "dropped_messages": dropped_count,
+        "kept_messages": len(result),
+        "tool_count": tool_count,
+        "file_mentions": len(file_mentions),
+    }
+
+    # ---------- char strategy (existing logic) ----------
     total_chars = _estimate_message_chars(messages)
     if total_chars < PROXY_CTX_CHARS_LIMIT:
         return messages, {
             "enabled": True,
+            "strategy": "char",
             "skipped": True,
             "reason": "below_limit",
             "chars": total_chars,
@@ -556,20 +688,17 @@ def truncate_messages_if_needed(messages):
 
     n = len(messages)
     if n <= PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL:
-        # Not enough messages to safely drop anything
         return messages, {
             "enabled": True,
+            "strategy": "char",
             "skipped": True,
             "reason": "too_few_messages",
             "count": n,
             "chars": total_chars,
         }
 
-    # Indices we must preserve: head [0, keep_head) + tail [n-keep_tail, n)
     preserved = set(range(PROXY_CTX_KEEP_HEAD))
     preserved.update(range(n - PROXY_CTX_KEEP_TAIL, n))
-
-    # Build a list of deletable indices in order (oldest first)
     deletable = [i for i in range(PROXY_CTX_KEEP_HEAD, n - PROXY_CTX_KEEP_TAIL)]
 
     dropped_count = 0
@@ -584,16 +713,15 @@ def truncate_messages_if_needed(messages):
         current_chars -= msg_chars
         dropped_count += 1
         dropped_chars += msg_chars
-        # Mark as dropped (replace with lightweight sentinel)
         messages[idx] = None
         if current_chars < PROXY_CTX_CHARS_LIMIT:
             break
 
-    # Compact the list: remove None entries
     messages = [m for m in messages if m is not None]
 
     return messages, {
         "enabled": True,
+        "strategy": "char",
         "truncated": True,
         "dropped_messages": dropped_count,
         "dropped_chars": dropped_chars,
@@ -601,6 +729,229 @@ def truncate_messages_if_needed(messages):
         "chars_after": current_chars,
         "limit": PROXY_CTX_CHARS_LIMIT,
     }
+
+
+# ---------------------------------------------------------------------------
+# Thinking/reasoning block stripping: remove old assistant thinking content
+# to reduce context size. Operates defensively since current clients rarely
+# send explicit thinking blocks (reasoning is usually inline text).
+# ---------------------------------------------------------------------------
+def _has_thinking_content(msg):
+    """Check if an assistant message contains thinking/reasoning content."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        for block in content:
+            if block.get("type") == "thinking":
+                return True
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                if "<thinking>" in text or "</thinking>" in text:
+                    return True
+    elif isinstance(content, str):
+        if "<thinking>" in content or "</thinking>" in content:
+            return True
+    return False
+
+
+def _strip_thinking_from_msg(msg):
+    """Remove thinking content from a message (in-place)."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        new_content = []
+        for block in content:
+            if block.get("type") == "thinking":
+                continue
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+                text = text.strip()
+                if text:
+                    new_content.append({"type": "text", "text": text})
+            else:
+                new_content.append(block)
+        msg["content"] = new_content
+    elif isinstance(content, str):
+        content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL).strip()
+        msg["content"] = content
+
+
+def strip_old_thinking_blocks(messages, keep_recent=3):
+    """
+    Remove thinking/reasoning content from old assistant messages.
+    Keeps the most recent keep_recent assistant messages with thinking intact.
+    Returns (messages, stats_dict).
+    """
+    if not messages:
+        return messages, {"enabled": False}
+
+    thinking_indices = []
+    for idx, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and _has_thinking_content(msg):
+            thinking_indices.append(idx)
+
+    if not thinking_indices:
+        return messages, {"enabled": True, "skipped": True, "reason": "no_thinking_found"}
+
+    if len(thinking_indices) <= keep_recent:
+        return messages, {"enabled": True, "skipped": True, "reason": "few_thinking", "count": len(thinking_indices)}
+
+    keep_set = set(thinking_indices[-keep_recent:])
+    stripped_count = 0
+    for idx in thinking_indices:
+        if idx in keep_set:
+            continue
+        _strip_thinking_from_msg(messages[idx])
+        stripped_count += 1
+
+    return messages, {
+        "enabled": True,
+        "stripped": True,
+        "stripped_count": stripped_count,
+        "kept": keep_recent,
+        "total_thinking": len(thinking_indices),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cleared tool-result compression: merge consecutive user messages that
+# contain only cleared tool_results into a single user message.
+# Reduces per-message JSON structural overhead (~50-100 tokens each).
+# ---------------------------------------------------------------------------
+def _is_pure_tool_use_msg(msg):
+    """Check if an assistant message contains only tool_use blocks (no text)."""
+    if msg.get("role") != "assistant":
+        return False
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        if not content:
+            return True
+        for block in content:
+            if block.get("type") != "tool_use":
+                return False
+        return True
+    elif isinstance(content, dict):
+        return content.get("type") == "tool_use"
+    return False
+
+
+def _is_cleared_tool_result_msg(msg):
+    """Check if a user message contains only cleared tool_results."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        if not content:
+            return False
+        for block in content:
+            if block.get("type") != "tool_result":
+                return False
+            block_content = str(block.get("content", ""))
+            if "[cleared to save context:" not in block_content and "[Result of tool call hidden]" not in block_content:
+                return False
+        return True
+    elif isinstance(content, dict):
+        if content.get("type") != "tool_result":
+            return False
+        block_content = str(content.get("content", ""))
+        return "[cleared to save context:" in block_content or "[Result of tool call hidden]" in block_content
+    return False
+
+
+def compress_cleared_tool_results(messages):
+    """
+    Compress tool-use cycles where the assistant message is a pure tool_use
+    (no explanatory text) and the following user message contains only cleared
+    tool_results. Consecutive such cycles are merged into a single lightweight
+    assistant+user placeholder pair, saving ~50-100 tokens of JSON structural
+    overhead per eliminated message.
+
+    Also merges consecutive user messages that contain only cleared tool_results
+    into a single user message.
+    Returns (messages, stats_dict).
+    """
+    if len(messages) < 4:
+        return messages, {"enabled": False}
+
+    compressed = []
+    stats = {"merged_cycles": 0, "merged_msgs": 0, "saved_overhead": 0}
+    i = 0
+
+    while i < len(messages):
+        # Pattern: assistant(pure tool_use) + user(cleared tool_result)
+        if (i + 1 < len(messages) and
+                _is_pure_tool_use_msg(messages[i]) and
+                _is_cleared_tool_result_msg(messages[i + 1])):
+
+            # Look ahead for consecutive cycles
+            cycles = [(messages[i], messages[i + 1])]
+            j = i + 2
+            while (j + 1 < len(messages) and
+                   _is_pure_tool_use_msg(messages[j]) and
+                   _is_cleared_tool_result_msg(messages[j + 1])):
+                cycles.append((messages[j], messages[j + 1]))
+                j += 2
+
+            if len(cycles) > 1:
+                tool_names = []
+                for assistant_msg, _ in cycles:
+                    content = assistant_msg.get("content", [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if block.get("type") == "tool_use":
+                                tool_names.append(block.get("name", "?"))
+                    elif isinstance(content, dict) and content.get("type") == "tool_use":
+                        tool_names.append(content.get("name", "?"))
+
+                compressed.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"[Previous {len(cycles)} tool calls: {', '.join(tool_names)}]"}],
+                })
+                compressed.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"[{len(cycles)} tool results cleared]"}],
+                })
+                stats["merged_cycles"] += len(cycles) - 1
+                stats["merged_msgs"] += len(cycles) * 2 - 2
+                stats["saved_overhead"] += (len(cycles) * 2 - 2) * 50
+                i = j
+                continue
+
+        # Fallback: merge consecutive user messages with only cleared tool_results
+        if _is_cleared_tool_result_msg(messages[i]):
+            cleared_run = [messages[i]]
+            j = i + 1
+            while j < len(messages) and _is_cleared_tool_result_msg(messages[j]):
+                cleared_run.append(messages[j])
+                j += 1
+
+            if len(cleared_run) > 1:
+                merged_blocks = []
+                for m in cleared_run:
+                    content = m.get("content", [])
+                    if isinstance(content, list):
+                        for block in content:
+                            if block.get("type") == "tool_result":
+                                merged_blocks.append(block)
+                    elif isinstance(content, dict) and content.get("type") == "tool_result":
+                        merged_blocks.append(content)
+
+                merged_msg = {
+                    "role": "user",
+                    "content": merged_blocks,
+                }
+                compressed.append(merged_msg)
+                stats["merged_cycles"] += len(cleared_run) - 1
+                stats["merged_msgs"] += len(cleared_run) - 1
+                stats["saved_overhead"] += (len(cleared_run) - 1) * 50
+                i = j
+                continue
+
+        compressed.append(messages[i])
+        i += 1
+
+    if stats["merged_cycles"] > 0:
+        return compressed, {"enabled": True, "merged": True, **stats}
+    return messages, {"enabled": True, "merged": False}
 
 
 def convert_anthropic_messages_to_openai(messages):
@@ -763,7 +1114,6 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
 import subprocess
 import time
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_PATH = os.path.join(_SCRIPT_DIR, "logs", "llama-server.log")
 _PID_PATH = os.path.join(_SCRIPT_DIR, "llama-server.pid")
 
@@ -816,10 +1166,14 @@ def _get_system_memory():
         elif "Pages stored in compressor:" in line:
             data["compress_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
     total = 48.0
-    used = total - data.get("free_gb", 0)
+    # macOS: Free is always tiny; Inactive is reclaimable cache.
+    # Show meaningful metrics: true used (wired+active) vs available (free+inactive).
+    true_used = data.get("wired_gb", 0) + data.get("active_gb", 0)
+    available = data.get("free_gb", 0) + data.get("inactive_gb", 0)
     data["total_gb"] = total
-    data["used_gb"] = used
-    data["used_pct"] = f"{used/total*100:.1f}"
+    data["used_gb"] = true_used          # Wired + Active (truly in use)
+    data["available_gb"] = available     # Free + Inactive (reclaimable)
+    data["used_pct"] = f"{true_used/total*100:.1f}"
     return data
 
 
@@ -891,17 +1245,312 @@ def _get_log_stats():
     }
 
 
+def _get_traffic_stats():
+    """Read proxy_requests.jsonl and compute traffic metrics + anomaly detection."""
+    try:
+        with open(_JSONL_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return _empty_traffic_stats()
+
+    if not lines:
+        return _empty_traffic_stats()
+
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            # Parse ISO timestamp
+            ts_str = rec.get("timestamp", "")
+            if ts_str:
+                try:
+                    rec["_ts"] = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+            else:
+                continue
+            records.append(rec)
+        except json.JSONDecodeError:
+            continue
+
+    if not records:
+        return _empty_traffic_stats()
+
+    now = datetime.now()
+    records_1h = [r for r in records if (now - r["_ts"]).total_seconds() <= 3600]
+    records_10m = [r for r in records_1h if (now - r["_ts"]).total_seconds() <= 600]
+
+    if not records_1h:
+        return _empty_traffic_stats()
+
+    def _stats(recs):
+        if not recs:
+            return {}
+        durations = [r.get("duration_ms", 0) for r in recs]
+        durations.sort()
+        inputs = [r.get("input_chars", 0) for r in recs]
+        outputs = [r.get("output_chars", 0) for r in recs]
+        statuses = [r.get("status", 200) for r in recs]
+        n = len(recs)
+        return {
+            "count": n,
+            "avg_latency_ms": round(sum(durations) / n, 1) if n else 0,
+            "p50_latency_ms": durations[n // 2] if n else 0,
+            "p95_latency_ms": durations[int(n * 0.95)] if n else 0,
+            "max_latency_ms": round(max(durations), 1) if durations else 0,
+            "avg_input_chars": round(sum(inputs) / n, 0) if n else 0,
+            "avg_output_chars": round(sum(outputs) / n, 0) if n else 0,
+            "max_input_chars": max(inputs) if inputs else 0,
+            "max_output_chars": max(outputs) if outputs else 0,
+            "success_rate": round(sum(1 for s in statuses if s == 200) / n * 100, 1) if n else 100.0,
+        }
+
+    stats_1h = _stats(records_1h)
+    stats_10m = _stats(records_10m)
+
+    # --- Anomaly detection ---
+    alerts = []
+    # Duplicate requests: same input_chars within same second
+    sec_to_inputs = {}
+    for r in records_10m:
+        sec_key = r["_ts"].strftime("%H:%M:%S")
+        sec_to_inputs.setdefault(sec_key, []).append(r.get("input_chars", 0))
+    for sec_key, inputs in sec_to_inputs.items():
+        from collections import Counter
+        c = Counter(inputs)
+        for inp_chars, cnt in c.items():
+            if cnt >= 2:
+                alerts.append(("warn", f"重复请求: {sec_key} 内 {cnt} 个请求 input_chars={inp_chars:,}"))
+    # Oversized requests
+    for r in records_10m:
+        inp = r.get("input_chars", 0)
+        if inp > 100000:
+            alerts.append(("warn", f"超大报文: {r['_ts'].strftime('%H:%M:%S')} input_chars={inp:,}"))
+    # Slow requests
+    for r in records_10m:
+        dur = r.get("duration_ms", 0)
+        if dur > 60000:
+            alerts.append(("warn", f"超长耗时: {r['_ts'].strftime('%H:%M:%S')} {dur/1000:.1f}s"))
+    # Very slow requests (critical)
+    for r in records_10m:
+        dur = r.get("duration_ms", 0)
+        if dur > 120000:
+            alerts.append(("critical", f"严重超时: {r['_ts'].strftime('%H:%M:%S')} {dur/1000:.1f}s"))
+
+    # Latency distribution buckets for visualization
+    all_durations = [r.get("duration_ms", 0) for r in records_1h]
+    buckets = [
+        ("<5s", 0), ("5-15s", 0), ("15-30s", 0),
+        ("30-60s", 0), ("60-120s", 0), (">120s", 0),
+    ]
+    for d in all_durations:
+        if d < 5000:
+            buckets[0] = (buckets[0][0], buckets[0][1] + 1)
+        elif d < 15000:
+            buckets[1] = (buckets[1][0], buckets[1][1] + 1)
+        elif d < 30000:
+            buckets[2] = (buckets[2][0], buckets[2][1] + 1)
+        elif d < 60000:
+            buckets[3] = (buckets[3][0], buckets[3][1] + 1)
+        elif d < 120000:
+            buckets[4] = (buckets[4][0], buckets[4][1] + 1)
+        else:
+            buckets[5] = (buckets[5][0], buckets[5][1] + 1)
+
+    return {
+        "stats_1h": stats_1h,
+        "stats_10m": stats_10m,
+        "alerts": alerts,
+        "latency_buckets": buckets,
+        "last_record_time": records[-1]["_ts"].strftime("%H:%M:%S") if records else "—",
+    }
+
+
+def _empty_traffic_stats():
+    return {
+        "stats_1h": {},
+        "stats_10m": {},
+        "alerts": [],
+        "latency_buckets": [("<5s", 0), ("5-15s", 0), ("15-30s", 0), ("30-60s", 0), ("60-120s", 0), (">120s", 0)],
+        "last_record_time": "—",
+    }
+
+
+def _get_session_trace():
+    """Parse /tmp/anthropic_request_body.json and build an HTML snippet showing
+    the semantic message timeline (roles, tool calls, text previews, errors).
+    Returns (html_str, tools_list) where tools_list is [(msg_idx, name, params), ...]
+    for modal popup display."""
+    try:
+        with open("/tmp/anthropic_request_body.json", "r", encoding="utf-8") as f:
+            body = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return '<div class="evt">No active request body</div>', []
+
+    msgs = body.get("messages", [])
+    model = body.get("model", "unknown")
+    max_tokens = body.get("max_tokens", "?")
+    total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
+
+    # Count roles and tool actions
+    user_count = sum(1 for m in msgs if m.get("role") == "user")
+    assistant_count = sum(1 for m in msgs if m.get("role") == "assistant")
+    tool_uses = 0
+    tool_results = 0
+    errors = 0
+    # Collect detailed tool use and error info for modal
+    tools_detail = []
+    errors_detail = []
+    for idx, m in enumerate(msgs):
+        content = m.get("content", [])
+        if isinstance(content, list):
+            for c in content:
+                if c.get("type") == "tool_use":
+                    tool_uses += 1
+                    name = c.get("name", "?")
+                    inp = c.get("input", {})
+                    params = ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:4])
+                    if len(inp) > 4:
+                        params += ", ..."
+                    tools_detail.append((str(tool_uses), f"{name}({params})"))
+                elif c.get("type") == "tool_result":
+                    tool_results += 1
+                    tr = c.get("content", "")
+                    err_text = ""
+                    if isinstance(tr, str) and "tool_use_error" in tr:
+                        errors += 1
+                        err_text = tr[:120]
+                    elif isinstance(tr, list) and tr:
+                        t = tr[0].get("text", "")
+                        if "tool_use_error" in str(t):
+                            errors += 1
+                            err_text = str(t)[:120]
+                    if err_text:
+                        err_summary = err_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        errors_detail.append((f"Msg {idx}", err_summary))
+
+    # Build timeline HTML (last 8 messages)
+    timeline = []
+    for idx, m in enumerate(msgs):
+        if idx < len(msgs) - 8:
+            continue
+        role = m.get("role", "?")
+        content = m.get("content", [])
+        prefix = f"Msg {idx}"
+        line = ""
+        if isinstance(content, list):
+            texts = []
+            tools = []
+            has_error = False
+            for c in content:
+                ctype = c.get("type", "")
+                if ctype == "text":
+                    t = c.get("text", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    texts.append(t[:60] + ("..." if len(t) > 60 else ""))
+                elif ctype == "tool_use":
+                    name = c.get("name", "?")
+                    inp = c.get("input", {})
+                    # Show a key param preview
+                    preview = ""
+                    if isinstance(inp, dict):
+                        for k in ("command", "file_path", "subject", "description", "old_string"):
+                            if k in inp:
+                                v = str(inp[k])[:40]
+                                preview = f" {k}={v}"
+                                break
+                    tools.append(f"{name}{preview}")
+                elif ctype == "tool_result":
+                    tr = c.get("content", "")
+                    if isinstance(tr, str) and "tool_use_error" in tr:
+                        has_error = True
+                    elif isinstance(tr, list) and tr:
+                        t = tr[0].get("text", "")
+                        if "tool_use_error" in str(t):
+                            has_error = True
+            parts = []
+            if texts:
+                parts.append(texts[0])
+            if tools:
+                parts.append(" | ".join(tools))
+            if has_error:
+                parts.append("❌ ERROR")
+            line = " | ".join(parts) if parts else "[empty]"
+        else:
+            t = str(content).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:60]
+            line = t + ("..." if len(str(content)) > 60 else "")
+
+        role_color = "#3498db" if role == "user" else ("#2ecc71" if role == "assistant" else "#888")
+        timeline.append(
+            f'<div class="evt"><span style="color:{role_color};font-weight:600;">{prefix} ({role})</span> {line}</div>'
+        )
+
+    if not timeline:
+        timeline.append('<div class="evt">No messages</div>')
+
+    summary = (
+        f'<div class="row"><span class="label">Messages</span>'
+        f'<span class="value">{len(msgs)}</span></div>'
+        f'<div class="row"><span class="label">Model</span>'
+        f'<span class="value">{model}</span></div>'
+        f'<div class="row"><span class="label">Max Tokens</span>'
+        f'<span class="value">{max_tokens}</span></div>'
+        f'<div class="row"><span class="label">Total Chars</span>'
+        f'<span class="value">{total_chars:,}</span></div>'
+        f'<div class="row"><span class="label">User / Assistant</span>'
+        f'<span class="value">{user_count} / {assistant_count}</span></div>'
+        f'<div class="row"><span class="label">Tool Uses</span>'
+        f'<span class="value clickable" onclick="showModal(\'tools\', \'🔧 Tool Calls Detail\')">{tool_uses}</span></div>'
+        f'<div class="row"><span class="label">Errors</span>'
+        f'<span class="value clickable" style="color:{"#e74c3c" if errors else "#2ecc71"}" onclick="showModal(' + "'errors', '❌ Errors Detail')" + f'">{errors}</span></div>'
+    )
+
+    return summary + "\n".join(timeline), tools_detail, errors_detail
+
+
 def _build_status_html():
     backend_info = _get_process_info("rapid-mlx|llama-server", "Backend")
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
     mem = _get_system_memory()
     log = _get_log_stats()
+    traffic = _get_traffic_stats()
+    session_trace, tools_detail, errors_detail = _get_session_trace()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     backend_color = "#2ecc71" if backend_info.get("running") else "#e74c3c"
     proxy_color = "#2ecc71" if proxy_info.get("running") else "#e74c3c"
-    mem_warn = float(mem.get("used_pct", 0)) > 90
+    mem_warn = float(mem.get("used_pct", 0)) > 75
     mem_color = "#e74c3c" if mem_warn else "#2ecc71"
+
+    # --- Traffic Stats card ---
+    s1h = traffic.get("stats_1h", {})
+    s10m = traffic.get("stats_10m", {})
+    qps = round(s10m.get("count", 0) / 600, 3) if s10m.get("count") else 0
+    traffic_card = f"""<div class="card">
+    <h2>📊 Traffic Stats</h2>
+    <div class="row"><span class="label">Requests (1h / 10m)</span><span class="value">{s1h.get("count", 0)} / {s10m.get("count", 0)}</span></div>
+    <div class="row"><span class="label">Avg Latency</span><span class="value">{s1h.get("avg_latency_ms", 0)/1000:.1f}s</span></div>
+    <div class="row"><span class="label">P95 Latency</span><span class="value">{s1h.get("p95_latency_ms", 0)/1000:.1f}s</span></div>
+    <div class="row"><span class="label">Max Latency</span><span class="value">{s1h.get("max_latency_ms", 0)/1000:.1f}s</span></div>
+    <div class="row"><span class="label">Avg In / Out</span><span class="value">{s1h.get("avg_input_chars", 0):.0f} / {s1h.get("avg_output_chars", 0):.0f} chars</span></div>
+    <div class="row"><span class="label">Max In / Out</span><span class="value">{s1h.get("max_input_chars", 0):,.0f} / {s1h.get("max_output_chars", 0):,.0f}</span></div>
+    <div class="row"><span class="label">Success Rate</span><span class="value" style="color:{"#2ecc71" if s1h.get("success_rate", 100) >= 95 else "#f39c12" if s1h.get("success_rate", 100) >= 80 else "#e74c3c"}">{s1h.get("success_rate", 100):.1f}%</span></div>
+    <div class="row"><span class="label">Est. QPS (10m)</span><span class="value">{qps:.3f}</span></div>
+    <div class="row"><span class="label">Last Record</span><span class="value">{traffic.get("last_record_time", "—")}</span></div>
+  </div>"""
+
+    # --- Alerts card ---
+    alerts = traffic.get("alerts", [])
+    if alerts:
+        alerts_html = ""
+        for severity, msg in alerts:
+            color = "#e74c3c" if severity == "critical" else "#f39c12"
+            icon = "🔴" if severity == "critical" else "⚠️"
+            alerts_html += f'<div class="evt"><span style="color:{color};font-weight:600;">{icon} {msg}</span></div>'
+    else:
+        alerts_html = '<div class="evt" style="color:#2ecc71;">✅ No anomalies detected (last 10m)</div>'
 
     # Cloud-backend status card (no PID/memory/uptime)
     if IS_CLOUD:
@@ -943,7 +1592,12 @@ def _build_status_html():
         "oom": log.get("oom_details", []),
         "clear": log.get("clear_details", []),
         "request": log.get("req_details", []),
+        "tools": tools_detail,
+        "errors": errors_detail,
     })
+    # Escape </script> inside <script> to prevent premature tag closure
+    # when eventData contains nested HTML/JS (e.g. Write tool content).
+    modal_data = modal_data.replace("</script>", "<\\/script>")
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1005,8 +1659,8 @@ def _build_status_html():
   <div class="card">
     <h2>System Memory</h2>
     <div class="row"><span class="label">Total</span><span class="value">{mem.get("total_gb", 48):.0f} GB</span></div>
-    <div class="row"><span class="label">Used</span><span class="value" style="color:{mem_color}">{mem.get("used_gb", 0):.1f} GB ({mem.get("used_pct", "0")}%)</span></div>
-    <div class="row"><span class="label">Free</span><span class="value">{mem.get("free_gb", 0):.2f} GB</span></div>
+    <div class="row"><span class="label">Used (Wired+Active)</span><span class="value" style="color:{mem_color}">{mem.get("used_gb", 0):.1f} GB ({mem.get("used_pct", "0")}%)</span></div>
+    <div class="row"><span class="label">Available</span><span class="value">{mem.get("available_gb", 0):.1f} GB (Free+Inactive)</span></div>
     <div class="row"><span class="label">Wired</span><span class="value">{mem.get("wired_gb", 0):.1f} GB</span></div>
     <div class="row"><span class="label">Active</span><span class="value">{mem.get("active_gb", 0):.1f} GB</span></div>
     <div class="row"><span class="label">Inactive</span><span class="value">{mem.get("inactive_gb", 0):.1f} GB</span></div>
@@ -1021,6 +1675,18 @@ def _build_status_html():
     <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
     <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={PROXY_MAX_CONCURRENT}</span></div>
     <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
+  </div>
+
+  {traffic_card}
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>🚨 Alerts (last 10m)</h2>
+    {alerts_html}
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Session Trace</h2>
+    {session_trace}
   </div>
 
   <div class="card" style="grid-column: 1 / -1;">
@@ -1134,6 +1800,8 @@ class Handler(BaseHTTPRequestHandler):
             # Timing wrapper for structured logging
             import time as _time
             _t0 = _time.monotonic()
+            self._last_jsonl_token = _next_jsonl_token()
+            _jsonl_output_map[self._last_jsonl_token] = 0
             try:
                 self._handle_messages(parsed)
                 # Non-streaming: log after response is sent
@@ -1141,13 +1809,14 @@ class Handler(BaseHTTPRequestHandler):
                 log_request(
                     model=parsed.get("model", "unknown"),
                     input_chars=total_chars,
-                    output_chars=0,  # filled by _handle_non_streaming_response
+                    output_chars=_jsonl_output_map.pop(self._last_jsonl_token, 0),
                     status=200,
                     duration_ms=_dur,
                 )
             except Exception as e:
                 _dur = (_time.monotonic() - _t0) * 1000
                 log(f"  -> Error: {e}")
+                _jsonl_output_map.pop(self._last_jsonl_token, None)
                 log_request(
                     model=parsed.get("model", "unknown"),
                     input_chars=total_chars,
@@ -1193,12 +1862,38 @@ class Handler(BaseHTTPRequestHandler):
                     raw_messages[0]["content"] = new_content
                     log(f"  -> Standardized date in msg0")
 
-        # Proxy-side message truncation when total context exceeds backend limit
+        # Proxy-side thinking block stripping (defensive: removes old assistant
+        # thinking/reasoning content to save tokens).
+        raw_messages, think_stats = strip_old_thinking_blocks(raw_messages, keep_recent=3)
+        if think_stats.get("stripped"):
+            log(f"  -> Thinking stripped: {think_stats['stripped_count']} old assistant messages cleaned (kept last {think_stats['kept']})")
+        elif think_stats.get("enabled") and not think_stats.get("skipped"):
+            log(f"  -> Thinking strip: active (keep_recent=3)")
+
+        # Proxy-side cleared tool-result compression: merge consecutive
+        # assistant(pure tool_use) + user(cleared) cycles into placeholders.
+        raw_messages, compress_stats = compress_cleared_tool_results(raw_messages)
+        if compress_stats.get("merged"):
+            log(f"  -> Tool-result compression: {compress_stats['merged_cycles']} cycles merged, {compress_stats['merged_msgs']} msgs removed (saved ~{compress_stats['saved_overhead']} tokens overhead)")
+        elif compress_stats.get("enabled") and not compress_stats.get("merged"):
+            log(f"  -> Tool-result compression: no consecutive cleared cycles to merge")
+
+        # Context truncation (char or rounds strategy, last step before conversion)
+        # Placed after think_strip and compress so those operate on full history first,
+        # then truncate reduces the final window.
         raw_messages, trunc_stats = truncate_messages_if_needed(raw_messages)
         if trunc_stats.get("truncated"):
-            log(f"  -> Context truncation: {trunc_stats['dropped_messages']} messages dropped, {trunc_stats['dropped_chars']:,} chars removed ({trunc_stats['chars_before']:,} -> {trunc_stats['chars_after']:,})")
+            strategy = trunc_stats.get("strategy", "char")
+            if strategy == "rounds":
+                est_tok = trunc_stats.get("estimated_tokens", "?")
+                actual_r = trunc_stats.get("actual_keep_rounds", "?")
+                log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{est_tok} tokens, budget={PROXY_CTX_TOKEN_BUDGET})")
+            else:
+                log(f"  -> Context truncation (char): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats['dropped_chars']:,} chars removed ({trunc_stats['chars_before']:,} -> {trunc_stats['chars_after']:,})")
         elif not trunc_stats.get("enabled"):
             log(f"  -> Context truncation: disabled ({BACKEND_TYPE} backend)")
+        elif trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
+            log(f"  -> Context truncation: active (strategy={trunc_stats.get('strategy', '?')})")
 
         # Debug: compute hashes of first two messages to diagnose cache misses
         if raw_messages:
@@ -1213,9 +1908,6 @@ class Handler(BaseHTTPRequestHandler):
             h0 = _msg_hash(raw_messages[0]) if len(raw_messages) > 0 else "none"
             h1 = _msg_hash(raw_messages[1]) if len(raw_messages) > 1 else "none"
             log(f"  -> Msg hashes: msg0={h0}, msg1={h1}, total_msgs={len(raw_messages)}")
-
-        if trunc_stats.get("enabled") and not trunc_stats.get("skipped") and not trunc_stats.get("truncated"):
-            log(f"  -> Context truncation: active (limit={PROXY_CTX_CHARS_LIMIT:,} chars, keep_head={PROXY_CTX_KEEP_HEAD}, keep_tail={PROXY_CTX_KEEP_TAIL})")
 
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)
@@ -1280,12 +1972,16 @@ class Handler(BaseHTTPRequestHandler):
             anthropic_body.get("model", "claude-3-5-sonnet-20241022")
         )
         content_summary = ""
+        output_chars = 0
         for block in anthropic_resp.get("content", []):
             if block.get("type") == "text":
                 content_summary += block.get("text", "")[:100]
+                output_chars += len(block.get("text", ""))
             elif block.get("type") == "tool_use":
                 content_summary += f"[tool_use: {block.get('name', '')}] "
-        log(f"  <- Responding: {content_summary[:200]}")
+                output_chars += len(json.dumps(block.get("input", {}), ensure_ascii=False))
+        _jsonl_output_map[self._last_jsonl_token] = output_chars
+        log(f"  <- Responding: {content_summary[:200]} (output_chars={output_chars})")
         self._respond_json(anthropic_resp)
 
     def _handle_streaming_response(self, resp, anthropic_body):
@@ -1310,15 +2006,18 @@ class Handler(BaseHTTPRequestHandler):
             nonlocal text_block_started, total_text
             if not t:
                 return
-            if not text_block_started:
-                text_block_started = True
-                self.wfile.write(
-                    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
-                )
-            total_text += t
-            ev = f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(t)}}}}}\n\n'
-            self.wfile.write(ev.encode("utf-8"))
-            self.wfile.flush()
+            try:
+                if not text_block_started:
+                    text_block_started = True
+                    self.wfile.write(
+                        b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                    )
+                total_text += t
+                ev = f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(t)}}}}}\n\n'
+                self.wfile.write(ev.encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Client disconnected, stop emitting
 
         # Send message_start (usage will be updated from llama-server timings)
         event = {
@@ -1471,12 +2170,16 @@ class Handler(BaseHTTPRequestHandler):
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": output_tokens}
         }
-        self.wfile.write(f"event: message_delta\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
+        try:
+            self.wfile.write(f"event: message_delta\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
-        # Send message_stop
-        event = {"type": "message_stop"}
-        self.wfile.write(f"event: message_stop\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
-        self.wfile.flush()
+            # Send message_stop
+            event = {"type": "message_stop"}
+            self.wfile.write(f"event: message_stop\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected before stream end
+        _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
     def _respond_json(self, data, status=200):

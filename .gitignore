@@ -29,3 +29,8 @@ models/
 
 # Kimi export files
 kimi-export-*.md
+
+# Backup files
+*.bak.*
+*.bak
+configs/*.bak.*
