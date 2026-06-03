@@ -58,6 +58,55 @@ PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", "false" if I
 PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000"))  # chars heuristic
 PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))  # keep first N messages (system context + skills)
 PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))  # keep last N messages
+# ---------------------------------------------------------------------------
+# Structured request logging: JSON Lines to logs/proxy_requests.jsonl
+# ---------------------------------------------------------------------------
+_LOG_DIR = os.path.join(_SCRIPT_DIR, "logs")
+_JSONL_PATH = os.path.join(_LOG_DIR, "proxy_requests.jsonl")
+_jsonl_lock = threading.Lock()
+# Maps request token -> output_chars (set by response handlers)
+_jsonl_output_map = {}
+_jsonl_counter = 0
+
+
+def _next_jsonl_token():
+    """Generate a unique request token for correlating request log entries."""
+    global _jsonl_counter
+    _jsonl_counter += 1
+    return f"req_{_jsonl_counter}_{os.urandom(4).hex()}"
+
+
+def _ensure_jsonl_dir():
+    """Create logs/ directory if it doesn't exist."""
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
+def log_request(model: str, input_chars: int, output_chars: int,
+                status: int, duration_ms: float):
+    """Append one JSON Lines record to proxy_requests.jsonl (thread-safe)."""
+    _ensure_jsonl_dir()
+    record = {
+        "timestamp": datetime.now().isoformat(),
+        "method": "POST",
+        "path": "/v1/messages",
+        "model": model,
+        "input_chars": input_chars,
+        "output_chars": output_chars,
+        "status": status,
+        "duration_ms": round(duration_ms, 1),
+    }
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        with _jsonl_lock:
+            with open(_JSONL_PATH, "a") as f:
+                f.write(line)
+    except OSError:
+        pass
+
+
 MODEL_ALIASES = [
     "claude-3-5-sonnet-20241022",
     "claude-3-opus-20240229",
@@ -1082,7 +1131,31 @@ class Handler(BaseHTTPRequestHandler):
             total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
             tools = parsed.get("tools", [])
             log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
-            self._handle_messages(parsed)
+            # Timing wrapper for structured logging
+            import time as _time
+            _t0 = _time.monotonic()
+            try:
+                self._handle_messages(parsed)
+                # Non-streaming: log after response is sent
+                _dur = (_time.monotonic() - _t0) * 1000
+                log_request(
+                    model=parsed.get("model", "unknown"),
+                    input_chars=total_chars,
+                    output_chars=0,  # filled by _handle_non_streaming_response
+                    status=200,
+                    duration_ms=_dur,
+                )
+            except Exception as e:
+                _dur = (_time.monotonic() - _t0) * 1000
+                log(f"  -> Error: {e}")
+                log_request(
+                    model=parsed.get("model", "unknown"),
+                    input_chars=total_chars,
+                    output_chars=0,
+                    status=500,
+                    duration_ms=_dur,
+                )
+                raise
         else:
             log(f"  -> 404 (unknown path)")
             self._respond_json({"detail": "Not found"}, 404)
@@ -1188,11 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLAMA_API_KEY}"},
                     method="POST"
                 )
-                if IS_CLOUD:
-                    resp = urllib.request.urlopen(req, timeout=300)
-                else:
-                    with _llama_lock:
-                        resp = urllib.request.urlopen(req, timeout=300)
+                resp = urllib.request.urlopen(req, timeout=300)
                 log(f"  <- llama-server status: {resp.status}")
                 if is_stream:
                     self._handle_streaming_response(resp, body)

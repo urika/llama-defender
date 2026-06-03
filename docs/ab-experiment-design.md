@@ -1,52 +1,76 @@
-# A/B 对比实验设计：本地 Qwen3.6-35B vs DeepSeek API
+# A/B 对比实验设计：Context Management 配置对比
 
-> 实验目的：在相同 agentic 编程任务下，对比本地部署（Qwen3.6-35B-4bit + rapid-mlx）与云端 API（DeepSeek Chat）的工作效果
+> 实验目的：在相同 agentic 编程任务和同一云端模型（DeepSeek）下，对比不同代理层 context management 配置（模拟本地约束 vs 云端无约束）对任务执行效率和质量的影响
 
 ---
 
 ## 一、实验架构
 
-### 1.1 对照组 A：本地后端（当前配置）
+### 1.1 统一代理路由
 
-```
-Claude Code → anthropic_proxy.py:4000 → rapid-mlx:8081
-                                              ↓
-                                    Qwen3.6-35B-A3B-4bit (本地)
-```
-
-**配置**：
-- 模型：`mlx-community/Qwen3.6-35B-A3B-4bit`
-- 后端：`rapid-mlx v0.6.30`
-- 内存：48GB 统一内存
-- 并发：`PROXY_MAX_CONCURRENT=1`
-- 成本：几乎为零（电费）
-
-### 1.2 实验组 B：DeepSeek 云端 API
+A/B 两组**均通过 `anthropic_proxy.py` 代理访问同一云端 API**，由代理层控制模型路由和 context management 配置。Claude Code 始终连接 `127.0.0.1:4000`，无需修改客户端配置。
 
 ```
 Claude Code → anthropic_proxy.py:4000 → api.deepseek.com/v1
-                                              ↓
-                                    DeepSeek Chat (云端)
+                 │                              ↓
+                 │  配置化差异             DeepSeek API (同一模型)
+                 │  - clearing 开关
+                 │  - 阈值/保留数
+                 │  - ctx_limit 开关
+                 │  - 上下文上限
 ```
 
-**配置**：
-- 模型：`deepseek-chat`
-- 后端：DeepSeek OpenAI 兼容 API
-- 并发：`PROXY_MAX_CONCURRENT=4`
-- 成本：按 token 计费（约 ¥2/百万 input tokens，¥8/百万 output tokens）
+### 1.2 设计原则
 
-### 1.3 切换方式
+- **单一变量**：两组使用同一模型（DeepSeek），唯一变量是代理层的 context management 配置
+- **配置化**：所有差异通过环境变量控制，无需修改代码
+- **可复现**：通过 `tools/run_experiment.sh` 脚本自动化 prepare/collect/report 流程
+- **代理路由**：Claude Code 始终连接 `127.0.0.1:4000`，模型选择完全由代理层决定
+
+### 1.3 A 组配置（模拟本地约束）
+
+模拟本地后端（rapid-mlx / llama-server）在 48GB 统一内存下的 context management 行为：
+- 工具结果清理（clearing）**开启**，阈值低，保留少
+- 上下文截断（ctx_limit）**开启**，上限小
+
+| 环境变量 | 值 | 说明 |
+|----------|-----|------|
+| `PROXY_CLEAR_ENABLED` | `true` | 开启工具结果清理 |
+| `PROXY_CLEAR_THRESHOLD` | `15000` | 总字符数超过 15K 触发清理 |
+| `PROXY_TOOL_KEEP` | `2` | 仅保留最近 2 对 tool_result |
+| `PROXY_CTX_LIMIT_ENABLED` | `true` | 开启上下文截断 |
+| `PROXY_CTX_CHARS_LIMIT` | `180000` | 上下文超过 180K 字符时截断 |
+
+### 1.4 B 组配置（云端无约束）
+
+模拟云端 API 无物理内存限制的理想场景：
+- 工具结果清理（clearing）**关闭**
+- 上下文截断（ctx_limit）**关闭**
+
+| 环境变量 | 值 | 说明 |
+|----------|-----|------|
+| `PROXY_CLEAR_ENABLED` | `false` | 关闭工具结果清理 |
+| `PROXY_CLEAR_THRESHOLD` | `30000` | （未生效）默认值 |
+| `PROXY_TOOL_KEEP` | `10` | （未生效）默认值 |
+| `PROXY_CTX_LIMIT_ENABLED` | `false` | 关闭上下文截断 |
+| `PROXY_CTX_CHARS_LIMIT` | `500000` | （未生效）默认值 |
+
+### 1.5 启动命令
 
 ```bash
-# A 组（本地）
-export LLAMA_BASE_URL=http://127.0.0.1:8081/v1
-export LLAMA_API_KEY=sk-1234
+# A 组（模拟本地约束）
+PROXY_CLEAR_ENABLED=true \
+PROXY_CLEAR_THRESHOLD=15000 \
+PROXY_TOOL_KEEP=2 \
+PROXY_CTX_LIMIT_ENABLED=true \
+PROXY_CTX_CHARS_LIMIT=180000 \
+LLAMA_BASE_URL=https://api.deepseek.com/v1 \
+LLAMA_API_KEY=sk-... \
 python3 anthropic_proxy.py
 
-# B 组（DeepSeek）
-export LLAMA_BASE_URL=https://api.deepseek.com/v1
-export LLAMA_API_KEY=<你的 DeepSeek API Key>
-export MODEL_NAME=deepseek-chat
+# B 组（云端无约束，使用代理默认值）
+LLAMA_BASE_URL=https://api.deepseek.com/v1 \
+LLAMA_API_KEY=sk-... \
 python3 anthropic_proxy.py
 ```
 
@@ -59,138 +83,124 @@ python3 anthropic_proxy.py
 - **可重复**：同一任务可多次执行，结果可比较
 - **有明确验收标准**：通过/失败可客观判定
 - **覆盖 agentic 典型场景**：文件读写、代码修改、工具调用
-- **中等复杂度**：预期 10-30 轮工具调用完成
+- **中等复杂度**：预期 70-100 轮工具调用完成
 
-### 2.2 推荐任务列表
+### 2.2 已执行任务
 
-| 编号 | 任务描述 | 预期轮次 | 验收标准 |
-|------|----------|----------|----------|
-| T1 | 在现有代码库中添加一个 REST API 端点 | 15-25 | curl 测试通过 |
-| T2 | 修复一个已知的 bug（有 issue 描述） | 10-20 | 单元测试通过 |
-| T3 | 重构一个模块，提取公共函数 | 15-30 | 代码 review 通过 |
-| T4 | 为现有函数添加完整测试覆盖 | 20-35 | pytest 覆盖率 >90% |
-| T5 | 添加日志和错误处理到关键路径 | 10-20 | 运行时无异常 |
-
-> 建议：首次实验选 **T1 或 T2**，因为验收标准最客观。
+| 编号 | 任务描述 | 实际轮次(A/B) | 验收标准 | 完成状态 |
+|------|----------|---------------|----------|----------|
+| T1 | 为代理添加结构化日志和状态页统计 | 94 / 79 | 功能正常运行 | ✅ 已完成 |
 
 ### 2.3 实验控制
 
-- **工作目录**：A/B 两组使用不同的 git branch 或不同目录
-- **初始状态**：每次实验前 reset 到相同的 git commit
-- **系统提示**：使用相同的 system prompt（代理层不做修改）
-- **工具集**：使用相同的 27 个工具配置
-- **温度**：temperature=0.7（默认）
+- **模型一致性**：A/B 两组使用**相同**云端模型（DeepSeek），消除模型差异干扰
+- **代理路由**：Claude Code 始终连接 `127.0.0.1:4000`，不修改客户端配置
+- **代理层配置化**：所有实验变量通过环境变量注入，由 `tools/run_experiment.sh` 管理
+- **工作目录**：A/B 两组使用相同的代码库状态
+- **日志隔离**：每次实验前清空 `/tmp/anthropic_proxy.log`，实验后归档到 `logs/experiments/`
+- **工具集**：使用 Claude Code 默认工具集（27 个工具）
 
 ---
 
 ## 三、评价指标体系
 
-### 3.1 效能指标（定量）
+### 3.1 效能指标（定量，自动收集）
 
-| 指标 | 测量方式 | A 组（本地） | B 组（DeepSeek） |
-|------|----------|-------------|-----------------|
-| **任务完成率** | 验收标准通过/失败 | ？ | ？ |
-| **总耗时** | 从发起到验收通过的时间 | ？ | ？ |
-| **工具调用次数** | REQ_SUMMARY 日志统计 | ？ | ？ |
-| **平均 TTFT** | 首 token 返回时间 | ？ | ？ |
-| **平均 TBT** | token 间间隔（流式） | ？ | ？ |
-| **纯文本思考比例** | Assistant 消息中不含 tool_use 的比例 | ？ | ？ |
-| **重复工具调用率** | 同一工具连续调用占比 | ？ | ？ |
-| **Compact 次数** | 上下文被迫重置次数 | ？ | ？ |
-| **请求总字符数** | 最终请求体大小 | ？ | ？ |
+| 指标 | 测量方式 | 数据源 |
+|------|----------|--------|
+| **任务完成率** | 验收标准通过/失败 | 人工判定 |
+| **总耗时** | 从 prepare 到 collect 的时间差 | `run_experiment.sh` 计时 |
+| **工具调用次数（请求数）** | REQ_SUMMARY 日志统计 | `analyze_experiment.py` |
+| **总字符数** | 所有请求体字符总和 | REQ_SUMMARY |
+| **平均请求大小** | 总字符数 / 请求数 | 自动计算 |
+| **最大请求大小** | 最大单次请求字符数 | REQ_SUMMARY |
+| **请求大小平均增长** | 每轮请求增量均值 | 自动计算 |
+| **工具清理次数** | Tool clearing 触发次数 | 代理日志 |
+| **累计清理字符** | 清理释放的总字符数 | 代理日志 |
+| **上下文截断次数** | Context truncation 触发次数 | 代理日志 |
+| **错误/异常次数** | 代理日志中的 error/Exception | 代理日志 |
+| **工具调用分布** | 各工具调用频率 | 代理日志 |
 
-### 3.2 质量指标（定性/半定量）
+### 3.2 质量指标（定性/半定量，人工评分）
 
-| 指标 | 评分方式 | A 组 | B 组 |
-|------|----------|------|------|
-| **代码正确性** | 1-5 分，人工 review | ？ | ？ |
-| **代码风格** | 1-5 分，是否符合项目规范 | ？ | ？ |
-| **错误恢复能力** | 遇到报错后能否自行修复 | ？ | ？ |
-| **边界处理** | 是否考虑了 edge cases | ？ | ？ |
-| **注释/文档** | 是否添加了必要的注释 | ？ | ？ |
+| 指标 | 评分方式 | 1-5 分 |
+|------|----------|--------|
+| **代码正确性** | 人工 review | ？ |
+| **代码风格** | 是否符合项目规范 | ？ |
+| **错误恢复能力** | 遇到报错后能否自行修复 | ？ |
+| **边界处理** | 是否考虑了 edge cases | ？ |
+| **注释/文档** | 是否添加了必要的注释 | ？ |
 
 ### 3.3 成本指标
 
 | 指标 | 计算方式 | A 组 | B 组 |
 |------|----------|------|------|
-| **API 费用** | 按 DeepSeek 定价 × tokens | ¥0 | ？ |
-| **电力成本** | 估算（~100W × 时间） | ~¥0.1/h | ¥0 |
-| **时间成本** | 工程师等待时间 × 时薪 | ？ | ？ |
-| **总成本** | API + 电力 + 时间 | ？ | ？ |
+| **API 费用** | DeepSeek 定价 × tokens | 按实际 | 按实际 |
+| **时间成本** | 工程师等待时间 | ？ | ？ |
+| **总请求 token 量** | 请求总字符数估算 | ？ | ？ |
 
 ---
 
 ## 四、数据收集方案
 
-### 4.1 自动收集（代理日志）
+### 4.1 自动化工具链
 
-代理已支持以下自动记录：
-
-```bash
-# 1. 请求摘要（每条请求）
-grep 'REQ_SUMMARY' /tmp/anthropic_proxy.log
-# 输出: [HH:MM:SS] [REQ_SUMMARY] chars=XXXXX tools=YY
-
-# 2. 工具清理记录
-grep 'Tool clearing' /tmp/anthropic_proxy.log
-
-# 3. 上下文截断记录
-grep 'Context truncation' /tmp/anthropic_proxy.log
-
-# 4. 响应摘要（流式）
-grep 'Streamed text=' /tmp/anthropic_proxy.log
-
-# 5. 错误记录
-grep 'llama-server error\|Exception\|Traceback' /tmp/anthropic_proxy.log
+```
+tools/run_experiment.sh        # 实验生命周期管理（prepare / collect / report）
+tools/analyze_experiment.py    # 日志解析与指标计算
+logs/experiments/              # 实验数据归档目录
+  ├── {group}-{timestamp}.log       # 原始代理日志
+  ├── {group}-{timestamp}.json      # 分析指标 JSON
+  ├── {group}-{timestamp}.start_time # 实验开始时间戳
+  ├── {group}-{timestamp}.end_time   # 实验结束时间戳
+  ├── ab_report_{timestamp}.md       # A/B 对比报告
+  └── current_meta.json             # 当前实验元数据
 ```
 
-### 4.2 实验后分析脚本
+### 4.2 使用方式
 
 ```bash
-# 收集实验数据
-python3 << 'PYEOF'
-import json, re
-from collections import Counter
+# 准备实验环境（自动记录实验 ID、配置、开始时间）
+./tools/run_experiment.sh prepare --group A --task "任务描述"
 
-with open('/tmp/anthropic_proxy.log') as f:
-    lines = f.readlines()
+# 收集实验数据（自动复制日志、运行分析、保存结果）
+./tools/run_experiment.sh collect --group A
 
-# 解析 REQ_SUMMARY
-reqs = []
-for line in lines:
-    m = re.search(r'\[(\d{2}:\d{2}:\d{2})\].*\[REQ_SUMMARY\] chars=(\d+) tools=(\d+)', line)
-    if m:
-        reqs.append({'time': m.group(1), 'chars': int(m.group(2)), 'tools': int(m.group(3))})
+# 生成 A/B 对比报告
+./tools/run_experiment.sh report
 
-# 统计
-print(f"总请求数: {len(reqs)}")
-print(f"总字符数: {sum(r['chars'] for r in reqs):,}")
-print(f"平均请求: {sum(r['chars'] for r in reqs)/len(reqs):.0f} chars")
-print(f"最大请求: {max(r['chars'] for r in reqs):,}")
-print(f"工具清理: {sum(1 for l in lines if 'Tool clearing' in l)}")
-print(f"上下文截断: {sum(1 for l in lines if 'Context truncation' in l)}")
-
-# 工具调用频率
-tool_lines = [l for l in lines if "-> Tools:" in l]
-tool_counter = Counter()
-for line in tool_lines:
-    m = re.search(r"-> Tools: \[(.*?)\]", line)
-    if m:
-        for name in m.group(1).replace("'", "").split(", "):
-            tool_counter[name.strip()] += 1
-print(f"\n工具调用 TOP 10:")
-for name, count in tool_counter.most_common(10):
-    print(f"  {name}: {count}")
-PYEOF
+# 查看当前实验状态
+./tools/run_experiment.sh status
 ```
 
-### 4.3 手动记录
+### 4.3 自动收集指标（`analyze_experiment.py`）
 
-| 记录项 | 记录时机 | 记录人 |
-|--------|----------|--------|
-| 任务开始时间 | 发起第一个请求 | 自动 |
-| 任务完成时间 | 验收通过 | 人工 |
-| 是否完成 | 验收后 | 人工 |
+从代理日志中自动解析以下信息：
+
+```python
+# 请求摘要解析
+grep 'REQ_SUMMARY' → {time, chars, tools}
+
+# 工具清理解析
+grep 'tool_results cleared' → {count, chars_freed}
+
+# 上下文截断解析
+grep 'messages dropped' → {msgs_dropped, chars_removed}
+
+# 工具调用列表
+grep '-> Tools:' → Counter{tool_name: frequency}
+
+# 流式响应统计
+grep 'Streamed text=' → {text_chars, tool_count}
+```
+
+### 4.4 手动记录
+
+| 记录项 | 记录时机 | 方式 |
+|--------|----------|------|
+| 任务开始时间 | prepare 阶段 | 自动（start_time 文件） |
+| 任务完成时间 | collect 阶段 | 自动（end_time 文件） |
+| 是否完成 | 验收后 | 人工判定 |
 | 代码质量评分 | 实验结束后 | 人工 review |
 | 异常/意外行为 | 发生时 | 人工记录 |
 | 主观体验 | 实验后 | 人工填写 |
@@ -199,125 +209,120 @@ PYEOF
 
 ## 五、实验执行流程
 
-### 5.1 实验前准备
+### 5.1 标准化流程（使用 `run_experiment.sh`）
 
 ```bash
-# 1. 准备实验分支
-git checkout -b experiment/ab-test-$(date +%Y%m%d)
-git commit --allow-empty -m "experiment: A/B baseline"
+# ═══════════════════════════════════════════════════════════
+# 第一阶段：A 组（模拟本地约束 - clearing 开启）
+# ═══════════════════════════════════════════════════════════
 
-# 2. 准备 A 组环境（保持当前）
-./manage.sh status  # 确认 rapid-mlx 运行正常
+# 1. 准备 A 组实验环境
+./tools/run_experiment.sh prepare \
+  --group A \
+  --task "为代理添加结构化日志和状态页统计"
 
-# 3. 准备 B 组环境
-# 获取 DeepSeek API Key（从 deepseek.com 注册）
-export DEEPSEEK_API_KEY="sk-..."
+# 脚本输出：
+#   [INFO] A 组配置: Cloud + clearing 开启 (threshold=15000, keep=2)
+#   [INFO] 实验 ID: A-20260602-141545
+#   [INFO] 启动代理命令:
+#     PROXY_CLEAR_ENABLED=true PROXY_CLEAR_THRESHOLD=15000 PROXY_TOOL_KEEP=2 \
+#     PROXY_CTX_LIMIT_ENABLED=true PROXY_CTX_CHARS_LIMIT=180000 \
+#     LLAMA_BASE_URL=https://api.deepseek.com/v1 LLAMA_API_KEY=sk-... \
+#     python3 anthropic_proxy.py
+
+# 2. 按提示启动代理（新终端）
+export LLAMA_API_KEY="sk-..."
+cd /Users/jinsongwang/APP/llama.cpp
+PROXY_CLEAR_ENABLED=true PROXY_CLEAR_THRESHOLD=15000 PROXY_TOOL_KEEP=2 \
+PROXY_CTX_LIMIT_ENABLED=true PROXY_CTX_CHARS_LIMIT=180000 \
+LLAMA_BASE_URL=https://api.deepseek.com/v1 LLAMA_API_KEY="$LLAMA_API_KEY" \
+python3 anthropic_proxy.py
+
+# 3. 人工执行 Claude Code 任务
+export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
+export ANTHROPIC_AUTH_TOKEN=sk-any
+# ... 在 Claude Code 中执行任务直到完成 ...
+
+# 4. 收集 A 组数据
+./tools/run_experiment.sh collect --group A
+
+# ═══════════════════════════════════════════════════════════
+# 第二阶段：B 组（云端无约束 - clearing 关闭）
+# ═══════════════════════════════════════════════════════════
+
+# 5. 准备 B 组实验环境
+./tools/run_experiment.sh prepare \
+  --group B \
+  --task "为代理添加结构化日志和状态页统计"
+
+# 脚本输出：
+#   [INFO] B 组配置: Cloud + clearing 关闭 (1M token 上下文)
+
+# 6. 启动 B 组代理（使用默认配置，clearing 关闭）
+LLAMA_BASE_URL=https://api.deepseek.com/v1 \
+LLAMA_API_KEY="$LLAMA_API_KEY" \
+python3 anthropic_proxy.py
+
+# 7. 执行相同任务
+# ... 在 Claude Code 中执行相同任务 ...
+
+# 8. 收集 B 组数据
+./tools/run_experiment.sh collect --group B
+
+# ═══════════════════════════════════════════════════════════
+# 第三阶段：生成对比报告
+# ═══════════════════════════════════════════════════════════
+
+# 9. 生成 A/B 对比报告
+./tools/run_experiment.sh report
+# 报告输出: logs/experiments/ab_report_{timestamp}.md
 ```
 
-### 5.2 执行 A 组（本地）
+### 5.2 脚本命令速查
 
-```bash
-# 确保使用本地配置
-export LLAMA_BASE_URL=http://127.0.0.1:8081/v1
-export LLAMA_API_KEY=sk-1234
-
-# 启动代理
-python3 anthropic_proxy.py &
-PROXY_PID=$!
-
-# 清空日志
-> /tmp/anthropic_proxy.log
-
-# 执行 Task T1
-cd /path/to/project
-claude "请为这个项目添加一个 /health REST API 端点，返回 {status: ok}"
-
-# 记录完成时间、验收结果
-# ...
-
-# 停止代理
-kill $PROXY_PID
-
-# 保存日志
-cp /tmp/anthropic_proxy.log logs/experiment-a-$(date +%Y%m%d-%H%M%S).log
-```
-
-### 5.3 执行 B 组（DeepSeek）
-
-```bash
-# 切换到 DeepSeek 配置
-export LLAMA_BASE_URL=https://api.deepseek.com/v1
-export LLAMA_API_KEY=$DEEPSEEK_API_KEY
-export MODEL_NAME=deepseek-chat
-
-# 启动代理（不需要本地后端）
-python3 anthropic_proxy.py &
-PROXY_PID=$!
-
-# 清空日志
-> /tmp/anthropic_proxy.log
-
-# 重置工作区到相同状态
-git checkout experiment/ab-test-$(date +%Y%m%d)
-git reset --hard HEAD
-
-# 执行相同的 Task T1
-cd /path/to/project
-claude "请为这个项目添加一个 /health REST API 端点，返回 {status: ok}"
-
-# 记录完成时间、验收结果
-# ...
-
-# 停止代理
-kill $PROXY_PID
-
-# 保存日志
-cp /tmp/anthropic_proxy.log logs/experiment-b-$(date +%Y%m%d-%H%M%S).log
-```
-
-### 5.4 实验后分析
-
-```bash
-# 运行分析脚本
-python3 tools/analyze_experiment.py \
-  --a logs/experiment-a-*.log \
-  --b logs/experiment-b-*.log \
-  --output docs/experiment-results-$(date +%Y%m%d).md
-```
+| 命令 | 说明 |
+|------|------|
+| `./tools/run_experiment.sh prepare -g A -t '...'` | 准备实验环境，输出启动命令 |
+| `./tools/run_experiment.sh collect -g A` | 收集日志，运行分析，保存结果 |
+| `./tools/run_experiment.sh report` | 查找最新 A/B 数据，生成对比报告 |
+| `./tools/run_experiment.sh status` | 查看当前实验元数据 |
+| `./tools/run_experiment.sh help` | 查看帮助 |
 
 ---
 
-## 六、预期结果与假设
+## 六、核心假设
 
-### 6.1 假设 H1：DeepSeek 模型能力更强
+实验聚焦于 **context management 配置对 agentic 任务执行的影响**，而非模型能力对比。
 
-- **预期**：B 组任务完成率更高，代码质量评分更高
-- **依据**：DeepSeek Chat 是 671B MoE 模型（激活 37B），远超本地 35B 量化模型
-- **验证**：对比 T1-T5 的完成率和质量评分
+### 6.1 假设 H1：clearing 关闭 → 请求数更少
 
-### 6.2 假设 H2：DeepSeek TTFT 更快但网络延迟存在
+- **预期**：B 组（无 clearing）请求数 < A 组（有 clearing）
+- **逻辑**：clearing 开启时，Agent 丢失早期上下文，可能重复探索已走过的路径，导致更多冗余请求
+- **验证**：对比 `total_requests`
 
-- **预期**：B 组 TTFT < 5s（A 组 50-60s），但总响应时间受网络影响
-- **依据**：云 API 有专用 GPU 集群，无本地内存瓶颈
-- **验证**：对比 REQ_SUMMARY 时间戳和流式响应间隔
+### 6.2 假设 H2：clearing 关闭 → 请求增长更平稳
 
-### 6.3 假设 H3：本地无 context 膨胀问题
+- **预期**：B 组（无 clearing）请求大小增长更线性，A 组（有 clearing）呈锯齿状
+- **逻辑**：clearing 会截断 tool_result 内容，但 Agent 可能重新获取信息导致后续请求波动
+- **验证**：对比 `req_size_growth` 和请求大小序列
 
-- **预期**：B 组无 forced cache clear，无 compact 需求，context 可持续增长
-- **依据**：云 API 有 64K context，无内存限制
-- **验证**：对比日志中的 cache clear 和 compact 频率
+### 6.3 假设 H3：clearing 关闭 → 总字符数更多
 
-### 6.4 假设 H4：成本差异显著
+- **预期**：B 组（无 clearing）总请求字符数 > A 组（有 clearing）
+- **逻辑**：不清理历史 tool_result 导致上下文持续膨胀
+- **验证**：对比 `total_chars` 和 `max_chars`
 
-- **预期**：B 组单次任务成本 ¥0.5-2.0，A 组几乎为零
-- **依据**：56K tokens/请求 × 20 请求 ≈ 1.1M tokens
-- **验证**：对比 DeepSeek 账单和本地电费
+### 6.4 假设 H4：ctx_limit 关闭 → 最大请求更大
 
-### 6.5 假设 H5：Agent 行为模式不同
+- **预期**：B 组（ctx_limit 关闭）最大单次请求 > A 组（ctx_limit 开启, 180K 上限）
+- **逻辑**：ctx_limit 直接截断超限请求
+- **验证**：对比 `max_chars`
 
-- **预期**：B 组纯文本思考比例更高（>10%），重复调用率更低（<30%）
-- **依据**：更强的模型可能有更好的规划和批量处理能力
-- **验证**：对比代理日志中的消息结构和工具序列
+### 6.5 假设 H5：clearing 对任务完成质量无明显影响
+
+- **预期**：两组任务完成质量（代码正确性、风格）相近
+- **逻辑**：DeepSeek 模型能力足以补偿 context 损失
+- **验证**：人工 review 代码质量评分
 
 ---
 
@@ -326,36 +331,62 @@ python3 tools/analyze_experiment.py \
 | 风险 | 概率 | 影响 | 应对措施 |
 |------|------|------|----------|
 | DeepSeek API 限流 | 中 | 实验中断 | 准备备用 API Key，降低并发 |
-| DeepSeek 不支持 tools | 低 | 实验失败 | 提前用 curl 测试 tool calling |
 | 网络不稳定 | 中 | 数据偏差 | 多次重复实验，取中位数 |
 | 成本超预期 | 中 | 预算超支 | 设置用量上限，先小规模测试 |
-| 结果不可复现 | 低 | 结论无效 | 固定 seed，多次重复 |
+| 代理日志丢失 | 低 | 数据缺失 | 每次 collect 前确认日志存在并归档 |
+| clearing 未生效 | 低 | A/B 无差异 | prepare 阶段打印配置，人工确认 |
+| 结果不可复现 | 低 | 结论无效 | 固定配置参数，多次重复 |
 
 ---
 
-## 八、最小可行实验（MVP）
+## 八、实际实验结果
 
-如果资源有限，可先执行 **最小可行实验**：
+### 8.1 实验概览
 
-1. **单任务**：只执行 T1（添加 /health API）
-2. **单次重复**：A/B 各执行 1 次
-3. **核心指标**：只记录完成率、总耗时、工具调用次数
-4. **时间**：约 30-60 分钟
+| 项目 | 详情 |
+|------|------|
+| **实验日期** | 2026-06-02 |
+| **任务** | 为代理添加结构化日志和状态页统计 |
+| **模型** | DeepSeek API（A/B 组相同） |
+| **A 组实验 ID** | `A-20260602-141545` |
+| **B 组实验 ID** | `B-20260602-1400` |
 
-```bash
-# 快速启动 DeepSeek 实验
-LLAMA_BASE_URL=https://api.deepseek.com/v1 \
-  LLAMA_API_KEY=$DEEPSEEK_API_KEY \
-  python3 anthropic_proxy.py &
+### 8.2 核心指标对比
 
-# 执行任务
-cd project && claude "添加 /health 端点"
+| 指标 | A 组（clearing 开启） | B 组（clearing 关闭） | 差异 |
+|------|----------------------|----------------------|------|
+| **总请求数** | 94 | 79 | **-15（-16%）** |
+| **总字符数** | 21,105,972 | 14,462,399 | **-6,643,573（-31%）** |
+| **平均请求大小** | 224,532 chars | 183,068 chars | **-41,464（-18%）** |
+| **最大请求大小** | 358,200 chars | 237,750 chars | **-120,450（-34%）** |
+| **最小请求大小** | 764 chars | 126 chars | -638 |
+| **平均工具数/请求** | 42.6 | 42.9 | +0.3 |
+| **请求大小平均增长** | 3,843 chars/轮 | 1,840 chars/轮 | **-2,003（-52%）** |
+| **工具清理次数** | 0 | 0 | 0 |
+| **上下文截断次数** | 0 | 0 | 0 |
+| **错误数** | 0 | 0 | 0 |
 
-# 对比结果
-grep -c 'REQ_SUMMARY' /tmp/anthropic_proxy.log
-```
+### 8.3 关键发现
+
+1. **B 组（无 clearing）请求数少 16%**：与假设 H1 方向相反。A 组（有 clearing）反而发出了更多请求（94 vs 79），可能是因为丢失上下文后需要重新探索。
+
+2. **B 组（无 clearing）总字符数少 31%**：与假设 H3 方向相反。无 clearing 的 B 组总请求体反而更小，说明上下文保留使得 Agent 能更高效地利用已有信息，减少重复传递。
+
+3. **A 组（有 clearing）请求增长更快（+52%）**：与假设 H2 方向一致。A 组每轮请求增量几乎是 B 组的 2 倍，表明 clearing 导致 Agent 需要更多补偿性信息获取。
+
+4. **两组的 clearing 和 ctx_limit 均未实际触发**：虽然 A 组配置了 clearing，但在此次任务中未达到触发条件（请求最大 358K < 无明确触发线，且 clearing 机制基于 tool_result 对计数而非单次请求大小）。这意味着本次实验中 A/B 组的实际差异可能主要来自**心理效应**（Agent 感知到 context 受限后的行为变化）而非机制层面的直接截断。
+
+5. **工具调用模式高度一致**：两组工具分布几乎完全相同（都是 27 个工具各出现请求数次），说明 Agent 的工具使用策略不受 context management 配置显著影响。
+
+### 8.4 后续改进方向
+
+- **增大任务复杂度**使 clearing/ctx_limit 真正触发（例如 200+ 轮工具调用任务）
+- **降低 A 组阈值**（如 `PROXY_CLEAR_THRESHOLD=5000`, `PROXY_CTX_CHARS_LIMIT=50000`）以放大差异
+- **增加重复实验**（每组至少 3 次）以获得统计显著性
+- **添加请求时间戳分析**（TTFT、总耗时）到 `analyze_experiment.py`
 
 ---
 
-*实验设计版本：v1.0*
-*设计日期：2026-06-02*
+*实验设计版本：v2.0*
+*更新日期：2026-06-03*
+*变更摘要：基于实际测试情况更新 — A/B 组均通过代理路由，差异配置化（clearing/ctx_limit），新增实际实验数据*

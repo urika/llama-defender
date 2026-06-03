@@ -58,7 +58,7 @@ _load_config
 : "${LLAMA_EXTRA_ARGS:=--jinja --flash-attn on --fit on}"
 
 # Rapid-MLX 默认参数
-: "${RAPID_MLX_TOOL_PARSER:=qwen3_coder}"
+: "${RAPID_MLX_TOOL_PARSER:=qwen3_coder_xml}"
 : "${RAPID_MLX_REASONING_PARSER:=qwen3}"
 : "${RAPID_MLX_ENABLE_PREFIX_CACHE:=true}"
 : "${RAPID_MLX_KV_QUANTIZATION:=false}"
@@ -357,6 +357,13 @@ _start_llama_server() {
         args+=(--chat-template-kwargs '{"enable_thinking":true}')
     fi
 
+    # Custom chat template override (e.g. fixed Qwen template)
+    if [[ -n "${LLAMA_CHAT_TEMPLATE:-}" && -f "$LLAMA_CHAT_TEMPLATE" ]]; then
+        local _template_content
+        _template_content=$(cat "$LLAMA_CHAT_TEMPLATE")
+        args+=(--chat-template "$_template_content")
+    fi
+
     if [[ -n "$LLAMA_EXTRA_ARGS" ]]; then
         read -ra extra <<< "$LLAMA_EXTRA_ARGS"
         args+=("${extra[@]}")
@@ -450,8 +457,10 @@ _start_proxy() {
     PROXY_LOG_PATH="$PROXY_LOGFILE" \
     PROXY_MAX_CONCURRENT="${PROXY_MAX_CONCURRENT:-1}" \
     PROXY_CLEAR_ENABLED="${PROXY_CLEAR_ENABLED:-true}" \
-    PROXY_CLEAR_THRESHOLD="${PROXY_CLEAR_THRESHOLD:-15000}" \
-    PROXY_TOOL_KEEP="${PROXY_TOOL_KEEP:-2}" \
+    PROXY_CLEAR_THRESHOLD="${PROXY_CLEAR_THRESHOLD:-50000}" \
+    PROXY_TOOL_KEEP="${PROXY_TOOL_KEEP:-5}" \
+    PROXY_CTX_LIMIT_ENABLED="${PROXY_CTX_LIMIT_ENABLED:-true}" \
+    PROXY_CTX_CHARS_LIMIT="${PROXY_CTX_CHARS_LIMIT:-350000}" \
     PROXY_CONTENT_TOOLS_FALLBACK="${PROXY_CONTENT_TOOLS_FALLBACK:-true}" \
     nohup python3 "$SCRIPT_DIR/anthropic_proxy.py" >> "$PROXY_LOGFILE" 2>&1 &
     local new_pid=$!
