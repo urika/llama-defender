@@ -4,6 +4,7 @@ Anthropic-to-OpenAI proxy for local llama-server.
 Handles Qwen3.6 reasoning_content, streaming, and tool use correctly.
 Includes XML->JSON fallback for Qwen tool calling quirks.
 """
+import hashlib
 import json
 import os
 import re
@@ -64,6 +65,34 @@ PROXY_CTX_TRUNCATE_STRATEGY = os.environ.get("PROXY_CTX_TRUNCATE_STRATEGY", "cha
 PROXY_CTX_KEEP_ROUNDS = int(os.environ.get("PROXY_CTX_KEEP_ROUNDS", "10"))
 PROXY_CTX_TOKEN_BUDGET = int(os.environ.get("PROXY_CTX_TOKEN_BUDGET", "30000"))
 PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
+
+# ---------------------------------------------------------------------------
+# Output token control: prevent rapid-mlx from generating unbounded output
+# Known Issue #1: rapid-mlx ignores max_tokens
+# ---------------------------------------------------------------------------
+PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0"))
+PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
+PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
+
+# ---------------------------------------------------------------------------
+# Loop detection: detect consecutive identical tool_use calls
+# ---------------------------------------------------------------------------
+PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
+
+# ---------------------------------------------------------------------------
+# Semantic tool-result clearing: priority-based scoring
+# ---------------------------------------------------------------------------
+TOOL_SEMANTIC_PRIORITY = {
+    "Read": 3, "Agent": 3, "WebFetch": 2, "WebSearch": 2,
+    "Bash": 1, "Edit": 1, "Write": 1,
+}
+TOOL_RESULT_HIGH_VALUE_PATTERNS = [
+    (re.compile(r'(function |class |def |import |from |\{\s*"[a-z]|\#include)', re.IGNORECASE), 3),
+    (re.compile(r'(total \d+|drwx|\.py$|\.js$|\.ts$)', re.IGNORECASE), 1),
+    (re.compile(r'(error|traceback|exception)', re.IGNORECASE), 2),
+    (re.compile(r'Wasted call', re.IGNORECASE), 0),
+]
+
 # ---------------------------------------------------------------------------
 # Structured request logging: JSON Lines to logs/proxy_requests.jsonl
 # ---------------------------------------------------------------------------
@@ -180,6 +209,46 @@ def _extract_xml_tool_name(raw: str) -> str:
     if m:
         return m.group(1)
     return ""
+
+
+def _repair_truncated_json(raw: str) -> str:
+    """Attempt to repair truncated JSON by closing open strings/braces."""
+    if not raw or not raw.strip():
+        return "{}"
+    s = raw.strip()
+    in_string = False
+    escape_next = False
+    depth = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if c == '\\':
+            if in_string:
+                escape_next = True
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            i += 1
+            continue
+        if in_string:
+            i += 1
+            continue
+        if c in ('{', '['):
+            depth += 1
+        elif c in ('}', ']'):
+            depth -= 1
+        i += 1
+    if in_string:
+        s += '"'
+    while depth > 0:
+        s += '}'
+        depth -= 1
+    return s
 
 
 def _coerce_booleans(obj):
@@ -501,12 +570,11 @@ def _estimate_message_chars(messages):
     return total
 
 
-def clear_old_tool_results(messages):
+def clear_old_tool_results(messages, tools_list=None):
     """
-    Proxy-side tool-result clearing.
+    Proxy-side tool-result clearing with semantic priority scoring.
     Replaces old tool_result contents with a placeholder, keeping the most
-    recent PROXY_TOOL_KEEP pairs intact so the model still knows the calls
-    happened but doesn't pay to carry the full payloads forward.
+    important tool_results based on tool name + content patterns.
     Operates on Anthropic-format messages in-place.
     Returns (messages, stats_dict).
     """
@@ -539,26 +607,130 @@ def clear_old_tool_results(messages):
             "count": len(tool_result_indices),
         }
 
-    # Keep the newest PROXY_TOOL_KEEP; clear the rest
-    keep_set = set(tool_result_indices[-PROXY_TOOL_KEEP:])
+    # Dynamic KEEP: detect sub-agent by checking tool set
+    keep = PROXY_TOOL_KEEP
+    if tools_list is not None:
+        has_agent = any(t == "Agent" or t == "EnterPlanMode" for t in tools_list)
+        if not has_agent and len(tools_list) > 0:
+            keep = max(PROXY_TOOL_KEEP, 15)
+            log(f"  -> Sub-agent detected ({len(tools_list)} tools, no Agent/Plan), dynamic KEEP={keep}")
+
+    # Score each tool_result by semantic priority
+    scored = []
+    for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
+        block = messages[msg_idx]["content"][block_idx]
+        tool_use_id = block.get("tool_use_id", "")
+        content_str = str(block.get("content", ""))
+        score = 0
+
+        # Find the paired tool_use to get tool name
+        tool_name = ""
+        for m_idx in range(msg_idx - 1, -1, -1):
+            m = messages[m_idx]
+            if m.get("role") == "assistant":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    for b in c:
+                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                            tool_name = b.get("name", "")
+                            break
+                if tool_name:
+                    break
+
+        score += TOOL_SEMANTIC_PRIORITY.get(tool_name, 1)
+        for pat, pts in TOOL_RESULT_HIGH_VALUE_PATTERNS:
+            if pat.search(content_str[:500]):
+                score += pts
+
+        scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
+
+    # Sort by score descending, keep top N by score (prefer high-value)
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    keep_positions = set(x[1] for x in scored[:keep])
+
+    # Build set of tool_use indices to scan for file_path metadata
+    cleared_files = set()
     cleared_count = 0
     cleared_chars = 0
-    for msg_idx, block_idx in tool_result_indices:
-        if (msg_idx, block_idx) in keep_set:
+    high_prio_count = 0
+
+    for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
+        if idx_pos in keep_positions:
+            score_entry = next((x for x in scored if x[1] == idx_pos), None)
+            if score_entry and score_entry[0] >= 3:
+                high_prio_count += 1
             continue
         block = messages[msg_idx]["content"][block_idx]
         original = block.get("content", "")
         original_len = len(str(original)) if original else 0
-        block["content"] = f"[cleared to save context: {original_len} chars]"
+
+        # Extract file path from paired tool_use
+        tool_use_id = block.get("tool_use_id", "")
+        meta_info = ""
+        for m_idx in range(msg_idx - 1, -1, -1):
+            m = messages[m_idx]
+            if m.get("role") == "assistant":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    for b in c:
+                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                            inp = b.get("input", {})
+                            if isinstance(inp, dict):
+                                fp = inp.get("file_path", inp.get("path", ""))
+                                cmd = inp.get("command", "")
+                                if fp:
+                                    meta_info = f" file={fp}"
+                                    cleared_files.add(fp)
+                                elif cmd:
+                                    meta_info = f" cmd={cmd[:60]}"
+                            break
+                if meta_info:
+                    break
+
+        preview = ""
+        orig_str = str(original) if original else ""
+        if orig_str and original_len > 300:
+            preview = f" Preview: {orig_str[:200]}..."
+        block["content"] = f"[cleared{meta_info}: {original_len} chars.{preview}]"
         cleared_count += 1
         cleared_chars += original_len
+
+    # Bash dedup among kept results: merge consecutive similar Bash outputs
+    dedup_bash = 0
+    dedup_chars = 0
+    kept_indices = [tool_result_indices[i] for i in sorted(keep_positions)]
+    for ki in range(len(kept_indices) - 1):
+        msg_idx_a, block_idx_a = kept_indices[ki]
+        msg_idx_b, block_idx_b = kept_indices[ki + 1]
+        ca = str(messages[msg_idx_a]["content"][block_idx_a].get("content", ""))
+        cb = str(messages[msg_idx_b]["content"][block_idx_b].get("content", ""))
+        if not ca or not cb:
+            continue
+        lines_a = set(ca.splitlines())
+        lines_b = set(cb.splitlines())
+        if not lines_a or not lines_b:
+            continue
+        intersection = lines_a & lines_b
+        union = lines_a | lines_b
+        jaccard = len(intersection) / len(union) if union else 0
+        if jaccard >= 0.7:
+            messages[msg_idx_b]["content"][block_idx_b]["content"] = (
+                f"[deduplicated Bash output (sim={int(jaccard*100)}%): "
+                f"{len(cb)} chars. Preview: {cb[:200]}...]"
+            )
+            dedup_bash += 1
+            dedup_chars += len(cb)
 
     return messages, {
         "enabled": True,
         "cleared": True,
         "cleared_tool_results": cleared_count,
         "cleared_chars": cleared_chars,
-        "kept": PROXY_TOOL_KEEP,
+        "kept": keep,
+        "high_prio": high_prio_count,
+        "cleared_files": list(cleared_files),
+        "dedup_bash": dedup_bash,
+        "dedup_chars_saved": dedup_chars,
         "total_chars_before": total_chars,
     }
 
@@ -1869,17 +2041,134 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_messages(self, body):
         is_stream = body.get("stream", False)
         model = body.get("model", "unknown")
+        _req_start_time = datetime.now().isoformat()
+        max_tokens_orig = body.get("max_tokens", 4096)
+
+        # REQ_SUMMARY with session_id
+        tools_list = None
+        raw_tools = body.get("tools", [])
+        if raw_tools:
+            tools_list = [t.get("name", "") for t in raw_tools if isinstance(t, dict)]
+        session_prefix = getattr(_log_ctx, 'session_id', None) or ""
+        total_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in body.get("messages", []))
+        log(f"  [REQ_SUMMARY] chars={total_chars} tools={len(tools_list or [])}")
+
         log(f"  -> Handling model={model}, stream={is_stream}")
 
-        # Proxy-side tool-result clearing
+        # Backend timeout & output token limit logging
+        log(f"  -> Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
+
+        # max_tokens override
+        if PROXY_MAX_TOKENS_OVERRIDE > 0 and max_tokens_orig > PROXY_MAX_TOKENS_OVERRIDE:
+            body["max_tokens"] = PROXY_MAX_TOKENS_OVERRIDE
+            log(f"  -> max_tokens override: {max_tokens_orig} -> {PROXY_MAX_TOKENS_OVERRIDE}")
+
+        # Error translation: intercept tool_result errors and rewrite to natural language
+        error_count = {"wasted": 0, "file_not_found": 0, "input_validation": 0}
         raw_messages = body.get("messages", [])
-        raw_messages, clear_stats = clear_old_tool_results(raw_messages)
+        for msg in raw_messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") != "tool_result":
+                        continue
+                    bc = str(block.get("content", ""))
+                    if "Wasted call" in bc:
+                        block["content"] = (
+                            "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"
+                            "如果需要查看文件内容，用 Bash cat 命令代替。]"
+                        )
+                        error_count["wasted"] += 1
+                    elif "File does not exist" in bc or "No such file" in bc:
+                        block["content"] = (
+                            "[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，"
+                            "然后使用正确的文件路径。]"
+                        )
+                        error_count["file_not_found"] += 1
+                    elif "InputValidationError" in bc or "invalid x" in bc.lower():
+                        block["content"] = (
+                            "[System: 工具调用参数错误。请检查工具参数格式，"
+                            "确保所有必填参数正确提供。]"
+                        )
+                        error_count["input_validation"] += 1
+        total_errors = sum(error_count.values())
+        if total_errors > 0:
+            log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
+                f"(wasted={error_count['wasted']}, file_not_found={error_count['file_not_found']}, "
+                f"input_validation={error_count['input_validation']})")
+
+        # Proxy-side tool-result clearing with semantic priority
+        raw_messages, clear_stats = clear_old_tool_results(raw_messages, tools_list=tools_list)
+        cleared_files = clear_stats.get("cleared_files", [])
         if clear_stats.get("cleared"):
-            log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, {clear_stats['cleared_chars']:,} chars freed (kept last {clear_stats['kept']})")
+            log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, "
+                f"{clear_stats['cleared_chars']:,} chars freed (kept {clear_stats['kept']}, high_prio={clear_stats.get('high_prio', 0)})")
+            if clear_stats.get("dedup_bash", 0) > 0:
+                log(f"  -> Bash dedup: {clear_stats['dedup_bash']} similar results merged, "
+                    f"{clear_stats['dedup_chars_saved']} chars saved")
         elif not clear_stats.get("enabled"):
             log(f"  -> Tool clearing: disabled ({BACKEND_TYPE} backend)")
         elif clear_stats.get("enabled") and not clear_stats.get("skipped"):
             log(f"  -> Tool clearing: active (threshold={PROXY_CLEAR_THRESHOLD}, keep={PROXY_TOOL_KEEP})")
+
+        # Consecutive calls tracking (max_run)
+        consecutive = {}
+        max_run = 0
+        for msg in raw_messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "tool_use":
+                        name = block.get("name", "")
+                        inp = block.get("input", {})
+                        args_str = json.dumps(inp, sort_keys=True, ensure_ascii=False) if isinstance(inp, dict) else str(inp)
+                        key = f"{name}:{args_str}"
+                        consecutive[key] = consecutive.get(key, 0) + 1
+                        max_run = max(max_run, consecutive[key])
+                    else:
+                        consecutive = {}
+            else:
+                consecutive = {}
+        if max_run > 1:
+            log(f"  -> Consecutive calls: max_run={max_run} (tools tracked)")
+
+        # Loop detection: if max_run >= threshold, inject break message
+        if max_run >= PROXY_LOOP_THRESHOLD:
+            loop_keys = [k for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD]
+            tool_name = loop_keys[0].split(":")[0] if loop_keys else "unknown"
+            log(f"  -> Loop detected: {tool_name} called {max_run} times with same args, injecting break message")
+            break_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[System notice: You have called {tool_name} {max_run} consecutive times with identical arguments. "
+                    f"This appears to be a loop. Please stop calling {tool_name} with these parameters and try a different approach.]"
+                }]
+            }
+            raw_messages.append(break_msg)
+
+        # Re-read detection: check if recent tool_uses target cleared files
+        if cleared_files:
+            re_read_count = 0
+            recent_msgs = raw_messages[-6:]
+            for msg in recent_msgs:
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if block.get("type") == "tool_use" and block.get("name") == "Read":
+                            inp = block.get("input", {})
+                            if isinstance(inp, dict):
+                                fp = inp.get("file_path", inp.get("path", ""))
+                                if fp in cleared_files:
+                                    re_read_count += 1
+            if re_read_count > 0:
+                log(f"  -> Re-read detected: {re_read_count} Read calls targeting cleared files "
+                    f"(cleared_files={len(cleared_files)})")
 
         # Normalize system-reminder date to stabilize prefix for KV cache hits
         if raw_messages and raw_messages[0].get("role") == "user":
@@ -1888,7 +2177,6 @@ class Handler(BaseHTTPRequestHandler):
                 for block in content:
                     if block.get("type") == "text":
                         text = block.get("text", "")
-                        # Replace dynamic date with fixed placeholder to stabilize prefix
                         new_text = re.sub(r"Today's date is \d{4}/\d{2}/\d{2}\.", "Today's date is DATE_PLACEHOLDER.", text)
                         if new_text != text:
                             block["text"] = new_text
@@ -1899,25 +2187,21 @@ class Handler(BaseHTTPRequestHandler):
                     raw_messages[0]["content"] = new_content
                     log(f"  -> Standardized date in msg0")
 
-        # Proxy-side thinking block stripping (defensive: removes old assistant
-        # thinking/reasoning content to save tokens).
+        # Proxy-side thinking block stripping
         raw_messages, think_stats = strip_old_thinking_blocks(raw_messages, keep_recent=3)
         if think_stats.get("stripped"):
             log(f"  -> Thinking stripped: {think_stats['stripped_count']} old assistant messages cleaned (kept last {think_stats['kept']})")
         elif think_stats.get("enabled") and not think_stats.get("skipped"):
             log(f"  -> Thinking strip: active (keep_recent=3)")
 
-        # Proxy-side cleared tool-result compression: merge consecutive
-        # assistant(pure tool_use) + user(cleared) cycles into placeholders.
+        # Proxy-side cleared tool-result compression
         raw_messages, compress_stats = compress_cleared_tool_results(raw_messages)
         if compress_stats.get("merged"):
             log(f"  -> Tool-result compression: {compress_stats['merged_cycles']} cycles merged, {compress_stats['merged_msgs']} msgs removed (saved ~{compress_stats['saved_overhead']} tokens overhead)")
         elif compress_stats.get("enabled") and not compress_stats.get("merged"):
             log(f"  -> Tool-result compression: no consecutive cleared cycles to merge")
 
-        # Context truncation (char or rounds strategy, last step before conversion)
-        # Placed after think_strip and compress so those operate on full history first,
-        # then truncate reduces the final window.
+        # Context truncation
         raw_messages, trunc_stats = truncate_messages_if_needed(raw_messages)
         if trunc_stats.get("truncated"):
             strategy = trunc_stats.get("strategy", "char")
@@ -1932,10 +2216,9 @@ class Handler(BaseHTTPRequestHandler):
         elif trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
             log(f"  -> Context truncation: active (strategy={trunc_stats.get('strategy', '?')})")
 
-        # Debug: compute hashes of first two messages to diagnose cache misses
+        # Debug: compute hashes of first two messages
         if raw_messages:
             def _msg_hash(m):
-                import hashlib
                 c = m.get("content", "")
                 if isinstance(c, list):
                     c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
@@ -1990,7 +2273,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLAMA_API_KEY}"},
                     method="POST"
                 )
-                resp = urllib.request.urlopen(req, timeout=300)
+                resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
                 log(f"  <- llama-server status: {resp.status}")
                 if is_stream:
                     self._handle_streaming_response(resp, body)
@@ -2008,8 +2291,30 @@ class Handler(BaseHTTPRequestHandler):
             openai_resp,
             anthropic_body.get("model", "claude-3-5-sonnet-20241022")
         )
-        content_summary = ""
+
+        # Output token truncation for non-streaming path
+        max_tokens = anthropic_body.get("max_tokens", 4096)
+        output_token_hard_limit = int(max_tokens * PROXY_OUTPUT_TOKEN_LIMIT_RATIO)
+        output_chars_limit = int(output_token_hard_limit / 0.4)
         output_chars = 0
+        force_stopped = False
+
+        for block in anthropic_resp.get("content", []):
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                output_chars += len(text)
+                if output_chars > output_chars_limit:
+                    block["text"] = text[:output_chars_limit - (output_chars - len(text))]
+                    block["text"] += "\n\n[Output truncated by proxy: exceeded token limit]"
+                    force_stopped = True
+                    output_chars = output_chars_limit
+                    break
+
+        if force_stopped:
+            anthropic_resp["stop_reason"] = "max_tokens"
+            log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})")
+
+        content_summary = ""
         for block in anthropic_resp.get("content", []):
             if block.get("type") == "text":
                 content_summary += block.get("text", "")[:100]
@@ -2038,9 +2343,15 @@ class Handler(BaseHTTPRequestHandler):
         tools_extractor = _StreamingToolsExtractor()
         content_tools_pending = []
 
+        # Output token truncation for streaming path
+        max_tokens = anthropic_body.get("max_tokens", 4096)
+        output_token_hard_limit = int(max_tokens * PROXY_OUTPUT_TOKEN_LIMIT_RATIO)
+        output_char_count = 0
+        output_force_stopped = False
+
         def _emit_text_delta(t):
             """Emit a text delta SSE event, opening the text block lazily."""
-            nonlocal text_block_started, total_text
+            nonlocal text_block_started, total_text, output_char_count, output_force_stopped
             if not t:
                 return
             try:
@@ -2050,6 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
                         b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
                     )
                 total_text += t
+                output_char_count += len(t)
                 ev = f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(t)}}}}}\n\n'
                 self.wfile.write(ev.encode("utf-8"))
                 self.wfile.flush()
@@ -2087,6 +2399,9 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 continue
 
+            if output_force_stopped:
+                break
+
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
 
@@ -2116,8 +2431,22 @@ class Handler(BaseHTTPRequestHandler):
                     if tc.get("function", {}).get("name"):
                         tool_calls_buffer[idx]["function"]["name"] += tc["function"]["name"]
                     if tc.get("function", {}).get("arguments"):
-                        tool_calls_buffer[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                        args_chunk = tc["function"]["arguments"]
+                        tool_calls_buffer[idx]["function"]["arguments"] += args_chunk
+                        output_char_count += len(args_chunk)
+                        est_tokens = output_char_count * 0.4
+                        if est_tokens > output_token_hard_limit:
+                            tool_name = tool_calls_buffer[idx]["function"].get("name", "?")
+                            log(f"  -> !! Output token limit on tool_call: est={int(est_tokens)}, limit={output_token_hard_limit}, tool={tool_name}, forcing stop")
+                            output_force_stopped = True
+                            break
                 continue
+
+            # Check text output token limit
+            if output_char_count * 0.4 > output_token_hard_limit:
+                log(f"  -> FORCE_STOPPED: output est={int(output_char_count * 0.4)} tokens, limit={output_token_hard_limit}")
+                output_force_stopped = True
+                break
 
             # Handle content text — pass through state machine that strips <tools> blocks
             text = delta.get("content", "") or delta.get("reasoning_content", "")
@@ -2144,6 +2473,19 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "function",
                     "function": {"name": t["name"], "arguments": json.dumps(t["arguments"])},
                 }
+
+        # Repair truncated JSON in tool_call arguments if FORCE_STOPPED
+        if output_force_stopped:
+            for idx in tool_calls_buffer:
+                tc = tool_calls_buffer[idx]
+                raw_args = tc["function"].get("arguments", "{}")
+                try:
+                    json.loads(raw_args)
+                except json.JSONDecodeError:
+                    repaired = _repair_truncated_json(raw_args)
+                    tc["function"]["arguments"] = repaired
+                    tool_name = tc["function"].get("name", "?")
+                    log(f"  -> Repaired truncated JSON for tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
 
         # Send content_block_stop for text (only if text was output)
         if text_block_started:
@@ -2239,6 +2581,7 @@ def main():
     log(f"Concurrency: {PROXY_MAX_CONCURRENT}")
     log(f"Tool clearing: {'enabled (threshold=' + str(PROXY_CLEAR_THRESHOLD) + ', keep=' + str(PROXY_TOOL_KEEP) + ')' if PROXY_CLEAR_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
     log(f"Context limit: {'enabled (limit=' + str(PROXY_CTX_CHARS_LIMIT) + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
+    log(f"Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
     if IS_CLOUD:
         log(f"Cloud API mode — no local backend required")
     ThreadingHTTPServer((host, port), Handler).serve_forever()
