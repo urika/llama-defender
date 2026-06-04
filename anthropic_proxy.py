@@ -91,11 +91,13 @@ def _ensure_jsonl_dir():
 
 
 def log_request(model: str, input_chars: int, output_chars: int,
-                status: int, duration_ms: float):
+                status: int, duration_ms: float, start_time: str = ""):
     """Append one JSON Lines record to proxy_requests.jsonl (thread-safe)."""
     _ensure_jsonl_dir()
+    now_iso = datetime.now().isoformat()
     record = {
-        "timestamp": datetime.now().isoformat(),
+        "start_time": start_time or now_iso,
+        "end_time": now_iso,
         "method": "POST",
         "path": "/v1/messages",
         "model": model,
@@ -124,9 +126,17 @@ MODEL_ALIASES = [
     MODEL_NAME,
 ]
 
+# Thread-local context for per-request logging (session_id prefix)
+_log_ctx = threading.local()
+
+
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+    sess = getattr(_log_ctx, 'session_id', None)
+    if sess:
+        line = f"[{ts}] [sess={sess}] {msg}"
+    else:
+        line = f"[{ts}] {msg}"
     print(line)
     log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
     try:
@@ -1263,8 +1273,7 @@ def _get_traffic_stats():
             continue
         try:
             rec = json.loads(line)
-            # Parse ISO timestamp
-            ts_str = rec.get("timestamp", "")
+            ts_str = rec.get("start_time", "") or rec.get("timestamp", "") or rec.get("end_time", "")
             if ts_str:
                 try:
                     rec["_ts"] = datetime.fromisoformat(ts_str)
@@ -1333,12 +1342,16 @@ def _get_traffic_stats():
     for r in records_10m:
         dur = r.get("duration_ms", 0)
         if dur > 60000:
-            alerts.append(("warn", f"超长耗时: {r['_ts'].strftime('%H:%M:%S')} {dur/1000:.1f}s"))
+            et = r.get("end_time", "")
+            et_short = datetime.fromisoformat(et).strftime('%H:%M:%S') if et else "?"
+            alerts.append(("warn", f"超长耗时: {r['_ts'].strftime('%H:%M:%S')}→{et_short} {dur/1000:.1f}s"))
     # Very slow requests (critical)
     for r in records_10m:
         dur = r.get("duration_ms", 0)
         if dur > 120000:
-            alerts.append(("critical", f"严重超时: {r['_ts'].strftime('%H:%M:%S')} {dur/1000:.1f}s"))
+            et = r.get("end_time", "")
+            et_short = datetime.fromisoformat(et).strftime('%H:%M:%S') if et else "?"
+            alerts.append(("critical", f"严重超时: {r['_ts'].strftime('%H:%M:%S')}→{et_short} {dur/1000:.1f}s"))
 
     # Latency distribution buckets for visualization
     all_durations = [r.get("duration_ms", 0) for r in records_1h]
@@ -1388,7 +1401,13 @@ def _get_session_trace():
         with open("/tmp/anthropic_request_body.json", "r", encoding="utf-8") as f:
             body = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return '<div class="evt">No active request body</div>', []
+        return '<div class="evt">No active request body</div>', [], []
+
+    try:
+        mtime = os.path.getmtime("/tmp/anthropic_request_body.json")
+        saved_at = datetime.fromtimestamp(mtime).strftime("%H:%M:%S")
+    except OSError:
+        saved_at = None
 
     msgs = body.get("messages", [])
     model = body.get("model", "unknown")
@@ -1415,7 +1434,7 @@ def _get_session_trace():
                     params = ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:4])
                     if len(inp) > 4:
                         params += ", ..."
-                    tools_detail.append((str(tool_uses), f"{name}({params})"))
+                    tools_detail.append((saved_at or "—", f"Msg {idx}: {name}({params})"))
                 elif c.get("type") == "tool_result":
                     tool_results += 1
                     tr = c.get("content", "")
@@ -1430,10 +1449,11 @@ def _get_session_trace():
                             err_text = str(t)[:120]
                     if err_text:
                         err_summary = err_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                        errors_detail.append((f"Msg {idx}", err_summary))
+                        errors_detail.append((saved_at or "—", f"Msg {idx}: {err_summary}"))
 
     # Build timeline HTML (last 8 messages)
     timeline = []
+    ts_html = f'<span class="evt-ts">{saved_at}</span> ' if saved_at else ''
     for idx, m in enumerate(msgs):
         if idx < len(msgs) - 8:
             continue
@@ -1484,7 +1504,7 @@ def _get_session_trace():
 
         role_color = "#3498db" if role == "user" else ("#2ecc71" if role == "assistant" else "#888")
         timeline.append(
-            f'<div class="evt"><span style="color:{role_color};font-weight:600;">{prefix} ({role})</span> {line}</div>'
+            f'<div class="evt">{ts_html}<span style="color:{role_color};font-weight:600;">{prefix} ({role})</span> {line}</div>'
         )
 
     if not timeline:
@@ -1506,6 +1526,8 @@ def _get_session_trace():
         f'<div class="row"><span class="label">Errors</span>'
         f'<span class="value clickable" style="color:{"#e74c3c" if errors else "#2ecc71"}" onclick="showModal(' + "'errors', '❌ Errors Detail')" + f'">{errors}</span></div>'
     )
+    if saved_at:
+        summary += f'<div class="row"><span class="label">Captured At</span><span class="value">{saved_at}</span></div>'
 
     return summary + "\n".join(timeline), tools_detail, errors_detail
 
@@ -1603,7 +1625,7 @@ def _build_status_html():
 <html>
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
+<!-- auto-refresh disabled when modal is open -->
 <title>Local LLM Stack Status</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
@@ -1735,6 +1757,11 @@ function closeModal(e) {{
 document.addEventListener('keydown', function(e) {{
   if (e.key === 'Escape') closeModal();
 }});
+setInterval(function() {{
+  if (document.getElementById('modal').style.display !== 'flex') {{
+    location.reload();
+  }}
+}}, 5000);
 </script>
 </body>
 </html>"""
@@ -1753,81 +1780,91 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        log(f"GET {self.path}")
-        log(f"  Headers: {dict(self.headers)}")
-        if self.path == "/v1/models":
-            models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "anthropic"}
-                      for name in MODEL_ALIASES]
-            self._respond_json({"object": "list", "data": models})
-        elif self.path == "/status":
-            html = _build_status_html()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
-        else:
-            self._respond_json({"detail": "Not found"}, 404)
+        _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
+        try:
+            log(f"GET {self.path}")
+            log(f"  Headers: {dict(self.headers)}")
+            if self.path == "/v1/models":
+                models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "anthropic"}
+                          for name in MODEL_ALIASES]
+                self._respond_json({"object": "list", "data": models})
+            elif self.path == "/status":
+                html = _build_status_html()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(html.encode("utf-8"))
+            else:
+                self._respond_json({"detail": "Not found"}, 404)
+        finally:
+            _log_ctx.session_id = None
 
     def do_POST(self):
-        content_len = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_len).decode("utf-8")
-        log(f"POST {self.path}")
-        log(f"  Headers: {dict(self.headers)}")
+        _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
         try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            log(f"  Body (invalid JSON): {body[:500]}")
-            self._respond_json(
-                {"error": {"type": "invalid_request_error", "message": "Invalid JSON"}},
-                400,
-            )
-            return
-
-        try:
-            with open("/tmp/anthropic_request_body.json", "w") as f:
-                f.write(json.dumps(parsed, ensure_ascii=False, indent=2))
-        except OSError as e:
-            log(f"  debug body write failed: {e}")
-        log(f"  Body: {json.dumps(parsed, ensure_ascii=False)[:1500]}")
-
-        if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
-            # Log request summary with timestamp for status page tracking
-            msgs = parsed.get("messages", [])
-            total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
-            tools = parsed.get("tools", [])
-            log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
-            # Timing wrapper for structured logging
-            import time as _time
-            _t0 = _time.monotonic()
-            self._last_jsonl_token = _next_jsonl_token()
-            _jsonl_output_map[self._last_jsonl_token] = 0
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len).decode("utf-8")
+            log(f"POST {self.path}")
+            log(f"  Headers: {dict(self.headers)}")
             try:
-                self._handle_messages(parsed)
-                # Non-streaming: log after response is sent
-                _dur = (_time.monotonic() - _t0) * 1000
-                log_request(
-                    model=parsed.get("model", "unknown"),
-                    input_chars=total_chars,
-                    output_chars=_jsonl_output_map.pop(self._last_jsonl_token, 0),
-                    status=200,
-                    duration_ms=_dur,
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                log(f"  Body (invalid JSON): {body[:500]}")
+                self._respond_json(
+                    {"error": {"type": "invalid_request_error", "message": "Invalid JSON"}},
+                    400,
                 )
-            except Exception as e:
-                _dur = (_time.monotonic() - _t0) * 1000
-                log(f"  -> Error: {e}")
-                _jsonl_output_map.pop(self._last_jsonl_token, None)
-                log_request(
-                    model=parsed.get("model", "unknown"),
-                    input_chars=total_chars,
-                    output_chars=0,
-                    status=500,
-                    duration_ms=_dur,
-                )
-                raise
-        else:
-            log(f"  -> 404 (unknown path)")
-            self._respond_json({"detail": "Not found"}, 404)
+                return
+
+            try:
+                with open("/tmp/anthropic_request_body.json", "w") as f:
+                    f.write(json.dumps(parsed, ensure_ascii=False, indent=2))
+            except OSError as e:
+                log(f"  debug body write failed: {e}")
+            log(f"  Body: {json.dumps(parsed, ensure_ascii=False)[:1500]}")
+
+            if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
+                # Log request summary with timestamp for status page tracking
+                msgs = parsed.get("messages", [])
+                total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
+                tools = parsed.get("tools", [])
+                log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
+                # Timing wrapper for structured logging
+                import time as _time
+                _t0 = _time.monotonic()
+                _req_start_time = datetime.now().isoformat()
+                self._last_jsonl_token = _next_jsonl_token()
+                _jsonl_output_map[self._last_jsonl_token] = 0
+                try:
+                    self._handle_messages(parsed)
+                    _dur = (_time.monotonic() - _t0) * 1000
+                    log_request(
+                        model=parsed.get("model", "unknown"),
+                        input_chars=total_chars,
+                        output_chars=_jsonl_output_map.pop(self._last_jsonl_token, 0),
+                        status=200,
+                        duration_ms=_dur,
+                        start_time=_req_start_time,
+                    )
+                except Exception as e:
+                    _dur = (_time.monotonic() - _t0) * 1000
+                    log(f"  -> Error: {e}")
+                    _jsonl_output_map.pop(self._last_jsonl_token, None)
+                    log_request(
+                        model=parsed.get("model", "unknown"),
+                        input_chars=total_chars,
+                        output_chars=0,
+                        status=500,
+                        duration_ms=_dur,
+                        start_time=_req_start_time,
+                    )
+                    raise
+            else:
+                log(f"  -> 404 (unknown path)")
+                self._respond_json({"detail": "Not found"}, 404)
+        finally:
+            _log_ctx.session_id = None
 
     def _handle_messages(self, body):
         is_stream = body.get("stream", False)
