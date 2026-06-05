@@ -1,9 +1,9 @@
 # 代理层上下文窗口替换设计文档
 
-> 状态: Phase 1 已实施，Prefix Cache 验证通过  
+> 状态: Phase 1-2 + P0/P1 已实施  
 > 作者: Kimi Code CLI / opencode  
-> 日期: 2026-06-04  
-> 版本: v5（死循环检测与修复 + 语义保留 + 集成测试验证）
+> 日期: 2026-06-05  
+> 版本: v7（P0/P1 实施：Metrics 日志 + 工具过滤 + 关键词索引 + 增量压缩）
 
 ---
 
@@ -571,10 +571,44 @@ PROXY_CTX_KEEP_ROUNDS_DYNAMIC=true
 - [ ] 评估动态窗口策略效果
 - [ ] 收集用户反馈
 
-### Phase 4：高级优化（后续迭代）
-- [ ] 评估 LLM 生成 summary 替代静态占位（可能用小模型如 Qwen3-4B 离线生成）
-- [ ] 评估高频小步压缩（每 N 次 tool call 触发一次）的可行性
+### Phase 4：高级优化 ✅ 已完成（提升至 Phase 1）
+- [x] ~~评估 LLM 生成 summary 替代静态占位~~ → 三级压缩链已实现：LLM → 规则 → 静态折叠
+- [x] 高频小步压缩 → P1-2 增量压缩已实现（`_incremental_compress`）
 - [ ] 研究阶段感知压缩的代理层实现可能性
+
+### P0-1：结构化 Metrics 日志 ✅ 已完成
+- [x] 新增 `_metrics_ctx` thread-local + `log_metrics()` 函数
+- [x] 每请求输出 `logs/proxy_metrics.jsonl`（结构化 JSON）
+- [x] 管线各步骤 metrics 收集：error_translation、tool_clear、loop_detect、think_strip、compress、truncate、tool_filter
+- [x] 质量标记自动生成：`high_drop_ratio`、`llm_compress_failed`、`budget_overflow`、`loop_injected`
+- [x] 压缩比计算（`compression_ratio`）
+- [x] 配置：`PROXY_METRICS_ENABLED=true`、`PROXY_METRICS_DIR=logs`
+
+### P0-2：动态工具定义过滤 ✅ 已完成
+- [x] 新增 `_filter_tools()` 函数 + `TOOL_ALWAYS_KEEP` 白名单（12 个核心工具）
+- [x] 扫描最近 N 轮 assistant 消息收集已使用工具名
+- [x] `tool_choice` 兼容：指定工具强制保留
+- [x] 过滤后过少时回退到原始列表
+- [x] 预期节省：44→15 tools ≈ 5-8K tokens
+- [x] 配置：`PROXY_TOOL_FILTER_ENABLED`、`PROXY_TOOL_FILTER_MAX=20`、`PROXY_TOOL_FILTER_RECENT=5`
+
+### P1-1：BM25 MVP（关键词索引）✅ 已完成
+- [x] `_extract_keywords()` 从 dropped 消息提取关键词（文件名、错误类型、函数名）
+- [x] `_inject_keyword_context()` 在 tail 消息中子串匹配并注入
+- [x] 集成到 `_apply_rounds_truncation()`，追加到压缩摘要后
+- [x] 纯内存，无持久化，~1-2ms 开销
+- [x] 配置：`PROXY_HISTORY_INDEX=rule`、`PROXY_HISTORY_TOP_K=5`、`PROXY_HISTORY_MAX_CHARS=500`
+
+### P1-2：增量压缩 ✅ 已完成
+- [x] 会话级 `_summary_cache`（LRU，最多 10 个会话，3000 chars/摘要）
+- [x] `_incremental_compress()` 只压缩新增 dropped 消息，合并已有缓存
+- [x] `_merge_summaries_with_llm()` LLM 合并两个摘要（总长 > 2000 chars 时触发）
+- [x] `truncate_messages_if_needed()` 和 `_apply_rounds_truncation()` 新增 `session_id` 参数
+- [x] 收益：LLM 调用从 40-60 条 → 5-10 条新消息，prompt 从 8K→1-2K chars
+
+### BM25 Phase 2-3（增强版/完整版）未开始
+- [ ] Bigram 分词器 + 内存倒排索引 + TF 评分
+- [ ] BM25 评分 + 代码感知分词 + JSONL 持久化 + 跨会话加载
 
 ---
 
@@ -879,14 +913,656 @@ resp = requests.post('http://127.0.0.1:4000/v1/messages', json=body)
 
 ### 14.6 已知限制
 
-1. **循环检测仅限同一 tool_use**：如果模型交替调用 `Read(a)` 和 `Read(b)`，不会被检测
+1. ~~**循环检测仅限同一 tool_use**~~：已在 v6 中修复，现在支持模式检测（相同文本+工具名集合）
 2. **预览可能截断关键信息**：200 字符对大文件可能不够，但受 token 预算约束
 3. **打断消息可能被模型忽略**：模型可能继续尝试其他工具获取同一信息
-4. **阈值硬编码**：循环检测阈值固定为 3 次，未做成可配置项
+4. ~~**阈值硬编码**~~：已实现 `PROXY_LOOP_THRESHOLD` 环境变量
 
-### 14.7 未来优化方向
+### 14.7 v6 优化（已实施）
 
-- **智能预览**：根据文件类型选择预览策略（如代码文件保留 import 和函数签名）
-- **循环模式扩展**：检测交替式循环（A→B→A→B）和语义等价循环（Read file1 → Read file2，file1=file2）
-- **主动缓存标记**：在清除时标记 "Wasted call" 可能的文件路径，提醒模型不要重复读取
-- **可配置循环阈值**：`PROXY_LOOP_THRESHOLD` 环境变量控制触发次数
+参见 §15-§19。
+
+---
+
+## 15. Lost-in-the-Middle 问题与缓解策略
+
+### 15.1 问题描述
+
+LLM 在长上下文中，**中间位置**的信息准确率显著低于**开头**（首因偏差）和**结尾**（近因偏差）。
+
+对编码智能体（可能运行数十轮甚至数百轮）的影响：
+- **开头**：原始任务描述 — 可能被保留但语义遗忘
+- **结尾**：最近行动 — 自然保留
+- **中间**：错误消息、解决方案、架构决策、代码演进 — **压缩时丢失风险最高**
+
+### 15.2 参考：kimix 四项缓解措施
+
+| # | 措施 | 代理层实现 | 状态 |
+|---|------|-----------|------|
+| 1 | HEAD 独立保留（首条消息永远不被压缩） | `PROXY_CTX_KEEP_HEAD=2` | ✅ 已有 |
+| 2 | 自适应保留深度（根据信号动态调整） | `_compute_adaptive_rounds()` | ✅ v6 新增 |
+| 3 | 结构化压缩（LLM/规则替代简单删除） | 三级降级链 | ✅ v6 新增 |
+| 4 | BM25 历史索引 | 未实现 | 🔜 未来 |
+
+---
+
+## 16. 自适应保留深度（措施 2）
+
+### 16.1 设计思路
+
+固定 `rounds=8` 无法适应不同复杂度的对话。当对话包含错误、多文件编辑等复杂状态时，需要保留更多近期上下文。
+
+### 16.2 信号与增量
+
+| 信号 | 增量 | 检测方式 | 理由 |
+|------|------|---------|------|
+| tool_result 含 error/exception/failed | +1 轮 | 扫描 user 消息中 tool_result 内容 | 错误状态需要更多上下文解决 |
+| assistant 中 Write/Edit > 2 个 | +1 轮 | 扫描 assistant 消息中 tool_use | 多文件变更需要连续性 |
+
+**上限**：`base_rounds × 2`，防止无限膨胀。
+
+### 16.3 实现
+
+函数 `_compute_adaptive_rounds(messages, base_rounds)` 在截断前计算自适应轮数，替代固定 `PROXY_CTX_KEEP_ROUNDS`。
+
+```
+实际保留轮数 = min(base_rounds + 额外轮数, base_rounds × 2)
+```
+
+---
+
+## 17. 三级压缩降级链（措施 3）
+
+### 17.1 降级架构
+
+```
+截断触发
+  ├─ dropped >= 10 消息 → 尝试 LLM 压缩（30s 超时）
+  │   ├─ 成功 → 使用 LLM 结构化摘要
+  │   └─ 失败 → 降级到规则压缩
+  ├─ dropped < 10 消息 → 直接规则压缩
+  │   ├─ 有提取内容 → 使用规则化摘要
+  │   └─ 无提取内容 → 降级到简单折叠
+  └─ 简单折叠（原始行为）："[Context folded: N messages omitted...]"
+```
+
+### 17.2 LLM 压缩（`_compress_middle_with_llm`）
+
+**触发条件**：被截断的中间消息 >= 10 条
+
+**流程**：
+1. 将中间消息转为文本格式（每条截断到 300 chars）
+2. 总量限制 8000 chars（防止压缩本身消耗过多 token）
+3. 调用本地 LLM（`http://127.0.0.1:8081/v1/chat/completions`）
+4. 使用结构化提示词，输出 XML 格式
+
+**压缩提示词结构**：
+```
+<current_focus>当前正在做什么</current_focus>
+<errors_solutions>所有错误及其解决方式</errors_solutions>
+<code_state>当前文件状态、关键代码签名</code_state>
+<decisions>架构/设计决策</decisions>
+<pending>未完成的任务</pending>
+```
+
+**优先级顺序**（参考 kimix）：
+1. 当前任务状态
+2. 错误与解决方案
+3. 代码演进（仅保留最终工作版本）
+4. 系统上下文
+5. 设计决策
+6. 待办事项
+
+**约束**：
+- `max_tokens=1024`（压缩输出不超过 1K tokens）
+- `temperature=0.3`（低创造性，高保真）
+- `timeout=30s`（不阻塞主请求太久）
+- `stream=False`（非流式，快速获取完整输出）
+
+### 17.3 规则化压缩（`_extract_middle_summary_rules`）
+
+**触发条件**：LLM 压缩失败，或被截断消息 < 10 条
+
+**提取逻辑**：
+
+| 提取目标 | 来源 | 格式 |
+|---------|------|------|
+| 错误信息 | user/tool_result 含 error/exception/failed | 原文保留（前 500 chars） |
+| 已解决信息 | tool_result 含 successfully/updated/created | `[resolved]` 前缀 |
+| 代码变更 | assistant/Write/Edit tool_use | `Write(file_path)` 列表 |
+| 文件状态 | 所有 tool_use 的 file_path | 文件→最后操作映射 |
+| 架构决策 | assistant/text 含 DECISION/TODO/FIXME/IMPORTANT | 原文保留（前 200 chars） |
+
+**输出格式**：
+```xml
+[Compressed context from N earlier messages (rule-based):]
+<errors_solutions>
+- Error: Cannot read property 'x' of undefined
+- [resolved] File created successfully
+</errors_solutions>
+<code_changes>
+- Write(/path/to/board.js)
+- Edit(/path/to/ai.js)
+</code_changes>
+<file_states>
+- /path/to/board.js: last Write
+- /path/to/ai.js: last Edit
+</file_states>
+```
+
+### 17.4 简单折叠（原始行为）
+
+**触发条件**：规则压缩也无法提取有价值内容
+
+**输出**：
+```
+[Context folded: N earlier messages omitted. Previous work included M tool interactions. Files previously accessed: a.js, b.js. Retaining last K conversation rounds.]
+```
+
+---
+
+## 18. 模式检测循环检测（v6 增强）
+
+### 18.1 问题
+
+v5 的循环检测只匹配"相同工具+相同参数"的精确循环。当模型交替调用 `Read(board.js)` → `Read(ai.js)` → `Read(board.js)` 时，参数不同，检测不触发。
+
+### 18.2 解决方案
+
+新增**模式匹配**：检测"相同文本输出 + 相同工具名集合"的语义循环。
+
+```
+pattern = (text前200 chars, 工具名sorted集合)
+连续 >= 3 次相同 pattern → 触发循环检测
+```
+
+**示例**：模型输出 "Based on the conversation history..." + Read(board.js)，下次 "Based on the conversation history..." + Read(ai.js) —— 文本相同，工具集合 {Read} 相同，触发检测。
+
+---
+
+## 19. 35B 模型配置优化
+
+### 19.1 GPU 内存配置演进
+
+| 参数 | v5 (0.60) | v6 (0.75) | 效果 |
+|------|-----------|-----------|------|
+| `--gpu-memory-utilization` | 0.60 | **0.75** | allocation_limit 28.8→30.2 GB |
+| `--cache-memory-mb` | 5120 | **4096** | 适配 35B 内存占用 |
+| `--kv-cache-turboquant` | 无 | **启用 (4-bit)** | 替代 8-bit 普通量化 |
+| `--pin-system-prompt` | 无 | **启用** | 固定 system prompt 在 KV cache |
+| `--max-num-seqs` | 默认 | **1** | 单请求独占 |
+
+### 19.2 效果对比
+
+| 指标 | 0.60 + 8bit KV | 0.75 + turboquant | 改善 |
+|------|---------------|-------------------|------|
+| Metal active | 28-30 GB | **23-25 GB** | -17% |
+| Forced cache clear | 1660 次 | **0 次** | 消除 |
+| Cache HIT rate | < 50% | 逐步积累 | 改善 |
+| 39K chars 响应 | 121s | **20-21s** | **6x** |
+
+### 19.3 配置文件
+
+```bash
+# configs/rapid-mlx-35b.conf 关键参数
+RAPID_MLX_EXTRA_ARGS="--no-mllm --gpu-memory-utilization 0.75 --cache-memory-mb 4096 --max-num-seqs 1 --kv-cache-turboquant --kv-cache-turboquant-bits 4 --pin-system-prompt"
+PROXY_MAX_TOKENS_OVERRIDE=16384
+PROXY_OUTPUT_TOKEN_LIMIT_RATIO=2.0
+PROXY_BACKEND_TIMEOUT=300
+PROXY_TOOL_KEEP=8
+PROXY_CTX_TOKEN_BUDGET=30000
+```
+
+### 19.4 System Prompt 稳定性分析
+
+| 组件 | 大小 | 变化频率 |
+|------|------|---------|
+| msg[0] user (system-reminder + claudeMd) | 1908 chars | ✅ 同日内不变 |
+| msg[1] system (skills 列表) | 5735 chars | ✅ 稳定 |
+| Tools schema (27 tools) | 81920 chars | ✅ 稳定 |
+
+`--pin-system-prompt` 配合日期标准化逻辑，确保前缀完全稳定，prefix cache 可持续命中。
+
+---
+
+## 20. 完整上下文管理流程（v7）
+
+```
+请求进入 anthropic_proxy.py
+  │
+  ├─ 1. 解析 messages, tools
+  ├─ 2. 日期标准化（固定 currentDate）
+  ├─ 3. Error translation（Wasted/FileNotFound → 自然语言）
+  ├─ 4. Tool clearing（语义优先级清除，PROXY_TOOL_KEEP=8）
+  │     ├─ 语义评分：Read=3, Agent=3, WebFetch=2, Bash=1, Edit/Write=1
+  │     ├─ 动态 KEEP：子代理 auto KEEP=15
+  │     └─ Bash dedup（Jaccard >= 0.7 合并）
+  ├─ 5. 循环检测（精确 + 模式匹配）
+  │     ├─ 精确：相同工具名+相同参数 >= 3 次
+  │     └─ 模式：相同文本+相同工具集合 >= 3 次
+  ├─ 6. Re-read 检测（Read 清除后的文件）
+  ├─ 7. Thinking block 清理
+  ├─ 8. Cleared tool-result 压缩
+  ├─ 9. Context truncation（核心）
+  │     ├─ 自适应保留深度：_compute_adaptive_rounds()
+  │     ├─ 分离：HEAD(2) + TAIL(自适应N轮) + MIDDLE
+  │     ├─ MIDDLE 压缩（增量优先）：
+  │     │   ├─ 增量压缩：_incremental_compress() 检查 _summary_cache
+  │     │   │   ├─ 缓存命中 → 只压缩新消息 → 合并缓存摘要
+  │     │   │   └─ 缓存未命中 → 全量压缩（下同）
+  │     │   ├─ >= 10 msgs → LLM 压缩（30s timeout）
+  │     │   ├─ 失败/<10 → 规则压缩
+  │     │   └─ 无内容 → 简单折叠
+  │     ├─ 关键词索引（P1-1）：
+  │     │   ├─ _extract_keywords(dropped) → 文件名/错误/函数名
+  │     │   └─ _inject_keyword_context(keywords, tail) → 子串匹配注入
+  │     └─ 重组：HEAD + 压缩摘要 + TAIL
+  ├─ 10. max_tokens override（16384）
+  ├─ 11. 工具过滤（P0-2）：_filter_tools()
+  │     ├─ TOOL_ALWAYS_KEEP 白名单（12 个核心工具）
+  │     ├─ 最近 N 轮已使用工具保留
+  │     └─ tool_choice 指定工具强制保留
+  ├─ 12. 转发到 rapid-mlx 后端
+  ├─ 13. 输出控制
+  │     ├─ Streaming: FORCE_STOPPED (text + tool_call args)
+  │     ├─ Non-streaming: text truncation
+  │     └─ _repair_truncated_json() 修复截断 JSON
+  └─ 14. Metrics 记录（P0-1）
+        ├─ _metrics_ctx 各步骤数据收集
+        ├─ _finalize_metrics() 质量标记 + 压缩比
+        └─ log_metrics() → logs/proxy_metrics.jsonl
+```
+
+---
+
+## 21. BM25 历史索引设计（措施 4）
+
+### 21.1 问题分析
+
+即使经过自适应保留深度和结构化压缩，中间部分的关键信息仍可能被归档。典型的遗忘场景：
+
+| 场景 | 丢失内容 | 后果 |
+|------|---------|------|
+| 长会话中修复过 bug | 错误信息和解决方案被截断 | 模型可能重犯同一错误 |
+| 做过架构决策 | 设计讨论被截断 | 模型可能推翻已定方案 |
+| 读过的关键文件 | 文件内容被清除 | 模型重新读取（Wasted call） |
+| 用户早期要求 | 原始需求描述被压缩 | 模型偏离原始目标 |
+
+**核心矛盾**：保留所有历史 → token 超限；截断历史 → 关键信息丢失。
+
+**BM25 索引的解法**：不保留原始消息，但保留**可搜索的索引**。当模型需要时，按需检索并注入。
+
+### 21.2 架构设计
+
+```
+┌─────────────────────────────────────────────────┐
+│                  请求处理流程                      │
+│                                                   │
+│  请求进入 → 解析 messages                          │
+│              │                                    │
+│              ├─→ [索引] 新消息写入 BM25 索引         │
+│              │    - user 消息全文索引               │
+│              │    - assistant 文本索引              │
+│              │    - tool_use: 工具名+参数索引        │
+│              │    - tool_result: 前 500 chars 索引  │
+│              │                                    │
+│              ├─→ [截断] 自适应保留 + 压缩            │
+│              │                                    │
+│              ├─→ [检索] 用最新 user 消息搜索索引      │
+│              │    - BM25 评分                       │
+│              │    - 取 top-K 相关片段               │
+│              │    - 注入为 user 消息（在末尾）        │
+│              │                                    │
+│              └─→ [转发] 压缩后 + 检索增强的请求       │
+└─────────────────────────────────────────────────┘
+
+索引持久化:
+  ┌──────────┐     ┌──────────┐
+  │ 内存索引  │ ←→  │ 磁盘文件  │
+  │ (dict)   │     │ JSONL    │
+  └──────────┘     └──────────┘
+```
+
+### 21.3 数据结构
+
+#### 21.3.1 索引条目
+
+```python
+class IndexEntry:
+    session_id: str       # 会话 ID
+    msg_index: int        # 消息在原始会话中的序号
+    role: str             # user / assistant
+    tokens: list[str]     # 分词结果 (bigram)
+    content_hash: str     # 内容哈希（去重用）
+    summary: str          # 压缩后的摘要（≤200 chars）
+    timestamp: str        # ISO 时间戳
+    metadata: dict        # 工具名、文件路径等
+```
+
+#### 21.3.2 倒排索引
+
+```python
+inverted_index: dict[str, list[tuple[int, int]]]
+# token → [(entry_id, term_frequency), ...]
+
+doc_lengths: list[int]    # 每个 entry 的 token 数
+avg_doc_length: float     # 平均文档长度
+N: int                    # 总文档数
+```
+
+### 21.4 分词策略
+
+#### Bigram 分词器（基础版）
+
+```python
+def tokenize(text: str) -> list[str]:
+    # 1. 清洗：去除标点、统一小写
+    cleaned = re.sub(r'[^\w\s]', ' ', text.lower())
+    words = cleaned.split()
+    
+    # 2. 停用词过滤
+    words = [w for w in words if w not in STOP_WORDS and len(w) > 1]
+    
+    # 3. Bigram 生成
+    bigrams = []
+    for i in range(len(words) - 1):
+        bigrams.append(f"{words[i]}_{words[i+1]}")
+    
+    # 4. 保留 unigram（单字词也有价值）
+    return words + bigrams
+```
+
+**示例**：
+```
+输入: "board.js 的 countLiberties 方法报错 TypeError"
+分词: ["boardjs", "countliberties", "方法", "报错", "typeerror",
+       "boardjs_countliberties", "countliberties_方法", "方法_报错", "报错_typeerror"]
+```
+
+#### 代码感知分词（增强版）
+
+```python
+def tokenize_code_aware(text: str) -> list[str]:
+    tokens = []
+    
+    # 提取文件路径
+    for path in re.findall(r'[/\w]+\.\w+', text):
+        tokens.append(f"path:{path}")
+    
+    # 提取函数/方法名
+    for name in re.findall(r'\b([a-z][a-zA-Z0-9_]*)\s*\(', text):
+        tokens.append(f"func:{name}")
+    
+    # 提取错误类型
+    for err in re.findall(r'\b([A-Z]\w+Error)\b', text):
+        tokens.append(f"error:{err}")
+    
+    # 常规 bigram
+    tokens.extend(tokenize(text))
+    
+    return tokens
+```
+
+### 21.5 BM25 评分算法
+
+```python
+def bm25_score(query_tokens: list[str], entry_id: int,
+               k1: float = 1.5, b: float = 0.75) -> float:
+    score = 0.0
+    dl = doc_lengths[entry_id]
+    
+    for qt in query_tokens:
+        if qt not in inverted_index:
+            continue
+        
+        # IDF = log((N - df + 0.5) / (df + 0.5) + 1)
+        df = len(inverted_index[qt])
+        idf = math.log((N - df + 0.5) / (df + 0.5) + 1)
+        
+        # TF in document
+        tf = 0
+        for eid, freq in inverted_index[qt]:
+            if eid == entry_id:
+                tf = freq
+                break
+        
+        # BM25 formula
+        numerator = tf * (k1 + 1)
+        denominator = tf + k1 * (1 - b + b * dl / avg_doc_length)
+        score += idf * numerator / denominator
+    
+    return score
+```
+
+### 21.6 检索与注入流程
+
+```
+1. 提取最新 user 消息作为 query
+2. 对 query 分词
+3. BM25 检索 top-K（K=5）相关条目
+4. 过滤：
+   - 已在当前 context 中的条目 → 跳过（去重）
+   - 相似度低于阈值 → 跳过
+   - 条目过多 → 只保留 top-K
+5. 格式化为检索结果消息
+6. 注入到 messages 末尾（在最新 user 消息之前）
+```
+
+**注入格式**：
+```json
+{
+  "role": "user",
+  "content": [{
+    "type": "text",
+    "text": "[History context retrieved for current task:]\n- [msg#23] Fixed TypeError in countLiberties by adding null check\n- [msg#45] Decision: Use BFS for group detection instead of DFS\n- [msg#67] board.js evaluated: countTerritory returns {black: 12, white: 8}\n..."
+  }]
+}
+```
+
+**关键设计决策**：
+- 注入为 **user 消息**（不是 system），避免破坏 system prompt 的 cache
+- 放在 **最新 user 消息之前**，确保模型优先处理真实用户输入
+- 带有 `[History context]` 前缀，模型可区分历史检索和当前上下文
+
+### 21.7 索引持久化
+
+#### 存储结构
+
+```
+data/
+├── index/
+│   ├── {session_id}.jsonl      # 索引条目（追加写入）
+│   └── {session_id}.meta.json   # 元数据（倒排索引快照）
+```
+
+#### 写入策略
+
+```
+每 N 个请求（N=5）刷新一次索引到磁盘
+代理重启时从磁盘加载 {session_id}.jsonl 重建倒排索引
+```
+
+#### JSONL 格式
+
+```jsonl
+{"idx":0,"role":"user","tokens":["hi","围棋","游戏"],"summary":"用户发起围棋游戏项目","hash":"abc123","ts":"2026-06-05T14:00:00","meta":{"tool":null,"files":[]}}
+{"idx":1,"role":"assistant","tokens":["read","boardjs","countliberties"],"summary":"读取 board.js 分析 countLiberties","hash":"def456","ts":"2026-06-05T14:00:20","meta":{"tool":"Read","files":["/path/board.js"]}}
+```
+
+### 21.8 与现有系统的集成点
+
+```
+_handle_messages() 中的位置：
+
+1. 解析 messages ──→ 索引新消息
+2. Error translation ──→ 标记错误类型到索引 metadata
+3. Tool clearing ──→ 更新索引（标记已清除的消息）
+4. 循环检测 ──→ 记录循环模式到索引
+5. Context truncation ──→ 截断前的消息已在索引中
+6. ★ BM25 检索 ──→ 注入相关历史（新增）
+7. 转发
+```
+
+---
+
+## 22. 基础半设计（MVP）
+
+### 22.1 设计原则
+
+完整版 BM25 索引需要持久化存储、倒排索引维护、磁盘 I/O。**基础半设计**用最简方式实现核心价值：
+
+> **"在截断时保留关键词索引，按需注入，无需持久化"**
+
+### 22.2 核心简化
+
+| 特性 | 完整版 | 基础半设计 |
+|------|--------|-----------|
+| 索引存储 | 磁盘 JSONL + 内存倒排索引 | **纯内存，随请求重建** |
+| 分词 | Bigram + 代码感知 | **简单关键词提取** |
+| 检索算法 | BM25 | **TF 匹配（词频排序）** |
+| 检索触发 | 每次请求 | **仅截断时** |
+| 持久化 | session 级磁盘存储 | **无持久化** |
+| 注入位置 | 最新 user 消息前 | **压缩摘要中嵌入** |
+
+### 22.3 基础版实现
+
+#### 22.3.1 关键词提取
+
+```python
+def _extract_keywords(messages):
+    """从被截断的消息中提取关键词索引"""
+    keywords = {}  # keyword -> [summary, ...]
+    
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        text = ""
+        files = []
+        
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict):
+                    if b.get("type") == "text":
+                        text += b.get("text", "") + " "
+                    elif b.get("type") == "tool_use":
+                        name = b.get("name", "")
+                        inp = b.get("input", {})
+                        if isinstance(inp, dict):
+                            fp = inp.get("file_path", inp.get("path", ""))
+                            if fp:
+                                files.append(fp)
+                        text += f"{name} "
+                    elif b.get("type") == "tool_result":
+                        tc = b.get("content", "")
+                        if isinstance(tc, str):
+                            text += tc[:200] + " "
+        
+        # 提取关键词：文件名 + 函数名 + 错误类型
+        for path in files:
+            fname = path.split("/")[-1]
+            keywords.setdefault(fname, []).append(f"{role}: {text[:100]}")
+        
+        for err in re.findall(r'\b([A-Z]\w*(?:Error|Exception))\b', text):
+            keywords.setdefault(err, []).append(f"{role}: {text[:100]}")
+        
+        for func in re.findall(r'\b([a-z][a-zA-Z0-9_]{3,})\s*\(', text):
+            keywords.setdefault(func, []).append(f"{role}: {text[:100]}")
+    
+    return keywords
+```
+
+#### 22.3.2 检索与注入
+
+```python
+def _inject_keyword_context(keywords, current_messages):
+    """检查当前消息是否引用了被截断的关键词"""
+    # 从最近 3 条消息中提取查询词
+    query_text = ""
+    for msg in current_messages[-3:]:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    query_text += b.get("text", "") + " "
+        elif isinstance(content, str):
+            query_text += content + " "
+    
+    # 匹配关键词
+    matches = []
+    for kw, summaries in keywords.items():
+        if kw.lower() in query_text.lower():
+            matches.append(f"[{kw}]: {summaries[-1]}")  # 取最新一条
+    
+    if not matches:
+        return None
+    
+    return "[Relevant history context:]\n" + "\n".join(matches[:5])
+```
+
+#### 22.3.3 集成方式
+
+在 `_apply_rounds_truncation()` 中：
+
+```python
+# 1. 从 dropped 消息提取关键词
+keywords = _extract_keywords(dropped)
+
+# 2. 检查 tail 消息是否引用了这些关键词
+keyword_context = _inject_keyword_context(keywords, tail)
+
+# 3. 追加到压缩摘要后面
+if keyword_context:
+    compressed_text += "\n\n" + keyword_context
+```
+
+### 22.4 基础版 vs 完整版效果对比
+
+| 场景 | 基础版 | 完整版 |
+|------|--------|--------|
+| 模型提到 "之前那个 TypeError" | ✅ 能找到错误摘要 | ✅ 能找到完整错误+解决方案 |
+| 模型提到 "board.js" | ✅ 能找到文件操作记录 | ✅ 能找到完整代码变更历史 |
+| 模型提到 "之前讨论的架构" | ❌ 无匹配（"架构"太泛） | ✅ BM25 语义匹配 |
+| 跨会话恢复 | ❌ 无持久化 | ✅ 从磁盘加载索引 |
+| 性能开销 | ~1ms | ~10ms + 磁盘 I/O |
+
+### 22.5 实施路线
+
+```
+Phase 1 (基础半设计) ✅ 已完成:
+  - _extract_keywords() 从被截断消息中提取关键词
+  - _inject_keyword_context() 在 tail 中匹配并注入
+  - 零持久化，零额外 I/O
+  - 与现有 _apply_rounds_truncation() 集成
+  - 配置: PROXY_HISTORY_INDEX=rule, PROXY_HISTORY_TOP_K=5, PROXY_HISTORY_MAX_CHARS=500
+
+Phase 2 (增强版) 未开始:
+  - Bigram 分词器
+  - 内存倒排索引
+  - TF 评分检索
+  - 会话级关键词缓存（避免重复提取）
+
+Phase 3 (完整版) 未开始:
+  - BM25 评分
+  - 代码感知分词
+  - JSONL 持久化
+  - 跨会话索引加载
+  - 自适应 top-K
+```
+
+### 22.6 配置参数
+
+```bash
+# 历史索引开关
+PROXY_HISTORY_INDEX=rule       # off / rule / bm25
+
+# 检索参数
+PROXY_HISTORY_TOP_K=5          # 最多注入 K 条检索结果
+PROXY_HISTORY_MAX_CHARS=500    # 检索结果最大字符数
+
+# BM25 参数（Phase 3）
+PROXY_HISTORY_BM25_K1=1.5      # BM25 k1 参数
+PROXY_HISTORY_BM25_B=0.75      # BM25 b 参数
+
+# 持久化（Phase 3）
+PROXY_HISTORY_INDEX_DIR=data/index  # 索引存储目录
+```

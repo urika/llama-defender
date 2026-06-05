@@ -995,7 +995,7 @@ def _compress_middle_with_llm(messages, timeout=30):
         )
 
         payload = {
-            "model": "compressor",
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1024,
             "temperature": 0.3,
@@ -1036,7 +1036,7 @@ def _merge_summaries_with_llm(old_summary, new_summary, timeout=15):
             f"<new_summary>\n{new_summary[:3000]}\n</new_summary>"
         )
         payload = {
-            "model": "compressor",
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 800,
             "temperature": 0.3,
