@@ -1427,6 +1427,36 @@ def _get_log_stats():
     }
 
 
+def _get_cache_stats():
+    """Parse backend log for prefix cache HIT/MISS since current startup.
+    Returns {"hit": N, "miss": N, "total": N, "rate_str": "X.X%"}.
+    Cloud backends return zeros."""
+    if IS_CLOUD:
+        return {"hit": 0, "miss": 0, "total": 0, "rate_str": "N/A"}
+    try:
+        with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return {"hit": 0, "miss": 0, "total": 0, "rate_str": "N/A"}
+
+    # Find the most recent startup (MemoryAwarePrefixCache initialized)
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if "MemoryAwarePrefixCache initialized" in line:
+            start_idx = i
+
+    hit = miss = 0
+    for line in lines[start_idx:]:
+        if "cache_fetch" in line:
+            if "HIT" in line:
+                hit += 1
+            elif "MISS" in line:
+                miss += 1
+    total = hit + miss
+    rate = (hit / total * 100) if total > 0 else 0
+    return {"hit": hit, "miss": miss, "total": total, "rate_str": f"{rate:.1f}%"}
+
+
 def _get_traffic_stats():
     """Read proxy_requests.jsonl and compute traffic metrics + anomaly detection."""
     try:
@@ -1711,9 +1741,14 @@ def _build_status_html():
     log = _get_log_stats()
     traffic = _get_traffic_stats()
     session_trace, tools_detail, errors_detail = _get_session_trace()
+    cache_stats = _get_cache_stats()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     backend_color = "#2ecc71" if backend_info.get("running") else "#e74c3c"
+    cache_rate_color = "#888"
+    if cache_stats["total"] > 0:
+        rate = cache_stats["hit"] / cache_stats["total"] * 100
+        cache_rate_color = "#2ecc71" if rate >= 50 else "#f39c12" if rate >= 20 else "#e74c3c"
     proxy_color = "#2ecc71" if proxy_info.get("running") else "#e74c3c"
     mem_warn = float(mem.get("used_pct", 0)) > 75
     mem_color = "#e74c3c" if mem_warn else "#2ecc71"
@@ -1867,6 +1902,7 @@ def _build_status_html():
     {oom_row}
     {cache_row}
     <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
+    <div class="row"><span class="label">Prefix Cache</span><span class="value" style="color:{cache_rate_color}">{cache_stats["hit"]}/{cache_stats["total"]} ({cache_stats["rate_str"]})</span></div>
     <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={PROXY_MAX_CONCURRENT}</span></div>
     <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
   </div>
