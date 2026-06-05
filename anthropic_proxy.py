@@ -116,6 +116,9 @@ TOOL_ALWAYS_KEEP = {
     "Read", "Write", "Edit", "Bash", "Glob", "Grep",
     "LS", "Task", "WebFetch", "WebSearch",
     "TodoRead", "TodoWrite",
+    "Skill", "Agent", "NotebookEdit",
+    "EnterPlanMode", "ExitPlanMode",
+    "AskUserQuestion",
 }
 
 # ---------------------------------------------------------------------------
