@@ -1201,10 +1201,13 @@ def truncate_messages_if_needed(messages, session_id=None):
 
         file_info = f" Files: {', '.join(sorted(file_mentions)[:10])}." if file_mentions else ""
 
-        compressed_text = (
-            f"[Context folded: {dropped_count} earlier messages omitted."
-            f" Previous work included {tool_count} tool interactions.{file_info}]"
-        )
+        # Plan 1 (prefix-cache fix): the placeholder text MUST be byte-for-byte
+        # identical across requests. Including dropped_count / tool_count /
+        # file_mentions here changes the text every request, breaking the
+        # cache at the placeholder boundary and dropping hit rate to 0%.
+        # Dynamic info is still kept in the stats dict below (used for
+        # proxy_metrics.jsonl) — it just doesn't leak into the prompt.
+        compressed_text = "[Context folded: earlier messages omitted.]"
 
         if tail and tail[0].get("role") == "user":
             tail_content = tail[0].get("content", [])

@@ -513,5 +513,83 @@ class TestCompressPromptStructure(unittest.TestCase):
         self.assertIn("<pending>", prompt)
 
 
+class TestFifoPlaceholderStability(unittest.TestCase):
+    """Plan 1: FIFO placeholder text MUST be byte-stable across requests so
+    prefix cache hits the same bytes at the fold boundary. Previously the
+    placeholder embedded dropped_count, tool_count, and file_mentions which
+    changed every request, causing 0% cache hit rate."""
+
+    def setUp(self):
+        # Force fifo strategy for these tests regardless of the process env.
+        self._patches = [
+            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"),
+            patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True),
+            patch.object(proxy, "PROXY_CTX_KEEP_MESSAGES", 40),
+            patch.object(proxy, "PROXY_CTX_KEEP_HEAD", 2),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _make_msgs(self, n_total):
+        msgs = [
+            {"role": "system", "content": "you are a helpful coding assistant."},
+            {"role": "user", "content": "please help me"},
+        ]
+        for i in range(n_total - 2):
+            if i % 2 == 0:
+                msgs.append({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": f"t{i}", "name": "Read",
+                     "input": {"file_path": f"/tmp/file_{i}.py"}},
+                ]})
+            else:
+                msgs.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i-1}",
+                     "content": f"contents {i-1}"},
+                ]})
+        return msgs
+
+    def _find_placeholder(self, result):
+        for m in result:
+            if isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and "Context folded" in b.get("text", ""):
+                        return b["text"]
+        return None
+
+    def test_placeholder_stable_across_message_counts(self):
+        """5 different total message counts must produce the same placeholder."""
+        seen = set()
+        for n in [50, 55, 60, 70, 80]:
+            msgs = self._make_msgs(n)
+            result, stats = proxy.truncate_messages_if_needed(msgs, session_id="t")
+            self.assertTrue(stats.get("truncated"), f"n={n} should trigger truncation")
+            pt = self._find_placeholder(result)
+            self.assertIsNotNone(pt, f"n={n} should produce a placeholder")
+            seen.add(pt)
+        self.assertEqual(len(seen), 1,
+            f"placeholder text must be identical for cache stability; got {len(seen)} variants: {seen}")
+
+    def test_placeholder_text_is_static(self):
+        """The placeholder must be exactly the fixed Plan 1 text."""
+        msgs = self._make_msgs(60)
+        result, _ = proxy.truncate_messages_if_needed(msgs, session_id="t")
+        pt = self._find_placeholder(result)
+        self.assertEqual(pt, "[Context folded: earlier messages omitted.]")
+
+    def test_placeholder_dynamic_info_still_in_stats(self):
+        """Plan 1 keeps the dropped/tool/file_mentions data available for
+        metrics logging — only the prompt text is fixed."""
+        msgs = self._make_msgs(60)
+        _, stats = proxy.truncate_messages_if_needed(msgs, session_id="t")
+        self.assertIn("dropped_messages", stats)
+        self.assertIn("tool_count", stats)
+        self.assertIn("file_mentions", stats)
+        self.assertGreater(stats["dropped_messages"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
