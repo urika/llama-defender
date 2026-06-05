@@ -65,13 +65,15 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   ├── qwen3.6-27b-mtp.conf   # llama-server + Qwen3.6-27B-MTP (GGUF)
 │   └── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
 ├── tools/
-│   ├── bench_mtp.py           # MTP model performance benchmark
-│   ├── test_proxy_fallback.py # Unit tests for proxy fallback logic
-│   ├── e2e_tools_fallback.sh  # End-to-end proxy tool-call test
-│   ├── logview.sh             # Unified log viewer
-│   ├── sysmon.sh              # System monitoring (memory, CPU, disk)
-│   ├── modelmon.sh            # Model service monitoring
-│   └── memcheck.sh            # Detailed memory analysis
+│   ├── bench_mtp.py                # MTP model performance benchmark
+│   ├── test_proxy_fallback.py      # Unit tests for proxy fallback + blocker
+│   ├── e2e_tools_fallback.sh       # End-to-end proxy tool-call test
+│   ├── test_blocker_integration.sh # Blocker detection integration matrix
+│   ├── mock_backend.py             # Mock OpenAI backend for integration tests
+│   ├── logview.sh                  # Unified log viewer
+│   ├── sysmon.sh                   # System monitoring (memory, CPU, disk)
+│   ├── modelmon.sh                 # Model service monitoring
+│   └── memcheck.sh                 # Detailed memory analysis
 ├── BENCHMARK.md               # Performance test report (Chinese)
 └── CLAUDE.md                  # Legacy agent guide (keep in sync)
 ```
@@ -253,6 +255,62 @@ Environment variables:
 | `PROXY_CTX_TOKEN_RATIO` | `1.3` | Chars-to-tokens estimation ratio for budget calculation |
 | `PROXY_CTX_KEEP_ROUNDS_DYNAMIC` | `true` | Dynamically adjust keep_rounds based on total message count |
 
+### Proxy-side tool definition filtering
+
+When enabled, the proxy reduces the number of tool definitions sent to the
+backend by keeping only high-frequency core tools and recently-used tools.
+This can save 5-8K tokens per request when 44 tools are defined.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_TOOL_FILTER_ENABLED` | `true` (local) / `false` (cloud) | Enable tool definition filtering |
+| `PROXY_TOOL_FILTER_MAX` | `20` | Only trigger filtering when tools exceed this count |
+| `PROXY_TOOL_FILTER_RECENT` | `5` | Scan last N assistant rounds for used tools |
+
+Always-kept tools: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `LS`,
+`Task`, `WebFetch`, `WebSearch`, `TodoRead`, `TodoWrite`.
+
+### Proxy-side structured metrics logging
+
+Per-request pipeline metrics written to `logs/proxy_metrics.jsonl`. Each line
+is a JSON object with input stats, per-step pipeline data, compression quality
+flags, and timing.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_METRICS_ENABLED` | `true` | Enable metrics JSONL logging |
+| `PROXY_METRICS_DIR` | `logs` | Directory for `proxy_metrics.jsonl` |
+
+### Proxy-side keyword index (BM25 MVP)
+
+When context truncation drops messages, keywords (filenames, error types,
+function names) are extracted from dropped messages and injected into the
+tail if relevant to current context.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_HISTORY_INDEX` | `rule` | Keyword index mode: `off` or `rule` (TF matching) |
+| `PROXY_HISTORY_TOP_K` | `5` | Max keyword entries to inject |
+| `PROXY_HISTORY_MAX_CHARS` | `500` | Max chars for injected keyword context |
+
+### Proxy-side blocker detection
+
+When the same tool fails the same way `PROXY_BLOCKER_THRESHOLD` times in a
+row (e.g. `Read` keeps returning "file not found", or `Bash` keeps getting
+parameter validation errors), the proxy injects a `[BLOCKER]` user message
+into the tail. The message tells the model to stop retrying and either
+switch tools or report the blocker to the user. This is a **stronger
+escalation** than the loop-detection break notice (which only fires on
+identical-arg loops) and addresses the case where the model keeps trying
+slightly different args against a fundamentally broken path.
+
+Disabled by default for cloud backends (1M+ context, low marginal value).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_BLOCKER_ENABLED` | `true` (local) / `false` (cloud) | Enable blocker detection |
+| `PROXY_BLOCKER_THRESHOLD` | `2` | Consecutive same-error results before injecting `[BLOCKER]` |
+
 ### Special handling
 
 - **XML→JSON fallback** (`parse_tool_arguments`): Qwen models occasionally emit
@@ -282,8 +340,10 @@ Environment variables:
 | Script | Purpose | How to run |
 |--------|---------|------------|
 | `bench_mtp.py` | MTP model performance benchmark | `python3 tools/bench_mtp.py --quick` |
-| `test_proxy_fallback.py` | Unit tests for proxy tool-call fallback | `python3 tools/test_proxy_fallback.py` |
+| `test_proxy_fallback.py` | Unit tests for proxy fallback + blocker | `python3 tools/test_proxy_fallback.py` |
 | `e2e_tools_fallback.sh` | End-to-end proxy tool-call test | `bash tools/e2e_tools_fallback.sh` (needs running backend) |
+| `test_blocker_integration.sh` | Blocker detection integration matrix (7 cases) | `bash tools/test_blocker_integration.sh` |
+| `mock_backend.py` | Mock OpenAI backend for integration tests | `python3 tools/mock_backend.py [PORT]` |
 | `logview.sh` | Unified log viewer | `./tools/logview.sh backend 100` |
 | `sysmon.sh` | System monitoring | `./tools/sysmon.sh` |
 | `modelmon.sh` | Model service monitoring | `./tools/modelmon.sh` |
@@ -328,6 +388,9 @@ Environment variables:
 - `_extract_content_tool_calls` (non-streaming `<tools>` fallback)
 - `_StreamingToolsExtractor` (streaming state machine)
 - `convert_openai_response_to_anthropic` (full response conversion)
+- `_detect_blocker_pattern` (blocker detection — same-type run, mixed types, threshold, breaks)
+- `_build_blocker_message` (cache-stability, tool/error metadata)
+- `_compress_middle_with_llm` prompt structure (`Root cause:`/`Fix:`/`Avoidance:`)
 
 Run with:
 ```bash
@@ -347,6 +410,33 @@ running) and validates:
 Run with:
 ```bash
 bash tools/e2e_tools_fallback.sh
+```
+
+### Blocker integration matrix
+
+`tools/test_blocker_integration.sh` boots `tools/mock_backend.py` (a tiny
+OpenAI-compatible mock) and the proxy once, then runs 7 test cases against
+the running proxy, asserting that the `[BLOCKER]` user message is (or is
+not) injected into the body forwarded to the backend:
+
+| TC | Scenario | Expected |
+|----|----------|----------|
+| 1 | 2× `file_not_found` (Read) | trigger, Read/file_not_found, run=2 |
+| 2 | 2× `Wasted call` (Read) | trigger, Read/wasted |
+| 3 | 2× `InputValidationError` (Bash) | trigger, Bash/input_validation |
+| 4 | 3× `file_not_found` (Read) | trigger, message says "3 times" |
+| 5 | 1× `file_not_found` only | no trigger (below threshold) |
+| 6 | mixed types (wasted + file_not_found) | no trigger (type change breaks run) |
+| 7 | 2 errors → 1 success → 1 error | no trigger (success breaks run) |
+
+The script also dumps a per-request metrics summary from
+`logs/itest/proxy_metrics.jsonl` showing which requests triggered the
+blocker and why. No real LLM is required.
+
+Run with:
+```bash
+bash tools/test_blocker_integration.sh
+# exit code 0 = all pass
 ```
 
 ### Manual validation
@@ -463,7 +553,8 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
 - [ ] If you change backend startup flags in `manage.sh`, test `start`, `stop`,
       `restart`, and `status` for both `llama-server` and `rapid-mlx` backends.
       Also test `start-cloud` and cloud-mode `status`.
-- [ ] If you modify `anthropic_proxy.py`, run `python3 tools/test_proxy_fallback.py`
+- [ ] If you modify `anthropic_proxy.py`, run `python3 tools/test_proxy_fallback.py`,
+      `bash tools/test_blocker_integration.sh` (uses mock backend, no LLM needed),
       and `bash tools/e2e_tools_fallback.sh` (with proxy + backend running).
       Test both local and cloud modes.
 - [ ] If you add a new config variable, add it to the defaults in `manage.sh` and

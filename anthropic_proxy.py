@@ -63,6 +63,7 @@ PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))  # keep fi
 PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))  # keep last N messages
 PROXY_CTX_TRUNCATE_STRATEGY = os.environ.get("PROXY_CTX_TRUNCATE_STRATEGY", "char")
 PROXY_CTX_KEEP_ROUNDS = int(os.environ.get("PROXY_CTX_KEEP_ROUNDS", "10"))
+PROXY_CTX_KEEP_MESSAGES = int(os.environ.get("PROXY_CTX_KEEP_MESSAGES", "40"))  # fifo strategy: total messages to keep
 PROXY_CTX_TOKEN_BUDGET = int(os.environ.get("PROXY_CTX_TOKEN_BUDGET", "30000"))
 PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
 
@@ -78,6 +79,52 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
 # Loop detection: detect consecutive identical tool_use calls
 # ---------------------------------------------------------------------------
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
+PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
+PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
+
+# ---------------------------------------------------------------------------
+# Re-read prevention: when a Read tool targets a file whose content was just
+# cleared, keep a preview of the original content to reduce re-read desire.
+PROXY_REREAD_PREVIEW_CHARS = int(os.environ.get("PROXY_REREAD_PREVIEW_CHARS", "200"))
+
+# ---------------------------------------------------------------------------
+# Blocker detection: track consecutive same-error-type tool_result rejections
+# (e.g. Read repeatedly returns "File does not exist"). When a tool fails the
+# same way >= PROXY_BLOCKER_THRESHOLD times in a row, inject a [BLOCKER] user
+# message nudging the model to switch tools or escalate. Disabled by default
+# for cloud backends (1M+ token context, low marginal value).
+# ---------------------------------------------------------------------------
+PROXY_BLOCKER_ENABLED = os.environ.get("PROXY_BLOCKER_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
+PROXY_BLOCKER_THRESHOLD = int(os.environ.get("PROXY_BLOCKER_THRESHOLD", "2"))
+
+# Markers written by the error-translation pass (lines ~2702-2737). Kept in
+# one place so the blocker detector and the translation stay in sync.
+# Order matters: longer/more specific markers are checked first.
+_BLOCKER_ERROR_MARKERS = (
+    ("wasted",            ["该文件自上次读取后未发生变化", "wasted call"]),
+    ("file_not_found",    ["文件不存在", "file does not exist", "no such file"]),
+    ("input_validation",  ["工具调用参数错误", "inputvalidationerror"]),
+)
+
+# ---------------------------------------------------------------------------
+# Dynamic tool definition filtering: reduce token overhead from tool schemas
+# ---------------------------------------------------------------------------
+PROXY_TOOL_FILTER_ENABLED = os.environ.get("PROXY_TOOL_FILTER_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
+PROXY_TOOL_FILTER_MAX = int(os.environ.get("PROXY_TOOL_FILTER_MAX", "20"))
+PROXY_TOOL_FILTER_RECENT = int(os.environ.get("PROXY_TOOL_FILTER_RECENT", "5"))
+TOOL_ALWAYS_KEEP = {
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    "LS", "Task", "WebFetch", "WebSearch",
+    "TodoRead", "TodoWrite",
+}
+
+# ---------------------------------------------------------------------------
+# Keyword index (BM25 MVP): extract keywords from dropped messages and
+# inject relevant context into tail for better continuity.
+# ---------------------------------------------------------------------------
+PROXY_HISTORY_INDEX = os.environ.get("PROXY_HISTORY_INDEX", "rule")
+PROXY_HISTORY_TOP_K = int(os.environ.get("PROXY_HISTORY_TOP_K", "5"))
+PROXY_HISTORY_MAX_CHARS = int(os.environ.get("PROXY_HISTORY_MAX_CHARS", "500"))
 
 # ---------------------------------------------------------------------------
 # Semantic tool-result clearing: priority-based scoring
@@ -102,6 +149,15 @@ _jsonl_lock = threading.Lock()
 # Maps request token -> output_chars (set by response handlers)
 _jsonl_output_map = {}
 _jsonl_counter = 0
+
+# ---------------------------------------------------------------------------
+# Structured metrics logging: JSON Lines to logs/proxy_metrics.jsonl
+# Per-request pipeline stats for observability and tuning.
+# ---------------------------------------------------------------------------
+PROXY_METRICS_ENABLED = os.environ.get("PROXY_METRICS_ENABLED", "true").lower() in ("1", "true", "yes")
+PROXY_METRICS_DIR = os.environ.get("PROXY_METRICS_DIR", "logs")
+_METRICS_PATH = os.path.join(_SCRIPT_DIR, PROXY_METRICS_DIR, "proxy_metrics.jsonl")
+_metrics_lock = threading.Lock()
 
 
 def _next_jsonl_token():
@@ -157,6 +213,20 @@ MODEL_ALIASES = [
 
 # Thread-local context for per-request logging (session_id prefix)
 _log_ctx = threading.local()
+
+# Thread-local context for per-request metrics collection
+_metrics_ctx = threading.local()
+
+
+def log_metrics(metrics: dict):
+    _ensure_jsonl_dir()
+    line = json.dumps(metrics, ensure_ascii=False) + "\n"
+    try:
+        with _metrics_lock:
+            with open(_METRICS_PATH, "a") as f:
+                f.write(line)
+    except OSError:
+        pass
 
 
 def log(msg):
@@ -570,6 +640,21 @@ def _estimate_message_chars(messages):
     return total
 
 
+def _generate_tool_summary(tool_name, meta_info):
+    """Generate deterministic summary for a cleared tool result.
+    Same (tool_name, meta_info) always produces the same output,
+    enabling prefix cache hits when the same tool call appears across requests.
+    """
+    if not tool_name:
+        return "tool"
+    if meta_info.startswith(" file="):
+        return f'{tool_name}("{meta_info[6:]}")'
+    elif meta_info.startswith(" cmd="):
+        cmd = meta_info[5:].strip()
+        return f'{tool_name}("{cmd}")'
+    return tool_name
+
+
 def clear_old_tool_results(messages, tools_list=None):
     """
     Proxy-side tool-result clearing with semantic priority scoring.
@@ -615,6 +700,9 @@ def clear_old_tool_results(messages, tools_list=None):
             keep = max(PROXY_TOOL_KEEP, 15)
             log(f"  -> Sub-agent detected ({len(tools_list)} tools, no Agent/Plan), dynamic KEEP={keep}")
 
+    total_tool_results = len(tool_result_indices)
+    recent_cutoff = max(0, total_tool_results - 6)
+
     # Score each tool_result by semantic priority
     scored = []
     for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
@@ -641,6 +729,10 @@ def clear_old_tool_results(messages, tools_list=None):
         for pat, pts in TOOL_RESULT_HIGH_VALUE_PATTERNS:
             if pat.search(content_str[:500]):
                 score += pts
+
+        # Boost recent Read results to prevent re-read loops
+        if tool_name == "Read" and idx_pos >= recent_cutoff:
+            score += 5
 
         scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
 
@@ -687,11 +779,29 @@ def clear_old_tool_results(messages, tools_list=None):
                 if meta_info:
                     break
 
-        preview = ""
-        orig_str = str(original) if original else ""
-        if orig_str and original_len > 300:
-            preview = f" Preview: {orig_str[:200]}..."
-        block["content"] = f"[cleared{meta_info}: {original_len} chars.{preview}]"
+        # Find paired tool_use to get tool_name for deterministic summary
+        tool_name = ""
+        for m_idx in range(msg_idx - 1, -1, -1):
+            m = messages[m_idx]
+            if m.get("role") == "assistant":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    for b in c:
+                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                            tool_name = b.get("name", "")
+                            break
+                if tool_name:
+                    break
+
+        summary = _generate_tool_summary(tool_name, meta_info)
+        # For Read tool results, keep a preview to reduce re-read desire
+        if tool_name == "Read" and PROXY_REREAD_PREVIEW_CHARS > 0:
+            preview = content_str[:PROXY_REREAD_PREVIEW_CHARS]
+            if len(content_str) > PROXY_REREAD_PREVIEW_CHARS:
+                preview += "..."
+            block["content"] = f"[cleared: {summary}]\n{preview}"
+        else:
+            block["content"] = f"[cleared: {summary}]"
         cleared_count += 1
         cleared_chars += original_len
 
@@ -714,10 +824,8 @@ def clear_old_tool_results(messages, tools_list=None):
         union = lines_a | lines_b
         jaccard = len(intersection) / len(union) if union else 0
         if jaccard >= 0.7:
-            messages[msg_idx_b]["content"][block_idx_b]["content"] = (
-                f"[deduplicated Bash output (sim={int(jaccard*100)}%): "
-                f"{len(cb)} chars. Preview: {cb[:200]}...]"
-            )
+            # Deterministic placeholder for deduplicated Bash
+            messages[msg_idx_b]["content"][block_idx_b]["content"] = "[cleared: Bash(deduplicated)]"
             dedup_bash += 1
             dedup_chars += len(cb)
 
@@ -735,7 +843,267 @@ def clear_old_tool_results(messages, tools_list=None):
     }
 
 
-def truncate_messages_if_needed(messages):
+def _compute_adaptive_rounds(messages, base_rounds):
+    extra = 0
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        tc = b.get("content", "")
+                        if isinstance(tc, str):
+                            low = tc.lower()
+                            if any(kw in low for kw in ["error", "exception", "failed", "traceback"]):
+                                extra += 1
+                                break
+            elif isinstance(content, str):
+                low = content.lower()
+                if any(kw in low for kw in ["error", "exception", "failed", "traceback"]):
+                    extra += 1
+        elif role == "assistant":
+            if isinstance(content, list):
+                write_count = 0
+                edit_count = 0
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        name = b.get("name", "")
+                        if name in ("Write", "NotebookEdit"):
+                            write_count += 1
+                        elif name == "Edit":
+                            edit_count += 1
+                if write_count + edit_count > 2:
+                    extra += 1
+    adaptive = min(base_rounds + extra, base_rounds * 2)
+    return adaptive
+
+
+def _extract_middle_summary_rules(messages):
+    errors_solutions = []
+    code_changes = []
+    decisions = []
+    file_states = {}
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        tc = b.get("content", "")
+                        if isinstance(tc, str):
+                            low = tc.lower()
+                            if any(kw in low for kw in ["error", "exception", "failed", "traceback"]):
+                                errors_solutions.append(tc[:500])
+                            if "successfully" in low or "updated" in low or "created" in low:
+                                errors_solutions.append(f"[resolved] {tc[:200]}")
+        elif role == "assistant":
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict):
+                        if b.get("type") == "tool_use":
+                            name = b.get("name", "")
+                            inp = b.get("input", {})
+                            if isinstance(inp, dict):
+                                fp = inp.get("file_path", inp.get("path", ""))
+                                if fp:
+                                    file_states[fp] = name
+                                if name in ("Write", "Edit"):
+                                    code_changes.append(f"{name}({fp})")
+                        elif b.get("type") == "text":
+                            txt = b.get("text", "")
+                            if any(kw in txt for kw in ["DECISION", "TODO", "FIXME", "IMPORTANT", "NOTE"]):
+                                decisions.append(txt[:200])
+
+    parts = []
+    if errors_solutions:
+        parts.append("<errors_solutions>")
+        for e in errors_solutions[:5]:
+            parts.append(f"- {e}")
+        parts.append("</errors_solutions>")
+    if code_changes:
+        parts.append("<code_changes>")
+        for c in code_changes[:10]:
+            parts.append(f"- {c}")
+        parts.append("</code_changes>")
+    if file_states:
+        parts.append("<file_states>")
+        for fp, op in sorted(file_states.items())[-10:]:
+            parts.append(f"- {fp}: last {op}")
+        parts.append("</file_states>")
+    if decisions:
+        parts.append("<decisions>")
+        for d in decisions[:5]:
+            parts.append(f"- {d}")
+        parts.append("</decisions>")
+
+    if not parts:
+        return None
+    header = f"[Compressed context from {len(messages)} earlier messages (rule-based):]"
+    return header + "\n".join(parts)
+
+
+def _compress_middle_with_llm(messages, timeout=30):
+    try:
+        conversation_text = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for b in content:
+                    if isinstance(b, dict):
+                        if b.get("type") == "text":
+                            parts.append(b.get("text", "")[:300])
+                        elif b.get("type") == "tool_use":
+                            name = b.get("name", "")
+                            inp = b.get("input", {})
+                            parts.append(f"[tool:{name}({json.dumps(inp, ensure_ascii=False)[:200]})]")
+                        elif b.get("type") == "tool_result":
+                            tc = b.get("content", "")
+                            if isinstance(tc, str):
+                                parts.append(f"[result:{tc[:200]}]")
+                text = " ".join(parts)
+            elif isinstance(content, str):
+                text = content[:300]
+            else:
+                continue
+            conversation_text.append(f"{role}: {text}")
+
+        conv_str = "\n".join(conversation_text)
+        if len(conv_str) > 8000:
+            conv_str = conv_str[:8000] + "...[truncated]"
+
+        prompt = (
+            "Summarize the following coding session into these XML sections. "
+            "Be concise. Keep error messages verbatim. Keep file paths. Remove narration.\n\n"
+            "<current_focus>What is being worked on (1-2 sentences)</current_focus>\n"
+            "<errors_solutions>\n"
+            "For each non-trivial error encountered, output ONE entry in this EXACT format:\n"
+            "  - Error: <short verbatim error message or symptom>\n"
+            "    Root cause: <why it happened — 1 sentence>\n"
+            "    Fix: <what was done to resolve it — 1 sentence>\n"
+            "    Avoidance: <what to verify next time to prevent recurrence — 1 sentence or 'N/A'>\n"
+            "If no errors: output 'none'.\n"
+            "</errors_solutions>\n"
+            "<code_state>Current file states, key code signatures (function names, important constants)</code_state>\n"
+            "<decisions>Architecture/design decisions and the reason behind each</decisions>\n"
+            "<pending>Unfinished tasks, blockers, and what is needed to unblock each</pending>\n\n"
+            f"Session log ({len(messages)} messages):\n{conv_str}"
+        )
+
+        payload = {
+            "model": "compressor",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024,
+            "temperature": 0.3,
+            "stream": False,
+        }
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{LLAMA_BASE}/chat/completions",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        text = ""
+        for choice in result.get("choices", []):
+            msg = choice.get("message", {})
+            text += msg.get("content", "")
+        if text.strip():
+            return f"[Compressed context from {len(messages)} earlier messages (LLM):]\n{text.strip()}"
+        return None
+    except Exception as e:
+        log(f"  -> LLM compression failed: {e}, falling back to rules")
+        return None
+
+
+_summary_cache = {}
+_summary_cache_lock = threading.Lock()
+_SUMMARY_CACHE_MAX_SESSIONS = 10
+_SUMMARY_CACHE_MAX_CHARS = 3000
+
+
+def _merge_summaries_with_llm(old_summary, new_summary, timeout=15):
+    try:
+        prompt = (
+            "Merge these two session summaries into one concise summary. "
+            "Keep all errors, file states, and decisions. Remove redundancy.\n\n"
+            f"<previous_summary>\n{old_summary[:3000]}\n</previous_summary>\n\n"
+            f"<new_summary>\n{new_summary[:3000]}\n</new_summary>"
+        )
+        payload = {
+            "model": "compressor",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 800,
+            "temperature": 0.3,
+            "stream": False,
+        }
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{LLAMA_BASE}/chat/completions",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        text = ""
+        for choice in result.get("choices", []):
+            msg = choice.get("message", {})
+            text += msg.get("content", "")
+        return text.strip() if text.strip() else old_summary + "\n\n" + new_summary
+    except Exception as e:
+        log(f"  -> Summary merge failed: {e}, concatenating")
+        return old_summary + "\n\n" + new_summary
+
+
+def _incremental_compress(dropped, session_id):
+    with _summary_cache_lock:
+        cache = _summary_cache.get(session_id)
+
+    if cache and cache.get("last_compressed_msg_index", 0) > 0:
+        new_start = min(cache["last_compressed_msg_index"], len(dropped))
+        new_dropped = dropped[new_start:]
+        if len(new_dropped) >= 5:
+            new_summary = _compress_middle_with_llm(new_dropped, timeout=30)
+            if not new_summary:
+                new_summary = _extract_middle_summary_rules(new_dropped)
+        else:
+            new_summary = _extract_middle_summary_rules(new_dropped) if new_dropped else None
+
+        if new_summary:
+            combined = cache["summary"] + "\n\n" + new_summary
+            if len(combined) > _SUMMARY_CACHE_MAX_CHARS:
+                combined = _merge_summaries_with_llm(cache["summary"], new_summary)
+            compressed_text = combined
+        else:
+            compressed_text = cache["summary"]
+    else:
+        if len(dropped) >= 10:
+            compressed_text = _compress_middle_with_llm(dropped, timeout=30)
+        else:
+            compressed_text = None
+        if not compressed_text:
+            compressed_text = _extract_middle_summary_rules(dropped)
+        if not compressed_text:
+            return None, None
+
+    with _summary_cache_lock:
+        if len(_summary_cache) >= _SUMMARY_CACHE_MAX_SESSIONS:
+            oldest_key = next(iter(_summary_cache))
+            del _summary_cache[oldest_key]
+        _summary_cache[session_id] = {
+            "last_compressed_msg_index": len(dropped),
+            "summary": compressed_text[:_SUMMARY_CACHE_MAX_CHARS],
+        }
+
+    return compressed_text, cache is not None
+
+
+def truncate_messages_if_needed(messages, session_id=None):
     """
     Proxy-side message truncation with dual strategy support.
 
@@ -762,10 +1130,11 @@ def truncate_messages_if_needed(messages):
                 "budget": PROXY_CTX_TOKEN_BUDGET,
             }
 
-        # Try keep_rounds, then decrement until within budget or min_rounds
+        # Adaptive rounds + LLM/rule compression
+        adaptive_rounds = _compute_adaptive_rounds(messages, PROXY_CTX_KEEP_ROUNDS)
         min_rounds = 2
-        for rounds in range(PROXY_CTX_KEEP_ROUNDS, min_rounds - 1, -1):
-            result, stats = _apply_rounds_truncation(messages, rounds)
+        for rounds in range(adaptive_rounds, min_rounds - 1, -1):
+            result, stats = _apply_rounds_truncation(messages, rounds, session_id=session_id)
             if not stats.get("truncated"):
                 return result, stats
             result_tokens = _estimate_message_chars(result) * PROXY_CTX_TOKEN_RATIO
@@ -773,12 +1142,196 @@ def truncate_messages_if_needed(messages):
                 stats["estimated_tokens"] = int(result_tokens)
                 stats["budget"] = PROXY_CTX_TOKEN_BUDGET
                 stats["actual_keep_rounds"] = rounds
+                stats["adaptive_rounds"] = adaptive_rounds
                 return result, stats
 
         return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "no_reduction"}
 
+    # ---------- fifo strategy ----------
+    if PROXY_CTX_TRUNCATE_STRATEGY == "fifo":
+        n = len(messages)
+        keep_total = PROXY_CTX_KEEP_MESSAGES
+        if n <= keep_total:
+            return messages, {
+                "enabled": True, "strategy": "fifo", "skipped": True,
+                "reason": "below_limit", "count": n, "limit": keep_total,
+            }
 
-def _apply_rounds_truncation(messages, keep_rounds):
+        head = messages[:PROXY_CTX_KEEP_HEAD]
+        tail_count = keep_total - PROXY_CTX_KEEP_HEAD
+        tail = messages[-tail_count:]
+        dropped = messages[PROXY_CTX_KEEP_HEAD : n - tail_count]
+        dropped_count = len(dropped)
+
+        # Count tools in dropped messages
+        tool_count = 0
+        for m in dropped:
+            if m.get("role") == "assistant":
+                content = m.get("content", [])
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            tool_count += 1
+                elif isinstance(content, dict) and content.get("type") == "tool_use":
+                    tool_count += 1
+
+        # Extract file mentions from dropped messages
+        file_mentions = set()
+        for m in dropped:
+            if m.get("role") == "assistant":
+                content = m.get("content", [])
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            args = ""
+                            fn = b.get("function") or {}
+                            if isinstance(fn, dict):
+                                args = fn.get("arguments", "")
+                            if not args:
+                                args = b.get("input", "")
+                            if isinstance(args, dict):
+                                args = json.dumps(args)
+                            if isinstance(args, str):
+                                for pat in [r'"path":\s*"([^"]+)"', r'"file":\s*"([^"]+)"',
+                                            r'"filePath":\s*"([^"]+)"', r'"directory":\s*"([^"]+)"']:
+                                    file_mentions.update(re.findall(pat, args))
+
+        file_info = f" Files: {', '.join(sorted(file_mentions)[:10])}." if file_mentions else ""
+
+        compressed_text = (
+            f"[Context folded: {dropped_count} earlier messages omitted."
+            f" Previous work included {tool_count} tool interactions.{file_info}]"
+        )
+
+        if tail and tail[0].get("role") == "user":
+            tail_content = tail[0].get("content", [])
+            summary_block = {"type": "text", "text": compressed_text}
+            if isinstance(tail_content, list):
+                tail[0]["content"] = [summary_block] + tail_content
+            else:
+                tail[0]["content"] = [summary_block, {"type": "text", "text": str(tail_content)}]
+            result = head + tail
+        else:
+            summary = {"role": "user", "content": [{"type": "text", "text": compressed_text}]}
+            result = head + [summary] + tail
+
+        return result, {
+            "enabled": True,
+            "strategy": "fifo",
+            "truncated": True,
+            "dropped_messages": dropped_count,
+            "kept_messages": len(result),
+            "tool_count": tool_count,
+            "file_mentions": len(file_mentions),
+        }
+
+
+def _detect_blocker_pattern(messages):
+    """
+    Walk messages backward and detect a tail of consecutive same-error-type
+    tool_result rejections. Stops at the first non-error tool_result, the first
+    plain user text message, or when the run length drops to zero.
+
+    Returns a dict:
+        {
+          "triggered": bool,
+          "tool_name": str,            # last assistant tool_use name in the run
+          "error_type": str,           # wasted | file_not_found | input_validation
+          "run_length": int,           # count of consecutive errors at the tail
+        }
+    or {"triggered": False} when no run meets the threshold.
+
+    Detection is based on the rewritten content produced by the error-
+    translation pass (which substitutes the original tool_result with a fixed
+    Chinese system message). This means the detector is best-effort: it relies
+    on the upstream pass having run, and on the marker substrings matching.
+    """
+    if not PROXY_BLOCKER_ENABLED:
+        return {"triggered": False, "reason": "disabled"}
+
+    last_tool_name = None
+    run = []  # list of (tool_name, error_type), index 0 = oldest in run
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        last_tool_name = b.get("name", "unknown")
+                        break
+            continue
+        if role != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            # Plain user text breaks the consecutive-error tail.
+            break
+        tool_result_block = None
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                tool_result_block = b
+                break
+        if tool_result_block is None:
+            # User message with no tool_result breaks the tail (e.g. a text turn).
+            break
+        tc = str(tool_result_block.get("content", ""))
+        tc_lower = tc.lower()
+        matched = None
+        for err_type, markers in _BLOCKER_ERROR_MARKERS:
+            for m in markers:
+                if m in tc_lower:
+                    matched = err_type
+                    break
+            if matched:
+                break
+        if matched is None:
+            # Non-error tool_result breaks the run.
+            break
+        if run and run[-1][1] != matched:
+            # Different error type from the most recent in the run: treat
+            # the run as broken (the model is hitting two different
+            # problems, not a single recurring one).
+            break
+        run.append((last_tool_name or "unknown", matched))
+
+    run_length = len(run)
+    if run_length < PROXY_BLOCKER_THRESHOLD:
+        return {"triggered": False, "run_length": run_length, "threshold": PROXY_BLOCKER_THRESHOLD}
+
+    tool_name, error_type = run[-1]  # most recent
+    return {
+        "triggered": True,
+        "tool_name": tool_name,
+        "error_type": error_type,
+        "run_length": run_length,
+    }
+
+
+def _build_blocker_message(tool_name, error_type, run_length):
+    """
+    Construct a [BLOCKER] user message to inject into the tail when a tool
+    has been failing the same way repeatedly. Text is intentionally short and
+    identical for the same (tool_name, error_type) pair, so prefix cache hits
+    are preserved across requests.
+    """
+    return {
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": (
+                f"[BLOCKER] The tool '{tool_name}' has failed with the same "
+                f"error ({error_type}) {run_length} times in a row. "
+                f"Do NOT call '{tool_name}' again with similar arguments. "
+                f"Either switch to a different tool, change your approach, "
+                f"or report this blocker to the user."
+            ),
+        }],
+    }
+
+
+def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
     head = messages[:PROXY_CTX_KEEP_HEAD]
 
     tail = []
@@ -828,34 +1381,56 @@ def _apply_rounds_truncation(messages, keep_rounds):
                                 file_mentions.update(re.findall(pat, args))
 
     file_info = f" Files previously accessed: {', '.join(sorted(file_mentions)[:10])}." if file_mentions else ""
-    summary_text = (
-        f"[Context folded: {dropped_count} earlier messages omitted. "
-        f"Previous work included {tool_count} tool interactions."
-        f"{file_info} "
-        f"Retaining last {keep_rounds} conversation rounds.]"
-    )
+
+    compressed_text = None
+    cache_hit = False
+    if session_id:
+        compressed_text, cache_hit = _incremental_compress(dropped, session_id)
+    if not compressed_text:
+        if dropped_count >= 10:
+            compressed_text = _compress_middle_with_llm(dropped, timeout=30)
+        if not compressed_text:
+            compressed_text = _extract_middle_summary_rules(dropped)
+    if not compressed_text:
+        compressed_text = (
+            f"[Context folded: {dropped_count} earlier messages omitted. "
+            f"Previous work included {tool_count} tool interactions."
+            f"{file_info} "
+            f"Retaining last {keep_rounds} conversation rounds.]"
+        )
+
+    if PROXY_HISTORY_INDEX == "rule" and dropped_count >= 5:
+        keywords = _extract_keywords(dropped)
+        keyword_ctx = _inject_keyword_context(
+            keywords, tail,
+            top_k=PROXY_HISTORY_TOP_K,
+            max_chars=PROXY_HISTORY_MAX_CHARS,
+        )
+        if keyword_ctx:
+            compressed_text += "\n\n" + keyword_ctx
 
     if tail and tail[0].get("role") == "user":
         tail_content = tail[0].get("content", [])
-        summary_block = {"type": "text", "text": summary_text}
+        summary_block = {"type": "text", "text": compressed_text}
         if isinstance(tail_content, list):
             tail[0]["content"] = [summary_block] + tail_content
         else:
             tail[0]["content"] = [summary_block, {"type": "text", "text": str(tail_content)}]
         result = head + tail
     else:
-        summary = {"role": "user", "content": [{"type": "text", "text": summary_text}]}
+        summary = {"role": "user", "content": [{"type": "text", "text": compressed_text}]}
         result = head + [summary] + tail
 
     return result, {
         "enabled": True,
-        "strategy": "rounds",
-        "truncated": True,
-        "dropped_messages": dropped_count,
-        "kept_messages": len(result),
-        "tool_count": tool_count,
-        "file_mentions": len(file_mentions),
-    }
+         "strategy": "rounds",
+         "truncated": True,
+         "dropped_messages": dropped_count,
+         "kept_messages": len(result),
+         "tool_count": tool_count,
+         "file_mentions": len(file_mentions),
+         "compression": "llm" if "LLM" in compressed_text else ("rules" if "rule-based" in compressed_text else "folded"),
+     }
 
     # ---------- char strategy (existing logic) ----------
     total_chars = _estimate_message_chars(messages)
@@ -1016,6 +1591,10 @@ def _is_pure_tool_use_msg(msg):
     return False
 
 
+# Prefixes used by cleared tool_results (supports old and new formats)
+_CLEARED_PREFIXES = ("[cleared:", "[cleared to save context:", "[Result of tool call hidden]")
+
+
 def _is_cleared_tool_result_msg(msg):
     """Check if a user message contains only cleared tool_results."""
     if msg.get("role") != "user":
@@ -1028,14 +1607,14 @@ def _is_cleared_tool_result_msg(msg):
             if block.get("type") != "tool_result":
                 return False
             block_content = str(block.get("content", ""))
-            if "[cleared to save context:" not in block_content and "[Result of tool call hidden]" not in block_content:
+            if not any(p in block_content for p in _CLEARED_PREFIXES):
                 return False
         return True
     elif isinstance(content, dict):
         if content.get("type") != "tool_result":
             return False
         block_content = str(content.get("content", ""))
-        return "[cleared to save context:" in block_content or "[Result of tool call hidden]" in block_content
+        return any(p in block_content for p in _CLEARED_PREFIXES)
     return False
 
 
@@ -1084,13 +1663,15 @@ def compress_cleared_tool_results(messages):
                     elif isinstance(content, dict) and content.get("type") == "tool_use":
                         tool_names.append(content.get("name", "?"))
 
+                # Use sorted unique tool names for deterministic output
+                tool_names_sorted = sorted(set(tool_names))
                 compressed.append({
                     "role": "assistant",
-                    "content": [{"type": "text", "text": f"[Previous {len(cycles)} tool calls: {', '.join(tool_names)}]"}],
+                    "content": [{"type": "text", "text": f"[Previous tool calls: {', '.join(tool_names_sorted)}]"}],
                 })
                 compressed.append({
                     "role": "user",
-                    "content": [{"type": "text", "text": f"[{len(cycles)} tool results cleared]"}],
+                    "content": [{"type": "text", "text": "[tool results cleared]"}],
                 })
                 stats["merged_cycles"] += len(cycles) - 1
                 stats["merged_msgs"] += len(cycles) * 2 - 2
@@ -1976,6 +2557,147 @@ setInterval(function() {{
     return html
 
 
+def _finalize_metrics(mc):
+    pipeline = mc.get("pipeline", {})
+    quality_flags = []
+    trunc = pipeline.get("truncate", {})
+    if trunc.get("triggered"):
+        dropped = trunc.get("dropped", 0)
+        kept = trunc.get("kept", 0)
+        if kept + dropped > 0 and dropped / (dropped + kept) > 0.7:
+            quality_flags.append("high_drop_ratio")
+        if trunc.get("compression") in ("rules", "folded") and dropped >= 10:
+            quality_flags.append("llm_compress_failed")
+        est_after = trunc.get("est_tokens_after", 0)
+        budget = trunc.get("budget", 0)
+        if budget > 0 and est_after > budget * 1.1:
+            quality_flags.append("budget_overflow")
+    loop = pipeline.get("loop_detect", {})
+    if loop.get("max_run", 0) >= PROXY_LOOP_THRESHOLD:
+        quality_flags.append("loop_injected")
+    blocker = pipeline.get("blocker_detect", {})
+    if blocker.get("triggered"):
+        quality_flags.append("blocker_injected")
+    mc["quality_flags"] = quality_flags
+    input_est = mc.get("input_chars", 0) / max(PROXY_CTX_TOKEN_RATIO, 0.1)
+    est_after = trunc.get("est_tokens_after", input_est) if trunc.get("triggered") else input_est
+    if input_est > 0:
+        mc["compression_ratio"] = round(est_after / input_est, 2)
+    else:
+        mc["compression_ratio"] = 1.0
+
+
+def _mc_put(step_key, data):
+    mc = getattr(_metrics_ctx, 'mc', None)
+    if mc and PROXY_METRICS_ENABLED:
+        mc["pipeline"][step_key] = data
+
+
+def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
+    if not tools or len(tools) <= PROXY_TOOL_FILTER_MAX:
+        return tools, {"filtered": False, "reason": "below_max"}
+
+    recent_tools = set()
+    assistant_count = 0
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            assistant_count += 1
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        recent_tools.add(b.get("name", ""))
+            if assistant_count >= recent_rounds:
+                break
+
+    keep_set = TOOL_ALWAYS_KEEP | recent_tools
+    if tool_choice_name:
+        keep_set.add(tool_choice_name)
+
+    kept = [t for t in tools if isinstance(t, dict) and t.get("name", "") in keep_set]
+
+    if len(kept) < 5:
+        return tools, {"filtered": False, "reason": "too_few_after_filter"}
+
+    return kept, {
+        "filtered": True,
+        "original": len(tools),
+        "kept": len(kept),
+        "always_keep": len(TOOL_ALWAYS_KEEP & {t.get("name", "") for t in kept}),
+        "recent_only": len(recent_tools - TOOL_ALWAYS_KEEP),
+    }
+
+
+def _extract_keywords(messages):
+    keywords = {}
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        text = ""
+        files = []
+        if isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    text += b.get("text", "") + " "
+                elif b.get("type") == "tool_use":
+                    name = b.get("name", "")
+                    inp = b.get("input", {})
+                    if isinstance(inp, dict):
+                        for k in ("file_path", "path", "directory"):
+                            fp = inp.get(k, "")
+                            if fp:
+                                files.append(fp)
+                    text += f"{name} "
+                elif b.get("type") == "tool_result":
+                    tc = b.get("content", "")
+                    if isinstance(tc, str):
+                        text += tc[:200] + " "
+                    elif isinstance(tc, list):
+                        for tb in tc:
+                            if isinstance(tb, dict):
+                                text += str(tb.get("text", ""))[:200] + " "
+        summary = f"{role}: {text[:100].strip()}"
+        for path in files:
+            fname = path.split("/")[-1]
+            keywords.setdefault(fname, []).append(summary)
+        for err in re.findall(r'\b([A-Z]\w*(?:Error|Exception))\b', text):
+            keywords.setdefault(err, []).append(summary)
+        for func in re.findall(r'\b([a-z][a-zA-Z0-9_]{3,})\s*\(', text):
+            keywords.setdefault(func, []).append(summary)
+    return keywords
+
+
+def _inject_keyword_context(keywords, current_messages, top_k=5, max_chars=500):
+    query_text = ""
+    for msg in list(reversed(current_messages))[:3]:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            query_text += content + " "
+        elif isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict):
+                    query_text += b.get("text", "") + " "
+    if not query_text.strip():
+        return None
+    matches = []
+    seen = set()
+    for kw, entries in keywords.items():
+        if kw.lower() in query_text.lower():
+            for entry in entries:
+                if entry not in seen:
+                    seen.add(entry)
+                    matches.append(f"[{kw}]: {entry}")
+    if not matches:
+        return None
+    matches = matches[:top_k]
+    result = "[Relevant history context:]\n" + "\n".join(f"- {m}" for m in matches)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "..."
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -2010,6 +2732,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
+        if PROXY_METRICS_ENABLED:
+            _metrics_ctx.mc = {
+                "ts": datetime.now().isoformat(),
+                "session_id": getattr(_log_ctx, 'session_id', None) or "",
+                "pipeline": {},
+            }
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len).decode("utf-8")
@@ -2047,14 +2775,23 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     self._handle_messages(parsed)
                     _dur = (_time.monotonic() - _t0) * 1000
+                    _out_chars = _jsonl_output_map.pop(self._last_jsonl_token, 0)
                     log_request(
                         model=parsed.get("model", "unknown"),
                         input_chars=total_chars,
-                        output_chars=_jsonl_output_map.pop(self._last_jsonl_token, 0),
+                        output_chars=_out_chars,
                         status=200,
                         duration_ms=_dur,
                         start_time=_req_start_time,
                     )
+                    if PROXY_METRICS_ENABLED:
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["output_chars"] = _out_chars
+                            mc["duration_ms"] = round(_dur, 1)
+                            mc["status"] = 200
+                            _finalize_metrics(mc)
+                            log_metrics(mc)
                 except Exception as e:
                     _dur = (_time.monotonic() - _t0) * 1000
                     log(f"  -> Error: {e}")
@@ -2067,12 +2804,23 @@ class Handler(BaseHTTPRequestHandler):
                         duration_ms=_dur,
                         start_time=_req_start_time,
                     )
+                    if PROXY_METRICS_ENABLED:
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["output_chars"] = 0
+                            mc["duration_ms"] = round(_dur, 1)
+                            mc["status"] = 500
+                            mc["error"] = str(e)[:200]
+                            _finalize_metrics(mc)
+                            log_metrics(mc)
                     raise
             else:
                 log(f"  -> 404 (unknown path)")
                 self._respond_json({"detail": "Not found"}, 404)
         finally:
             _log_ctx.session_id = None
+            if PROXY_METRICS_ENABLED:
+                _metrics_ctx.mc = None
 
     def _handle_messages(self, body):
         is_stream = body.get("stream", False)
@@ -2088,6 +2836,13 @@ class Handler(BaseHTTPRequestHandler):
         session_prefix = getattr(_log_ctx, 'session_id', None) or ""
         total_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in body.get("messages", []))
         log(f"  [REQ_SUMMARY] chars={total_chars} tools={len(tools_list or [])}")
+
+        if PROXY_METRICS_ENABLED:
+            mc = getattr(_metrics_ctx, 'mc', None)
+            if mc:
+                mc["input_msgs"] = len(body.get("messages", []))
+                mc["input_chars"] = total_chars
+                mc["input_tools"] = len(tools_list or [])
 
         log(f"  -> Handling model={model}, stream={is_stream}")
 
@@ -2134,10 +2889,17 @@ class Handler(BaseHTTPRequestHandler):
             log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
                 f"(wasted={error_count['wasted']}, file_not_found={error_count['file_not_found']}, "
                 f"input_validation={error_count['input_validation']})")
+            _mc_put("error_translation", {"count": total_errors, **error_count})
 
         # Proxy-side tool-result clearing with semantic priority
         raw_messages, clear_stats = clear_old_tool_results(raw_messages, tools_list=tools_list)
         cleared_files = clear_stats.get("cleared_files", [])
+        if PROXY_METRICS_ENABLED and clear_stats.get("cleared"):
+            _mc_put("tool_clear", {
+                "cleared": clear_stats.get("cleared_tool_results", 0),
+                "kept": clear_stats.get("kept", 0),
+                "chars_freed": clear_stats.get("cleared_chars", 0),
+            })
         if clear_stats.get("cleared"):
             log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, "
                 f"{clear_stats['cleared_chars']:,} chars freed (kept {clear_stats['kept']}, high_prio={clear_stats.get('high_prio', 0)})")
@@ -2194,21 +2956,102 @@ class Handler(BaseHTTPRequestHandler):
                 last_pattern = None
         if max_run > 1:
             log(f"  -> Consecutive calls: max_run={max_run} (tools tracked)")
+        _mc_put("loop_detect", {"max_run": max_run})
 
-        # Loop detection: if max_run >= threshold, inject break message
+        # Loop detection: escalating intervention based on severity
         if max_run >= PROXY_LOOP_THRESHOLD:
             loop_keys = [k for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD]
             tool_name = loop_keys[0].split(":")[0] if loop_keys else (pattern_tool_name or "unknown")
-            log(f"  -> Loop detected: {tool_name} called {max_run} times (pattern-based), injecting break message")
-            break_msg = {
-                "role": "user",
-                "content": [{"type": "text", "text":
-                    f"[System notice: You have repeated the same action {max_run} times "
-                    f"(tool: {tool_name} with similar text output). "
-                    f"This appears to be a loop. Please stop and try a completely different approach.]"
-                }]
-            }
-            raw_messages.append(break_msg)
+
+            if max_run >= PROXY_LOOP_LEVEL3:
+                # Level 3 (severe): suppress tool_use in last assistant, force text-only
+                log(f"  -> LOOP LEVEL 3: {tool_name} called {max_run} times, suppressing tool calls in last assistant")
+                for msg in reversed(raw_messages):
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            new_content = []
+                            suppressed = 0
+                            for block in content:
+                                if block.get("type") == "tool_use":
+                                    suppressed += 1
+                                else:
+                                    new_content.append(block)
+                            if suppressed > 0:
+                                new_content.append({
+                                    "type": "text",
+                                    "text": f"[System: {suppressed} tool call(s) suppressed due to loop detection "
+                                            f"(tool: {tool_name}, repeated {max_run} times). "
+                                            f"Respond with text only — describe what you know and what to do next.]"
+                                })
+                                msg["content"] = new_content
+                        break
+                raw_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text":
+                        f"[CRITICAL SYSTEM NOTICE: You are in an infinite loop. "
+                        f"Tool '{tool_name}' has been called {max_run} times with no progress. "
+                        f"The tool is now DISABLED. You MUST respond with text only. "
+                        f"Summarize what you have learned and propose next steps WITHOUT any tool calls.]"
+                    }]
+                })
+                loop_level = 3
+            elif max_run >= PROXY_LOOP_LEVEL2:
+                # Level 2 (medium): remove looping tool from tools list + strong message
+                log(f"  -> LOOP LEVEL 2: {tool_name} called {max_run} times, removing tool + injecting strong break")
+                removed_count = 0
+                if raw_tools:
+                    filtered_tools = []
+                    for t in raw_tools:
+                        if isinstance(t, dict) and t.get("name", "") == tool_name:
+                            removed_count += 1
+                        else:
+                            filtered_tools.append(t)
+                    if removed_count > 0:
+                        body["tools"] = filtered_tools
+                        log(f"    removed {tool_name} from tools list ({len(filtered_tools)} remaining)")
+                raw_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text":
+                        f"[IMPORTANT: You have called '{tool_name}' {max_run} times in a row with no progress. "
+                        f"This tool has been temporarily REMOVED from your available tools. "
+                        f"You MUST use a different approach. "
+                        f"If you need file content, use Bash with cat/head/tail. "
+                        f"If you are stuck, describe the problem and ask for guidance.]"
+                    }]
+                })
+                loop_level = 2
+            else:
+                # Level 1 (mild): enhanced break message
+                log(f"  -> LOOP LEVEL 1: {tool_name} called {max_run} times, injecting break message")
+                raw_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text":
+                        f"[System notice: You have repeated the same action {max_run} times "
+                        f"(tool: {tool_name}). This is likely a loop. "
+                        f"STOP using {tool_name} immediately and try a completely different approach. "
+                        f"If file content was cleared, assume the file is unchanged and work from memory.]"
+                    }]
+                })
+                loop_level = 1
+            _mc_put("loop_detect", {"max_run": max_run, "level": loop_level, "tool": tool_name})
+        else:
+            _mc_put("loop_detect", {"max_run": max_run})
+
+        # Blocker detection: same-error-type consecutive tool_result rejections
+        blocker_info = _detect_blocker_pattern(raw_messages)
+        if blocker_info.get("triggered"):
+            log(
+                f"  -> Blocker detected: {blocker_info['tool_name']} failed "
+                f"({blocker_info['error_type']}) {blocker_info['run_length']} times in a row, "
+                f"injecting [BLOCKER] message"
+            )
+            raw_messages.append(_build_blocker_message(
+                blocker_info["tool_name"],
+                blocker_info["error_type"],
+                blocker_info["run_length"],
+            ))
+        _mc_put("blocker_detect", blocker_info)
 
         # Re-read detection: check if recent tool_uses target cleared files
         if cleared_files:
@@ -2251,6 +3094,7 @@ class Handler(BaseHTTPRequestHandler):
         raw_messages, think_stats = strip_old_thinking_blocks(raw_messages, keep_recent=3)
         if think_stats.get("stripped"):
             log(f"  -> Thinking stripped: {think_stats['stripped_count']} old assistant messages cleaned (kept last {think_stats['kept']})")
+            _mc_put("think_strip", {"stripped": think_stats["stripped_count"]})
         elif think_stats.get("enabled") and not think_stats.get("skipped"):
             log(f"  -> Thinking strip: active (keep_recent=3)")
 
@@ -2258,19 +3102,40 @@ class Handler(BaseHTTPRequestHandler):
         raw_messages, compress_stats = compress_cleared_tool_results(raw_messages)
         if compress_stats.get("merged"):
             log(f"  -> Tool-result compression: {compress_stats['merged_cycles']} cycles merged, {compress_stats['merged_msgs']} msgs removed (saved ~{compress_stats['saved_overhead']} tokens overhead)")
+            _mc_put("compress", {"merged_cycles": compress_stats["merged_cycles"], "msgs_removed": compress_stats["merged_msgs"]})
         elif compress_stats.get("enabled") and not compress_stats.get("merged"):
             log(f"  -> Tool-result compression: no consecutive cleared cycles to merge")
 
         # Context truncation
-        raw_messages, trunc_stats = truncate_messages_if_needed(raw_messages)
+        raw_messages, trunc_stats = truncate_messages_if_needed(
+            raw_messages,
+            session_id=getattr(_log_ctx, 'session_id', None),
+        )
         if trunc_stats.get("truncated"):
             strategy = trunc_stats.get("strategy", "char")
+            trunc_metrics = {
+                "triggered": True,
+                "strategy": strategy,
+                "dropped": trunc_stats.get("dropped_messages", 0),
+                "kept": trunc_stats.get("kept_messages", 0),
+            }
             if strategy == "rounds":
                 est_tok = trunc_stats.get("estimated_tokens", "?")
                 actual_r = trunc_stats.get("actual_keep_rounds", "?")
-                log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{est_tok} tokens, budget={PROXY_CTX_TOKEN_BUDGET})")
+                comp = trunc_stats.get("compression", "folded")
+                adaptive = trunc_stats.get("adaptive_rounds", "")
+                extra_info = f", adaptive={adaptive}" if adaptive else ""
+                log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{est_tok} tokens, budget={PROXY_CTX_TOKEN_BUDGET}, compress={comp}{extra_info})")
+                trunc_metrics["compression"] = comp
+                trunc_metrics["est_tokens_after"] = trunc_stats.get("estimated_tokens", 0)
+                trunc_metrics["budget"] = PROXY_CTX_TOKEN_BUDGET
+                trunc_metrics["rounds"] = actual_r
+                trunc_metrics["adaptive_rounds"] = adaptive
+            elif strategy == "fifo":
+                log(f"  -> Context truncation (fifo): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (limit={PROXY_CTX_KEEP_MESSAGES})")
             else:
                 log(f"  -> Context truncation (char): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats['dropped_chars']:,} chars removed ({trunc_stats['chars_before']:,} -> {trunc_stats['chars_after']:,})")
+            _mc_put("truncate", trunc_metrics)
         elif not trunc_stats.get("enabled"):
             log(f"  -> Context truncation: disabled ({BACKEND_TYPE} backend)")
         elif trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
@@ -2315,6 +3180,22 @@ class Handler(BaseHTTPRequestHandler):
             openai_body["stop"] = body["stop_sequences"]
 
         # Handle tools
+        raw_tools = body.get("tools")
+        if raw_tools and PROXY_TOOL_FILTER_ENABLED:
+            tc_raw = body.get("tool_choice")
+            tc_name = None
+            if isinstance(tc_raw, dict) and tc_raw.get("type") == "tool":
+                tc_name = tc_raw.get("name", "")
+            raw_tools, tf_stats = _filter_tools(
+                raw_tools, raw_messages,
+                recent_rounds=PROXY_TOOL_FILTER_RECENT,
+                tool_choice_name=tc_name,
+            )
+            if tf_stats.get("filtered"):
+                body["tools"] = raw_tools
+                log(f"  -> Tool filter: {tf_stats['original']} -> {tf_stats['kept']} "
+                    f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']})")
+                _mc_put("tool_filter", tf_stats)
         tools = convert_anthropic_tools_to_openai(body.get("tools"))
         if tools:
             openai_body["tools"] = tools
@@ -2640,7 +3521,15 @@ def main():
     log(f"Model: {MODEL_NAME}")
     log(f"Concurrency: {PROXY_MAX_CONCURRENT}")
     log(f"Tool clearing: {'enabled (threshold=' + str(PROXY_CLEAR_THRESHOLD) + ', keep=' + str(PROXY_TOOL_KEEP) + ')' if PROXY_CLEAR_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
-    log(f"Context limit: {'enabled (limit=' + str(PROXY_CTX_CHARS_LIMIT) + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
+    log(f"Blocker tracker: {'enabled (threshold=' + str(PROXY_BLOCKER_THRESHOLD) + ' consecutive)' if PROXY_BLOCKER_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
+    _trunc_info = f"strategy={PROXY_CTX_TRUNCATE_STRATEGY}"
+    if PROXY_CTX_TRUNCATE_STRATEGY == "rounds":
+        _trunc_info += f", rounds={PROXY_CTX_KEEP_ROUNDS}, budget={PROXY_CTX_TOKEN_BUDGET}"
+    elif PROXY_CTX_TRUNCATE_STRATEGY == "fifo":
+        _trunc_info += f", keep_messages={PROXY_CTX_KEEP_MESSAGES}"
+    else:
+        _trunc_info += f", limit={PROXY_CTX_CHARS_LIMIT}"
+    log(f"Context limit: {'enabled (' + _trunc_info + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
     log(f"Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
     if IS_CLOUD:
         log(f"Cloud API mode — no local backend required")

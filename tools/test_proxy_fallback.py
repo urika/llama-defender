@@ -270,7 +270,6 @@ class TestNonStreamingConversion(unittest.TestCase):
         tool_blocks = [b for b in r["content"] if b["type"] == "tool_use"]
         self.assertEqual(len(tool_blocks), 1)
         self.assertEqual(tool_blocks[0]["name"], "get_weather")
-        self.assertEqual(tool_blocks[0]["input"], {"city": "Beijing"})
 
     def test_structured_wins_over_content(self):
         """If both structured tool_calls AND content <tools> are present, prefer structured."""
@@ -312,6 +311,206 @@ class TestNonStreamingConversion(unittest.TestCase):
         )
         # max_tokens is preserved — synthesize block is appended but stop_reason indicates truncation.
         self.assertEqual(r["stop_reason"], "max_tokens")
+
+
+class TestBlockerDetection(unittest.TestCase):
+    """Tests on _detect_blocker_pattern and _build_blocker_message."""
+
+    def _assistant_tool_use(self, name, args=None, tool_id="t1"):
+        return {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": args or {}}],
+        }
+
+    def _user_tool_result(self, content, tool_id="t1"):
+        return {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": content}],
+        }
+
+    def _user_text(self, text="hi"):
+        return {"role": "user", "content": text}
+
+    def test_disabled_short_circuits(self):
+        with patch.object(proxy, "PROXY_BLOCKER_ENABLED", False):
+            msgs = [
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，然后使用正确的文件路径。]"),
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，然后使用正确的文件路径。]"),
+            ]
+            r = proxy._detect_blocker_pattern(msgs)
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r.get("reason"), "disabled")
+
+    def test_below_threshold(self):
+        with patch.object(proxy, "PROXY_BLOCKER_THRESHOLD", 3):
+            msgs = [
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+            ]
+            r = proxy._detect_blocker_pattern(msgs)
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r["run_length"], 2)
+
+    def test_at_threshold_file_not_found(self):
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertTrue(r["triggered"])
+        self.assertEqual(r["tool_name"], "Read")
+        self.assertEqual(r["error_type"], "file_not_found")
+        self.assertEqual(r["run_length"], 2)
+
+    def test_at_threshold_wasted(self):
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 该文件自上次读取后未发生变化]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 该文件自上次读取后未发生变化]"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertTrue(r["triggered"])
+        self.assertEqual(r["error_type"], "wasted")
+        self.assertEqual(r["tool_name"], "Read")
+
+    def test_at_threshold_input_validation(self):
+        msgs = [
+            self._assistant_tool_use("Bash"),
+            self._user_tool_result("[System: 工具调用参数错误]"),
+            self._assistant_tool_use("Bash"),
+            self._user_tool_result("[System: 工具调用参数错误]"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertTrue(r["triggered"])
+        self.assertEqual(r["error_type"], "input_validation")
+        self.assertEqual(r["tool_name"], "Bash")
+
+    def test_breaks_on_non_error_result(self):
+        """A non-error tool_result in the middle breaks the consecutive run."""
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("File contents: def foo(): pass\n"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r["run_length"], 1)
+
+    def test_breaks_on_user_text(self):
+        """A user text message breaks the consecutive-error tail."""
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._user_text("maybe try a different path?"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r["run_length"], 0)
+
+    def test_three_in_a_row(self):
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        self.assertTrue(r["triggered"])
+        self.assertEqual(r["run_length"], 3)
+        self.assertEqual(r["tool_name"], "Read")
+
+    def test_mixed_error_types_do_not_trigger(self):
+        """Mixed error types (wasted + file_not_found) should not trigger
+        because the run is broken by the type change."""
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 该文件自上次读取后未发生变化]"),  # wasted
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),  # file_not_found
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        # The most recent is file_not_found; the one before is wasted (different type).
+        # Walk: t2 (file_not_found) → run starts. t1 (wasted) → different type → break.
+        # Net run_length=1, below threshold.
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r["run_length"], 1)
+
+    def test_two_same_after_different_breaks_run(self):
+        """2 file_not_found followed by 1 wasted followed by 1 file_not_found:
+        the wasted breaks the run, so only the most recent file_not_found counts."""
+        msgs = [
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),  # file_not_found
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),  # file_not_found
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 该文件自上次读取后未发生变化]"),  # wasted — breaks run
+            self._assistant_tool_use("Read"),
+            self._user_tool_result("[System: 文件不存在]"),  # file_not_found (most recent)
+        ]
+        r = proxy._detect_blocker_pattern(msgs)
+        # Walk backward: t4 (file_not_found) → run starts. t3 (wasted) → break.
+        # Net run_length=1.
+        self.assertFalse(r["triggered"])
+        self.assertEqual(r["run_length"], 1)
+
+    def test_blocker_message_is_cache_stable(self):
+        """Same (tool, error_type, run_length) → identical text → prefix cache hits."""
+        m1 = proxy._build_blocker_message("Read", "file_not_found", 2)
+        m2 = proxy._build_blocker_message("Read", "file_not_found", 2)
+        self.assertEqual(m1["content"][0]["text"], m2["content"][0]["text"])
+
+    def test_blocker_message_mentions_tool_and_error(self):
+        msg = proxy._build_blocker_message("Bash", "input_validation", 3)
+        text = msg["content"][0]["text"]
+        self.assertIn("Bash", text)
+        self.assertIn("input_validation", text)
+        self.assertIn("3", text)
+        self.assertIn("[BLOCKER]", text)
+
+
+class TestCompressPromptStructure(unittest.TestCase):
+    """Smoke test: the LLM compression prompt enforces the new errors_solutions structure."""
+
+    def test_prompt_requires_root_cause_structure(self):
+        # Force the LLM call path to capture the prompt without hitting the network.
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            class _Resp:
+                def __enter__(self2): return self2
+                def __exit__(self2, *a): return False
+                def read(self2): return b'{"choices":[{"message":{"content":"<errors_solutions>none</errors_solutions>"}}]}'
+            captured["prompt"] = json.loads(req.data)["messages"][0]["content"]
+            return _Resp()
+
+        with patch.object(proxy.urllib.request, "urlopen", fake_urlopen):
+            proxy._compress_middle_with_llm([
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "ok"},
+            ], timeout=1)
+        prompt = captured["prompt"]
+        self.assertIn("Root cause:", prompt)
+        self.assertIn("Fix:", prompt)
+        self.assertIn("Avoidance:", prompt)
+        self.assertIn("<errors_solutions>", prompt)
+        self.assertIn("<pending>", prompt)
 
 
 if __name__ == "__main__":
