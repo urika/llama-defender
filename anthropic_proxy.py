@@ -2150,38 +2150,62 @@ class Handler(BaseHTTPRequestHandler):
             log(f"  -> Tool clearing: active (threshold={PROXY_CLEAR_THRESHOLD}, keep={PROXY_TOOL_KEEP})")
 
         # Consecutive calls tracking (max_run)
+        # Track both: (A) identical args per tool, (B) same text+tool_name pattern
         consecutive = {}
         max_run = 0
+        pattern_run = 0
+        last_pattern = None
+        pattern_tool_name = None
         for msg in raw_messages:
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
             if isinstance(content, list):
+                tool_names_in_msg = []
+                text_parts = []
                 for block in content:
                     if block.get("type") == "tool_use":
                         name = block.get("name", "")
+                        tool_names_in_msg.append(name)
                         inp = block.get("input", {})
                         args_str = json.dumps(inp, sort_keys=True, ensure_ascii=False) if isinstance(inp, dict) else str(inp)
                         key = f"{name}:{args_str}"
                         consecutive[key] = consecutive.get(key, 0) + 1
                         max_run = max(max_run, consecutive[key])
-                    else:
-                        consecutive = {}
+                    elif block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                for _ in tool_names_in_msg:
+                    consecutive = {}
+                pattern = ("".join(text_parts)[:200], tuple(sorted(set(tool_names_in_msg))))
+                if pattern == last_pattern and pattern[1]:
+                    pattern_run += 1
+                    if pattern_run > max_run:
+                        max_run = pattern_run
+                        pattern_tool_name = tool_names_in_msg[0] if tool_names_in_msg else "unknown"
+                    for k in list(consecutive.keys()):
+                        if not k.startswith(pattern_tool_name + ":"):
+                            del consecutive[k]
+                else:
+                    pattern_run = 1
+                    last_pattern = pattern
             else:
                 consecutive = {}
+                pattern_run = 0
+                last_pattern = None
         if max_run > 1:
             log(f"  -> Consecutive calls: max_run={max_run} (tools tracked)")
 
         # Loop detection: if max_run >= threshold, inject break message
         if max_run >= PROXY_LOOP_THRESHOLD:
             loop_keys = [k for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD]
-            tool_name = loop_keys[0].split(":")[0] if loop_keys else "unknown"
-            log(f"  -> Loop detected: {tool_name} called {max_run} times with same args, injecting break message")
+            tool_name = loop_keys[0].split(":")[0] if loop_keys else (pattern_tool_name or "unknown")
+            log(f"  -> Loop detected: {tool_name} called {max_run} times (pattern-based), injecting break message")
             break_msg = {
                 "role": "user",
                 "content": [{"type": "text", "text":
-                    f"[System notice: You have called {tool_name} {max_run} consecutive times with identical arguments. "
-                    f"This appears to be a loop. Please stop calling {tool_name} with these parameters and try a different approach.]"
+                    f"[System notice: You have repeated the same action {max_run} times "
+                    f"(tool: {tool_name} with similar text output). "
+                    f"This appears to be a loop. Please stop and try a completely different approach.]"
                 }]
             }
             raw_messages.append(break_msg)
