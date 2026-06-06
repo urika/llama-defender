@@ -2977,9 +2977,15 @@ class Handler(BaseHTTPRequestHandler):
                     if pattern_run > max_run:
                         max_run = pattern_run
                         pattern_tool_name = tool_names_in_msg[0] if tool_names_in_msg else "unknown"
-                    for k in list(consecutive.keys()):
-                        if not k.startswith(pattern_tool_name + ":"):
-                            del consecutive[k]
+                    # pattern_tool_name is only assigned when pattern_run
+                    # exceeds max_run. max_run can carry a higher value from
+                    # the inherited `consecutive` dict (prior session state),
+                    # leaving pattern_tool_name as None here. In that case
+                    # we have no pattern to filter by, so skip the cleanup.
+                    if pattern_tool_name is not None:
+                        for k in list(consecutive.keys()):
+                            if not k.startswith(pattern_tool_name + ":"):
+                                del consecutive[k]
                 else:
                     pattern_run = 1
                     last_pattern = pattern

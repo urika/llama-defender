@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# ============================================================
+# Pre-commit hook: run fast unit tests before allowing commit.
+#
+# Why --unit only:
+#   - unit tests are <1s, no infrastructure, no network
+#   - integration tests boot a mock + proxy (~5s, mostly fine but slower)
+#   - e2e tests require a real proxy + backend, can't run in arbitrary envs
+#
+# Skip mechanisms (use sparingly):
+#   SKIP_TESTS=1 git commit -m "..."    # explicit env-var skip
+#   git commit --no-verify              # bypasses ALL hooks (git built-in)
+#
+# To install on a fresh clone:
+#   git config core.hooksPath .githooks
+# (or run: bash test/run_tests.sh --help for full instructions)
+# ============================================================
+set -uo pipefail
+
+# Resolve repo root from the hook's own location. The hook lives at
+# .githooks/pre-commit inside the work tree, so $(git rev-parse --show-toplevel)
+# is the most reliable anchor regardless of how the hook was invoked.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "$REPO_ROOT" || ! -d "$REPO_ROOT" ]]; then
+  echo "pre-commit: cannot determine repo root; aborting" >&2
+  exit 1
+fi
+
+# Skip if user explicitly opted out.
+if [[ "${SKIP_TESTS:-0}" == "1" ]]; then
+  echo "pre-commit: SKIP_TESTS=1 — skipping test gate (use sparingly)"
+  exit 0
+fi
+
+# Skip during rebase / merge internal commits (they replay past work).
+# `git rev-parse --git-dir` is the canonical way to detect a rebase/merge
+# in progress without depending on $GIT_DIR.
+GIT_DIR="$(git rev-parse --git-dir)"
+if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" \
+      || -f "$GIT_DIR/MERGE_HEAD" ]]; then
+  echo "pre-commit: rebase/merge in progress — skipping test gate"
+  exit 0
+fi
+
+# Make sure the runner exists. If it doesn't, fail loudly — something is wrong
+# with the repo layout (e.g. the user forgot to install the hook directory).
+RUNNER="$REPO_ROOT/test/run_tests.sh"
+if [[ ! -x "$RUNNER" ]]; then
+  echo "pre-commit: test runner not found or not executable: $RUNNER" >&2
+  echo "  Fix: chmod +x test/run_tests.sh" >&2
+  exit 1
+fi
+
+echo "pre-commit: running fast unit tests before commit..."
+echo ""
+
+# Run --unit only. Capture exit code without aborting on a failure so we can
+# print a clean final message. Pipe through cat so colors render in the
+# user's terminal even when git is capturing output.
+bash "$RUNNER" --unit
+rc=$?
+
+if [[ $rc -ne 0 ]]; then
+  echo ""
+  echo "❌ pre-commit: unit tests failed." >&2
+  echo "  • Fix the failures and amend:    git commit --amend" >&2
+  echo "  • Or skip (use sparingly):       SKIP_TESTS=1 git commit -m '...'" >&2
+  echo "  • Or bypass all hooks:           git commit --no-verify" >&2
+  exit 1
+fi
+
+echo ""
+echo "✅ pre-commit: unit tests passed."
+exit 0
