@@ -999,17 +999,26 @@ class TestIncrementalCompress(unittest.TestCase):
         with proxy._summary_cache_lock:
             proxy._summary_cache.clear()
 
-    def _msg(self, content):
-        return {"role": "user", "content": content}
+    def _err_msg(self, text):
+        """A user message with a tool_result block that contains 'error'
+        — exactly the shape _extract_middle_summary_rules looks for."""
+        return {
+            "role": "user",
+            "content": [{
+                "type": "tool_result", "tool_use_id": "t1",
+                "content": f"error: {text}",
+            }],
+        }
 
     def test_first_call_no_cache_uses_rules_path(self):
         """R1.3: first compression on a fresh session uses the rule-based
         path (not the LLM) because dropped has <10 messages."""
         with proxy._summary_cache_lock:
             proxy._summary_cache.pop("sess_A", None)
-        dropped = [self._msg("error: foo"), self._msg("error: bar"), self._msg("ok")]
+        dropped = [self._err_msg(f"boom_{i}") for i in range(3)]
         result, was_incremental = proxy._incremental_compress(dropped, "sess_A")
         self.assertIsNotNone(result)
+        self.assertIn("[Compressed context", result)  # rule header
         self.assertIs(was_incremental, False)  # not incremental on first call
         # The LLM was NOT called (rule path handles <10 msgs).
         self.assertEqual(self._llm_calls, [])
@@ -1019,11 +1028,11 @@ class TestIncrementalCompress(unittest.TestCase):
         compression returns was_incremental=True (cache hit), even when
         the dropped set is identical (so 0 new messages)."""
         # First call: prime the cache.
-        proxy._incremental_compress([self._msg("error: foo")] * 3, "sess_B")
+        proxy._incremental_compress([self._err_msg("foo")] * 3, "sess_B")
         self.assertEqual(self._llm_calls, [])
         # Second call: same dropped set, should hit the cache.
         result, was_incremental = proxy._incremental_compress(
-            [self._msg("error: foo")] * 3, "sess_B"
+            [self._err_msg("foo")] * 3, "sess_B"
         )
         self.assertIsNotNone(result)
         self.assertIs(was_incremental, True)
@@ -1038,13 +1047,13 @@ class TestIncrementalCompress(unittest.TestCase):
         real_max = proxy._SUMMARY_CACHE_MAX_SESSIONS
         with patch.object(proxy, "_SUMMARY_CACHE_MAX_SESSIONS", 2):
             # Fill the cache: sess_1 (oldest), sess_2.
-            proxy._incremental_compress([self._msg("a")], "sess_1")
-            proxy._incremental_compress([self._msg("b")], "sess_2")
+            proxy._incremental_compress([self._err_msg("a")], "sess_1")
+            proxy._incremental_compress([self._err_msg("b")], "sess_2")
             with proxy._summary_cache_lock:
                 self.assertIn("sess_1", proxy._summary_cache)
                 self.assertIn("sess_2", proxy._summary_cache)
             # Add sess_3 → sess_1 (oldest) should be evicted.
-            proxy._incremental_compress([self._msg("c")], "sess_3")
+            proxy._incremental_compress([self._err_msg("c")], "sess_3")
             with proxy._summary_cache_lock:
                 self.assertNotIn("sess_1", proxy._summary_cache)
                 self.assertIn("sess_2", proxy._summary_cache)
@@ -1062,6 +1071,235 @@ class TestIncrementalCompress(unittest.TestCase):
         self.assertIsNone(was_incremental)
         with proxy._summary_cache_lock:
             self.assertNotIn("sess_E", proxy._summary_cache)
+
+
+# =============================================================================
+# R1.4 — keyword index (_extract_keywords + _inject_keyword_context)
+# =============================================================================
+class TestKeywordIndex(unittest.TestCase):
+    """Covers the keyword-based history retrieval: when a tool_result
+    is truncated away, the proxy keeps a keyword→summary index so it
+    can re-surface relevant prior context if the user later asks about
+    a file/error/function that was dropped."""
+
+    def _user_msg(self, content):
+        return {"role": "user", "content": content}
+
+    def _assistant_tool_use(self, name, file_path=None, command=None):
+        inp = {}
+        if file_path:
+            inp["file_path"] = file_path
+        if command:
+            inp["command"] = command
+        return {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"tu_{name}",
+                         "name": name, "input": inp}],
+        }
+
+    def _user_tool_result(self, text):
+        return {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu_x",
+                         "content": text}],
+        }
+
+    def test_extract_picks_up_filenames(self):
+        """R1.4: filenames from tool_use.file_path are indexed. The dict
+        key is the basename (not the full path) so 'config.json' matches
+        queries even when the absolute path differs."""
+        msgs = [self._assistant_tool_use("Read", file_path="/tmp/config.json"),
+                self._user_tool_result("contents of config.json")]
+        kw = proxy._extract_keywords(msgs)
+        self.assertIn("config.json", kw)
+        # The summary should mention the read.
+        self.assertTrue(any("Read" in s for s in kw["config.json"]))
+
+    def test_extract_picks_up_error_names(self):
+        """R1.4: PascalCase names ending in 'Error' or 'Exception' are
+        indexed as separate keywords. This lets a follow-up question
+        about 'the ValueError' retrieve the relevant prior traceback."""
+        msgs = [self._user_tool_result(
+            "Traceback (most recent call last):\n"
+            "  File \"x.py\", line 5, in <module>\n"
+            "ValueError: invalid input"
+        )]
+        kw = proxy._extract_keywords(msgs)
+        self.assertIn("ValueError", kw)
+
+    def test_extract_picks_up_function_names(self):
+        """R1.4: function-call patterns like `parse_config(...)` are
+        captured as keywords for later re-lookup."""
+        msgs = [self._user_tool_result("calling parse_config() and validate()")]
+        kw = proxy._extract_keywords(msgs)
+        self.assertIn("parse_config", kw)
+        self.assertIn("validate", kw)
+
+    def test_inject_returns_none_when_no_keyword_match(self):
+        """R1.4: if the query (last 3 messages) doesn't mention any
+        indexed keyword, the injector returns None — no spurious
+        "Relevant history" block clutters the prompt."""
+        past = [self._assistant_tool_use("Read", file_path="/tmp/secret.py")]
+        current = [self._user_msg("what is the weather today?")]
+        self.assertIsNone(proxy._inject_keyword_context(
+            proxy._extract_keywords(past), current,
+        ))
+
+    def test_inject_respects_top_k_and_max_chars(self):
+        """R1.4: the injected block is capped at top_k entries and
+        truncated to max_chars (with '...' suffix). The cap prevents
+        a stale keyword from blowing up the prompt budget."""
+        # 10 distinct Read tool_uses; current query mentions the first 3.
+        past = [self._assistant_tool_use(
+                    "Read", file_path=f"/tmp/file_{i}.py")
+                for i in range(10)]
+        # The keyword in the index is "file_N.py" (full basename),
+        # so the query must contain the full filename to match.
+        current = [self._user_msg(
+            "show me file_0.py, file_1.py, file_2.py please")]
+        result = proxy._inject_keyword_context(
+            proxy._extract_keywords(past), current,
+            top_k=2, max_chars=200,
+        )
+        self.assertIsNotNone(result)
+        # At most top_k=2 entries.
+        self.assertLessEqual(result.count("- [file_"), 2)
+        # Truncated to ≤ max_chars + the trailing "...".
+        self.assertLessEqual(len(result), 200 + 3)
+
+
+# =============================================================================
+# R3.3 — _filter_tools (44 → 15 tool definition trim)
+# =============================================================================
+class TestToolFilter(unittest.TestCase):
+    """Covers _filter_tools — the proxy trims the tool definitions list
+    when it exceeds PROXY_TOOL_FILTER_MAX. Whitelist + recently-used
+    tools are kept; tool_choice forces an extra keep; and a too-
+    aggressive filter falls back to the full list."""
+
+    def setUp(self):
+        # Lower the threshold so small tests can still exercise the
+        # filter path without building 44+ tool definitions.
+        self._patches = [
+            patch.object(proxy, "PROXY_TOOL_FILTER_MAX", 5),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _tool(self, name):
+        return {"name": name, "description": "fake", "input_schema": {"type": "object"}}
+
+    def _tools(self, names):
+        return [self._tool(n) for n in names]
+
+    def _asst(self, tool_names):
+        return {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"tu_{n}", "name": n, "input": {}}
+                        for n in tool_names],
+        }
+
+    def test_below_max_is_passthrough(self):
+        """R3.3: when len(tools) <= PROXY_TOOL_FILTER_MAX, no filter
+        is applied — the full list is returned unchanged."""
+        tools = self._tools(["Read", "Write", "Edit"])  # 3 < 5
+        result, stats = proxy._filter_tools(tools, [])
+        self.assertEqual(result, tools)
+        self.assertFalse(stats["filtered"])
+        self.assertEqual(stats["reason"], "below_max")
+
+    def test_above_max_keeps_whitelist_and_recent(self):
+        """R3.3: with 10 tools, the filter keeps TOOL_ALWAYS_KEEP
+        (~18 items) + recently-used (last 5 assistant messages).
+        The filter list is strictly smaller than the input."""
+        tools = self._tools([
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+            "LS", "Task", "WebFetch", "WebSearch", "TodoRead", "TodoWrite",
+            "Agent", "NotebookEdit", "EnterPlanMode", "ExitPlanMode",
+            "AskUserQuestion", "Skill",
+            "CustomA", "CustomB", "CustomC", "CustomD",  # 22 total > 5
+            "CustomE", "CustomF", "CustomG", "CustomH", "CustomI", "CustomJ",
+        ])
+        # 3 last assistant messages: Read, Bash, CustomA, CustomB
+        recent_msgs = [self._asst(["Read"]), self._asst(["Bash"]),
+                       self._asst(["CustomA", "CustomB"])]
+        result, stats = proxy._filter_tools(tools, recent_msgs)
+        self.assertTrue(stats["filtered"])
+        kept_names = [t["name"] for t in result]
+        # TOOL_ALWAYS_KEEP are all present.
+        for must in ["Read", "Write", "Bash", "Glob"]:
+            self.assertIn(must, kept_names)
+        # CustomA + CustomB are recent → kept.
+        self.assertIn("CustomA", kept_names)
+        self.assertIn("CustomB", kept_names)
+        # CustomC..CustomJ were not used recently and not in whitelist → dropped.
+        for unused in ["CustomC", "CustomD", "CustomE", "CustomJ"]:
+            self.assertNotIn(unused, kept_names)
+
+    def test_tool_choice_forces_keep(self):
+        """R3.3: when the request specifies tool_choice pointing at a
+        tool that's NOT in the whitelist and NOT recently used, the
+        filter must still keep it (otherwise the model can't pick it)."""
+        tools = self._tools(["Read", "Bash", "CustomA", "CustomB",
+                             "CustomC", "CustomD", "CustomE"])
+        recent_msgs = [self._asst(["Read"])]
+        result, _ = proxy._filter_tools(
+            tools, recent_msgs, tool_choice_name="CustomE"
+        )
+        kept_names = [t["name"] for t in result]
+        self.assertIn("CustomE", kept_names)
+
+    def test_too_few_after_filter_falls_back_to_all(self):
+        """R3.3: if filtering would leave < 5 tools (the model can't
+        do much with fewer), the function returns the full original
+        list with reason=too_few_after_filter — better to send a few
+        extra tool defs than to break the conversation."""
+        # Build a set of 7 tools where recent + always_keep yield < 5.
+        # Use only 2 recent and rely on a small whitelist by patching.
+        small_whitelist = {"Read", "Bash"}
+        tools = self._tools(["Read", "Bash", "Custom1", "Custom2",
+                             "Custom3", "Custom4", "Custom5"])
+        recent_msgs = [self._asst(["Custom3", "Custom4"])]
+        with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist):
+            result, stats = proxy._filter_tools(tools, recent_msgs)
+        # Too_few_after_filter: kept would be {Read, Bash, Custom3, Custom4} = 4 < 5.
+        self.assertFalse(stats["filtered"])
+        self.assertEqual(stats["reason"], "too_few_after_filter")
+        self.assertEqual(result, tools)  # returned full list
+
+    def test_recent_rounds_scans_only_last_n_assistant_messages(self):
+        """R3.3: recent_rounds=5 means the filter walks BACKWARDS through
+        messages and stops after collecting 5 assistant messages. Older
+        tool_uses are forgotten (intentional — they're stale)."""
+        # 6 assistants: the oldest uses CustomA, the 5 most recent use Read.
+        # recent_rounds=5 → CustomA should be dropped.
+        msgs = [
+            self._asst(["CustomA"]),  # 6th-from-end
+            self._asst(["Read"]),     # 5th
+            self._asst(["Read"]),
+            self._asst(["Read"]),
+            self._asst(["Read"]),
+            self._asst(["Read"]),     # most recent
+        ]
+        # Build 10 tools: 6 from TOOL_ALWAYS_KEEP (so kept >= 5 to
+        # avoid the too_few_after_filter fallback) + 4 non-whitelist
+        # custom tools to test the recent_rounds scan.
+        tools = self._tools([
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep",  # 6 whitelist
+            "CustomA", "CustomB", "CustomC", "CustomD",       # 4 non-whitelist
+        ])
+        result, stats = proxy._filter_tools(tools, msgs, recent_rounds=5)
+        self.assertTrue(stats["filtered"], f"filter should have run (10 tools > max=5); got {stats}")
+        kept = [t["name"] for t in result]
+        # CustomA was the 6th assistant message → outside the recent-5 window.
+        self.assertNotIn("CustomA", kept)
+        # The 6 whitelist tools are all kept regardless of recency.
+        for must in ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]:
+            self.assertIn(must, kept)
 
 
 # =============================================================================
