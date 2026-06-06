@@ -80,7 +80,6 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
 # ---------------------------------------------------------------------------
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
 PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
-PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
 
 # ---------------------------------------------------------------------------
 # Re-read prevention: when a Read tool targets a file whose content was just
@@ -1026,7 +1025,7 @@ def _compress_middle_with_llm(messages, timeout=30):
 
 _summary_cache = {}
 _summary_cache_lock = threading.Lock()
-LOOP_BANNED_TOOLS = {}
+LOOP_CONSECUTIVE = {}
 _SUMMARY_CACHE_MAX_SESSIONS = 10
 _SUMMARY_CACHE_MAX_CHARS = 3000
 
@@ -1231,6 +1230,19 @@ def truncate_messages_if_needed(messages, session_id=None):
             "tool_count": tool_count,
             "file_mentions": len(file_mentions),
         }
+
+    # ---------- char strategy (and any other unhandled strategy) ----------
+    # Falls back to no-op truncation when strategy is "char" or anything other
+    # than rounds/fifo. The actual char-window implementation lives (misnamed)
+    # inside _apply_rounds_truncation above and is currently only invoked
+    # through that path. Returning a no-op stats dict here prevents the caller
+    # from hitting `TypeError: cannot unpack non-iterable NoneType object`.
+    return messages, {
+        "enabled": True,
+        "strategy": PROXY_CTX_TRUNCATE_STRATEGY,
+        "skipped": True,
+        "reason": "char_strategy_uses_noop_fallback",
+    }
 
 
 def _detect_blocker_pattern(messages):
@@ -2848,16 +2860,10 @@ class Handler(BaseHTTPRequestHandler):
         # REQ_SUMMARY with session_id
         tools_list = None
         raw_tools = body.get("tools", [])
-        session_id = getattr(_log_ctx, 'session_id', None)
-        if session_id and session_id in LOOP_BANNED_TOOLS:
-            banned = LOOP_BANNED_TOOLS[session_id]
-            if banned:
-                raw_tools = [t for t in raw_tools if isinstance(t, dict) and t.get("name", "") not in banned]
-                body["tools"] = raw_tools
-                log(f"  -> Banned tools filtered for session: {banned}")
         if raw_tools:
             tools_list = [t.get("name", "") for t in raw_tools if isinstance(t, dict)]
         session_prefix = getattr(_log_ctx, 'session_id', None) or ""
+        session_id = session_prefix
         total_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in body.get("messages", []))
         log(f"  [REQ_SUMMARY] chars={total_chars} tools={len(tools_list or [])}")
 
@@ -2937,37 +2943,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # Consecutive calls tracking (max_run)
         # Track both: (A) identical args per tool, (B) same text+tool_name pattern
-        #
-        # IMPORTANT: Only track within the current request, NOT the full session
-        # history.  Old assistant messages from prior turns would otherwise inflate
-        # max_run and trigger false-positive loop interventions.
-        # We identify the "current request" boundary as the last user message whose
-        # content blocks are all text (i.e. no tool_result blocks).
-        track_start_idx = 0
-        for i in range(len(raw_messages) - 1, -1, -1):
-            msg = raw_messages[i]
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                has_tool_result = any(
-                    block.get("type") == "tool_result" for block in content
-                    if isinstance(block, dict)
-                )
-                if not has_tool_result:
-                    track_start_idx = i
-                    break
-            elif isinstance(content, str) and content.strip():
-                track_start_idx = i
-                break
-        log(f"  -> Loop detection scope: messages[{track_start_idx}:] (skipping {track_start_idx} history msgs)")
-
-        consecutive = {}
+        # Scans ALL messages in raw_messages (full session history) to accumulate
+        # across requests within the same session.
+        consecutive = dict(LOOP_CONSECUTIVE.get(session_id, {}))
         max_run = 0
         pattern_run = 0
         last_pattern = None
         pattern_tool_name = None
-        for msg in raw_messages[track_start_idx:]:
+        for msg in raw_messages:
             if msg.get("role") != "assistant":
                 continue
             content = msg.get("content", "")
@@ -2985,8 +2968,6 @@ class Handler(BaseHTTPRequestHandler):
                         max_run = max(max_run, consecutive[key])
                     elif block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
-                for _ in tool_names_in_msg:
-                    consecutive = {}
                 pattern = ("".join(text_parts)[:200], tuple(sorted(set(tool_names_in_msg))))
                 if pattern == last_pattern and pattern[1]:
                     pattern_run += 1
@@ -3012,81 +2993,9 @@ class Handler(BaseHTTPRequestHandler):
             loop_keys = [k for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD]
             tool_name = loop_keys[0].split(":")[0] if loop_keys else (pattern_tool_name or "unknown")
 
-            if max_run >= PROXY_LOOP_LEVEL3:
-                # Level 3 (severe): suppress tool_use in last assistant, force text-only
-                log(f"  -> LOOP LEVEL 3: {tool_name} called {max_run} times, suppressing tool calls in last assistant")
-                suppressed = 0
-                already_has_suppression = False
-                new_content = []
-                for msg in reversed(raw_messages):
-                    if msg.get("role") == "assistant":
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            new_content = []
-                            suppressed = 0
-                            for block in content:
-                                if block.get("type") == "tool_use":
-                                    suppressed += 1
-                                else:
-                                    new_content.append(block)
-                            already_has_suppression = any(
-                                "STOP" in b.get("text", "") or "suppressed" in b.get("text", "")
-                                for b in new_content if isinstance(b, dict)
-                            )
-                            if suppressed > 0 and not already_has_suppression:
-                                new_content.append({
-                                    "type": "text",
-                                    "text": f"[System: {suppressed} tool call(s) suppressed — loop detected ({tool_name} x{max_run}). "
-                                            f"STOP. Reply to the user in plain text only. "
-                                            f"Do NOT call any tools. State the current status and ask for the user's next instruction.]"
-                                })
-                                msg["content"] = new_content
-                        break
-                last_user = None
-                for m in reversed(raw_messages):
-                    if m.get("role") == "user":
-                        last_user = m
-                        break
-                last_user_is_loop = False
-                if last_user:
-                    uc = last_user.get("content", "")
-                    if isinstance(uc, str) and "CRITICAL: Loop detected" in uc:
-                        last_user_is_loop = True
-                    elif isinstance(uc, list):
-                        for b in uc:
-                            if isinstance(b, dict) and b.get("type") == "text" and "CRITICAL: Loop detected" in b.get("text", ""):
-                                last_user_is_loop = True
-                                break
-                if not last_user_is_loop:
-                    raw_messages.append({
-                        "role": "user",
-                        "content": [{"type": "text", "text":
-                            f"[CRITICAL: Loop detected. '{tool_name}' called {max_run} times consecutively. "
-                            f"DO NOT call any tools. "
-                            f"Reply to the user with a plain text status summary and wait for the user's next instruction.]"
-                        }]
-                    })
-                loop_level = 3
-                log(f"  -> LEVEL 3 injected: suppressed={suppressed}, tool={tool_name}, already_suppressed={last_user_is_loop or already_has_suppression}, msg_text='{new_content[-1]['text'][:120]}...'")
-                consecutive = {}
-                max_run = 0
-                if session_id:
-                    if session_id not in LOOP_BANNED_TOOLS:
-                        LOOP_BANNED_TOOLS[session_id] = set()
-                    LOOP_BANNED_TOOLS[session_id].add(tool_name)
-                    log(f"  -> Tool '{tool_name}' permanently banned for session {session_id}")
-                if raw_tools:
-                    filtered_tools = []
-                    for t in raw_tools:
-                        if isinstance(t, dict) and t.get("name", "") == tool_name:
-                            pass
-                        else:
-                            filtered_tools.append(t)
-                    body["tools"] = filtered_tools
-                    log(f"    LEVEL 3 also removed {tool_name} from tools list to prevent recurrence")
-            elif max_run >= PROXY_LOOP_LEVEL2:
+            if max_run >= PROXY_LOOP_LEVEL2:
                 # Level 2 (medium): remove looping tool from tools list + strong message
-                log(f"  -> LOOP LEVEL 2: {tool_name} called {max_run} times, removing tool + injecting strong break")
+                log(f"  -> LOOP LEVEL 2: tool={tool_name} key={loop_keys[0]} max_run={max_run} consecutive={dict(consecutive)}")
                 removed_count = 0
                 if raw_tools:
                     filtered_tools = []
@@ -3108,10 +3017,11 @@ class Handler(BaseHTTPRequestHandler):
                         f"If you are stuck, describe the problem and ask for guidance.]"
                     }]
                 })
+
                 loop_level = 2
             else:
                 # Level 1 (mild): enhanced break message
-                log(f"  -> LOOP LEVEL 1: {tool_name} called {max_run} times, injecting break message")
+                log(f"  -> LOOP LEVEL 1: tool={tool_name} key={loop_keys[0]} max_run={max_run} consecutive={dict(consecutive)}")
                 raw_messages.append({
                     "role": "user",
                     "content": [{"type": "text", "text":
@@ -3125,6 +3035,9 @@ class Handler(BaseHTTPRequestHandler):
             _mc_put("loop_detect", {"max_run": max_run, "level": loop_level, "tool": tool_name})
         else:
             _mc_put("loop_detect", {"max_run": max_run})
+        if session_id:
+            LOOP_CONSECUTIVE[session_id] = dict(consecutive)
+            log(f"  -> Loop counts persisted for session: {dict(consecutive)}")
 
         # Blocker detection: same-error-type consecutive tool_result rejections
         blocker_info = _detect_blocker_pattern(raw_messages)
