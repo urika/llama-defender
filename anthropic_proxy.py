@@ -2752,6 +2752,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                if not getattr(self, "_request_id", None):
+                    self._request_id = f"req_{os.urandom(8).hex()}"
+                self.send_header("request-id", self._request_id)
                 self.end_headers()
                 self.wfile.write(html.encode("utf-8"))
             else:
@@ -3273,6 +3276,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_request_id", None):
+            self._request_id = f"req_{os.urandom(8).hex()}"
+        self.send_header("request-id", self._request_id)
         self.end_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
@@ -3507,6 +3513,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_request_id", None):
+            self._request_id = f"req_{os.urandom(8).hex()}"
+        self.send_header("request-id", self._request_id)
         self.end_headers()
         raw = json.dumps(data, ensure_ascii=False)
         log(f"  <- Response body: {raw[:500]}")
