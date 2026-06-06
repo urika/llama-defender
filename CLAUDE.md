@@ -113,21 +113,20 @@ When using DeepSeek's Anthropic-compatible endpoint, `claude-opus` maps to
   A typical agentic coding task (56K tokens × 20 requests) costs approximately
   ¥1–3. Monitor via `REQ_SUMMARY` lines in proxy logs.
 - **MTP (Multi-Token Prediction)**: Qwen3.6 supports MTP for ~1.15–1.4× faster generation. Requires MTP-specific GGUF models and a llama-server built from source with `--spec-type draft-mtp` support (Brew version lacks this). Use `--spec-type draft-mtp --spec-draft-n-max 2` in `LLAMA_EXTRA_ARGS`. Config: `qwen3.6-27b-mtp.conf`. Performance benchmark: `python3 tools/bench_mtp.py --quick`.
-- **Testing**: unit tests at `tools/test_proxy_fallback.py` (`python3 tools/test_proxy_fallback.py`); blocker integration matrix at `tools/test_blocker_integration.sh` (uses `tools/mock_backend.py`, no LLM needed); end-to-end at `tools/e2e_tools_fallback.sh` (requires proxy + backend running). When modifying `anthropic_proxy.py`, run all three — tool-call paths (streaming and non-streaming), blocker detection, and cloud mode (e.g., `./manage.sh start-cloud`) are all easy to break.
+- **Testing**: all tests live under `test/` with three tiers — `test/unit/` (pure logic, no I/O, runs in <1s), `test/integration/` (boots a mock backend, no LLM needed, ~5s), `test/e2e/` (requires a running proxy + backend, ~30-60s). Unified runner at `test/run_tests.sh` with `--unit`/`--integration`/`--e2e`/`--all` flags. A pre-commit hook at `.githooks/pre-commit` runs `--unit` on every commit; install via `git config core.hooksPath .githooks`. Skip with `SKIP_TESTS=1 git commit …` (or `git commit --no-verify` to bypass all hooks). When modifying `anthropic_proxy.py`, run all three tiers — tool-call paths (streaming and non-streaming), blocker detection, and cloud mode (e.g., `./manage.sh start-cloud`) are all easy to break.
 
 ## Tools
 
 | Script | Purpose |
 |--------|---------|
 | `tools/bench_mtp.py` | MTP model performance benchmark (local + HF models, draft-n sweep) |
-| `tools/test_proxy_fallback.py` | Unit tests for proxy tool-call fallback + blocker logic |
-| `tools/test_blocker_integration.sh` | Blocker detection integration matrix (7 cases, mock-backend driven) |
-| `tools/mock_backend.py` | Mock OpenAI backend for blocker integration tests |
-| `tools/e2e_tools_fallback.sh` | End-to-end proxy tool-call test (needs running backend) |
 | `tools/logview.sh` | Unified log viewer for backend and proxy logs |
 | `tools/sysmon.sh` | System monitoring (memory, CPU, disk, processes) |
 | `tools/modelmon.sh` | Model service monitoring (process, download, API health) |
 | `tools/memcheck.sh` | Detailed memory analysis (`vm_stat` breakdown) |
+
+All automated tests live under `test/` (see `test/README.md`); the pre-commit hook
+at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.
 
 ## Building llama-server from source
 

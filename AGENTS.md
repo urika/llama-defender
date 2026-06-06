@@ -66,14 +66,17 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   └── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
 ├── tools/
 │   ├── bench_mtp.py                # MTP model performance benchmark
-│   ├── test_proxy_fallback.py      # Unit tests for proxy fallback + blocker
-│   ├── e2e_tools_fallback.sh       # End-to-end proxy tool-call test
-│   ├── test_blocker_integration.sh # Blocker detection integration matrix
-│   ├── mock_backend.py             # Mock OpenAI backend for integration tests
 │   ├── logview.sh                  # Unified log viewer
 │   ├── sysmon.sh                   # System monitoring (memory, CPU, disk)
 │   ├── modelmon.sh                 # Model service monitoring
 │   └── memcheck.sh                 # Detailed memory analysis
+├── test/                          # Automated tests (see test/README.md)
+│   ├── run_tests.sh               # Unified tier-based runner
+│   ├── unit/                      # Pure logic, no I/O (<1s)
+│   ├── integration/               # Mock backend, no LLM (~5s)
+│   └── e2e/                       # Requires running proxy + backend
+├── .githooks/
+│   └── pre-commit                 # Pre-commit gate: runs --unit on every commit
 ├── BENCHMARK.md               # Performance test report (Chinese)
 └── CLAUDE.md                  # Legacy agent guide (keep in sync)
 ```
@@ -340,14 +343,13 @@ Disabled by default for cloud backends (1M+ context, low marginal value).
 | Script | Purpose | How to run |
 |--------|---------|------------|
 | `bench_mtp.py` | MTP model performance benchmark | `python3 tools/bench_mtp.py --quick` |
-| `test_proxy_fallback.py` | Unit tests for proxy fallback + blocker | `python3 tools/test_proxy_fallback.py` |
-| `e2e_tools_fallback.sh` | End-to-end proxy tool-call test | `bash tools/e2e_tools_fallback.sh` (needs running backend) |
-| `test_blocker_integration.sh` | Blocker detection integration matrix (7 cases) | `bash tools/test_blocker_integration.sh` |
-| `mock_backend.py` | Mock OpenAI backend for integration tests | `python3 tools/mock_backend.py [PORT]` |
 | `logview.sh` | Unified log viewer | `./tools/logview.sh backend 100` |
 | `sysmon.sh` | System monitoring | `./tools/sysmon.sh` |
 | `modelmon.sh` | Model service monitoring | `./tools/modelmon.sh` |
 | `memcheck.sh` | Detailed memory analysis | `./tools/memcheck.sh` |
+
+All automated tests live under `test/` (see `test/README.md`); the pre-commit hook
+at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.
 
 ---
 
@@ -382,42 +384,67 @@ Disabled by default for cloud backends (1M+ context, low marginal value).
 
 ## Testing Strategy
 
+All automated tests live under `test/` (see `test/README.md` for the full layout
+and pre-commit instructions). Three tiers, in order of speed/cost:
+
+| Tier          | Location                  | Runtime | What it needs                              |
+|---------------|---------------------------|---------|--------------------------------------------|
+| **unit**      | `test/unit/`              | <1s     | nothing (no I/O)                           |
+| **integration** | `test/integration/`     | ~5s     | nothing (boots its own mock backend)       |
+| **e2e**       | `test/e2e/`               | ~30-60s | a running proxy (port 4000) + backend      |
+
+A pre-commit hook at `.githooks/pre-commit` runs the **unit** tier on every
+`git commit`. Install with `git config core.hooksPath .githooks` on a fresh
+clone. Skip with `SKIP_TESTS=1 git commit …` or `git commit --no-verify`.
+
+### Unified runner
+
+```bash
+bash test/run_tests.sh --unit          # default if no flag
+bash test/run_tests.sh --integration
+bash test/run_tests.sh --e2e
+bash test/run_tests.sh --all           # unit + integration + e2e
+bash test/run_tests.sh --fast          # alias for --unit (pre-commit uses this)
+```
+
 ### Unit tests
 
-`tools/test_proxy_fallback.py` contains `unittest` tests for:
+`test/unit/test_proxy_fallback.py` contains `unittest` tests for:
 - `_extract_content_tool_calls` (non-streaming `<tools>` fallback)
 - `_StreamingToolsExtractor` (streaming state machine)
 - `convert_openai_response_to_anthropic` (full response conversion)
 - `_detect_blocker_pattern` (blocker detection — same-type run, mixed types, threshold, breaks)
 - `_build_blocker_message` (cache-stability, tool/error metadata)
 - `_compress_middle_with_llm` prompt structure (`Root cause:`/`Fix:`/`Avoidance:`)
+- `truncate_messages_if_needed` (FIFO placeholder cache-stability)
 
-Run with:
+Run directly:
 ```bash
-python3 tools/test_proxy_fallback.py
+python3 test/unit/test_proxy_fallback.py
 # or
-python3 -m unittest discover -s tools -p 'test_*.py' -v
+python3 -m unittest discover -s test/unit -p 'test_*.py' -v
 ```
 
 ### End-to-end tests
 
-`tools/e2e_tools_fallback.sh` hits the live proxy (requires backend + proxy
+`test/e2e/e2e_tools_fallback.sh` hits the live proxy (requires backend + proxy
 running) and validates:
 1. Non-streaming tool call returns correct `tool_use` block
 2. Streaming tool call emits correct SSE event sequence
 3. Plain chat without tools still works
 
-Run with:
-```bash
-bash tools/e2e_tools_fallback.sh
-```
+`test/e2e/test_proxy_integration.py` is a 12-case matrix covering route
+discovery, simple chat, Chinese, tool use, multi-turn tool flows, streaming,
+session continuity, concurrency, count_tokens, long context, special chars,
+and Anthropic SDK headers. Both sub-suites run under `test/run_tests.sh --e2e`.
 
 ### Blocker integration matrix
 
-`tools/test_blocker_integration.sh` boots `tools/mock_backend.py` (a tiny
-OpenAI-compatible mock) and the proxy once, then runs 7 test cases against
-the running proxy, asserting that the `[BLOCKER]` user message is (or is
-not) injected into the body forwarded to the backend:
+`test/integration/test_blocker_integration.sh` boots
+`test/integration/mock_backend.py` (a tiny OpenAI-compatible mock) and the
+proxy once, then runs 7 test cases against the running proxy, asserting that
+the `[BLOCKER]` user message is (or is not) injected into the body forwarded
+to the backend:
 
 | TC | Scenario | Expected |
 |----|----------|----------|
@@ -433,12 +460,6 @@ The script also dumps a per-request metrics summary from
 `logs/itest/proxy_metrics.jsonl` showing which requests triggered the
 blocker and why. No real LLM is required.
 
-Run with:
-```bash
-bash tools/test_blocker_integration.sh
-# exit code 0 = all pass
-```
-
 ### Manual validation
 
 1. **Backend health**: `./manage.sh status` checks process + API endpoint.
@@ -447,8 +468,9 @@ bash tools/test_blocker_integration.sh
    response format and content.
 4. **Benchmarking**: `python3 tools/bench_mtp.py --quick` measures MTP throughput.
 
-When modifying `anthropic_proxy.py`, run **both** unit tests and e2e tests,
-for both streaming and non-streaming paths, with and without tool calls.
+When modifying `anthropic_proxy.py`, run **all three tiers** (`bash test/run_tests.sh --all`),
+covering both streaming and non-streaming paths, with and without tool calls,
+in both local and cloud modes.
 
 When modifying `manage.sh`, test `start`, `stop`, `restart`, `switch`, and
 `status` for both backends.
@@ -553,10 +575,10 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
 - [ ] If you change backend startup flags in `manage.sh`, test `start`, `stop`,
       `restart`, and `status` for both `llama-server` and `rapid-mlx` backends.
       Also test `start-cloud` and cloud-mode `status`.
-- [ ] If you modify `anthropic_proxy.py`, run `python3 tools/test_proxy_fallback.py`,
-      `bash tools/test_blocker_integration.sh` (uses mock backend, no LLM needed),
-      and `bash tools/e2e_tools_fallback.sh` (with proxy + backend running).
-      Test both local and cloud modes.
+- [ ] If you modify `anthropic_proxy.py`, run `bash test/run_tests.sh --all`
+      (covers unit, integration, and e2e tiers — the e2e tier needs a running
+      proxy + backend). Test both local and cloud modes. The pre-commit hook
+      runs only `--unit` for speed; manually run the other tiers before push.
 - [ ] If you add a new config variable, add it to the defaults in `manage.sh` and
       document it in `CLAUDE.md` and this file.
 - [ ] When adding a new backend type (cloud API provider), ensure `BACKEND_TYPE`
