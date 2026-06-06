@@ -16,7 +16,7 @@ Configurable via env vars:
   MOCK_USAGE_COMPLETION  (default: 20)
 
 Run:
-  python3 tools/mock_backend.py [PORT]
+  python3 test/integration/mock_backend.py [PORT]
 """
 import json
 import os
@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CAPTURE_PATH = os.environ.get(
     "MOCK_CAPTURE_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "..", "logs", "itest", "mock_capture.jsonl"),
+                 "..", "..", "logs", "itest", "mock_capture.jsonl"),
 )
 CAPTURE_LOCK = threading.Lock()
 

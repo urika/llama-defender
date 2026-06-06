@@ -4,11 +4,16 @@
 # Boots a mock OpenAI backend and the proxy once, then runs a
 # matrix of test cases that drive different request patterns
 # and assert the [BLOCKER] user message is (or isn't) injected.
+#
+# Lives under test/integration/ — run via:
+#     bash test/run_tests.sh --integration
+# or directly:
+#     bash test/integration/test_blocker_integration.sh
 # ============================================================
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/logs/itest"
 MOCK_PORT="${MOCK_PORT:-8089}"
 PROXY_PORT="${PROXY_PORT:-4001}"

@@ -2,6 +2,11 @@
 # ============================================================
 # End-to-end test for anthropic_proxy.py <tools> fallback.
 # Hits the live proxy on 4000 (which forwards to llama-server:8081).
+#
+# Lives under test/e2e/ — run via:
+#     bash test/run_tests.sh --e2e
+# or directly:
+#     bash test/e2e/e2e_tools_fallback.sh
 # ============================================================
 
 set -euo pipefail

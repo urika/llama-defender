@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration test suite for the running anthropic_proxy.
+"""End-to-end test suite for the running anthropic_proxy.
 
 Exercises the live HTTP server on http://127.0.0.1:4000 (or whatever
 PROXY_BASE points at) and reports a PASS/FAIL matrix covering:
@@ -15,9 +15,11 @@ PROXY_BASE points at) and reports a PASS/FAIL matrix covering:
     - request-id response header (Anthropic API parity)
 
 Run directly:
-    python3 tools/test_proxy_integration.py
+    python3 test/e2e/test_proxy_integration.py
 Or with a custom base URL:
-    PROXY_BASE=http://localhost:4000 python3 tools/test_proxy_integration.py
+    PROXY_BASE=http://localhost:4000 python3 test/e2e/test_proxy_integration.py
+Or via the unified runner (requires running proxy + backend):
+    bash test/run_tests.sh --e2e
 
 Exit code is 0 on full pass, 1 if any case fails.
 """

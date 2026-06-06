@@ -2,9 +2,11 @@
 """Unit tests for anthropic_proxy's content-tools fallback.
 
 Run directly:
-    python3 tools/test_proxy_fallback.py
+    python3 test/unit/test_proxy_fallback.py
 Or via unittest discovery from repo root:
-    python3 -m unittest discover -s tools -p 'test_*.py' -v
+    python3 -m unittest discover -s test/unit -p 'test_*.py' -v
+Or via the unified runner:
+    bash test/run_tests.sh --unit
 """
 import json
 import os
@@ -12,8 +14,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
-# Make sibling anthropic_proxy.py importable.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Walk up to the repo root (test/unit/ → test/ → repo root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
