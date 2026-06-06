@@ -593,5 +593,214 @@ class TestFifoPlaceholderStability(unittest.TestCase):
         self.assertGreater(stats["dropped_messages"], 0)
 
 
+# =============================================================================
+# R2.1 — Loop intervention (Level 1 + Level 2 escalation)
+# =============================================================================
+class TestLoopIntervention(unittest.TestCase):
+    """Covers _apply_loop_intervention — extracted from _handle_messages
+    so we can assert on the level-mapping rules in isolation.
+    """
+
+    def _tool(self, name):
+        return {"name": name, "description": "fake", "input_schema": {"type": "object"}}
+
+    def test_level1_injects_stop_message_and_keeps_tool(self):
+        """max_run == threshold (3) and < LEVEL2 (6) → Level 1.
+        The user message must mention 'STOP using' and the tool must remain
+        in the tools list (Level 1 does not remove it)."""
+        consecutive = {"Read:{\"/x.py\"}": 3}
+        tools = [self._tool("Read"), self._tool("Bash")]
+        msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=[],
+            raw_tools=tools,
+            max_run=3,
+            consecutive=consecutive,
+            threshold=3, level2_threshold=6,
+        )
+        self.assertEqual(level, 1)
+        self.assertEqual(tool_name, "Read")
+        # The new user message was appended.
+        self.assertEqual(len(msgs), 1)
+        text = msgs[0]["content"][0]["text"]
+        self.assertIn("STOP using Read", text)
+        self.assertIn("[System notice:", text)
+        # Tools list is unchanged at Level 1.
+        self.assertEqual(new_tools, tools)
+
+    def test_level2_removes_tool_and_emits_strong_message(self):
+        """max_run == LEVEL2 (6) → Level 2.
+        The looping tool must be filtered out of the tools list and the
+        message must use the 'REMOVED' wording."""
+        consecutive = {"Read:{\"/x.py\"}": 6}
+        tools = [self._tool("Read"), self._tool("Bash"), self._tool("Glob")]
+        msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=[{"role": "user", "content": "do the thing"}],
+            raw_tools=tools,
+            max_run=6,
+            consecutive=consecutive,
+            threshold=3, level2_threshold=6,
+        )
+        self.assertEqual(level, 2)
+        self.assertEqual(tool_name, "Read")
+        # Tool removed.
+        self.assertEqual([t["name"] for t in new_tools], ["Bash", "Glob"])
+        # Strong message injected (replaces the Level-1 message).
+        text = msgs[-1]["content"][0]["text"]
+        self.assertIn("REMOVED", text)
+        self.assertIn("Read", text)
+        self.assertIn("MUST use a different approach", text)
+        # Original message preserved.
+        self.assertEqual(msgs[0], {"role": "user", "content": "do the thing"})
+
+    def test_below_threshold_is_a_pure_noop(self):
+        """max_run < threshold → no message added, no tool removed,
+        level == 0, tool_name == ''."""
+        consecutive = {"Read:{\"/x.py\"}": 2}
+        tools = [self._tool("Read"), self._tool("Bash")]
+        msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=[{"role": "user", "content": "hi"}],
+            raw_tools=tools,
+            max_run=2,
+            consecutive=consecutive,
+            threshold=3, level2_threshold=6,
+        )
+        self.assertEqual(level, 0)
+        self.assertEqual(tool_name, "")
+        # No new user message; the original is untouched.
+        self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
+        self.assertEqual(new_tools, tools)
+
+
+# =============================================================================
+# R4.4 — _repair_truncated_json (7 cases)
+# =============================================================================
+class TestRepairTruncatedJson(unittest.TestCase):
+    """Covers _repair_truncated_json — invoked when Qwen's tool_call
+    arguments JSON is cut off mid-stream."""
+
+    def test_empty_input_returns_empty_dict(self):
+        self.assertEqual(proxy._repair_truncated_json(""), "{}")
+        self.assertEqual(proxy._repair_truncated_json("   "), "{}")
+        self.assertEqual(proxy._repair_truncated_json(None), "{}")
+
+    def test_complete_json_unchanged(self):
+        # Well-formed inputs are returned verbatim.
+        ok = '{"a": 1, "b": [2, 3]}'
+        self.assertEqual(proxy._repair_truncated_json(ok), ok)
+
+    def test_unclosed_string_closes_quote_and_brace(self):
+        # The string was never closed (e.g. arguments cut after `{"file": "`).
+        # Repair should append `"` then `}`.
+        out = proxy._repair_truncated_json('{"file": "/tmp/x')
+        parsed = json.loads(out)
+        self.assertEqual(parsed, {"file": "/tmp/x"})
+
+    def test_unclosed_brace_adds_closing_brace(self):
+        # No unclosed string, but one too few `}`s.
+        out = proxy._repair_truncated_json('{"a": 1, "b": 2')
+        parsed = json.loads(out)
+        self.assertEqual(parsed, {"a": 1, "b": 2})
+
+    def test_nested_truncation_closes_multiple_levels(self):
+        # depth=2 (object inside object) → must add two `}`s.
+        # (Note: _repair_truncated_json only emits `}` to close, not `]`,
+        # so we avoid trailing-`[` inputs here — that case is a known
+        # limitation of the current implementation.)
+        out = proxy._repair_truncated_json('{"outer": {"inner": 1, "a": 2')
+        parsed = json.loads(out)
+        self.assertEqual(parsed, {"outer": {"inner": 1, "a": 2}})
+
+    def test_escape_sequence_does_not_falsely_close(self):
+        # The function tracks `in_string` correctly across `\\` and `\"` —
+        # a JSON `"\""` should NOT be treated as ending the string.
+        out = proxy._repair_truncated_json(r'{"msg": "say \"hello\"')
+        parsed = json.loads(out)
+        self.assertEqual(parsed, {"msg": 'say "hello"'})
+
+    def test_whitespace_only_input_returns_empty_dict(self):
+        # Newlines and tabs are stripped; if nothing remains we get "{}".
+        self.assertEqual(proxy._repair_truncated_json("\n\t  \n"), "{}")
+
+
+# =============================================================================
+# R6.1 / R6.2 — structured metrics + quality_flags
+# =============================================================================
+class TestMetrics(unittest.TestCase):
+    """Covers log_metrics (R6.1) and _finalize_metrics quality_flags (R6.2)."""
+
+    def setUp(self):
+        # Redirect PROXY_METRICS_DIR to a temp file so log_metrics doesn't
+        # touch the real logs/proxy_metrics.jsonl.
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._metrics_path = os.path.join(self._tmpdir, "metrics.jsonl")
+        self._patches = [
+            patch.object(proxy, "_METRICS_PATH", self._metrics_path),
+            patch.object(proxy, "_ensure_jsonl_dir", lambda: None),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_log_metrics_writes_valid_jsonl_line(self):
+        """R6.1: a metrics dict is serialized as one line of valid JSON
+        and appended to the configured metrics file."""
+        proxy.log_metrics({
+            "session_id": "sess_abc",
+            "input_msgs": 42,
+            "input_chars": 1000,
+            "input_tools": 15,
+            "pipeline": {"tool_filter": {"original": 44, "kept": 15}},
+            "compression_ratio": 0.74,
+            "quality_flags": ["loop_injected"],
+        })
+        with open(self._metrics_path) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        # Required fields per PRD §5.8 schema are all present and well-typed.
+        self.assertEqual(record["session_id"], "sess_abc")
+        self.assertEqual(record["input_msgs"], 42)
+        self.assertEqual(record["input_tools"], 15)
+        self.assertEqual(record["compression_ratio"], 0.74)
+        self.assertEqual(record["quality_flags"], ["loop_injected"])
+        self.assertIn("tool_filter", record["pipeline"])
+
+    def test_finalize_metrics_quality_flags(self):
+        """R6.2: _finalize_metrics derives the four quality_flags from
+        the pipeline state. Verify each flag is correctly emitted under
+        the conditions that should trigger it, and stays absent otherwise."""
+        # (a) high_drop_ratio: dropped / (dropped + kept) > 0.7
+        mc_a = {"pipeline": {"truncate": {"triggered": True, "dropped": 80, "kept": 10, "compression": "llm",
+                                          "est_tokens_after": 5000, "budget": 5000}}}
+        proxy._finalize_metrics(mc_a)
+        self.assertIn("high_drop_ratio", mc_a["quality_flags"])
+        # (b) llm_compress_failed: compression in {rules, folded} and dropped >= 10
+        mc_b = {"pipeline": {"truncate": {"triggered": True, "dropped": 12, "kept": 5, "compression": "folded",
+                                          "est_tokens_after": 3000, "budget": 5000}}}
+        proxy._finalize_metrics(mc_b)
+        self.assertIn("llm_compress_failed", mc_b["quality_flags"])
+        # (c) budget_overflow: est_after > budget * 1.1
+        mc_c = {"pipeline": {"truncate": {"triggered": True, "dropped": 5, "kept": 20, "compression": "llm",
+                                          "est_tokens_after": 6000, "budget": 5000}}}
+        proxy._finalize_metrics(mc_c)
+        self.assertIn("budget_overflow", mc_c["quality_flags"])
+        # (d) loop_injected: loop_detect.max_run >= PROXY_LOOP_THRESHOLD (default 3)
+        mc_d = {"pipeline": {"truncate": {"triggered": False, "dropped": 0, "kept": 0,
+                                          "est_tokens_after": 0, "budget": 0},
+                             "loop_detect": {"max_run": 5}}}
+        proxy._finalize_metrics(mc_d)
+        self.assertIn("loop_injected", mc_d["quality_flags"])
+        # (e) clean request: no flag should fire
+        mc_e = {"pipeline": {"truncate": {"triggered": False, "dropped": 0, "kept": 0,
+                                          "est_tokens_after": 0, "budget": 0},
+                             "loop_detect": {"max_run": 1}}}
+        proxy._finalize_metrics(mc_e)
+        self.assertEqual(mc_e["quality_flags"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
