@@ -155,6 +155,25 @@ run_e2e() {
 }
 
 # ------------------------------------------------------------
+# Tier 4: requirement traceability (--strict exits non-zero on issues)
+# ------------------------------------------------------------
+run_trace() {
+  print_banner "Requirement traceability (tools/trace_requirements.py)"
+  local out rc
+  out=$(python3 "$REPO_ROOT/tools/trace_requirements.py" --strict 2>&1)
+  rc=$?
+  echo "$out" | tail -20
+  if [[ $rc -ne 0 ]]; then
+    record "trace" "fail" "trace_requirements.py --strict exited $rc"
+    return
+  fi
+  # Parse the "N requirements, M with code anchor, K with test coverage" line.
+  local summary
+  summary=$(echo "$out" | grep -E "^\*\*[0-9]+ requirements" | tail -1)
+  record "trace" "ok" "${summary#\*\*}"
+}
+
+# ------------------------------------------------------------
 # Main dispatch
 # ------------------------------------------------------------
 usage() {
@@ -165,7 +184,8 @@ Tiers:
   --unit          Pure logic tests (default if no flag given)
   --integration   Boots a mock backend, no LLM needed
   --e2e           Requires a running proxy + backend
-  --all           Run all tiers in order (--unit then --integration then --e2e)
+  --trace         Requirement traceability matrix (docs/requirements.yaml)
+  --all           Run all tiers in order
   --fast          Alias for --unit (used by pre-commit hook)
   -h, --help      Show this help
 
@@ -184,6 +204,7 @@ main() {
     --unit)         run_unit ;;
     --integration)  run_integration ;;
     --e2e)          run_e2e ;;
+    --trace)        run_trace ;;
     --all)
       run_unit
       echo ""
@@ -195,6 +216,8 @@ main() {
       else
         run_e2e
       fi
+      echo ""
+      run_trace
       ;;
     --fast) run_unit ;;
     *)
@@ -204,7 +227,7 @@ main() {
       ;;
   esac
 
-  # Summary
+  # Summary  # Summary
   echo ""
   print_banner "Summary"
   local total=0 failed=0

@@ -594,6 +594,384 @@ class TestFifoPlaceholderStability(unittest.TestCase):
 
 
 # =============================================================================
+# R2.2 / R2.3 — clear_old_tool_results (smart clearing + recent Read protection)
+# =============================================================================
+class TestToolClearing(unittest.TestCase):
+    """Covers clear_old_tool_results — the proxy-side tool_result trim
+    with semantic priority scoring. Verifies the 200-char Read preview
+    (R2.2) and the +5 boost for the 6 most recent Read results (R2.3)."""
+
+    def setUp(self):
+        # Force clearing ON with a small KEEP and a tiny threshold so
+        # every test case actually triggers the clear pass. Read preview
+        # length stays at the production default (200 chars).
+        self._patches = [
+            patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
+            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0),
+            patch.object(proxy, "PROXY_TOOL_KEEP", 2),
+            patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _msgs_with(self, n_reads, n_bash=0):
+        """Build an Anthropic-format message list with `n_reads` Read
+        tool_use + tool_result pairs and `n_bash` Bash pairs.
+
+        Each Read's content includes a unique fingerprint so the Bash-dedup
+        pass (which keys on content similarity) does not merge distinct
+        results together. Read content is long enough to trigger the
+        200-char preview suffix on cleared entries."""
+        msgs = []
+        for i in range(n_reads):
+            path = f"/tmp/file_{i}.py"
+            long_content = (
+                f"FILE_{i}_MARKER " + ("the quick brown fox jumps over the lazy dog. " * 10)
+            )  # 460+ chars; unique marker per file
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": f"tu_r{i}",
+                              "name": "Read", "input": {"file_path": path}}],
+            })
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": f"tu_r{i}",
+                              "content": long_content}],
+            })
+        for i in range(n_bash):
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": f"tu_b{i}",
+                              "name": "Bash", "input": {"command": f"ls {i}"}}],
+            })
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": f"tu_b{i}",
+                              "content": f"BASH_{i}_MARKER " + "x" * 500}],
+            })
+        return msgs
+
+    def test_read_cleared_keeps_200_char_preview(self):
+        """R2.2: a cleared Read tool_result retains a 200-char preview
+        (followed by '...' since the original was >200 chars) so the
+        model can re-use the result without re-reading."""
+        msgs = self._msgs_with(n_reads=4)  # 4 reads → only 2 kept
+        msgs, stats = proxy.clear_old_tool_results(msgs)
+        self.assertEqual(stats["kept"], 2)
+        # Find cleared Read results — they start with "[cleared:" AND
+        # contain a FILE_N marker (the original content preview).
+        cleared_reads = [
+            b for m in msgs for b in m.get("content", [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+            and "FILE_" in str(b.get("content", ""))  # preview contains the marker
+            and str(b.get("content", "")).startswith("[cleared:")
+        ]
+        self.assertGreaterEqual(len(cleared_reads), 1)
+        # The cleared block's content is "[cleared: Read(...)]\\n{preview}".
+        # preview = 200 chars + "..." = 203 chars.
+        text = str(cleared_reads[0]["content"])
+        parts = text.split("\n", 1)
+        self.assertEqual(len(parts), 2)
+        # First line is the [cleared: Read(...)] header.
+        self.assertTrue(parts[0].startswith("[cleared: Read"))
+        # Second line is the preview: exactly 200 chars + "..." = 203.
+        self.assertEqual(len(parts[1]), 203)
+        self.assertTrue(parts[1].endswith("..."))
+
+    def test_non_read_cleared_replaced_with_placeholder_only(self):
+        """R2.2: a cleared Bash tool_result has NO preview, just the
+        [cleared: ...] placeholder. The model must re-run Bash if it
+        needs the output back."""
+        msgs = self._msgs_with(n_reads=2, n_bash=4)
+        # 6 tool_results total, KEEP=2 → 4 cleared.
+        msgs, stats = proxy.clear_old_tool_results(msgs)
+        self.assertEqual(stats["kept"], 2)
+        # Find tool_results that are CLEARED (start with "[cleared:").
+        cleared = [
+            b for m in msgs for b in m.get("content", [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+            and str(b.get("content", "")).startswith("[cleared:")
+        ]
+        # 4 cleared entries.
+        self.assertEqual(len(cleared), 4)
+        # The 2 cleared Read entries DO have a preview (multi-line);
+        # the 2 cleared Bash entries do NOT (single-line placeholder).
+        bash_cleared = [b for b in cleared
+                        if "Bash" in str(b["content"])]
+        self.assertGreaterEqual(len(bash_cleared), 1)
+        for block in bash_cleared:
+            self.assertNotIn("\n", block["content"])
+            self.assertNotIn("...", block["content"])
+
+    def test_recent_reads_get_5_point_bonus_and_are_kept(self):
+        """R2.3: the 6 most recent Read results get a +5 semantic bonus
+        so they survive the keep-top-N trim. With 5 Reads + KEEP=2,
+        the two MOST RECENT (FILE_3, FILE_4) survive; FILE_0..FILE_2
+        are cleared. The dedup pass on the kept results keeps both
+        because their content is unique per-file."""
+        msgs = self._msgs_with(n_reads=5)
+        msgs, stats = proxy.clear_old_tool_results(msgs)
+        self.assertEqual(stats["kept"], 2)
+        # Identify kept tool_results: they were NOT replaced with
+        # "[cleared: ..." and still contain their original marker.
+        kept = [
+            b for m in msgs for b in m.get("content", [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+            and not str(b.get("content", "")).startswith("[cleared:")
+        ]
+        # After dedup, the two kept Read results should be FILE_3 and
+        # FILE_4 (the most recent — they got the +5 boost).
+        kept_text = " ".join(str(b["content"]) for b in kept)
+        self.assertIn("FILE_3_MARKER", kept_text)
+        self.assertIn("FILE_4_MARKER", kept_text)
+        # FILE_0, FILE_1, FILE_2 should NOT appear in kept (they're
+        # cleared and only show up in the preview portion).
+        for old in ["FILE_0_MARKER ", "FILE_1_MARKER ", "FILE_2_MARKER "]:
+            self.assertNotIn(old, kept_text)
+
+    def test_disabled_returns_immediately(self):
+        """R2.2: when PROXY_CLEAR_ENABLED is False, the function is a
+        no-op — no clearing, no scoring, stats.enabled=False."""
+        with patch.object(proxy, "PROXY_CLEAR_ENABLED", False):
+            msgs = self._msgs_with(n_reads=4)
+            original = [m for m in msgs]  # shallow copy
+            msgs, stats = proxy.clear_old_tool_results(msgs)
+            self.assertFalse(stats["enabled"])
+            self.assertEqual(msgs, original)  # untouched
+
+
+# =============================================================================
+# R4.1 — parse_tool_arguments (4-level fallback)
+# =============================================================================
+class TestParseToolArguments(unittest.TestCase):
+    """Covers parse_tool_arguments — Qwen occasionally emits XML or freeform
+    text instead of clean JSON arguments. The parser tries 4 increasingly
+    lenient strategies: pure JSON → embedded JSON → XML → heuristic by
+    tool_name_hint. Stringified booleans are coerced to real bools along
+    the way so the Anthropic client validator accepts them.
+    """
+
+    def test_level1_pure_json(self):
+        """Level 1: a well-formed JSON object parses on the first try."""
+        result = proxy.parse_tool_arguments('{"city": "Beijing", "unit": "c"}')
+        self.assertEqual(result, {"city": "Beijing", "unit": "c"})
+
+    def test_level2_embedded_json_in_text(self):
+        """Level 2: when the raw string has leading/trailing text around
+        a JSON object, the parser finds the {…} span and parses that."""
+        # Common Qwen quirk: prefix text + JSON + trailing text.
+        raw = 'Sure, calling the tool: {"path": "/tmp/x.py", "limit": 50} (done)'
+        result = proxy.parse_tool_arguments(raw)
+        self.assertEqual(result, {"path": "/tmp/x.py", "limit": 50})
+
+    def test_level3_xml_format(self):
+        """Level 3: Qwen XML-style <parameter=key>value</parameter>."""
+        # Two equivalent XML forms the parser recognises.
+        raw_a = '<parameter=file_path>/tmp/foo.py</parameter><parameter=offset>10</parameter>'
+        raw_b = '<param name="file_path">/tmp/foo.py</param><param name="offset">10</param>'
+        for raw in (raw_a, raw_b):
+            result = proxy.parse_tool_arguments(raw)
+            self.assertEqual(result.get("file_path"), "/tmp/foo.py")
+            self.assertEqual(result.get("offset"), "10")
+
+    def test_level4_heuristic_bash(self):
+        """Level 4 (heuristic): when nothing parses, the tool_name_hint
+        routes a freeform string into the most likely arg name:
+        bash/exec/shell → `command`."""
+        result = proxy.parse_tool_arguments("ls -la /tmp", tool_name_hint="bash")
+        self.assertEqual(result, {"command": "ls -la /tmp"})
+
+    def test_level4_heuristic_read(self):
+        """Level 4 (heuristic): read/view/file → `file_path`."""
+        result = proxy.parse_tool_arguments("/etc/hosts", tool_name_hint="read")
+        self.assertEqual(result, {"file_path": "/etc/hosts"})
+
+    def test_stringified_booleans_are_coerced(self):
+        """String 'True'/'False' (any case) are coerced to real bools
+        so the Anthropic SDK's strict JSON Schema validator accepts them."""
+        result = proxy.parse_tool_arguments('{"verbose": "True", "debug": "false"}')
+        self.assertIs(result["verbose"], True)
+        self.assertIs(result["debug"], False)
+
+    def test_unparseable_with_no_hint_returns_empty(self):
+        """When nothing matches and there's no helpful tool_name_hint,
+        the function returns {} (rather than crashing or fabricating)."""
+        result = proxy.parse_tool_arguments("random nonsense", tool_name_hint="unknown_tool")
+        self.assertEqual(result, {})
+
+    def test_empty_string_returns_empty(self):
+        """Empty / None / whitespace inputs return {} immediately
+        (no exception, no spurious JSON-parse error log)."""
+        self.assertEqual(proxy.parse_tool_arguments(""), {})
+        self.assertEqual(proxy.parse_tool_arguments("   "), {})
+        self.assertEqual(proxy.parse_tool_arguments(None), {})
+
+
+# =============================================================================
+# R4.5 — reasoning_content extraction (Qwen thinking-mode quirk)
+# =============================================================================
+class TestReasoningExtraction(unittest.TestCase):
+    """Covers convert_openai_response_to_anthropic's handling of
+    Qwen3.6's `reasoning_content` field. When content is empty but
+    reasoning exists, the reasoning is promoted to the visible text
+    block (a Qwen3.6 fix). When both are present, content wins.
+    """
+
+    def _openai_resp(self, content="", reasoning="", tool_calls=None, finish="stop"):
+        return {
+            "id": "chatcmpl-test",
+            "choices": [{
+                "finish_reason": finish,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls or [],
+                    **({"reasoning_content": reasoning} if reasoning else {}),
+                },
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10},
+        }
+
+    def test_empty_content_promotes_reasoning_to_text(self):
+        """R4.5: when content='' but reasoning='...' is present, the
+        reasoning is surfaced as the response's text block (otherwise
+        the model would appear to have said nothing)."""
+        r = proxy.convert_openai_response_to_anthropic(
+            self._openai_resp(content="", reasoning="Let me think about this..."),
+            anthropic_model="claude-sonnet-4-6",
+        )
+        text_blocks = [b for b in r["content"] if b["type"] == "text"]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertIn("Let me think", text_blocks[0]["text"])
+
+    def test_content_wins_when_both_present(self):
+        """R4.5: when BOTH content and reasoning are populated, content
+        is the visible text and reasoning is dropped (it's an internal
+        scratchpad, not meant to be shown to the user)."""
+        r = proxy.convert_openai_response_to_anthropic(
+            self._openai_resp(content="The answer is 42.",
+                              reasoning="internal scratchpad"),
+            anthropic_model="claude-sonnet-4-6",
+        )
+        text_blocks = [b for b in r["content"] if b["type"] == "text"]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertEqual(text_blocks[0]["text"], "The answer is 42.")
+        self.assertNotIn("scratchpad", r["content"][0]["text"])
+
+    def test_whitespace_only_content_still_promotes_reasoning(self):
+        """R4.5: content='\\n  ' (whitespace only) is treated as empty
+        — the `.strip()` check means reasoning is promoted."""
+        r = proxy.convert_openai_response_to_anthropic(
+            self._openai_resp(content="\n   ", reasoning="actual answer"),
+            anthropic_model="claude-sonnet-4-6",
+        )
+        text_blocks = [b for b in r["content"] if b["type"] == "text"]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertEqual(text_blocks[0]["text"], "actual answer")
+
+    def test_no_reasoning_no_special_handling(self):
+        """R4.5 baseline: when reasoning is absent, the function
+        behaves as it did before this fix (content is text)."""
+        r = proxy.convert_openai_response_to_anthropic(
+            self._openai_resp(content="Hello there."),
+            anthropic_model="claude-sonnet-4-6",
+        )
+        text_blocks = [b for b in r["content"] if b["type"] == "text"]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertEqual(text_blocks[0]["text"], "Hello there.")
+
+
+# =============================================================================
+# R5.1 / R5.2 — error translation (3 patterns + solution hints)
+# =============================================================================
+class TestErrorTranslation(unittest.TestCase):
+    """Covers _translate_tool_result_errors — the proxy rewrites
+    backend's English error strings (Wasted call, File does not exist,
+    InputValidationError) into natural-language Chinese hints with
+    actionable next-step suggestions."""
+
+    def _msg(self, tool_use_id, content):
+        return {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": content},
+        ]}
+
+    def test_translate_wasted_call(self):
+        """R5.1 + R5.2: 'Wasted call' is replaced with a hint to use
+        Bash cat instead of re-reading the file."""
+        msgs = [self._msg("t1", "<tool_use_error>Wasted call - file unchanged</tool_use_error>")]
+        _, counts = proxy._translate_tool_result_errors(msgs)
+        self.assertEqual(counts["wasted"], 1)
+        self.assertEqual(counts["file_not_found"], 0)
+        self.assertEqual(counts["input_validation"], 0)
+        # The replacement includes the actionable hint (R5.2).
+        text = msgs[0]["content"][0]["content"]
+        self.assertIn("未发生变化", text)
+        self.assertIn("Bash cat", text)  # solution hint
+
+    def test_translate_file_not_found(self):
+        """R5.1 + R5.2: 'File does not exist' (or 'No such file') is
+        replaced with a hint to use Bash ls/find to discover paths."""
+        msgs_a = [self._msg("t1", "<tool_use_error>File does not exist. /nope.py</tool_use_error>")]
+        msgs_b = [self._msg("t1", "<tool_use_error>No such file or directory</tool_use_error>")]
+        for msgs in (msgs_a, msgs_b):
+            _, counts = proxy._translate_tool_result_errors(msgs)
+            self.assertEqual(counts["file_not_found"], 1)
+            text = msgs[0]["content"][0]["content"]
+            self.assertIn("文件不存在", text)
+            self.assertIn("Bash ls", text)  # solution hint
+
+    def test_translate_input_validation(self):
+        """R5.1 + R5.2: 'InputValidationError' is replaced with a hint
+        to check the tool parameter format."""
+        msgs = [self._msg("t1", "<tool_use_error>InputValidationError: missing required parameter 'command'</tool_use_error>")]
+        _, counts = proxy._translate_tool_result_errors(msgs)
+        self.assertEqual(counts["input_validation"], 1)
+        text = msgs[0]["content"][0]["content"]
+        self.assertIn("工具调用参数错误", text)
+        self.assertIn("工具参数格式", text)  # solution hint
+
+    def test_unrelated_tool_result_left_untouched(self):
+        """A successful tool_result (no error string) must pass through
+        unchanged — the translator only acts on recognised patterns."""
+        original = "FILE_CONTENTS: hello world\n"
+        msgs = [self._msg("t1", original)]
+        _, counts = proxy._translate_tool_result_errors(msgs)
+        self.assertEqual(sum(counts.values()), 0)
+        self.assertEqual(msgs[0]["content"][0]["content"], original)
+
+    def test_mixed_messages_each_counted(self):
+        """Three tool_results of three different patterns → all three
+        counts incremented, all three contents rewritten in place."""
+        msgs = [
+            self._msg("t1", "Wasted call - foo"),
+            self._msg("t2", "File does not exist. /x.py"),
+            self._msg("t3", "InputValidationError: bad arg"),
+        ]
+        _, counts = proxy._translate_tool_result_errors(msgs)
+        self.assertEqual(counts, {"wasted": 1, "file_not_found": 1, "input_validation": 1})
+        # Each block now starts with the [System: prefix.
+        for msg in msgs:
+            self.assertTrue(msg["content"][0]["content"].startswith("[System:"))
+
+    def test_assistant_messages_skipped(self):
+        """The translator walks user-role messages only. Assistant
+        tool_use blocks are not error results and must be ignored."""
+        msgs = [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            self._msg("t1", "Wasted call - foo"),
+        ]
+        _, counts = proxy._translate_tool_result_errors(msgs)
+        # Only the user-side tool_result is translated.
+        self.assertEqual(counts["wasted"], 1)
+        # The assistant's tool_use block is untouched.
+        self.assertEqual(msgs[0]["content"][0]["type"], "tool_use")
+
+
+# =============================================================================
 # R2.1 — Loop intervention (Level 1 + Level 2 escalation)
 # =============================================================================
 class TestLoopIntervention(unittest.TestCase):

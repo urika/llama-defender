@@ -92,7 +92,8 @@ requirements:
     priority: P0
     impl:
       - anthropic_proxy.py:clear_old_tool_results
-    tests: []
+    tests:
+      - test/unit/test_proxy_fallback.py::TestToolClearing
 
   - id: R2.3
     domain: R2
@@ -101,7 +102,8 @@ requirements:
     priority: P0
     impl:
       - anthropic_proxy.py:clear_old_tool_results
-    tests: []
+    tests:
+      - test/unit/test_proxy_fallback.py::TestToolClearing
 
   - id: R2.4
     domain: R2
@@ -155,7 +157,8 @@ requirements:
     priority: P0
     impl:
       - anthropic_proxy.py:parse_tool_arguments
-    tests: []
+    tests:
+      - test/unit/test_proxy_fallback.py::TestParseToolArguments
 
   - id: R4.2
     domain: R4
@@ -201,7 +204,8 @@ requirements:
     impl:
       - anthropic_proxy.py:convert_openai_response_to_anthropic
       - anthropic_proxy.py:Handler._handle_streaming_response
-    tests: []
+    tests:
+      - test/unit/test_proxy_fallback.py::TestReasoningExtraction
 
   # ---------------------------------------------------------------------------
   # R5 — 错误理解增强 [P1]
@@ -212,8 +216,9 @@ requirements:
     desc: 后端英文错误→中文自然语言提示 (3 种类型)
     priority: P1
     impl:
-      - anthropic_proxy.py:Handler._handle_messages
-    tests: []
+      - anthropic_proxy.py:_translate_tool_result_errors
+    tests:
+      - test/unit/test_proxy_fallback.py::TestErrorTranslation
 
   - id: R5.2
     domain: R5
@@ -221,8 +226,9 @@ requirements:
     desc: 翻译时附带解决建议 (如「用 Bash ls 确认」)
     priority: P1
     impl:
-      - anthropic_proxy.py:Handler._handle_messages
-    tests: []
+      - anthropic_proxy.py:_translate_tool_result_errors
+    tests:
+      - test/unit/test_proxy_fallback.py::TestErrorTranslation
 
   # ---------------------------------------------------------------------------
   # R6 — 可观测性 [P0/P1]

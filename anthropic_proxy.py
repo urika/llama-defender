@@ -2728,6 +2728,56 @@ def _inject_keyword_context(keywords, current_messages, top_k=5, max_chars=500):
 
 
 # ---------------------------------------------------------------------------
+# Error translation (R5.1 / R5.2) — extracted from _handle_messages for testability
+# ---------------------------------------------------------------------------
+def _translate_tool_result_errors(messages):
+    """Walk the user-side tool_result blocks and rewrite known backend
+    error patterns into natural-language Chinese hints. Returns
+    (messages, counts_dict) and mutates `messages` in place.
+
+    Three patterns are recognised:
+      - "Wasted call"     → "文件自上次读取后未发生变化"  (R5.1 wasted)
+      - "File does not exist" / "No such file" → "文件不存在..."  (R5.1 file_not_found)
+      - "InputValidationError" / "invalid x" → "工具调用参数错误..."  (R5.1 input_validation)
+
+    Each replacement includes a solution hint (R5.2):
+      - wasted: 用 Bash cat 代替
+      - file_not_found: 用 Bash ls 或 find 确认项目结构
+      - input_validation: 检查工具参数格式
+    """
+    error_count = {"wasted": 0, "file_not_found": 0, "input_validation": 0}
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") != "tool_result":
+                continue
+            bc = str(block.get("content", ""))
+            if "Wasted call" in bc:
+                block["content"] = (
+                    "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"
+                    "如果需要查看文件内容，用 Bash cat 命令代替。]"
+                )
+                error_count["wasted"] += 1
+            elif "File does not exist" in bc or "No such file" in bc:
+                block["content"] = (
+                    "[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，"
+                    "然后使用正确的文件路径。]"
+                )
+                error_count["file_not_found"] += 1
+            elif "InputValidationError" in bc or "invalid x" in bc.lower():
+                block["content"] = (
+                    "[System: 工具调用参数错误。请检查工具参数格式，"
+                    "确保所有必填参数正确提供。]"
+                )
+                error_count["input_validation"] += 1
+    return messages, error_count
+
+
+# ---------------------------------------------------------------------------
 # Loop intervention (R2.1) — extracted from _handle_messages for testability
 # ---------------------------------------------------------------------------
 def _apply_loop_intervention(
@@ -2950,35 +3000,7 @@ class Handler(BaseHTTPRequestHandler):
             log(f"  -> max_tokens override: {max_tokens_orig} -> {PROXY_MAX_TOKENS_OVERRIDE}")
 
         # Error translation: intercept tool_result errors and rewrite to natural language
-        error_count = {"wasted": 0, "file_not_found": 0, "input_validation": 0}
-        raw_messages = body.get("messages", [])
-        for msg in raw_messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                for block in content:
-                    if block.get("type") != "tool_result":
-                        continue
-                    bc = str(block.get("content", ""))
-                    if "Wasted call" in bc:
-                        block["content"] = (
-                            "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"
-                            "如果需要查看文件内容，用 Bash cat 命令代替。]"
-                        )
-                        error_count["wasted"] += 1
-                    elif "File does not exist" in bc or "No such file" in bc:
-                        block["content"] = (
-                            "[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，"
-                            "然后使用正确的文件路径。]"
-                        )
-                        error_count["file_not_found"] += 1
-                    elif "InputValidationError" in bc or "invalid x" in bc.lower():
-                        block["content"] = (
-                            "[System: 工具调用参数错误。请检查工具参数格式，"
-                            "确保所有必填参数正确提供。]"
-                        )
-                        error_count["input_validation"] += 1
+        raw_messages, error_count = _translate_tool_result_errors(body.get("messages", []))
         total_errors = sum(error_count.values())
         if total_errors > 0:
             log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
