@@ -972,6 +972,99 @@ class TestErrorTranslation(unittest.TestCase):
 
 
 # =============================================================================
+# R1.3 — _incremental_compress (summary cache + incremental updates)
+# =============================================================================
+class TestIncrementalCompress(unittest.TestCase):
+    """Covers _incremental_compress — the proxy caches its per-session
+    compression summary so subsequent truncations only re-compress the
+    newly-dropped tail (saves an LLM call when nothing new was dropped)."""
+
+    def setUp(self):
+        # Patch the LLM call to return a deterministic marker so we can
+        # assert when it was (or wasn't) invoked.
+        self._llm_calls = []
+        def fake_llm(messages, timeout=30):
+            self._llm_calls.append(messages)
+            return f"[LLM_SUMMARY for {len(messages)} msgs]"
+        self._patches = [
+            patch.object(proxy, "_compress_middle_with_llm", fake_llm),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        # Wipe session cache so cross-test state doesn't leak.
+        with proxy._summary_cache_lock:
+            proxy._summary_cache.clear()
+
+    def _msg(self, content):
+        return {"role": "user", "content": content}
+
+    def test_first_call_no_cache_uses_rules_path(self):
+        """R1.3: first compression on a fresh session uses the rule-based
+        path (not the LLM) because dropped has <10 messages."""
+        with proxy._summary_cache_lock:
+            proxy._summary_cache.pop("sess_A", None)
+        dropped = [self._msg("error: foo"), self._msg("error: bar"), self._msg("ok")]
+        result, was_incremental = proxy._incremental_compress(dropped, "sess_A")
+        self.assertIsNotNone(result)
+        self.assertIs(was_incremental, False)  # not incremental on first call
+        # The LLM was NOT called (rule path handles <10 msgs).
+        self.assertEqual(self._llm_calls, [])
+
+    def test_second_call_with_cache_marks_incremental(self):
+        """R1.3: a second call on the same session after a prior
+        compression returns was_incremental=True (cache hit), even when
+        the dropped set is identical (so 0 new messages)."""
+        # First call: prime the cache.
+        proxy._incremental_compress([self._msg("error: foo")] * 3, "sess_B")
+        self.assertEqual(self._llm_calls, [])
+        # Second call: same dropped set, should hit the cache.
+        result, was_incremental = proxy._incremental_compress(
+            [self._msg("error: foo")] * 3, "sess_B"
+        )
+        self.assertIsNotNone(result)
+        self.assertIs(was_incremental, True)
+        # LLM is NOT called even for the second compression: with 0 new
+        # messages, the function uses cached summary directly.
+        self.assertEqual(self._llm_calls, [])
+
+    def test_cache_size_limit_evicts_oldest(self):
+        """R1.3: when _SUMMARY_CACHE_MAX_SESSIONS is reached, the oldest
+        session is evicted to make room. New sessions start fresh."""
+        # Save the real limit and override for this test.
+        real_max = proxy._SUMMARY_CACHE_MAX_SESSIONS
+        with patch.object(proxy, "_SUMMARY_CACHE_MAX_SESSIONS", 2):
+            # Fill the cache: sess_1 (oldest), sess_2.
+            proxy._incremental_compress([self._msg("a")], "sess_1")
+            proxy._incremental_compress([self._msg("b")], "sess_2")
+            with proxy._summary_cache_lock:
+                self.assertIn("sess_1", proxy._summary_cache)
+                self.assertIn("sess_2", proxy._summary_cache)
+            # Add sess_3 → sess_1 (oldest) should be evicted.
+            proxy._incremental_compress([self._msg("c")], "sess_3")
+            with proxy._summary_cache_lock:
+                self.assertNotIn("sess_1", proxy._summary_cache)
+                self.assertIn("sess_2", proxy._summary_cache)
+                self.assertIn("sess_3", proxy._summary_cache)
+        # Restore so teardown's `cache.clear()` is consistent.
+        proxy._SUMMARY_CACHE_MAX_SESSIONS = real_max
+
+    def test_empty_dropped_returns_none(self):
+        """R1.3: when dropped is empty, the function returns (None, None)
+        — there's nothing to summarise. The cache must NOT be populated."""
+        with proxy._summary_cache_lock:
+            proxy._summary_cache.pop("sess_E", None)
+        result, was_incremental = proxy._incremental_compress([], "sess_E")
+        self.assertIsNone(result)
+        self.assertIsNone(was_incremental)
+        with proxy._summary_cache_lock:
+            self.assertNotIn("sess_E", proxy._summary_cache)
+
+
+# =============================================================================
 # R2.1 — Loop intervention (Level 1 + Level 2 escalation)
 # =============================================================================
 class TestLoopIntervention(unittest.TestCase):
