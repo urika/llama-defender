@@ -23,7 +23,7 @@ import anthropic_proxy as proxy
 
 
 class TestExtractContentToolCalls(unittest.TestCase):
-    """Pure tests on _extract_content_tool_calls."""
+    """R4.2: pure tests on _extract_content_tool_calls (non-streaming <tools> fallback)."""
 
     def test_empty_input(self):
         self.assertEqual(proxy._extract_content_tool_calls(""), {"text": "", "tools": []})
@@ -98,7 +98,7 @@ class TestExtractContentToolCalls(unittest.TestCase):
 
 
 class TestStreamingStateMachine(unittest.TestCase):
-    """Tests on _StreamingToolsExtractor."""
+    """R4.2: tests on _StreamingToolsExtractor (state machine for streaming <tools>)."""
 
     def _drain(self, ext, chunks):
         """Feed chunks, finalize, return list of (kind, value) events."""
@@ -216,7 +216,7 @@ class TestStreamingStateMachine(unittest.TestCase):
 
 
 class TestNonStreamingConversion(unittest.TestCase):
-    """Tests on convert_openai_response_to_anthropic."""
+    """R4.2 + R4.3: tests on convert_openai_response_to_anthropic (full response conversion + max_tokens preservation)."""
 
     def _openai_resp(self, content="", tool_calls=None, finish="stop"):
         return {
@@ -316,7 +316,7 @@ class TestNonStreamingConversion(unittest.TestCase):
 
 
 class TestBlockerDetection(unittest.TestCase):
-    """Tests on _detect_blocker_pattern and _build_blocker_message."""
+    """R2.4: tests on _detect_blocker_pattern and _build_blocker_message (blocker detection logic)."""
 
     def _assistant_tool_use(self, name, args=None, tool_id="t1"):
         return {
@@ -488,7 +488,7 @@ class TestBlockerDetection(unittest.TestCase):
 
 
 class TestCompressPromptStructure(unittest.TestCase):
-    """Smoke test: the LLM compression prompt enforces the new errors_solutions structure."""
+    """R1.2: smoke test — the LLM compression prompt enforces the new errors_solutions structure."""
 
     def test_prompt_requires_root_cause_structure(self):
         # Force the LLM call path to capture the prompt without hitting the network.
@@ -516,10 +516,10 @@ class TestCompressPromptStructure(unittest.TestCase):
 
 
 class TestFifoPlaceholderStability(unittest.TestCase):
-    """Plan 1: FIFO placeholder text MUST be byte-stable across requests so
-    prefix cache hits the same bytes at the fold boundary. Previously the
-    placeholder embedded dropped_count, tool_count, and file_mentions which
-    changed every request, causing 0% cache hit rate."""
+    """R1.1 + R3.2: Plan 1 — FIFO placeholder text MUST be byte-stable across
+    requests so prefix cache hits the same bytes at the fold boundary.
+    Previously the placeholder embedded dropped_count, tool_count, and
+    file_mentions which changed every request, causing 0% cache hit rate."""
 
     def setUp(self):
         # Force fifo strategy for these tests regardless of the process env.
@@ -605,7 +605,7 @@ class TestLoopIntervention(unittest.TestCase):
         return {"name": name, "description": "fake", "input_schema": {"type": "object"}}
 
     def test_level1_injects_stop_message_and_keeps_tool(self):
-        """max_run == threshold (3) and < LEVEL2 (6) → Level 1.
+        """R2.1: max_run == threshold (3) and < LEVEL2 (6) → Level 1.
         The user message must mention 'STOP using' and the tool must remain
         in the tools list (Level 1 does not remove it)."""
         consecutive = {"Read:{\"/x.py\"}": 3}
@@ -628,7 +628,7 @@ class TestLoopIntervention(unittest.TestCase):
         self.assertEqual(new_tools, tools)
 
     def test_level2_removes_tool_and_emits_strong_message(self):
-        """max_run == LEVEL2 (6) → Level 2.
+        """R2.1: max_run == LEVEL2 (6) → Level 2.
         The looping tool must be filtered out of the tools list and the
         message must use the 'REMOVED' wording."""
         consecutive = {"Read:{\"/x.py\"}": 6}
@@ -653,7 +653,7 @@ class TestLoopIntervention(unittest.TestCase):
         self.assertEqual(msgs[0], {"role": "user", "content": "do the thing"})
 
     def test_below_threshold_is_a_pure_noop(self):
-        """max_run < threshold → no message added, no tool removed,
+        """R2.1: max_run < threshold → no message added, no tool removed,
         level == 0, tool_name == ''."""
         consecutive = {"Read:{\"/x.py\"}": 2}
         tools = [self._tool("Read"), self._tool("Bash")]
@@ -679,16 +679,19 @@ class TestRepairTruncatedJson(unittest.TestCase):
     arguments JSON is cut off mid-stream."""
 
     def test_empty_input_returns_empty_dict(self):
+        """R4.4: empty/whitespace/None inputs return the canonical '{}'."""
         self.assertEqual(proxy._repair_truncated_json(""), "{}")
         self.assertEqual(proxy._repair_truncated_json("   "), "{}")
         self.assertEqual(proxy._repair_truncated_json(None), "{}")
 
     def test_complete_json_unchanged(self):
+        """R4.4: a well-formed JSON object is returned verbatim."""
         # Well-formed inputs are returned verbatim.
         ok = '{"a": 1, "b": [2, 3]}'
         self.assertEqual(proxy._repair_truncated_json(ok), ok)
 
     def test_unclosed_string_closes_quote_and_brace(self):
+        """R4.4: cut after an unclosed string → repair appends '"' then '}'."""
         # The string was never closed (e.g. arguments cut after `{"file": "`).
         # Repair should append `"` then `}`.
         out = proxy._repair_truncated_json('{"file": "/tmp/x')
@@ -696,12 +699,14 @@ class TestRepairTruncatedJson(unittest.TestCase):
         self.assertEqual(parsed, {"file": "/tmp/x"})
 
     def test_unclosed_brace_adds_closing_brace(self):
+        """R4.4: cut mid-object (no unclosed string) → repair appends '}'."""
         # No unclosed string, but one too few `}`s.
         out = proxy._repair_truncated_json('{"a": 1, "b": 2')
         parsed = json.loads(out)
         self.assertEqual(parsed, {"a": 1, "b": 2})
 
     def test_nested_truncation_closes_multiple_levels(self):
+        """R4.4: depth=2 (object in object) → repair appends two '}'s."""
         # depth=2 (object inside object) → must add two `}`s.
         # (Note: _repair_truncated_json only emits `}` to close, not `]`,
         # so we avoid trailing-`[` inputs here — that case is a known
@@ -711,6 +716,7 @@ class TestRepairTruncatedJson(unittest.TestCase):
         self.assertEqual(parsed, {"outer": {"inner": 1, "a": 2}})
 
     def test_escape_sequence_does_not_falsely_close(self):
+        """R4.4: a backslash-escaped quote does not terminate the string."""
         # The function tracks `in_string` correctly across `\\` and `\"` —
         # a JSON `"\""` should NOT be treated as ending the string.
         out = proxy._repair_truncated_json(r'{"msg": "say \"hello\"')
@@ -718,6 +724,7 @@ class TestRepairTruncatedJson(unittest.TestCase):
         self.assertEqual(parsed, {"msg": 'say "hello"'})
 
     def test_whitespace_only_input_returns_empty_dict(self):
+        """R4.4: only whitespace → stripped, returns '{}'."""
         # Newlines and tabs are stripped; if nothing remains we get "{}".
         self.assertEqual(proxy._repair_truncated_json("\n\t  \n"), "{}")
 

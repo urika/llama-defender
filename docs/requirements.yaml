@@ -1,0 +1,281 @@
+# =============================================================================
+# Requirements traceability matrix — authoritative source.
+#
+# Single source of truth for the 23 functional requirements (R1.x ... R7.x)
+# defined in docs/PRD-anthropic-proxy.md §3.
+#
+# Schema (per requirement):
+#   id:       R<domain>.<num>, e.g. R2.4
+#   domain:   R1..R7 (matches PRD §3 sub-headings)
+#   title:    Short Chinese title (from PRD)
+#   desc:     One-line summary
+#   priority: P0 | P1
+#   impl:     file:symbol anchors:
+#               "anthropic_proxy.py:FUNC"          — top-level `def FUNC`
+#               "anthropic_proxy.py:Class.method"  — class method
+#               "anthropic_proxy.py:CONST"         — module-level `CONST = ...`
+#             Anchors point at the *enclosing* function for inline code blocks
+#             (e.g. R3.2 date normalization is inline in `_handle_messages`).
+#   tests:    List of test anchors:
+#               "test/.../test_*.py::TestClass"             (whole class)
+#               "test/.../test_*.py::TestClass::test_method" (single method)
+#               "test/.../test_*.py::test_function"          (module-level function)
+#               "test/.../test_*.sh"                         (whole script)
+#               "test/.../test_*.sh::TC1"                    (bash test name)
+#
+# tools/trace_requirements.py reads this file, verifies each anchor resolves,
+# scans for orphan R<id> tags, and renders a coverage matrix.
+# =============================================================================
+
+requirements:
+
+  # ---------------------------------------------------------------------------
+  # R1 — 上下文容量不足 [P0]
+  # ---------------------------------------------------------------------------
+  - id: R1.1
+    domain: R1
+    title: 主动上下文截断
+    desc: 超过 token 预算时主动丢弃旧消息；三策略 (rounds/fifo/char)
+    priority: P0
+    impl:
+      - anthropic_proxy.py:truncate_messages_if_needed
+    tests:
+      - test/unit/test_proxy_fallback.py::TestFifoPlaceholderStability
+
+  - id: R1.2
+    domain: R1
+    title: 压缩摘要替代
+    desc: 被丢弃消息生成结构化摘要；三级压缩链 (LLM→规则→静态折叠)
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_compress_middle_with_llm
+      - anthropic_proxy.py:_extract_middle_summary_rules
+    tests:
+      - test/unit/test_proxy_fallback.py::TestCompressPromptStructure
+
+  - id: R1.3
+    domain: R1
+    title: 增量压缩
+    desc: 避免每次全量重压缩；增量摘要缓存
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_incremental_compress
+    tests: []
+
+  - id: R1.4
+    domain: R1
+    title: 关键词按需检索
+    desc: 保留被截断消息的关键词索引；匹配 tail 注入
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_extract_keywords
+      - anthropic_proxy.py:_inject_keyword_context
+    tests: []
+
+  # ---------------------------------------------------------------------------
+  # R2 — 循环与失控 [P0]
+  # ---------------------------------------------------------------------------
+  - id: R2.1
+    domain: R2
+    title: 递进式循环干预
+    desc: 三级升级：Level 1 提示 → Level 2 移除工具（注：PRD §3 提到的 Level 3 强制纯文本当前未实现）
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_apply_loop_intervention
+    tests:
+      - test/unit/test_proxy_fallback.py::TestLoopIntervention
+
+  - id: R2.2
+    domain: R2
+    title: 智能清除策略
+    desc: 清除 Read 时保留 200 字符预览
+    priority: P0
+    impl:
+      - anthropic_proxy.py:clear_old_tool_results
+    tests: []
+
+  - id: R2.3
+    domain: R2
+    title: 近期 Read 保护
+    desc: 最近 6 个 Read 结果 +5 分语义加分
+    priority: P0
+    impl:
+      - anthropic_proxy.py:clear_old_tool_results
+    tests: []
+
+  - id: R2.4
+    domain: R2
+    title: 阻塞模式检测
+    desc: 连续相同错误类型 (2 次) 干预；注入 [BLOCKER] 消息
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_detect_blocker_pattern
+      - anthropic_proxy.py:_build_blocker_message
+    tests:
+      - test/unit/test_proxy_fallback.py::TestBlockerDetection
+      - test/integration/test_blocker_integration.sh
+
+  # ---------------------------------------------------------------------------
+  # R3 — 延迟优化 [P0]
+  # ---------------------------------------------------------------------------
+  - id: R3.1
+    domain: R3
+    title: KV Cache 复用
+    desc: 利用 prefix cache 避免重复计算
+    priority: P0
+    impl: []
+    tests: []
+
+  - id: R3.2
+    domain: R3
+    title: 前缀稳定化
+    desc: 日期标准化 + 固定占位文本 (Plan 1 静态化)
+    priority: P0
+    impl:
+      - anthropic_proxy.py:Handler._handle_messages
+    tests:
+      - test/unit/test_proxy_fallback.py::TestFifoPlaceholderStability
+
+  - id: R3.3
+    domain: R3
+    title: 工具定义过滤
+    desc: 44 → 15 个工具，白名单+最近使用；节省 5-8K tokens
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_filter_tools
+    tests: []
+
+  # ---------------------------------------------------------------------------
+  # R4 — 模型兼容性 [P0/P1]
+  # ---------------------------------------------------------------------------
+  - id: R4.1
+    domain: R4
+    title: XML→JSON 回退
+    desc: Qwen 偶尔输出 XML 格式 tool_call；parse_tool_arguments 四级回退
+    priority: P0
+    impl:
+      - anthropic_proxy.py:parse_tool_arguments
+    tests: []
+
+  - id: R4.2
+    domain: R4
+    title: Content-text 工具提取
+    desc: 从 <tools>...</tools> 文本中提取工具调用；流式+非流式双路径
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_extract_content_tool_calls
+      - anthropic_proxy.py:_StreamingToolsExtractor
+      - anthropic_proxy.py:convert_openai_response_to_anthropic
+    tests:
+      - test/unit/test_proxy_fallback.py::TestExtractContentToolCalls
+      - test/unit/test_proxy_fallback.py::TestStreamingStateMachine
+      - test/unit/test_proxy_fallback.py::TestNonStreamingConversion
+      - test/e2e/e2e_tools_fallback.sh
+
+  - id: R4.3
+    domain: R4
+    title: 输出截断
+    desc: 代理层强制限制输出长度 (max_tokens + force_stopped)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:Handler._handle_non_streaming_response
+      - anthropic_proxy.py:Handler._handle_streaming_response
+    tests:
+      - test/unit/test_proxy_fallback.py::TestNonStreamingConversion
+
+  - id: R4.4
+    domain: R4
+    title: JSON 修复
+    desc: 修复被截断的 tool_call arguments JSON
+    priority: P0
+    impl:
+      - anthropic_proxy.py:_repair_truncated_json
+    tests:
+      - test/unit/test_proxy_fallback.py::TestRepairTruncatedJson
+
+  - id: R4.5
+    domain: R4
+    title: Reasoning 提取
+    desc: 处理 Qwen reasoning_content 字段
+    priority: P1
+    impl:
+      - anthropic_proxy.py:convert_openai_response_to_anthropic
+      - anthropic_proxy.py:Handler._handle_streaming_response
+    tests: []
+
+  # ---------------------------------------------------------------------------
+  # R5 — 错误理解增强 [P1]
+  # ---------------------------------------------------------------------------
+  - id: R5.1
+    domain: R5
+    title: 错误翻译
+    desc: 后端英文错误→中文自然语言提示 (3 种类型)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:Handler._handle_messages
+    tests: []
+
+  - id: R5.2
+    domain: R5
+    title: 错误上下文增强
+    desc: 翻译时附带解决建议 (如「用 Bash ls 确认」)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:Handler._handle_messages
+    tests: []
+
+  # ---------------------------------------------------------------------------
+  # R6 — 可观测性 [P0/P1]
+  # ---------------------------------------------------------------------------
+  - id: R6.1
+    domain: R6
+    title: 结构化 Metrics
+    desc: 每请求输出管线各步骤结构化 JSON 指标 (proxy_metrics.jsonl)
+    priority: P0
+    impl:
+      - anthropic_proxy.py:log_metrics
+      - anthropic_proxy.py:_mc_put
+    tests:
+      - test/unit/test_proxy_fallback.py::TestMetrics
+
+  - id: R6.2
+    domain: R6
+    title: 质量标记
+    desc: 自动标记 4 种异常模式 (high_drop_ratio / llm_compress_failed / budget_overflow / loop_injected + blocker_injected)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:_finalize_metrics
+    tests:
+      - test/unit/test_proxy_fallback.py::TestMetrics
+
+  - id: R6.3
+    domain: R6
+    title: 压缩比追踪
+    desc: 记录截断前后 token 估算比 (compression_ratio 字段)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:_finalize_metrics
+    tests:
+      - test/unit/test_proxy_fallback.py::TestMetrics
+
+  # ---------------------------------------------------------------------------
+  # R7 — 资源约束适配 [P0/P1]
+  # ---------------------------------------------------------------------------
+  - id: R7.1
+    domain: R7
+    title: 并发控制
+    desc: threading.Semaphore 限制同时转发请求数 (local=1, cloud=4)
+    priority: P0
+    impl:
+      - anthropic_proxy.py:PROXY_MAX_CONCURRENT
+    tests:
+      - test/e2e/test_proxy_integration.py::test_concurrent_serialization
+
+  - id: R7.2
+    domain: R7
+    title: 云端切换
+    desc: 无缝切换到云端 API 绕过本地内存限制 (BACKEND_TYPE auto-detect)
+    priority: P1
+    impl:
+      - anthropic_proxy.py:PROXY_MAX_CONCURRENT
+    tests: []
