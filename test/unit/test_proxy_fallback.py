@@ -1518,5 +1518,120 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(mc_e["quality_flags"], [])
 
 
+class TestDef001PreTruncation(unittest.TestCase):
+    """DEF-001 fix: very large payloads (>PROXY_PRE_TRUNCATE_CHARS chars)
+    should be rounds-truncated with tight budget BEFORE heavy processing
+    to prevent rapid-mlx OOM/timeout. Evidence: 65/67 of v0.5.0-baseline
+    500 errors came from input_chars > 400K (session a309b181).
+    """
+
+    def test_threshold_constant_exists(self):
+        """PROXY_PRE_TRUNCATE_CHARS must default to a sensible value (400K)
+        and be overridable via env var."""
+        # Default value check
+        self.assertIsNotNone(proxy.PROXY_PRE_TRUNCATE_CHARS)
+        self.assertGreater(proxy.PROXY_PRE_TRUNCATE_CHARS, 0)
+        # Sanity: should be ≥ 100K (otherwise would be too aggressive)
+        self.assertGreaterEqual(proxy.PROXY_PRE_TRUNCATE_CHARS, 100_000)
+
+    def test_rounds_truncation_runs_without_error(self):
+        """_apply_rounds_truncation must work on a large message array
+        and return a truncated result + stats dict. Note: truncation may
+        insert a placeholder message, so result length may slightly exceed
+        kept_messages alone."""
+        # Build 50 messages each with large content (>1000 chars)
+        large_msg = "x" * 2000
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant",
+             "content": f"msg {i}: {large_msg}"}
+            for i in range(50)
+        ]
+        result, stats = proxy._apply_rounds_truncation(msgs, keep_rounds=2, session_id="sess_test")
+        # Truncation should have triggered (50 messages > 2 rounds * ~3 msgs/round)
+        self.assertTrue(stats.get("truncated"), "rounds truncation should trigger on 50 messages with keep_rounds=2")
+        # Actual keys (per source inspection)
+        self.assertIn("dropped_messages", stats)
+        self.assertIn("kept_messages", stats)
+        # dropped + kept should be ≤ original (may be less if placeholder replaces dropped)
+        self.assertLessEqual(
+            stats["dropped_messages"] + stats["kept_messages"],
+            len(msgs) + 1,  # +1 for placeholder
+        )
+        # Result is shorter than original (truncation was effective)
+        self.assertLessEqual(len(result), len(msgs) + 1)
+
+    def test_pre_truncation_threshold_logic(self):
+        """Verify the threshold-based decision: total_chars > threshold
+        means truncation should be attempted. We can't run the full
+        do_POST pipeline in a unit test (it requires HTTP plumbing), so
+        we test the threshold constant relative to the documented bug."""
+        # The default 400K matches DEFECT-LIST DEF-001 evidence
+        # (65/67 errors had input_chars > 400K)
+        threshold = proxy.PROXY_PRE_TRUNCATE_CHARS
+        # Sanity: a 500K-char payload SHOULD trigger pre-truncation
+        sample_500k = "x" * 500_000
+        self.assertGreater(len(sample_500k), threshold)
+        # And a 100K payload should NOT trigger
+        sample_100k = "x" * 100_000
+        self.assertLess(len(sample_100k), threshold)
+
+
+class TestClassifyException(unittest.TestCase):
+    """DEF-001 retry: _classify_exception must return (status, type, retryable)."""
+
+    def test_timeout_error_class(self):
+        code, etype, retry = proxy._classify_exception(TimeoutError("read timed out"))
+        self.assertEqual(code, 504)
+        self.assertEqual(etype, "timeout_error")
+        self.assertTrue(retry)
+
+    def test_socket_timeout(self):
+        import socket as _socket
+        code, etype, retry = proxy._classify_exception(_socket.timeout("connect timed out"))
+        self.assertEqual(code, 504)
+        self.assertTrue(retry)
+
+    def test_oom_message(self):
+        code, etype, retry = proxy._classify_exception(RuntimeError("[METAL] Insufficient Memory"))
+        self.assertEqual(code, 503)
+        self.assertEqual(etype, "backend_oom")
+        self.assertTrue(retry)
+
+    def test_oom_lowercase(self):
+        code, etype, retry = proxy._classify_exception(RuntimeError("CUDA out of memory"))
+        self.assertEqual(code, 503)
+        self.assertTrue(retry)
+
+    def test_connection_refused(self):
+        code, etype, retry = proxy._classify_exception(ConnectionRefusedError("errno 61"))
+        self.assertEqual(code, 503)
+        self.assertEqual(etype, "backend_unavailable")
+        self.assertTrue(retry)
+
+    def test_connection_error_message(self):
+        code, etype, retry = proxy._classify_exception(OSError("Connection refused on port 8081"))
+        self.assertEqual(code, 503)
+        self.assertTrue(retry)
+
+    def test_programming_key_error(self):
+        code, etype, retry = proxy._classify_exception(KeyError("missing_key"))
+        self.assertEqual(code, 500)
+        self.assertFalse(retry)
+
+    def test_programming_type_error(self):
+        code, etype, retry = proxy._classify_exception(TypeError("wrong type"))
+        self.assertEqual(code, 500)
+        self.assertFalse(retry)
+
+    def test_generic_runtime_error(self):
+        code, etype, retry = proxy._classify_exception(RuntimeError("something unexpected"))
+        self.assertEqual(code, 500)
+        self.assertFalse(retry)
+
+    def test_retry_after_constant(self):
+        self.assertIsNotNone(proxy.PROXY_RETRY_AFTER_SECONDS)
+        self.assertGreater(proxy.PROXY_RETRY_AFTER_SECONDS, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

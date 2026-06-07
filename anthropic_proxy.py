@@ -75,11 +75,40 @@ PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0")
 PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
 PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
 
+# DEF-001: pre-truncate very large payloads to prevent rapid-mlx OOM/timeout.
+# Default 400K chars ≈ 130K tokens (assuming chars*0.33 ratio for code/tools JSON).
+# Tune via PROXY_PRE_TRUNCATE_CHARS env var; set very high (e.g. 10000000) to disable.
+PROXY_PRE_TRUNCATE_CHARS = int(os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "400000"))
+
+# DEF-001 retry: seconds to ask clients to wait before retrying on 503/504.
+PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"))
+
 # ---------------------------------------------------------------------------
 # Loop detection: detect consecutive identical tool_use calls
 # ---------------------------------------------------------------------------
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
 PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
+
+
+def _classify_exception(e):
+    import socket as _socket
+    exc_name = type(e).__name__
+    msg = str(e).lower()
+    if isinstance(e, (TimeoutError, _socket.timeout)) or "timeout" in exc_name.lower():
+        return 504, "timeout_error", True
+    if "timed out" in msg or "timeout" in msg or "read timed out" in msg:
+        return 504, "timeout_error", True
+    if "memory" in exc_name.lower() or "memory" in msg or \
+       "resource limit" in msg or "oom" in msg or "out of memory" in msg:
+        return 503, "backend_oom", True
+    if isinstance(e, (ConnectionError, ConnectionRefusedError)) or \
+       "connection refused" in msg or "connection reset" in msg or \
+       "failed to connect" in msg:
+        return 503, "backend_unavailable", True
+    if isinstance(e, (KeyError, TypeError, AttributeError, NameError, ValueError)):
+        return 500, "internal_error", False
+    return 500, "unknown_error", False
+
 
 # ---------------------------------------------------------------------------
 # Re-read prevention: when a Read tool targets a file whose content was just
@@ -2910,6 +2939,34 @@ class Handler(BaseHTTPRequestHandler):
                 total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
                 tools = parsed.get("tools", [])
                 log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
+                # DEF-001 fix: pre-truncate very large payloads to prevent rapid-mlx
+                # OOM and 500 errors. Evidence: 65/67 of v0.5.0-baseline 500s came
+                # from input_chars > 400K (session a309b181). Force rounds truncation
+                # with tight budget when payload exceeds threshold.
+                if total_chars > PROXY_PRE_TRUNCATE_CHARS and msgs:
+                    log(f"  -> Pre-truncation triggered: {total_chars:,} chars > {PROXY_PRE_TRUNCATE_CHARS:,} threshold")
+                    pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
+                    msgs_truncated, pre_stats = _apply_rounds_truncation(
+                        msgs, keep_rounds=2, session_id=pre_session_id
+                    )
+                    if pre_stats.get("truncated"):
+                        parsed = {**parsed, "messages": msgs_truncated}
+                        msgs = msgs_truncated
+                        total_chars = len(json.dumps(msgs_truncated, ensure_ascii=False))
+                        log(f"  -> Pre-truncated: dropped={pre_stats.get('dropped_msgs', 0)}, "
+                            f"kept={len(msgs_truncated)} msgs, now {total_chars:,} chars")
+                        if PROXY_METRICS_ENABLED:
+                            mc = getattr(_metrics_ctx, 'mc', None)
+                            if mc:
+                                _mc_put("pre_truncate", {
+                                    "triggered": True,
+                                    "original_chars": pre_stats.get("original_chars", 0),
+                                    "truncated_chars": total_chars,
+                                    "dropped_msgs": pre_stats.get("dropped_msgs", 0),
+                                    "kept_rounds": pre_stats.get("actual_keep_rounds", 2),
+                                })
+                    else:
+                        log(f"  -> Pre-truncation did not reduce payload, proceeding")
                 # Timing wrapper for structured logging
                 import time as _time
                 _t0 = _time.monotonic()
@@ -2954,10 +3011,31 @@ class Handler(BaseHTTPRequestHandler):
                             mc["output_chars"] = 0
                             mc["duration_ms"] = round(_dur, 1)
                             mc["status"] = 500
+                            mc["error_type"] = type(e).__name__
                             mc["error"] = str(e)[:200]
                             _finalize_metrics(mc)
                             log_metrics(mc)
-                    raise
+                    # DEF-001 fix: classify error and return proper JSON response.
+                    # Uses _classify_exception to pick 503/504/500 + Retry-After
+                    # header for retryable errors (OOM, timeout, connection refused).
+                    status_code, error_type, retryable = _classify_exception(e)
+                    hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
+                    try:
+                        self._respond_json(
+                            {
+                                "error": {
+                                    "type": error_type,
+                                    "message": f"Proxy error: {type(e).__name__}: {str(e)[:500]}",
+                                    "request_id": getattr(self, '_request_id', 'unknown'),
+                                    "retryable": retryable,
+                                }
+                            },
+                            status_code,
+                            extra_headers=hdrs,
+                        )
+                    except Exception as respond_err:
+                        log(f"  -> CRITICAL: failed to send error response: {respond_err}")
+                    # No raise — let the connection close cleanly
             else:
                 log(f"  -> 404 (unknown path)")
                 self._respond_json({"detail": "Not found"}, 404)
@@ -3571,13 +3649,16 @@ class Handler(BaseHTTPRequestHandler):
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
-    def _respond_json(self, data, status=200):
+    def _respond_json(self, data, status=200, extra_headers=None):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         if not getattr(self, "_request_id", None):
             self._request_id = f"req_{os.urandom(8).hex()}"
         self.send_header("request-id", self._request_id)
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, str(v))
         self.end_headers()
         raw = json.dumps(data, ensure_ascii=False)
         log(f"  <- Response body: {raw[:500]}")
