@@ -1,5 +1,4 @@
-<!-- From: /Users/jinsongwang/APP/llama.cpp/AGENTS.md -->
-# AGENTS.md — Local LLM Inference Stack
+<!-- AGENTS.md — Local LLM Inference Stack -->
 
 > This file provides guidance to AI coding agents working with this repository.
 > The codebase contains a mix of English and Chinese documentation; this file is
@@ -58,27 +57,54 @@ etc.). The project is a collection of runnable scripts and configuration files.
 ```
 .
 ├── manage.sh                  # Main service manager (bash)
-├── anthropic_proxy.py         # Anthropic→OpenAI proxy (python3)
+├── anthropic_proxy.py         # Anthropic→OpenAI proxy (python3, ~3,600 lines)
 ├── configs/
 │   ├── active.conf            # Symlink to the currently active config
 │   ├── deepseek-chat.conf     # Cloud proxy → DeepSeek API (no local backend)
 │   ├── qwen3.6-27b-mtp.conf   # llama-server + Qwen3.6-27B-MTP (GGUF)
-│   └── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
+│   ├── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
+│   └── rapid-mlx-9b.conf      # rapid-mlx + Qwen3.6-9B (lightweight)
 ├── tools/
-│   ├── bench_mtp.py                # MTP model performance benchmark
-│   ├── logview.sh                  # Unified log viewer
-│   ├── sysmon.sh                   # System monitoring (memory, CPU, disk)
-│   ├── modelmon.sh                 # Model service monitoring
-│   └── memcheck.sh                 # Detailed memory analysis
-├── test/                          # Automated tests (see test/README.md)
-│   ├── run_tests.sh               # Unified tier-based runner
-│   ├── unit/                      # Pure logic, no I/O (<1s)
-│   ├── integration/               # Mock backend, no LLM (~5s)
-│   └── e2e/                       # Requires running proxy + backend
+│   ├── bench_mtp.py           # MTP model performance benchmark
+│   ├── bench_rapidmlx.py      # Rapid-MLX throughput benchmark
+│   ├── bench_agent.py         # Agentic end-to-end benchmark
+│   ├── bench_compress.py      # Context compression benchmark
+│   ├── cache_analyzer.py      # Prefix-cache hit-rate analyzer
+│   ├── context_stress_test.py # Long-context stress test
+│   ├── stress_test.py         # Load stress test
+│   ├── analyze_claude_semantics.py  # Semantic behavior analysis
+│   ├── analyze_experiment.py  # A/B experiment result analyzer
+│   ├── trace_requirements.py  # Requirement traceability checker
+│   ├── logview.sh             # Unified log viewer
+│   ├── sysmon.sh              # System monitoring (memory, CPU, disk)
+│   ├── modelmon.sh            # Model service monitoring
+│   ├── memcheck.sh            # Detailed memory analysis
+│   └── run_experiment.sh      # A/B experiment runner
+├── test/                      # Automated tests (see test/README.md)
+│   ├── run_tests.sh           # Unified tier-based runner
+│   ├── unit/                  # Pure logic, no I/O (<1s)
+│   ├── integration/           # Mock backend, no LLM (~5s)
+│   ├── e2e/                   # Requires running proxy + backend
+│   └── fixtures/              # Shared test fixtures
+├── docs/                      # Project documentation (24+ files)
+│   ├── 01-requirements-product/
+│   ├── 02-architecture-design/
+│   ├── 03-experiments-testing/
+│   ├── 04-analysis-diagnostics/
+│   ├── 05-operations-changelog/
+│   ├── 06-reference-metrics/
+│   ├── DEFECT-LIST.md         # 30 defects (7 P0 + 8 P1 + 10 P2 + 5 P3)
+│   ├── OSS-REPLACEMENT-EVALUATION.md
+│   ├── PM-ANALYSIS-FUTURE-ROADMAP.md
+│   └── README.md              # Documentation navigation
+├── assets/
+│   └── chat-templates/        # Fixed Qwen Jinja templates
 ├── .githooks/
-│   └── pre-commit                 # Pre-commit gate: runs --unit on every commit
+│   └── pre-commit             # Pre-commit gate: runs --unit on every commit
 ├── BENCHMARK.md               # Performance test report (Chinese)
-└── CLAUDE.md                  # Legacy agent guide (keep in sync)
+├── CHANGELOG.md               # Release changelog (v0.5.0-baseline)
+├── CLAUDE.md                  # Legacy agent guide (keep in sync)
+└── TROUBLESHOOTING.md         # Incident records and fixes (Chinese)
 ```
 
 ### Runtime artifacts (not in git)
@@ -87,6 +113,8 @@ etc.). The project is a collection of runnable scripts and configuration files.
 - `anthropic_proxy.pid` — Proxy PID file written by `manage.sh`
 - `logs/llama-server.log` — Combined stdout/stderr log of the backend process
 - `logs/anthropic_proxy.log` — Proxy request/response log
+- `logs/proxy_metrics.jsonl` — Structured per-request pipeline metrics
+- `logs/proxy_requests.jsonl` — Structured request/response summary log
 - `/tmp/anthropic_request_body.json` — Last proxy request body (debug)
 
 ---
@@ -218,7 +246,22 @@ Switching between local and cloud models is done by:
 
 - `GET /v1/models` — Returns model aliases (Claude model IDs mapped to local model)
 - `POST /v1/messages` — Anthropic Messages API (streaming and non-streaming)
+- `GET /status` — HTML status page with real-time metrics, memory bars, and alerts
 - `OPTIONS` — CORS preflight
+
+### 8-layer request pipeline
+
+The proxy processes every request through an 8-layer pipeline (documented in
+`docs/02-architecture-design/proxy-pipeline-reference.md`):
+
+1. **Request Entry** (`Handler.do_POST`) — routing, JSON parse, session tracking, metrics init
+2. **Semantic Preprocessing** — error translation, tool-result clearing, placeholder preservation
+3. **Loop & Blocker Guard** — exact/pattern loop detection, escalating intervention, re-read detection
+4. **Cache Optimizer** — date normalization, thinking clearing, cleared-content compression
+5. **Context Truncator** — rounds/fifo/char strategies, three-tier compression, incremental summary
+6. **Format & Forward** — Anthropic→OpenAI conversion, tool filtering, backend forwarding
+7. **Response Control** — streaming/non-streaming SSE reconstruction, output truncation, JSON repair
+8. **Observability** — metrics JSONL logging, request/response JSONL logging
 
 ### Format conversions
 
@@ -252,11 +295,42 @@ Environment variables:
 | `PROXY_MAX_CONCURRENT` | `4` (cloud) / `1` (local) | Max concurrent requests forwarded to backend |
 | `PROXY_CTX_LIMIT_ENABLED` | `false` (cloud) / `true` (local) | Enable message truncation when context exceeds limit |
 | `PROXY_CTX_CHARS_LIMIT` | `500000` (cloud) / `180000` (local) | Character limit for context truncation (char strategy) |
-| `PROXY_CTX_TRUNCATE_STRATEGY` | `char` | Truncation strategy: `char` = threshold-based, `rounds` = keep last N assistant rounds with token budget |
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `char` | Truncation strategy: `char` = threshold-based, `rounds` = keep last N assistant rounds with token budget, `fifo` = fixed message count |
 | `PROXY_CTX_KEEP_ROUNDS` | `10` | Max number of recent assistant rounds to preserve (rounds strategy) |
+| `PROXY_CTX_KEEP_MESSAGES` | `40` | Total messages to keep (fifo strategy) |
+| `PROXY_CTX_KEEP_HEAD` | `2` | Keep first N messages (system context + skills) |
+| `PROXY_CTX_KEEP_TAIL` | `4` | Keep last N messages |
 | `PROXY_CTX_TOKEN_BUDGET` | `30000` | Prompt tokens budget上限 (rounds strategy), triggers dynamic round reduction |
-| `PROXY_CTX_TOKEN_RATIO` | `1.3` | Chars-to-tokens estimation ratio for budget calculation |
-| `PROXY_CTX_KEEP_ROUNDS_DYNAMIC` | `true` | Dynamically adjust keep_rounds based on total message count |
+| `PROXY_CTX_TOKEN_RATIO` | `2.0` | Chars-to-tokens estimation ratio for budget calculation |
+| `PROXY_MAX_TOKENS_OVERRIDE` | `0` | Hard cap on `max_tokens` (0 = disabled); works around rapid-mlx ignoring max_tokens |
+| `PROXY_OUTPUT_TOKEN_LIMIT_RATIO` | `2.0` | Multiplier applied to max_tokens for output safety margin |
+| `PROXY_BACKEND_TIMEOUT` | `300` | Backend request timeout in seconds |
+| `PROXY_PRE_TRUNCATE_CHARS` | `400000` | Pre-truncate very large payloads to prevent OOM/timeout |
+| `PROXY_RETRY_AFTER_SECONDS` | `30` | Retry-After header value (seconds) for 503/504 responses |
+
+### Proxy-side error classification and retry (DEF-001)
+
+The proxy classifies unhandled exceptions in `do_POST` via `_classify_exception(e)`
+and returns the appropriate HTTP status code with structured error JSON:
+
+| Error class | HTTP status | `error.type` | Retryable | Example |
+|-------------|-------------|--------------|-----------|---------|
+| Backend OOM / resource exhaustion | 503 | `backend_oom` | Yes | `[METAL] Insufficient Memory`, `out of memory` |
+| Backend timeout | 504 | `timeout_error` | Yes | `urllib.error.URLError: timed out` |
+| Backend unavailable / connection refused | 503 | `backend_unavailable` | Yes | `ConnectionRefusedError` |
+| Programming error (KeyError, TypeError, etc.) | 500 | `internal_error` | No | — |
+| Unknown | 500 | `unknown_error` | No | — |
+
+For **retryable** errors (503/504), the proxy adds a `Retry-After` response header
+(RFC 7231 §7.1.3) with the value of `PROXY_RETRY_AFTER_SECONDS`, and includes a
+`"retryable": true` field in the error JSON body. Well-behaved clients (Anthropic
+SDK, Claude Code) can use this to back off automatically.
+
+Detection uses both Python exception class names **and** message-substring matching,
+since rapid-mlx raises generic `RuntimeError` for OOM/timeout conditions.
+
+`_respond_json()` accepts an optional `extra_headers` dict for sending additional
+headers before `end_headers()`.
 
 ### Proxy-side tool definition filtering
 
@@ -271,7 +345,8 @@ This can save 5-8K tokens per request when 44 tools are defined.
 | `PROXY_TOOL_FILTER_RECENT` | `5` | Scan last N assistant rounds for used tools |
 
 Always-kept tools: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `LS`,
-`Task`, `WebFetch`, `WebSearch`, `TodoRead`, `TodoWrite`.
+`Task`, `WebFetch`, `WebSearch`, `TodoRead`, `TodoWrite`, `Skill`, `Agent`,
+`NotebookEdit`, `EnterPlanMode`, `ExitPlanMode`, `AskUserQuestion`.
 
 ### Proxy-side structured metrics logging
 
@@ -314,6 +389,20 @@ Disabled by default for cloud backends (1M+ context, low marginal value).
 | `PROXY_BLOCKER_ENABLED` | `true` (local) / `false` (cloud) | Enable blocker detection |
 | `PROXY_BLOCKER_THRESHOLD` | `2` | Consecutive same-error results before injecting `[BLOCKER]` |
 
+### Loop detection and intervention
+
+The proxy tracks consecutive identical tool_use calls and escalating patterns.
+When a loop is detected, it applies 3 levels of intervention:
+
+- **Level 1**: Soft hint injected into the user message tail
+- **Level 2**: Remove the looping tool from the tools list
+- **Level 3**: Force plain-text mode (no tools) for one turn
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_LOOP_THRESHOLD` | `3` | Consecutive identical calls before Level 1 intervention |
+| `PROXY_LOOP_LEVEL2` | `6` | Threshold for Level 2 (defaults to `PROXY_LOOP_THRESHOLD * 2`) |
+
 ### Special handling
 
 - **XML→JSON fallback** (`parse_tool_arguments`): Qwen models occasionally emit
@@ -335,6 +424,7 @@ Disabled by default for cloud backends (1M+ context, low marginal value).
   map to `deepseek-v4-flash`.
 - **Tool IDs**: Some backends omit `tool_call_id` in streaming; the proxy
   generates synthetic IDs (`call_<hex>`) to satisfy Anthropic SDK requirements.
+- **Error translation**: Known backend error patterns (`Wasted call`, `File does not exist`, `InputValidationError`) are rewritten into natural-language Chinese hints with solution suggestions.
 
 ---
 
@@ -343,10 +433,20 @@ Disabled by default for cloud backends (1M+ context, low marginal value).
 | Script | Purpose | How to run |
 |--------|---------|------------|
 | `bench_mtp.py` | MTP model performance benchmark | `python3 tools/bench_mtp.py --quick` |
+| `bench_rapidmlx.py` | Rapid-MLX throughput benchmark | `python3 tools/bench_rapidmlx.py` |
+| `bench_agent.py` | Agentic end-to-end benchmark | `python3 tools/bench_agent.py` |
+| `bench_compress.py` | Context compression benchmark | `python3 tools/bench_compress.py` |
+| `cache_analyzer.py` | Prefix-cache hit-rate analyzer | `python3 tools/cache_analyzer.py` |
+| `context_stress_test.py` | Long-context stress test | `python3 tools/context_stress_test.py` |
+| `stress_test.py` | Load stress test | `python3 tools/stress_test.py` |
+| `analyze_claude_semantics.py` | Semantic behavior analysis | `python3 tools/analyze_claude_semantics.py` |
+| `analyze_experiment.py` | A/B experiment result analyzer | `python3 tools/analyze_experiment.py <log>` |
+| `trace_requirements.py` | Requirement traceability checker | `python3 tools/trace_requirements.py --strict` |
 | `logview.sh` | Unified log viewer | `./tools/logview.sh backend 100` |
 | `sysmon.sh` | System monitoring | `./tools/sysmon.sh` |
 | `modelmon.sh` | Model service monitoring | `./tools/modelmon.sh` |
 | `memcheck.sh` | Detailed memory analysis | `./tools/memcheck.sh` |
+| `run_experiment.sh` | A/B experiment runner | `./tools/run_experiment.sh` |
 
 All automated tests live under `test/` (see `test/README.md`); the pre-commit hook
 at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.
@@ -403,8 +503,9 @@ clone. Skip with `SKIP_TESTS=1 git commit …` or `git commit --no-verify`.
 bash test/run_tests.sh --unit          # default if no flag
 bash test/run_tests.sh --integration
 bash test/run_tests.sh --e2e
-bash test/run_tests.sh --all           # unit + integration + e2e
+bash test/run_tests.sh --all           # unit + integration + e2e + trace
 bash test/run_tests.sh --fast          # alias for --unit (pre-commit uses this)
+bash test/run_tests.sh --trace         # requirement traceability (docs/requirements.yaml)
 ```
 
 ### Unit tests
@@ -417,6 +518,8 @@ bash test/run_tests.sh --fast          # alias for --unit (pre-commit uses this)
 - `_build_blocker_message` (cache-stability, tool/error metadata)
 - `_compress_middle_with_llm` prompt structure (`Root cause:`/`Fix:`/`Avoidance:`)
 - `truncate_messages_if_needed` (FIFO placeholder cache-stability)
+- `_filter_tools` (tool definition filtering)
+- `_translate_tool_result_errors` (error translation patterns)
 
 Run directly:
 ```bash
@@ -425,20 +528,7 @@ python3 test/unit/test_proxy_fallback.py
 python3 -m unittest discover -s test/unit -p 'test_*.py' -v
 ```
 
-### End-to-end tests
-
-`test/e2e/e2e_tools_fallback.sh` hits the live proxy (requires backend + proxy
-running) and validates:
-1. Non-streaming tool call returns correct `tool_use` block
-2. Streaming tool call emits correct SSE event sequence
-3. Plain chat without tools still works
-
-`test/e2e/test_proxy_integration.py` is a 12-case matrix covering route
-discovery, simple chat, Chinese, tool use, multi-turn tool flows, streaming,
-session continuity, concurrency, count_tokens, long context, special chars,
-and Anthropic SDK headers. Both sub-suites run under `test/run_tests.sh --e2e`.
-
-### Blocker integration matrix
+### Integration tests
 
 `test/integration/test_blocker_integration.sh` boots
 `test/integration/mock_backend.py` (a tiny OpenAI-compatible mock) and the
@@ -460,13 +550,32 @@ The script also dumps a per-request metrics summary from
 `logs/itest/proxy_metrics.jsonl` showing which requests triggered the
 blocker and why. No real LLM is required.
 
+### End-to-end tests
+
+`test/e2e/e2e_tools_fallback.sh` hits the live proxy (requires backend + proxy
+running) and validates:
+1. Non-streaming tool call returns correct `tool_use` block
+2. Streaming tool call emits correct SSE event sequence
+3. Plain chat without tools still works
+
+`test/e2e/test_proxy_integration.py` is a 12-case matrix covering route
+discovery, simple chat, Chinese, tool use, multi-turn tool flows, streaming,
+session continuity, concurrency, count_tokens, long context, special chars,
+and Anthropic SDK headers. Both sub-suites run under `test/run_tests.sh --e2e`.
+
+### Requirement traceability
+
+`tools/trace_requirements.py` audits `docs/requirements.yaml` against code
+anchors and test coverage. Run via `bash test/run_tests.sh --trace`.
+
 ### Manual validation
 
 1. **Backend health**: `./manage.sh status` checks process + API endpoint.
 2. **Proxy health**: `curl http://127.0.0.1:4000/v1/models`.
-3. **End-to-end**: Send an Anthropic-format request through the proxy and verify
+3. **Status page**: Open `http://127.0.0.1:4000/status` in a browser.
+4. **End-to-end**: Send an Anthropic-format request through the proxy and verify
    response format and content.
-4. **Benchmarking**: `python3 tools/bench_mtp.py --quick` measures MTP throughput.
+5. **Benchmarking**: `python3 tools/bench_mtp.py --quick` measures MTP throughput.
 
 When modifying `anthropic_proxy.py`, run **all three tiers** (`bash test/run_tests.sh --all`),
 covering both streaming and non-streaming paths, with and without tool calls,
@@ -507,10 +616,12 @@ Set `LLAMA_SERVER_BIN` env var or update `tools/bench_mtp.py`'s constant.
 
 ## Known Issues & Limitations
 
-Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
+Documented in `BENCHMARK.md` (Chinese), `docs/DEFECT-LIST.md`, and briefly here
+for agent context:
 
 1. **Rapid-MLX ignores `max_tokens`** (v0.6.30) — requests may generate far more
-   tokens than requested. Workaround: use `llama-server` when token limits matter.
+   tokens than requested. Workaround: `PROXY_MAX_TOKENS_OVERRIDE` enforces a
+   hard cap in the proxy.
 2. **llama.cpp poor Qwen3.5-9B performance** — Gated DeltaNet architecture has
    incomplete Metal support; only ~17 tok/s. This model config has been removed;
    use Rapid-MLX or Qwen3.6-27B-MTP instead.
@@ -549,6 +660,10 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
 10. **`deepseek-chat` deprecation** — DeepSeek's `deepseek-chat` and
     `deepseek-reasoner` model names will be deprecated on 2026-07-24. Use
     `deepseek-v4-pro` and `deepseek-v4-flash` instead.
+11. **P0 defects at v0.5.0-baseline** — `docs/DEFECT-LIST.md` tracks 30 defects
+    including 7 P0 (22% 500 error rate, 37% loop injection rate, re_read_rate
+    formula error, tool-filter recent scan failure, Metal OOM, kernel panic risk,
+    chat-template fix not toolized). Review this file before attempting fixes.
 
 ---
 
@@ -576,11 +691,13 @@ Documented in `BENCHMARK.md` (Chinese) and briefly here for agent context:
       `restart`, and `status` for both `llama-server` and `rapid-mlx` backends.
       Also test `start-cloud` and cloud-mode `status`.
 - [ ] If you modify `anthropic_proxy.py`, run `bash test/run_tests.sh --all`
-      (covers unit, integration, and e2e tiers — the e2e tier needs a running
+      (covers unit, integration, e2e, and trace tiers — the e2e tier needs a running
       proxy + backend). Test both local and cloud modes. The pre-commit hook
       runs only `--unit` for speed; manually run the other tiers before push.
 - [ ] If you add a new config variable, add it to the defaults in `manage.sh` and
       document it in `CLAUDE.md` and this file.
 - [ ] When adding a new backend type (cloud API provider), ensure `BACKEND_TYPE`
       auto-detection in `anthropic_proxy.py` covers its URL pattern.
+- [ ] When modifying context truncation, loop detection, or blocker logic,
+      verify against `docs/DEFECT-LIST.md` to avoid re-introducing known P0 issues.
 - [ ] Keep `CLAUDE.md` and `AGENTS.md` in sync when architectural changes happen.

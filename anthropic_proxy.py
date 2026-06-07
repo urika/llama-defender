@@ -101,8 +101,10 @@ def _classify_exception(e):
     if "memory" in exc_name.lower() or "memory" in msg or \
        "resource limit" in msg or "oom" in msg or "out of memory" in msg:
         return 503, "backend_oom", True
+    if isinstance(e, (BrokenPipeError, ConnectionResetError)):
+        return 499, "client_closed", False
     if isinstance(e, (ConnectionError, ConnectionRefusedError)) or \
-       "connection refused" in msg or "connection reset" in msg or \
+       "connection refused" in msg or \
        "failed to connect" in msg:
         return 503, "backend_unavailable", True
     if isinstance(e, (KeyError, TypeError, AttributeError, NameError, ValueError)):
@@ -3010,31 +3012,36 @@ class Handler(BaseHTTPRequestHandler):
                         if mc:
                             mc["output_chars"] = 0
                             mc["duration_ms"] = round(_dur, 1)
-                            mc["status"] = 500
+                            status_code, _, _ = _classify_exception(e)
+                            mc["status"] = status_code
                             mc["error_type"] = type(e).__name__
                             mc["error"] = str(e)[:200]
                             _finalize_metrics(mc)
                             log_metrics(mc)
                     # DEF-001 fix: classify error and return proper JSON response.
-                    # Uses _classify_exception to pick 503/504/500 + Retry-After
+                    # Uses _classify_exception to pick 503/504/499/500 + Retry-After
                     # header for retryable errors (OOM, timeout, connection refused).
                     status_code, error_type, retryable = _classify_exception(e)
-                    hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
-                    try:
-                        self._respond_json(
-                            {
-                                "error": {
-                                    "type": error_type,
-                                    "message": f"Proxy error: {type(e).__name__}: {str(e)[:500]}",
-                                    "request_id": getattr(self, '_request_id', 'unknown'),
-                                    "retryable": retryable,
-                                }
-                            },
-                            status_code,
-                            extra_headers=hdrs,
-                        )
-                    except Exception as respond_err:
-                        log(f"  -> CRITICAL: failed to send error response: {respond_err}")
+                    if status_code == 499:
+                        # Client already disconnected, no point sending a response.
+                        log(f"  -> Client disconnected (499): {type(e).__name__}")
+                    else:
+                        hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
+                        try:
+                            self._respond_json(
+                                {
+                                    "error": {
+                                        "type": error_type,
+                                        "message": f"Proxy error: {type(e).__name__}: {str(e)[:500]}",
+                                        "request_id": getattr(self, '_request_id', 'unknown'),
+                                        "retryable": retryable,
+                                    }
+                                },
+                                status_code,
+                                extra_headers=hdrs,
+                            )
+                        except Exception as respond_err:
+                            log(f"  -> CRITICAL: failed to send error response: {respond_err}")
                     # No raise — let the connection close cleanly
             else:
                 log(f"  -> 404 (unknown path)")
@@ -3198,8 +3205,10 @@ class Handler(BaseHTTPRequestHandler):
         _mc_put("blocker_detect", blocker_info)
 
         # Re-read detection: check if recent tool_uses target cleared files
+        re_read_info = {"count": 0, "cleared_files": len(cleared_files), "rate_pct": 0.0}
         if cleared_files:
             re_read_count = 0
+            re_read_targets = set()
             recent_msgs = raw_messages[-6:]
             for msg in recent_msgs:
                 if msg.get("role") != "assistant":
@@ -3213,9 +3222,13 @@ class Handler(BaseHTTPRequestHandler):
                                 fp = inp.get("file_path", inp.get("path", ""))
                                 if fp in cleared_files:
                                     re_read_count += 1
+                                    re_read_targets.add(fp)
             if re_read_count > 0:
-                log(f"  -> Re-read detected: {re_read_count} Read calls targeting cleared files "
-                    f"(cleared_files={len(cleared_files)})")
+                rate = min(len(re_read_targets) / len(cleared_files) * 100, 100.0)
+                re_read_info = {"count": re_read_count, "cleared_files": len(cleared_files), "re_read_files": len(re_read_targets), "rate_pct": round(rate, 1)}
+                log(f"  -> Re-read detected: {re_read_count} Read calls targeting {len(re_read_targets)}/{len(cleared_files)} cleared files "
+                    f"(rate={rate:.1f}%)")
+        _mc_put("re_read", re_read_info)
 
         # Normalize system-reminder date to stabilize prefix for KV cache hits
         if raw_messages and raw_messages[0].get("role") == "user":

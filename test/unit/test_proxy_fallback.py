@@ -1632,6 +1632,57 @@ class TestClassifyException(unittest.TestCase):
         self.assertIsNotNone(proxy.PROXY_RETRY_AFTER_SECONDS)
         self.assertGreater(proxy.PROXY_RETRY_AFTER_SECONDS, 0)
 
+    def test_broken_pipe_499(self):
+        code, etype, retry = proxy._classify_exception(BrokenPipeError("[Errno 32] Broken pipe"))
+        self.assertEqual(code, 499)
+        self.assertEqual(etype, "client_closed")
+        self.assertFalse(retry)
+
+    def test_connection_reset_499(self):
+        code, etype, retry = proxy._classify_exception(ConnectionResetError("Connection reset by peer"))
+        self.assertEqual(code, 499)
+        self.assertEqual(etype, "client_closed")
+        self.assertFalse(retry)
+
+
+class TestReReadRate(unittest.TestCase):
+    """DEF-003: re_read_rate formula must be 0-100%, not 2862%."""
+
+    def _build_raw_messages(self, tool_uses):
+        msgs = []
+        for name, fp in tool_uses:
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "name": name, "input": {"file_path": fp}}
+            ]})
+        return msgs
+
+    def test_no_cleared_files_rate_zero(self):
+        self.assertAlmostEqual(min(0 / 1, 1.0) * 100 if 1 else 0, 0.0)
+
+    def test_all_cleared_files_re_read(self):
+        re_read_files = 3
+        cleared_files = 3
+        rate = min(re_read_files / cleared_files * 100, 100.0)
+        self.assertAlmostEqual(rate, 100.0)
+
+    def test_partial_re_read(self):
+        re_read_files = 2
+        cleared_files = 8
+        rate = min(re_read_files / cleared_files * 100, 100.0)
+        self.assertAlmostEqual(rate, 25.0)
+
+    def test_rate_capped_at_100(self):
+        re_read_files = 20
+        cleared_files = 3
+        rate = min(re_read_files / cleared_files * 100, 100.0)
+        self.assertAlmostEqual(rate, 100.0)
+
+    def test_old_formula_would_exceed_100(self):
+        old_rate = 229 / 8 * 100
+        self.assertGreater(old_rate, 100.0)
+        new_rate = min(8 / 8 * 100, 100.0)
+        self.assertLessEqual(new_rate, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

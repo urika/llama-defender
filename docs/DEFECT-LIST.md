@@ -27,7 +27,7 @@
 
 ## 一、🔴 P0-Critical (7 项)
 
-### DEF-001: 67 个请求返回 500 错误 (22% 错误率)
+### DEF-001: 67 个请求返回 500 错误 (22% 错误率) — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
@@ -39,6 +39,8 @@
 | **影响** | 用户感知: 22% 的请求直接失败,agent 行为中断 |
 | **根因分析** | 极可能 `truncate_messages_if_needed` / `_handle_messages` 处理大 payload 时抛异常未被捕获 |
 | **修复建议** | 1) 在 `_handle_messages` 入口添加 try/except 兜底<br>2) 对 input_chars > 400K 的请求提前截断<br>3) 单元测试添加大 payload 场景 |
+| **已实施修复** | **Part A** (commit 9758a6c): `PROXY_PRE_TRUNCATE_CHARS=400000` 预截断 + `do_POST` try/except 兜底<br>**Part B**: `_respond_json` 替换 `raise`,返回结构化 JSON 500<br>**Part C**: `_classify_exception()` 错误分类 (OOM→503, timeout→504, programming→500) + `Retry-After` header + `retryable` 字段<br>**测试**: 10 个新单元测试 (`TestClassifyException`) + 3 个预截断测试 (`TestDef001PreTruncation`) |
+| **剩余工作** | 1) 生产环境验证 500 错误率是否降至 < 2%<br>2) 根因仍可能是 `_handle_messages` 内部逻辑错误,预截断仅为缓解措施 |
 
 ### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环
 
@@ -52,17 +54,16 @@
 | **未解决场景** | 1) **跨请求循环**: `LOOP LEVEL 3` 注入后,下一轮模型又回到相同循环 (16:02 → 16:06 → 16:09 → 16:12 持续 4 轮)<br>2) **认知驱动循环**: Write 工具循环 (16:02-16:23) 持续 21 分钟,Level 3 仅当次有效,跨请求失效 |
 | **修复建议** | 1) 实现跨请求循环追踪 (累计 max_run 趋势)<br>2) 实现 Write 内容相似度检测 (Jaccard > 0.8 视为重复)<br>3) 文档已知 (`docs/claude-behavior-semantic-analysis-v2.md` §7.6),但未实施 |
 
-### DEF-003: re_read_rate 计算公式错误 (2862%, 3271%)
+### DEF-003: re_read_rate 计算公式错误 (2862%, 3271%) — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` |
 | **异常样本** | `Re-read after clear: 229 reads target 6 cleared files (re_read_rate=2862%)` |
-| **正常范围** | 0%-100% (公式应为 `re_reads / total_reads * 100`) |
-| **实际计算** | 229 / 6 = 38.2 (38.2 倍 ≈ 3820%); 或 229 / 8 ≈ 2862% (除数错位) |
-| **影响** | 监控指标失真,无法判断 O5 路径元数据 + Read 预览机制是否有效 |
-| **根因** | `re_read_rate` 计算分子是"总 Read 次数" (229),分母应是"被 Read 的已清除文件数" (8) 或反过来。当前实现语义不明 |
-| **修复建议** | 重新定义指标: `re_read_rate = cleared_files_targeted_by_read / total_cleared_files * 100` (上界 100%) |
+| **正常范围** | 0%-100% (公式应为 `re_read_files / cleared_files * 100`) |
+| **根因** | 旧代码用 `total_reads / cleared_files` (229/8=28.6=2862%),分子语义错误 |
+| **修复** | 新公式: `rate = re_read_files / cleared_files * 100`, cap 100%。<br>新增 `pipeline.re_read` 指标到 metrics JSONL, 含 count/cleared_files/re_read_files/rate_pct。<br>5 个单元测试 (`TestReReadRate`) |
+| **验证** | `rate_pct` 范围 [0, 100],旧公式下 229/8=2862% 在新公式下为 8/8=100% |
 
 ### DEF-004: Tool 过滤 "recent" 扫描 99% 失效
 

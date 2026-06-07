@@ -48,7 +48,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ### Known Issues (P0, 7 项)
 
 来自 `docs/DEFECT-LIST.md`:
-- **DEF-001**: 22% 请求返回 500 错误
+- **DEF-001**: 22% 请求返回 500 错误 — **🟡 部分修复** (预截断 + 错误分类 + Retry-After)
 - **DEF-002**: 37% 请求触发循环注入 (R2.1 未根治跨请求循环)
 - **DEF-003**: re_read_rate 公式错误 (2,862%, 应 ≤ 100%)
 - **DEF-004**: 工具过滤 recent 扫描 99% 失效
@@ -93,7 +93,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 **主题**: P0 缺陷修复 + Langfuse 集成
 
 待办 (来自 DEFECT-LIST):
-- 修复 DEF-001 (500 错误率降至 < 2%)
+- ~~- 修复 DEF-001 (500 错误率降至 < 2%)~~ → **已部分修复**: 预截断 + `_classify_exception` (503/504/500) + `Retry-After` header (详见 AGENTS.md "Proxy-side error classification and retry")
 - 修复 DEF-002 (循环注入率降至 < 20%)
 - 修复 DEF-003 (re_read_rate 公式)
 - 修复 DEF-004 (工具过滤 recent 扫描)

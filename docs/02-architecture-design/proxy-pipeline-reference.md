@@ -91,7 +91,7 @@ do_POST()
   ├─ 写入 /tmp/anthropic_request_body.json (调试)
   ├─ 调用 _handle_messages(body)          ← 核心管线
   ├─ 成功: log_request() + log_metrics()
-  ├─ 失败: log error + log_metrics(status=500)
+  ├─ 失败: _classify_exception(e) → 503/504/500 + Retry-After (retryable)
   └─ finally: 清理 _log_ctx, _metrics_ctx
 ```
 
