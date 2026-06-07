@@ -1229,6 +1229,10 @@ class TestToolFilter(unittest.TestCase):
                        self._asst(["CustomA", "CustomB"])]
         result, stats = proxy._filter_tools(tools, recent_msgs)
         self.assertTrue(stats["filtered"])
+        self.assertIn("recent_tools", stats)
+        self.assertIn("CustomA", stats["recent_tools"])
+        self.assertIn("CustomB", stats["recent_tools"])
+        self.assertEqual(stats["scanned_assistant"], 3)
         kept_names = [t["name"] for t in result]
         # TOOL_ALWAYS_KEEP are all present.
         for must in ["Read", "Write", "Bash", "Glob"]:

@@ -2685,6 +2685,8 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
         "kept": len(kept),
         "always_keep": len(TOOL_ALWAYS_KEEP & {t.get("name", "") for t in kept}),
         "recent_only": len(recent_tools - TOOL_ALWAYS_KEEP),
+        "recent_tools": sorted(recent_tools),
+        "scanned_assistant": assistant_count,
     }
 
 
@@ -3350,8 +3352,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             if tf_stats.get("filtered"):
                 body["tools"] = raw_tools
+                recent_names = tf_stats.get("recent_tools", [])
+                recent_info = f", recent_names={recent_names}" if recent_names else ""
                 log(f"  -> Tool filter: {tf_stats['original']} -> {tf_stats['kept']} "
-                    f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']})")
+                    f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']}, "
+                    f"scanned={tf_stats.get('scanned_assistant',0)}{recent_info})")
                 _mc_put("tool_filter", tf_stats)
         tools = convert_anthropic_tools_to_openai(body.get("tools"))
         if tools:

@@ -65,17 +65,14 @@
 | **修复** | 新公式: `rate = re_read_files / cleared_files * 100`, cap 100%。<br>新增 `pipeline.re_read` 指标到 metrics JSONL, 含 count/cleared_files/re_read_files/rate_pct。<br>5 个单元测试 (`TestReReadRate`) |
 | **验证** | `rate_pct` 范围 [0, 100],旧公式下 229/8=2862% 在新公式下为 8/8=100% |
 
-### DEF-004: Tool 过滤 "recent" 扫描 99% 失效
+### DEF-004: Tool 过滤 "recent" 扫描 99% 失效 — ✅ 已验证 (非 bug, 增强观测性)
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` |
-| **统计** | 99 条 `Tool filter: 44 -> 12 (always=12, recent=0)` / 130 总条数 = **76% recent=0** |
-| **预期行为** | "recent" 应扫描最近 N=5 轮 assistant tool_use,收集实际用过的工具 |
-| **实际行为** | 永远 0 — 工具过滤仅依赖 TOOL_ALWAYS_KEEP 白名单 (12 个),完全忽略"最近使用"维度 |
-| **影响** | R3.3 工具过滤只起到白名单作用,失去"按需扩展"能力。当用户调用非白名单工具 (如 `Skill`) 时,工具被剔除 → 模型调用失败 |
-| **根因** | 可能 `_filter_tools()` 扫描 assistant 消息时,role 字段名不匹配 (Anthropic 用 `assistant`,转换后可能丢失) |
-| **修复建议** | 1) 在 `_filter_tools()` 中添加调试日志,记录 `recent_tools` 集合<br>2) 检查消息转换后 `role="assistant"` 是否完整保留<br>3) 单元测试: 模拟最近 5 轮使用 `Skill` 工具,验证是否在过滤后保留 |
+| **统计** | 143/143 条 `recent=0` |
+| **调查结论** | `_filter_tools()` 逻辑正确。recent=0 是因为: 1) 早期会话模型主要使用白名单工具 (Read/Write/Bash),recent_tools 检测到但 `recent_only=0` (已计入 always_keep); 2) 用 27-tool 请求验证,`TaskCreate`/`TaskUpdate` 等非白名单工具被正确检测为 recent |
+| **增强** | 新增 `recent_tools` (名称列表) + `scanned_assistant` (扫描轮数) 到 filter stats 和 metrics JSONL,方便后续诊断。日志行也显示 recent_tools 名称和扫描轮数 |
 
 ### DEF-005: 后端 Metal OOM 仍会发生 (未根除)
 
