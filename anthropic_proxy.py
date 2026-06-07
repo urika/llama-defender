@@ -80,6 +80,11 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
 # Tune via PROXY_PRE_TRUNCATE_CHARS env var; set very high (e.g. 10000000) to disable.
 PROXY_PRE_TRUNCATE_CHARS = int(os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "400000"))
 
+# DEF-005: estimated prompt token limit to prevent Metal OOM.
+# After all pipeline steps, if estimated tokens exceed this, force aggressive FIFO.
+# Set to 0 to disable. Default 60000 (~120K chars at ratio 2.0) for 48GB Apple Silicon.
+PROXY_OOM_SAFE_TOKENS = int(os.environ.get("PROXY_OOM_SAFE_TOKENS", "60000"))
+
 # DEF-001 retry: seconds to ask clients to wait before retrying on 503/504.
 PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"))
 
@@ -848,6 +853,8 @@ def clear_old_tool_results(messages, tools_list=None):
         ca = str(messages[msg_idx_a]["content"][block_idx_a].get("content", ""))
         cb = str(messages[msg_idx_b]["content"][block_idx_b].get("content", ""))
         if not ca or not cb:
+            continue
+        if ca.startswith("[cleared:") or cb.startswith("[cleared:"):
             continue
         lines_a = set(ca.splitlines())
         lines_b = set(cb.splitlines())
@@ -3095,6 +3102,22 @@ class Handler(BaseHTTPRequestHandler):
                 f"input_validation={error_count['input_validation']})")
             _mc_put("error_translation", {"count": total_errors, **error_count})
 
+        # Blocker detection MUST run BEFORE tool-result clearing, which overwrites
+        # error markers with [cleared: ...] summaries (DEF-108 pipeline ordering fix)
+        blocker_info = _detect_blocker_pattern(raw_messages)
+        if PROXY_BLOCKER_ENABLED and blocker_info.get("triggered"):
+            log(
+                f"  -> Blocker detected: {blocker_info['tool_name']} failed "
+                f"({blocker_info['error_type']}) {blocker_info['run_length']} times in a row, "
+                f"injecting [BLOCKER] message"
+            )
+            raw_messages.append(_build_blocker_message(
+                blocker_info["tool_name"],
+                blocker_info["error_type"],
+                blocker_info["run_length"],
+            ))
+        _mc_put("blocker_detect", blocker_info)
+
         # Proxy-side tool-result clearing with semantic priority
         raw_messages, clear_stats = clear_old_tool_results(raw_messages, tools_list=tools_list)
         cleared_files = clear_stats.get("cleared_files", [])
@@ -3190,21 +3213,6 @@ class Handler(BaseHTTPRequestHandler):
         if session_id:
             LOOP_CONSECUTIVE[session_id] = dict(consecutive)
             log(f"  -> Loop counts persisted for session: {dict(consecutive)}")
-
-        # Blocker detection: same-error-type consecutive tool_result rejections
-        blocker_info = _detect_blocker_pattern(raw_messages)
-        if blocker_info.get("triggered"):
-            log(
-                f"  -> Blocker detected: {blocker_info['tool_name']} failed "
-                f"({blocker_info['error_type']}) {blocker_info['run_length']} times in a row, "
-                f"injecting [BLOCKER] message"
-            )
-            raw_messages.append(_build_blocker_message(
-                blocker_info["tool_name"],
-                blocker_info["error_type"],
-                blocker_info["run_length"],
-            ))
-        _mc_put("blocker_detect", blocker_info)
 
         # Re-read detection: check if recent tool_uses target cleared files
         re_read_info = {"count": 0, "cleared_files": len(cleared_files), "rate_pct": 0.0}
@@ -3313,6 +3321,21 @@ class Handler(BaseHTTPRequestHandler):
             h1 = _msg_hash(raw_messages[1]) if len(raw_messages) > 1 else "none"
             log(f"  -> Msg hashes: msg0={h0}, msg1={h1}, total_msgs={len(raw_messages)}")
 
+        # DEF-005: OOM safety — if estimated tokens still exceed safe limit after
+        # all pipeline steps, force aggressive FIFO truncation to prevent Metal OOM.
+        if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD:
+            est_chars = _estimate_message_chars(raw_messages)
+            est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
+            if est_tokens > PROXY_OOM_SAFE_TOKENS:
+                keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 10)
+                if len(raw_messages) > keep:
+                    dropped = len(raw_messages) - keep
+                    raw_messages[:] = raw_messages[:PROXY_CTX_KEEP_HEAD] + raw_messages[-(keep - PROXY_CTX_KEEP_HEAD):]
+                    log(f"  -> OOM safety truncation: {dropped} messages dropped, "
+                        f"~{est_tokens} tokens > {PROXY_OOM_SAFE_TOKENS} safe limit, "
+                        f"kept {len(raw_messages)} msgs (head={PROXY_CTX_KEEP_HEAD}, tail={keep - PROXY_CTX_KEEP_HEAD})")
+                    _mc_put("oom_safety", {"triggered": True, "est_tokens": est_tokens, "limit": PROXY_OOM_SAFE_TOKENS, "dropped": dropped})
+
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)
 
@@ -3416,6 +3439,20 @@ class Handler(BaseHTTPRequestHandler):
         if force_stopped:
             anthropic_resp["stop_reason"] = "max_tokens"
             log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})")
+            for block in anthropic_resp.get("content", []):
+                if block.get("type") == "tool_use" and block.get("input") == {}:
+                    tool_name = block.get("name", "")
+                    for tc in openai_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls", []):
+                        if tc.get("function", {}).get("name") == tool_name:
+                            raw_args = tc["function"].get("arguments", "{}")
+                            try:
+                                json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                repaired = _repair_truncated_json(raw_args)
+                                parsed = json.loads(repaired) if repaired else {}
+                                block["input"] = parsed
+                                log(f"  -> Repaired truncated JSON for tool {tool_name}")
+                            break
 
         content_summary = ""
         for block in anthropic_resp.get("content", []):

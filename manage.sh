@@ -383,6 +383,23 @@ _start_llama_server() {
 _start_rapid_mlx() {
     _check_port "$LLAMA_PORT" || return 1
 
+    # DEF-006: GPU 内存安全检查 — 防止 kernel panic
+    if [[ -n "${RAPID_MLX_EXTRA_ARGS:-}" ]]; then
+        local gpu_mem_val
+        gpu_mem_val=$(echo "$RAPID_MLX_EXTRA_ARGS" | grep -oE '\-\-gpu-memory-utilization[[:space:]]+([0-9.]+)' | grep -oE '[0-9.]+$' || true)
+        if [[ -n "$gpu_mem_val" ]]; then
+            if (( $(echo "$gpu_mem_val > 0.85" | bc -l 2>/dev/null || echo 0) )); then
+                error "DEF-006 安全检查: --gpu-memory-utilization=$gpu_mem_val > 0.85"
+                error "超过 0.85 可能触发 macOS kernel panic (Apple Silicon firmware 限制)"
+                error "请在配置文件中降低 --gpu-memory-utilization 的值 (推荐 ≤ 0.80)"
+                return 1
+            elif (( $(echo "$gpu_mem_val > 0.80" | bc -l 2>/dev/null || echo 0) )); then
+                warn "DEF-006 警告: --gpu-memory-utilization=$gpu_mem_val 接近危险阈值 (0.80-0.85)"
+                warn "如果出现 kernel panic，请降低到 ≤ 0.80"
+            fi
+        fi
+    fi
+
     info "启动 Rapid-MLX..."
     info "  配置: ${CYAN}$(_current_config_name)${NC}"
     info "  模型: $LLAMA_MODEL"
@@ -898,6 +915,48 @@ cmd_current() {
 }
 
 # ============================================================
+# 修复 Chat Template (DEF-007)
+# ============================================================
+cmd_fix_template() {
+    local model_dir="${1:-}"
+    if [[ -z "$model_dir" ]]; then
+        error "用法: ./manage.sh fix-template <model_dir>"
+        error "  model_dir: HuggingFace 模型目录 (如 ~/.cache/huggingface/hub/models--*/snapshots/*)"
+        info ""
+        info "搜索已缓存的 Qwen 模型:"
+        find ~/.cache/huggingface/hub -name "chat_template.jinja" -type f 2>/dev/null | while read -r f; do
+            local dir
+            dir=$(dirname "$f")
+            echo "  $dir"
+        done
+        return 1
+    fi
+
+    local template_src="$_SCRIPT_DIR/assets/chat-templates/qwen-fixed-chat-template.jinja"
+    if [[ ! -f "$template_src" ]]; then
+        error "修复模板不存在: $template_src"
+        return 1
+    fi
+
+    local target="$model_dir/chat_template.jinja"
+    if [[ ! -e "$target" ]]; then
+        warn "目标文件不存在: $target"
+        info "将创建新文件"
+    fi
+
+    # 如果是软链接，先删除
+    if [[ -L "$target" ]]; then
+        info "删除旧软链接: $target -> $(readlink "$target")"
+        rm -f "$target"
+    fi
+
+    cp "$template_src" "$target"
+    info "已修复: $target"
+    info "模板: qwen-fixed-chat-template.jinja (支持 mid-conversation system, developer role)"
+    info "请重启服务以生效: ./manage.sh restart"
+}
+
+# ============================================================
 # 帮助信息
 # ============================================================
 cmd_help() {
@@ -919,6 +978,9 @@ llama.cpp / Rapid-MLX 服务管理脚本
   list                 列出所有可用配置
   switch <name>        切换到指定配置
   current              显示当前配置详情
+
+维护命令:
+  fix-template <dir>   修复模型的 chat_template (防止 system message 崩溃)
 
 支持的后端:
   llama-server         标准 llama.cpp 后端 (GGUF)
@@ -972,6 +1034,9 @@ main() {
             ;;
         current)
             cmd_current
+            ;;
+        fix-template)
+            cmd_fix_template "$2"
             ;;
         help|--help|-h)
             cmd_help

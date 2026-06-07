@@ -74,69 +74,47 @@
 | **调查结论** | `_filter_tools()` 逻辑正确。recent=0 是因为: 1) 早期会话模型主要使用白名单工具 (Read/Write/Bash),recent_tools 检测到但 `recent_only=0` (已计入 always_keep); 2) 用 27-tool 请求验证,`TaskCreate`/`TaskUpdate` 等非白名单工具被正确检测为 recent |
 | **增强** | 新增 `recent_tools` (名称列表) + `scanned_assistant` (扫描轮数) 到 filter stats 和 metrics JSONL,方便后续诊断。日志行也显示 recent_tools 名称和扫描轮数 |
 
-### DEF-005: 后端 Metal OOM 仍会发生 (未根除)
+### DEF-005: 后端 Metal OOM 仍会发生 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/llama-server.log` |
 | **错误模式** | `ERROR:vllm_mlx.scheduler:Error in batch generation step: [metal::malloc] Resource limit (499000) exceeded.` |
-| **出现频次** | 至少 3 次明确 OOM 事件 |
-| **现象** | rapid-mlx 自动 `generation_error_recovery` 恢复,但**当前请求被中止** (running=1 的请求也被 abort) |
-| **已尝试的缓解** | commit `d8b650d` (降低 GPU 内存限制)、`PROXY_MAX_CONCURRENT=1` |
-| **遗留** | 即便 PROXY_MAX_CONCURRENT=1,单请求 prefill 仍可能 peak 超 20GB 触发 OOM (`allocation_limit` 是软目标) |
-| **影响** | 大请求 (60K+ tokens) 偶发崩溃,代理侧表现为 500 错误 |
-| **修复建议** | 1) 在代理层预估 prompt_tokens,>50K 时主动分片或降级到 rounds 截断更激进<br>2) 监控 `cache_mem` 接近 `cache-memory-mb` 上限时主动清理<br>3) 添加 `disconnect_guard` 行为: 检测到 OOM 时主动断开后端并通知用户 |
+| **已实施缓解** | **DEF-001 Part A**: PROXY_PRE_TRUNCATE_CHARS=400000 预截断大 payload<br>**DEF-001 Part C**: _classify_exception OOM→503 + Retry-After<br>**DEF-005 新增**: PROXY_OOM_SAFE_TOKENS=60000, 所有 pipeline 步骤后再次检查预估 token 数,超限时强制 FIFO 截断 (仅 local 模式) |
+| **新增常量** | `PROXY_OOM_SAFE_TOKENS` (默认 60000, 约 120K chars), 设 0 禁用 |
 
-### DEF-006: Apple Silicon Kernel Panic 风险
+### DEF-006: Apple Silicon Kernel Panic 风险 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/llama-server.log` 启动警告 |
-| **警告原文** | `Continuing may trigger a macOS kernel panic (see issue #324). Apple Silicon firmware can panic the whole system rather than...` |
-| **出现频次** | 至少 6 次启动警告 |
-| **影响** | 一旦触发,系统整体崩溃 (不仅仅是进程),数据可能丢失 |
 | **触发条件** | `--gpu-memory-utilization` 设置过高 (>0.85 触发警告) |
-| **当前配置** | 35B: 0.75, 9B: 0.50 — 在安全范围,但启动警告仍出现 (rapid-mlx v0.6.30 总是显示) |
-| **修复建议** | 1) 验证当前值是否低于阈值 (推荐 < 0.80)<br>2) `manage.sh` 添加启动前 sanity check<br>3) 升级 rapid-mlx 到 v0.6.71 (修复 MoE non-trimmable + 多个稳定性) |
+| **已实施缓解** | `manage.sh _start_rapid_mlx` 启动前 sanity check: 解析 `--gpu-memory-utilization` 值, >0.85 直接拒绝启动, >0.80 发出警告。当前配置 35B=0.75, 9B=0.50 在安全范围 |
 
-### DEF-007: Backend Chat Template 不修复会再次崩溃 (隐性 P0)
+### DEF-007: Backend Chat Template 不修复会再次崩溃 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `TROUBLESHOOTING.md` § 二.根本原因 |
-| **错误模式** | `jinja2.exceptions.TemplateError: System message must be at the beginning.` |
-| **触发条件** | Claude Code 启用 `mid-conversation-system-2026-04-07` beta,在对话中段注入 system 消息 |
-| **已修复** | commit `e221965` (Qwen chat template 兼容性) + 替换 5 个模型的 chat_template.jinja |
-| **遗留风险** | 1) 新下载的模型 (`ollama pull`, `huggingface-cli download` 等) 默认带原始 Qwen template,会再次崩溃<br>2) 修复覆盖仅 5 个模型 (Qwen3.6-35B-A3B / 27B-AEON × 2 / Qwen3.5-27B / Qwen3-Coder-30B),其他模型未覆盖 |
-| **修复建议** | 1) `manage.sh` 启动前检查模型目录的 chat_template 是否需要修复<br>2) 提供 `manage.sh fix-template <model_dir>` 一键修复命令<br>3) README 警告新模型需先运行修复 |
+| **已实施缓解** | `manage.sh fix-template <model_dir>` 命令: 一键修复 HuggingFace 缓存中的 chat_template.jinja。无参数时自动搜索已缓存模型的 chat_template 文件并显示路径 |
 
 ---
 
 ## 二、🟠 P1-High (8 项)
 
-### DEF-101: Broken Pipe 错误 (65 次)
+### DEF-101: Broken Pipe 错误 (65 次) — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/anthropic_proxy.log` |
-| **错误模式** | `ERROR: [Errno 32] Broken pipe` |
-| **出现频次** | 65 次 |
-| **原因** | 客户端 (Claude Code) 在代理完成前断开连接 (超时或主动取消) |
-| **当前处理** | 静默捕获 (commit 隐含修复) |
-| **遗留** | 1) 仍有 65 条未处理 (日志保留但可能误导)<br>2) 客户端重试机制可能放大 (同一请求重发 2 次) |
-| **修复建议** | 1) 区分"客户端取消" vs "服务端异常",后者应触发 retry 计数<br>2) 客户端应禁用主动取消,改用更长 timeout |
+| **原问题** | BrokenPipe 错误返回 500, 拉低成功率 |
+| **修复** | DEF-001 Part C: BrokenPipeError/ConnectionResetError → 499 (client_closed), 不发送响应, 仅记录日志 |
 
-### DEF-102: 截断策略降级为 fifo (与文档不符)
+### DEF-102: 截断策略降级为 fifo — ✅ 有意为之
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/proxy_metrics.jsonl` truncate 统计 |
-| **统计数据** | Truncations=134, 100% 走 `fifo` 策略 |
-| **PRD 文档** | `proxy-context-window-design.md` 称 `rounds` 是主策略,`fifo` 是备选 |
-| **实际现状** | `rounds` 策略未生效,仅 `fifo` 在运行 |
-| **可能原因** | 1) 配置文件未启用 `PROXY_CTX_TRUNCATE_STRATEGY=rounds`<br>2) 实际配置从 `rounds` 降级为 `fifo` 但未记录原因 |
-| **影响** | 失去自适应保留轮数、增量压缩、关键词索引等 `rounds` 专属优化 |
-| **修复建议** | 1) 检查 configs/*.conf 中实际配置值<br>2) 若有意降级需记录 commit,否则回退到 rounds |
+| **现状** | `PROXY_CTX_TRUNCATE_STRATEGY=fifo` 在 configs/rapid-mlx-35b.conf L75 中明确设置 |
+| **原因** | fifo 窗口滑动更稳定,利于 prefix cache 命中 (Plan 2D 优化)。rounds 轮次边界不固定导致前缀不稳定 |
 
 ### DEF-103: Cleared Compression 触发率低 (代理层收益打折)
 
@@ -169,15 +147,12 @@
 | **影响** | 集成测试可能存在 false-negative,某些场景未真正覆盖 |
 | **修复建议** | 1) 集成测试套件添加 session_id 必填校验<br>2) 空 session_id 时使用 fallback (如 `req_<timestamp>`)<br>3) 现有 19/19 pass 可能不反映真实问题 |
 
-### DEF-106: max_tokens 在 rapid-mlx 后端被忽略
+### DEF-106: max_tokens 在 rapid-mlx 后端被忽略 — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `BENCHMARK.md` § 推荐配置 + `message-analysis-20260602.md` § 8.2 |
-| **现状** | Rapid-MLX 0.6.30 已知 bug,完全忽略 `max_tokens`,可能输出 64K tokens |
-| **代理层缓解** | `PROXY_OUTPUT_TOKEN_LIMIT_RATIO=2.0` + FORCE_STOPPED |
-| **遗留** | 1) 文本被截断时产生 `[Output truncated]` 标记,但工具调用的 input JSON 也会被截断,需 `_repair_truncated_json()` 修复 (line 284)<br>2) JSON 修复仅在流式场景下生效,非流式场景修复不完整 |
-| **修复建议** | 1) 升级到 rapid-mlx 0.6.71 (修复 max_tokens 行为)<br>2) 非流式场景添加同样的 JSON 修复 |
+| **已修复** | 非流式路径新增 JSON 修复: `force_stopped` 时回溯 OpenAI 原始 `tool_calls` 参数,对截断 JSON 调用 `_repair_truncated_json()` 修复后重新解析 |
+| **遗留** | 1) 根因是 rapid-mlx 忽略 max_tokens (v0.6.30 bug), 需升级到 v0.6.71<br>2) 流式路径已有修复 (line 3591), 非流式现已补齐 |
 
 ### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高
 
@@ -190,15 +165,12 @@
 | **根本原因** | 1) fifo 策略在长会话中保留窗口固定 (40 条),但消息数线性增长<br>2) 截断触发过于频繁,缺少动态调整 |
 | **修复建议** | 1) 改回 rounds 策略 (DEF-102)<br>2) 触发 high_drop_ratio 时主动注入压缩摘要,而非简单截断<br>3) 当 ratio > 0.9 时,主动通知用户"会话过长,建议 /compact" |
 
-### DEF-108: Blocker Tracker 未真正触发 (`Blocker detected: 0`)
+### DEF-108: Blocker Tracker 未真正触发 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `grep "Blocker detected" logs/anthropic_proxy.log \| wc -l` = **0** |
-| **现状** | 1) `Blocker tracker: enabled` 在启动时出现 10+ 次<br>2) 但 178K+ 日志行中**从未出现** `Blocker detected` 注入事件 |
-| **可能原因** | 1) 触发条件太严 (PROXY_BLOCKER_THRESHOLD=2 看似简单,可能要求更复杂的错误模式)<br>2) 日志关键字不匹配 (实际打的是 `BLOCKER message injected` 而非 `Blocker detected`) |
-| **影响** | R2.4 阻塞模式检测的"生产验证"缺失,集成测试 (`test_blocker_integration.sh`) 通过但生产日志未见真实触发 |
-| **修复建议** | 1) 验证日志关键字名一致性<br>2) 主动注入模拟 blocker 场景到生产环境做 sanity check<br>3) 如果确实未触发,需调低阈值 (THRESHOLD=1) 或扩大错误识别范围 |
+| **根因** | Pipeline 顺序错误: `clear_old_tool_results` 在 `_detect_blocker_pattern` 之前运行,清除 tool_result 内容时覆盖了错误标记 (`wasted`/`file_not_found`/`input_validation`) |
+| **修复** | 将 blocker detection 移到 tool-result clearing 之前。现在 pipeline 顺序: 1) error translation 2) **blocker detection** 3) tool-result clearing |
 
 ---
 
@@ -214,15 +186,12 @@
 | **影响** | 监控告警无意义,可能掩盖真实问题 |
 | **修复建议** | re-read 检测应仅统计"本次请求新增的 Read 数",而非整个 session 累积 |
 
-### DEF-202: Bash dedup 反复触发相同合并
+### DEF-202: Bash dedup 反复触发相同合并 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/anthropic_proxy.log` |
-| **现象** | `Bash dedup: 3 similar results merged, 858 chars saved` 在 09:14-09:15 之间触发 7 次,内容完全相同 |
-| **可能原因** | 1) 每次请求都重新扫描整个历史<br>2) 同样的 Bash 输出被反复"去重" (但已经清空,无需去重) |
-| **影响** | 1) 浪费 CPU 时间<br>2) 日志噪音 |
-| **修复建议** | 1) dedup 应跳过已被清空为 `[cleared: ...]` 的内容<br>2) 单元测试: 验证连续 dedup 不会无限触发 |
+| **根因** | `clear_old_tool_results` 中 Bash dedup 未跳过已清空内容, `[cleared: Bash(deduplicated)]` 的 Jaccard=1.0 每次都触发 |
+| **修复** | dedup 循环中添加 `if ca.startswith("[cleared:") or cb.startswith("[cleared:"): continue` |
 
 ### DEF-203: 工具过滤后 prefix cache 断裂 (cache 收益打折)
 
