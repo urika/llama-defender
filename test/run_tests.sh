@@ -127,15 +127,19 @@ run_promptfoo() {
   fi
 
   local out rc
-  out=$(cd "$REPO_ROOT" && "$promptfoo_bin" eval \
-      --config promptfooconfig.yaml \
-      --no-cache \
-      --no-share \
-      --max-concurrency 1 \
-      --output "$json_out" \
-      --description "run_tests.sh regression" \
-      "${extra_args[@]}" \
-      2>&1)
+  # Build arg list safely (handles empty extra_args with set -u)
+  local args=(
+      --config promptfooconfig.yaml
+      --no-cache
+      --no-share
+      --max-concurrency 1
+      --output "$json_out"
+      --description "run_tests.sh regression"
+  )
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+      args+=("${extra_args[@]}")
+  fi
+  out=$(cd "$REPO_ROOT" && "$promptfoo_bin" eval "${args[@]}" 2>&1)
   rc=$?
   echo "$out" | tail -15 | tee "$log"
 

@@ -116,7 +116,7 @@
 | **现状** | `PROXY_CTX_TRUNCATE_STRATEGY=fifo` 在 configs/rapid-mlx-35b.conf L75 中明确设置 |
 | **原因** | fifo 窗口滑动更稳定,利于 prefix cache 命中 (Plan 2D 优化)。rounds 轮次边界不固定导致前缀不稳定 |
 
-### DEF-103: Cleared Compression 触发率低 (代理层收益打折)
+### DEF-103: Cleared Compression 触发率低 (代理层收益打折) — ✅ 设计限制 (已记录)
 
 | 项 | 内容 |
 |------|------|
@@ -125,16 +125,17 @@
 | **PRD 文档** | `optimization-log-20260603.md` 称 `compress_cleared_tool_results()` 每轮合并 1-21 个 cycles,节省 2-42 条消息 |
 | **实际效果** | 在当前 fifo 策略下,cleared messages 已被截断,二次压缩空间有限 |
 | **影响** | Layer 4 的 `compress_cleared_tool_results` 价值降低 |
-| **修复建议** | 1) 重新评估 cleared compression 的触发条件<br>2) 文档同步更新,避免误判 |
+| **结论** | 设计限制: fifo 策略已截断大部分 cleared messages, compression 在 fifo 模式下收益有限。保留作为 rounds 策略的补充优化 |
 
-### DEF-104: TOOL_ALWAYS_KEEP 持续扩展表明白名单设计缺陷
+### DEF-104: TOOL_ALWAYS_KEEP 持续扩展表明白名单设计缺陷 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | git commit `8ce382e` "extend TOOL_ALWAYS_KEEP with newer Claude Code tools" |
 | **现象** | Claude Code 升级后,新工具未在白名单 → 被过滤 → 调用失败 → 用户报告 → 添加白名单 |
 | **影响** | 1) 每次 Claude Code 更新都可能引入新工具失败<br>2) 修复方式为被动扩展,无主动发现机制 |
-| **修复建议** | 1) 在状态页添加"被过滤但被调用的工具"统计<br>2) 自动将"最近 N 轮高频使用但不在白名单"的工具临时加入 |
+| **已缓解** | 工具过滤日志新增 `filtered_out` 字段,记录被过滤的工具名称列表。可通过日志快速发现需要添加的新工具 |
+| **剩余风险** | 仍需人工根据日志添加到 TOOL_ALWAYS_KEEP |
 
 ### DEF-105: 集成测试空 session_id 失败
 
@@ -154,7 +155,7 @@
 | **已修复** | 非流式路径新增 JSON 修复: `force_stopped` 时回溯 OpenAI 原始 `tool_calls` 参数,对截断 JSON 调用 `_repair_truncated_json()` 修复后重新解析 |
 | **遗留** | 1) 根因是 rapid-mlx 忽略 max_tokens (v0.6.30 bug), 需升级到 v0.6.71<br>2) 流式路径已有修复 (line 3591), 非流式现已补齐 |
 
-### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高
+### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
@@ -163,7 +164,8 @@
 | **触发条件** | `dropped / (dropped + kept) > 0.7` |
 | **影响** | 21.6% 的请求丢失超过 70% 的历史消息,模型"失忆"风险高 |
 | **根本原因** | 1) fifo 策略在长会话中保留窗口固定 (40 条),但消息数线性增长<br>2) 截断触发过于频繁,缺少动态调整 |
-| **修复建议** | 1) 改回 rounds 策略 (DEF-102)<br>2) 触发 high_drop_ratio 时主动注入压缩摘要,而非简单截断<br>3) 当 ratio > 0.9 时,主动通知用户"会话过长,建议 /compact" |
+| **已缓解** | 当 drop ratio > 85% 时,注入 `[System: Context severely truncated]` 用户消息,提示模型使用 /compact 或新建会话 |
+| **剩余工作** | 1) 改回 rounds 策略 (DEF-102)<br>2) 截断时注入压缩摘要替代简单截断 |
 
 ### DEF-108: Blocker Tracker 未真正触发 — ✅ 已修复
 
@@ -203,24 +205,22 @@
 | **影响** | 42.6% 的请求即使 rounds 稳定,prefix cache 仍 miss (因为工具列表变了) |
 | **修复建议** | 1) 缓存过滤后的工具列表 (按"最近使用工具"分组)<br>2) 只过滤不变的尾部,保留稳定的 tools schema 前缀 |
 
-### DEF-204: 状态页 `/status` 被高频轮询
+### DEF-204: 状态页 `/status` 被高频轮询 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` 中 `GET /status` 条目 |
 | **现象** | 浏览器每 5 秒轮询一次状态页,产生大量日志噪音 |
-| **数据支撑** | `message-analysis-20260604.md` §5 列为"🟢 低"问题 |
-| **修复建议** | 1) `/status` 不写入 `proxy_requests.jsonl` (只写 `proxy_metrics.jsonl`)<br>2) 状态页添加 ETag/Last-Modified 减少 304 响应 |
+| **修复** | `do_GET` 中 `/status` 请求不再记录 Headers 日志,仅记录 `GET /status` 一行 (后改为完全跳过日志) |
 
-### DEF-205: 双重 POST (Claude Code 客户端行为)
+### DEF-205: 双重 POST (Claude Code 客户端行为) — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `message-analysis-20260602.md` §10.3 |
 | **现象** | 同一秒内出现 2 个完全相同的请求 (大小、工具数均相同) |
 | **影响** | 后端被迫双倍处理,GPU 资源浪费 |
-| **代理层处理** | 无 — 文档明确"客户端行为,代理层无法修复" |
-| **修复建议** | 1) 在代理层做请求去重 (基于 body hash + 时间窗口 1s)<br>2) 减少并发压力测试影响 |
+| **修复** | 代理层新增请求去重: `_check_dedup()` 基于 body hash + 时间窗口 (默认 2s)。重复请求返回 429 + Retry-After header。可通过 `PROXY_DEDUP_WINDOW` 配置窗口大小 |
 
 ### DEF-206: A/B 实验数据未用于实际调参
 
@@ -279,14 +279,13 @@
 | **影响** | 已知的"未实现"功能 (U1-U7) 无代码内标记,新开发者难以快速识别 |
 | **修复建议** | 在 U1-U7 位置添加 `# TODO(roadmap): ...` 注释 |
 
-### DEF-302: API Key 在云模式可能误显示
+### DEF-302: API Key 在云模式可能误显示 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `AGENTS.md` § 安全注意事项 |
-| **现状** | 状态页显示 `API Key: sk-xxxx****` (前 8 位 + 掩码) |
-| **遗留** | 1) 日志中可能完整打印 API Key (`log_request` 调试信息)<br>2) 错误堆栈中可能包含 Authorization header |
-| **修复建议** | 1) 在所有日志输出前过滤 `Bearer sk-...` 模式<br>2) 错误堆栈中脱敏 |
+| **现象** | 日志中 `log(f"  Headers: {dict(self.headers)}")` 会打印完整的 Authorization header,包括 API Key |
+| **修复** | 新增 `_mask_sensitive()` 函数,自动脱敏 `Authorization` 和 `X-Api-Key` header。日志中显示为 `sk-123456****wxyz` 格式 (前8后4) |
 
 ### DEF-303: 日志格式不一致
 
@@ -305,14 +304,13 @@
 | **缺失** | 1) TTFT 趋势 (按小时/天)<br>2) 循环触发率 (loop_injected 比例)<br>3) 截断频率 (truncation/小时)<br>4) 工具使用分布 (TOP 10)<br>5) 会话大小分布 (P50/P95/P99) |
 | **修复建议** | 1) 在 `/status` 页面添加迷你趋势图 (Chart.js)<br>2) 集成 Grafana / Prometheus (如增加 prometheus_client 依赖,违反 zero-dep 原则) |
 
-### DEF-305: `manage.sh` start-cloud 启动日志缺少健康检查
+### DEF-305: `manage.sh` start-cloud 启动日志缺少健康检查 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `DEEPSEEK-AB-EXPERIMENT-GUIDE.md` § 3.2 |
 | **现象** | `start-cloud` 启动后未自动验证 `https://api.deepseek.com/v1/models` 可达性 |
-| **影响** | 用户需手动 `curl` 验证,出错时排查路径长 |
-| **修复建议** | 在 `start-cloud` 末尾添加 health check 步骤 |
+| **修复** | `cmd_start_cloud` 末尾新增健康检查: curl 云端 API `/models` 端点,验证 HTTP 200。失败时输出警告但不阻止启动 |
 
 ---
 

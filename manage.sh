@@ -647,6 +647,23 @@ cmd_start_cloud() {
 
     # 启动代理（不启动本地后端）
     if _start_proxy; then
+        # 云端 API 健康检查
+        info "验证云端 API 可达性..."
+        local health_url="${LLAMA_BASE_URL%/}/models"
+        local health_rc
+        health_rc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+            -H "Authorization: Bearer $LLAMA_API_KEY" \
+            "$health_url" 2>/dev/null || echo "000")
+        if [[ "$health_rc" == "200" ]]; then
+            info "✅ 云端 API 可达 ($health_url)"
+        elif [[ "$health_rc" == "000" ]]; then
+            warn "⚠️  云端 API 不可达 ($health_url): 连接失败/超时"
+            warn "   代理已启动，但请求可能失败"
+        else
+            warn "⚠️  云端 API 返回 HTTP $health_rc (预期 200)"
+            warn "   请检查 API Key 和 URL 是否正确"
+        fi
+
         info ""
         info "✅ 云端代理已启动"
         info ""

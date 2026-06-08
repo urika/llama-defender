@@ -96,6 +96,20 @@ PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRES
 PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
 _LOOP_SESSION_STATE = {}
 
+PROXY_DEDUP_WINDOW = int(os.environ.get("PROXY_DEDUP_WINDOW", "2"))
+_DEDUP_CACHE = {}
+
+def _check_dedup(body_str):
+    h = hash(body_str)
+    now = datetime.now().timestamp()
+    for k in list(_DEDUP_CACHE):
+        if now - _DEDUP_CACHE[k] > PROXY_DEDUP_WINDOW:
+            del _DEDUP_CACHE[k]
+    if h in _DEDUP_CACHE:
+        return True
+    _DEDUP_CACHE[h] = now
+    return False
+
 
 def _classify_exception(e):
     import socket as _socket
@@ -267,6 +281,22 @@ def log_metrics(metrics: dict):
                 f.write(line)
     except OSError:
         pass
+
+
+def _mask_sensitive(headers_dict):
+    if not isinstance(headers_dict, dict):
+        return headers_dict
+    masked = {}
+    for k, v in headers_dict.items():
+        kl = k.lower()
+        if kl in ("authorization", "x-api-key") and isinstance(v, str):
+            if len(v) > 12:
+                masked[k] = v[:8] + "****" + v[-4:]
+            else:
+                masked[k] = v[:4] + "****"
+        else:
+            masked[k] = v
+    return masked
 
 
 def log(msg):
@@ -2687,14 +2717,19 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
     if len(kept) < 5:
         return tools, {"filtered": False, "reason": "too_few_after_filter"}
 
+    all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
+    kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
+    filtered_out = sorted(all_names - kept_names)
+
     return kept, {
         "filtered": True,
         "original": len(tools),
         "kept": len(kept),
-        "always_keep": len(TOOL_ALWAYS_KEEP & {t.get("name", "") for t in kept}),
+        "always_keep": len(TOOL_ALWAYS_KEEP & kept_names),
         "recent_only": len(recent_tools - TOOL_ALWAYS_KEEP),
         "recent_tools": sorted(recent_tools),
         "scanned_assistant": assistant_count,
+        "filtered_out": filtered_out,
     }
 
 
@@ -2903,8 +2938,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
         try:
-            log(f"GET {self.path}")
-            log(f"  Headers: {dict(self.headers)}")
+            if self.path != "/status":
+                log(f"GET {self.path}")
+                log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
             if self.path == "/v1/models":
                 models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "anthropic"}
                           for name in MODEL_ALIASES]
@@ -2936,7 +2972,15 @@ class Handler(BaseHTTPRequestHandler):
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len).decode("utf-8")
             log(f"POST {self.path}")
-            log(f"  Headers: {dict(self.headers)}")
+            log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
+            if _check_dedup(body):
+                log(f"  -> Duplicate request detected (body hash match within {PROXY_DEDUP_WINDOW}s), skipping")
+                self._respond_json(
+                    {"error": {"type": "duplicate_request", "message": "Duplicate request within dedup window"}},
+                    429,
+                    extra_headers={"Retry-After": str(PROXY_DEDUP_WINDOW)},
+                )
+                return
             try:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
@@ -3317,6 +3361,22 @@ class Handler(BaseHTTPRequestHandler):
         elif trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
             log(f"  -> Context truncation: active (strategy={trunc_stats.get('strategy', '?')})")
 
+        # DEF-107: inject context-loss notice when drop ratio is very high
+        if trunc_stats.get("truncated"):
+            dropped = trunc_stats.get("dropped_messages", 0)
+            kept = trunc_stats.get("kept_messages", 0)
+            if kept + dropped > 0 and dropped / (kept + dropped) > 0.85:
+                notice = ("[System: Context severely truncated — "
+                          f"{dropped} of {dropped + kept} messages dropped. "
+                          "Consider using /compact or starting a new session "
+                          "to maintain context quality.]")
+                raw_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": notice}],
+                })
+                log(f"  -> High drop ratio notice injected ({dropped}/{dropped+kept} = "
+                    f"{dropped/(kept+dropped)*100:.0f}%)")
+
         # Debug: compute hashes of first two messages
         if raw_messages:
             def _msg_hash(m):
@@ -3392,9 +3452,11 @@ class Handler(BaseHTTPRequestHandler):
                 body["tools"] = raw_tools
                 recent_names = tf_stats.get("recent_tools", [])
                 recent_info = f", recent_names={recent_names}" if recent_names else ""
+                filtered_out = tf_stats.get("filtered_out", [])
+                filtered_info = f", removed={filtered_out}" if filtered_out else ""
                 log(f"  -> Tool filter: {tf_stats['original']} -> {tf_stats['kept']} "
                     f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']}, "
-                    f"scanned={tf_stats.get('scanned_assistant',0)}{recent_info})")
+                    f"scanned={tf_stats.get('scanned_assistant',0)}{recent_info}{filtered_info})")
                 _mc_put("tool_filter", tf_stats)
         tools = convert_anthropic_tools_to_openai(body.get("tools"))
         if tools:
