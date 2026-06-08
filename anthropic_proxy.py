@@ -3229,12 +3229,27 @@ class Handler(BaseHTTPRequestHandler):
         # Proxy-side tool-result clearing with semantic priority
         raw_messages, clear_stats = clear_old_tool_results(raw_messages, tools_list=tools_list)
         cleared_files = clear_stats.get("cleared_files", [])
-        if PROXY_METRICS_ENABLED and clear_stats.get("cleared"):
+        if PROXY_METRICS_ENABLED:
             _mc_put("tool_clear", {
+                "applied": clear_stats.get("cleared", False),
                 "cleared": clear_stats.get("cleared_tool_results", 0),
                 "kept": clear_stats.get("kept", 0),
                 "chars_freed": clear_stats.get("cleared_chars", 0),
+                "high_prio": clear_stats.get("high_prio", 0),
+                "cleared_files_count": len(cleared_files),
+                "total_chars_before": clear_stats.get("total_chars_before", 0),
+                "dedup_bash": clear_stats.get("dedup_bash", 0),
+                "dedup_chars_saved": clear_stats.get("dedup_chars_saved", 0),
+                "enabled": clear_stats.get("enabled", True),
+                "skipped": clear_stats.get("skipped", False),
+                "reason": clear_stats.get("reason", ""),
             })
+            if clear_stats.get("dedup_bash", 0) > 0:
+                _mc_put("bash_dedup", {
+                    "applied": True,
+                    "merged": clear_stats.get("dedup_bash", 0),
+                    "chars_saved": clear_stats.get("dedup_chars_saved", 0),
+                })
         if clear_stats.get("cleared"):
             log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, "
                 f"{clear_stats['cleared_chars']:,} chars freed (kept {clear_stats['kept']}, high_prio={clear_stats.get('high_prio', 0)})")
@@ -3383,9 +3398,15 @@ class Handler(BaseHTTPRequestHandler):
         raw_messages, compress_stats = compress_cleared_tool_results(raw_messages)
         if compress_stats.get("merged"):
             log(f"  -> Tool-result compression: {compress_stats['merged_cycles']} cycles merged, {compress_stats['merged_msgs']} msgs removed (saved ~{compress_stats['saved_overhead']} tokens overhead)")
-            _mc_put("compress", {"merged_cycles": compress_stats["merged_cycles"], "msgs_removed": compress_stats["merged_msgs"]})
+            _mc_put("compress", {
+                "applied": True,
+                "merged_cycles": compress_stats["merged_cycles"],
+                "msgs_removed": compress_stats["merged_msgs"],
+                "saved_overhead": compress_stats.get("saved_overhead", 0),
+            })
         elif compress_stats.get("enabled") and not compress_stats.get("merged"):
             log(f"  -> Tool-result compression: no consecutive cleared cycles to merge")
+            _mc_put("compress", {"applied": False, "merged_cycles": 0, "msgs_removed": 0})
 
         # Context truncation
         raw_messages, trunc_stats = truncate_messages_if_needed(
@@ -3395,6 +3416,7 @@ class Handler(BaseHTTPRequestHandler):
         if trunc_stats.get("truncated"):
             strategy = trunc_stats.get("strategy", "char")
             trunc_metrics = {
+                "applied": True,
                 "triggered": True,
                 "strategy": strategy,
                 "dropped": trunc_stats.get("dropped_messages", 0),
@@ -3419,8 +3441,12 @@ class Handler(BaseHTTPRequestHandler):
             _mc_put("truncate", trunc_metrics)
         elif not trunc_stats.get("enabled"):
             log(f"  -> Context truncation: disabled ({BACKEND_TYPE} backend)")
+            _mc_put("truncate", {"applied": False, "enabled": False})
         elif trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
             log(f"  -> Context truncation: active (strategy={trunc_stats.get('strategy', '?')})")
+            _mc_put("truncate", {"applied": False, "enabled": True, "strategy": trunc_stats.get("strategy", "")})
+        elif trunc_stats.get("skipped"):
+            _mc_put("truncate", {"applied": False, "enabled": True, "skipped": True})
 
         # DEF-107: inject context-loss notice when drop ratio is very high
         if trunc_stats.get("truncated"):
@@ -3454,26 +3480,35 @@ class Handler(BaseHTTPRequestHandler):
         # DEF-005: OOM safety — if estimated tokens still exceed safe limit after
         # all pipeline steps, force aggressive FIFO truncation to prevent Metal OOM.
         if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD:
-            est_chars = _estimate_message_chars(raw_messages)
             _sys = body.get("system")
+            _tools = body.get("tools")
+            static_chars = 0
             if _sys:
                 if isinstance(_sys, list):
-                    est_chars += sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
+                    static_chars += sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
                 else:
-                    est_chars += len(str(_sys))
-            _tools = body.get("tools")
+                    static_chars += len(str(_sys))
             if _tools:
-                est_chars += sum(len(json.dumps(t, ensure_ascii=False)) for t in _tools if isinstance(t, dict))
-            est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
-            if est_tokens > PROXY_OOM_SAFE_TOKENS:
-                keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 10)
+                static_chars += sum(len(json.dumps(t, ensure_ascii=False)) for t in _tools if isinstance(t, dict))
+            _iteration = 0
+            while True:
+                est_chars = _estimate_message_chars(raw_messages) + static_chars
+                est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
+                if est_tokens <= PROXY_OOM_SAFE_TOKENS or len(raw_messages) <= 4:
+                    break
+                _iteration += 1
+                keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 4)
                 if len(raw_messages) > keep:
                     dropped = len(raw_messages) - keep
                     raw_messages[:] = raw_messages[:PROXY_CTX_KEEP_HEAD] + raw_messages[-(keep - PROXY_CTX_KEEP_HEAD):]
-                    log(f"  -> OOM safety truncation: {dropped} messages dropped, "
-                        f"~{est_tokens} tokens > {PROXY_OOM_SAFE_TOKENS} safe limit, "
-                        f"kept {len(raw_messages)} msgs (head={PROXY_CTX_KEEP_HEAD}, tail={keep - PROXY_CTX_KEEP_HEAD})")
-                    _mc_put("oom_safety", {"triggered": True, "est_tokens": est_tokens, "limit": PROXY_OOM_SAFE_TOKENS, "dropped": dropped})
+                    log(f"  -> OOM safety (iter {_iteration}): est_tokens={est_tokens}, "
+                        f"dropped {dropped} msgs, kept {len(raw_messages)}")
+                else:
+                    break
+            if _iteration > 0:
+                _mc_put("oom_safety", {"triggered": True, "est_tokens": est_tokens,
+                                       "limit": PROXY_OOM_SAFE_TOKENS,
+                                       "iterations": _iteration, "final_msgs": len(raw_messages)})
 
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)
@@ -3521,7 +3556,9 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"  -> Tool filter: {tf_stats['original']} -> {tf_stats['kept']} "
                     f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']}, "
                     f"scanned={tf_stats.get('scanned_assistant',0)}{recent_info}{filtered_info})")
-                _mc_put("tool_filter", tf_stats)
+                _mc_put("tool_filter", {**tf_stats, "applied": True})
+            else:
+                _mc_put("tool_filter", {**tf_stats, "applied": False})
         tools = convert_anthropic_tools_to_openai(body.get("tools"))
         if tools:
             openai_body["tools"] = tools

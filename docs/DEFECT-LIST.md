@@ -162,7 +162,8 @@
 | **影响** | 21.6% 的请求丢失超过 70% 的历史消息,模型"失忆"风险高 |
 | **根本原因** | 1) fifo 策略在长会话中保留窗口固定 (40 条),但消息数线性增长<br>2) 截断触发过于频繁,缺少动态调整 |
 | **已缓解** | 当 drop ratio > 85% 时,注入 `[System: Context severely truncated]` 用户消息,提示模型使用 /compact 或新建会话 |
-| **剩余工作** | 1) 改回 rounds 策略 (DEF-102)<br>2) 截断时注入压缩摘要替代简单截断 |
+| **已切换** | `PROXY_CTX_TRUNCATE_STRATEGY=rounds` (生产配置 `rapid-mlx-35b.conf`) — token budget 动态管理替代固定 fifo 窗口 |
+| **剩余工作** | 1) 截断时注入压缩摘要替代简单截断<br>2) 验证 rounds 策略下 prefill 延迟是否下降 |
 
 ### DEF-108: Blocker Tracker 未真正触发 — ✅ 已修复
 
