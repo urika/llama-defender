@@ -138,6 +138,13 @@ PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
 PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
 PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
+
+# Text output loop detection: detect repeated similar text in assistant messages
+PROXY_TEXT_LOOP_ENABLED = os.environ.get("PROXY_TEXT_LOOP_ENABLED", "true").lower() in ("true", "1", "yes")
+PROXY_TEXT_LOOP_THRESHOLD = int(os.environ.get("PROXY_TEXT_LOOP_THRESHOLD", "3"))
+PROXY_TEXT_LOOP_MIN_CHARS = int(os.environ.get("PROXY_TEXT_LOOP_MIN_CHARS", "100"))
+PROXY_TEXT_LOOP_SIMILARITY = float(os.environ.get("PROXY_TEXT_LOOP_SIMILARITY", "0.85"))
+
 _LOOP_SESSION_STATE = {}
 
 PROXY_DEDUP_WINDOW = int(os.environ.get("PROXY_DEDUP_WINDOW", "2"))
@@ -153,6 +160,70 @@ def _check_dedup(body_str):
         return True
     _DEDUP_CACHE[h] = now
     return False
+
+
+def _compute_text_similarity(text1, text2):
+    """Compute similarity between two texts using character-level Jaccard index.
+    Returns float 0.0 (completely different) to 1.0 (identical)."""
+    if not text1 or not text2:
+        return 0.0
+    # Use bigrams for better granularity
+    def bigrams(s):
+        return set(s[i:i+2] for i in range(len(s)-1)) if len(s) >= 2 else set(s)
+    b1 = bigrams(text1)
+    b2 = bigrams(text2)
+    if not b1 or not b2:
+        return 0.0
+    intersection = len(b1 & b2)
+    union = len(b1 | b2)
+    return intersection / union if union > 0 else 0.0
+
+
+def _detect_text_loop(tail_assistant, threshold=PROXY_TEXT_LOOP_THRESHOLD,
+                      min_chars=PROXY_TEXT_LOOP_MIN_CHARS,
+                      similarity_threshold=PROXY_TEXT_LOOP_SIMILARITY):
+    """Detect repeated similar text output in assistant messages.
+    Returns (max_run, is_text_loop) tuple."""
+    if not PROXY_TEXT_LOOP_ENABLED or len(tail_assistant) < threshold:
+        return 0, False
+
+    # Extract text content from assistant messages
+    text_history = []
+    for msg in tail_assistant:
+        content = msg.get("content", "")
+        text = ""
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+        elif isinstance(content, str):
+            text = content
+        # Only consider substantial text (ignore short tool-only messages)
+        if len(text) >= min_chars:
+            text_history.append(text[:500])  # Cap at 500 chars for comparison
+        else:
+            text_history.append("")  # Short messages break the chain
+
+    if len(text_history) < threshold:
+        return 0, False
+
+    # Check for consecutive similar texts from the end
+    max_run = 1
+    current_run = 1
+    for i in range(len(text_history) - 1, 0, -1):
+        curr = text_history[i]
+        prev = text_history[i - 1]
+        if curr and prev:
+            sim = _compute_text_similarity(curr, prev)
+            if sim >= similarity_threshold:
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 1
+        else:
+            current_run = 1
+
+    return max_run, max_run >= threshold
 
 
 def _classify_exception(e):
@@ -3021,6 +3092,7 @@ def _apply_loop_intervention(
     raw_messages, raw_tools, max_run, consecutive,
     threshold=PROXY_LOOP_THRESHOLD, level2_threshold=PROXY_LOOP_LEVEL2,
     level3_threshold=PROXY_LOOP_LEVEL3, pattern_tool_name=None,
+    is_text_loop=False, text_loop_run=0,
 ):
     """Escalating loop intervention (R2.1). Returns (messages, tools, level, tool_name).
 
@@ -3032,13 +3104,49 @@ def _apply_loop_intervention(
     - threshold <= max_run < L2    → Level 1: append hint user message
     - L2 <= max_run < L3           → Level 2: remove ALL high-count tools from raw_tools
     - max_run >= L3                → Level 3: strip ALL tools (force plain text)
-
-    The function is intentionally pure (does not call log/_mc_put) so unit tests
-    can assert on its output without spinning up a handler.
     """
     if max_run < threshold:
         return raw_messages, raw_tools, 0, ""
 
+    # Text loop detection: different intervention for repeated similar text
+    if is_text_loop and text_loop_run >= threshold:
+        if text_loop_run >= level3_threshold:
+            new_messages = list(raw_messages) + [{
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[CRITICAL: You have been repeating the same text output {text_loop_run} times. "
+                    f"This is a text output loop. ALL tools have been DISABLED for this turn. "
+                    f"You MUST stop repeating yourself. "
+                    f"If you are stuck, say 'I am stuck' and explain what is wrong. "
+                    f"Do NOT repeat the same explanation again.]"
+                }]
+            }]
+            return new_messages, [], 3, "text_loop"
+        elif text_loop_run >= level2_threshold:
+            new_messages = list(raw_messages) + [{
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[IMPORTANT: You have repeated similar text {text_loop_run} times. "
+                    f"This indicates you are stuck in a loop. "
+                    f"STOP repeating the same explanation. "
+                    f"If you cannot solve the problem, say so clearly and ask for help. "
+                    f"Do NOT repeat your previous analysis.]"
+                }]
+            }]
+            return new_messages, raw_tools, 2, "text_loop"
+        else:
+            new_messages = list(raw_messages) + [{
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[System notice: You have repeated similar text output {text_loop_run} times. "
+                    f"This appears to be a loop. "
+                    f"STOP repeating yourself and either provide a NEW response or acknowledge you are stuck. "
+                    f"Do NOT repeat the same explanation.]"
+                }]
+            }]
+            return new_messages, raw_tools, 1, "text_loop"
+
+    # Tool loop detection (original logic)
     loop_keys = [k for k, v in consecutive.items() if v >= threshold]
     high_count_tools = sorted(set(k.split(":")[0] for k in loop_keys))
     tool_name = high_count_tools[0] if high_count_tools else (pattern_tool_name or "unknown")
@@ -3432,7 +3540,20 @@ class Handler(BaseHTTPRequestHandler):
                 last_pattern = None
         if max_run > 1:
             log(f"  -> Loop scan: max_run={max_run} (tail={len(tail_assistant)} msgs)")
-        _mc_put("loop_detect", {"max_run": max_run})
+
+        # Text output loop detection: detect repeated similar text in assistant messages
+        text_loop_run = 0
+        is_text_loop = False
+        if PROXY_TEXT_LOOP_ENABLED:
+            text_loop_run, is_text_loop = _detect_text_loop(tail_assistant)
+            if text_loop_run > 1:
+                log(f"  -> Text loop scan: text_run={text_loop_run} (threshold={PROXY_TEXT_LOOP_THRESHOLD}, "
+                    f"similarity>={PROXY_TEXT_LOOP_SIMILARITY})")
+            # Merge with tool loop: take the higher count
+            if text_loop_run > max_run:
+                max_run = text_loop_run
+
+        _mc_put("loop_detect", {"max_run": max_run, "text_loop_run": text_loop_run, "is_text_loop": is_text_loop})
 
         # Session-level loop state: persist level across requests for early intervention
         session_loop = _LOOP_SESSION_STATE.get(session_id, {"level": 0, "triggers": 0})
@@ -3449,22 +3570,28 @@ class Handler(BaseHTTPRequestHandler):
         new_messages, new_tools, loop_level, loop_tool_name = _apply_loop_intervention(
             raw_messages, raw_tools, max_run, consecutive,
             pattern_tool_name=pattern_tool_name,
+            is_text_loop=is_text_loop,
+            text_loop_run=text_loop_run,
         )
         if loop_level >= 1:
             if loop_level >= 2 and raw_tools is not None and new_tools != raw_tools:
                 body["tools"] = new_tools
             raw_messages[:] = new_messages
-            log(f"  -> LOOP LEVEL {loop_level}: tool={loop_tool_name} max_run={max_run} consecutive={{k: v for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD}}")
+            if loop_tool_name == "text_loop":
+                log(f"  -> TEXT LOOP LEVEL {loop_level}: text_run={text_loop_run} max_run={max_run}")
+            else:
+                log(f"  -> LOOP LEVEL {loop_level}: tool={loop_tool_name} max_run={max_run} consecutive={{k: v for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD}}")
             if loop_level == 2:
-                removed = sorted(set(k.split(":")[0] for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD))
-                log(f"    removed tools: {removed} ({len(new_tools)} remaining)")
+                if loop_tool_name != "text_loop":
+                    removed = sorted(set(k.split(":")[0] for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD))
+                    log(f"    removed tools: {removed} ({len(new_tools)} remaining)")
             elif loop_level == 3:
                 log(f"    ALL tools stripped — force plain text response")
-            _mc_put("loop_detect", {"max_run": max_run, "level": loop_level, "tool": loop_tool_name})
+            _mc_put("loop_detect", {"max_run": max_run, "level": loop_level, "tool": loop_tool_name, "text_loop_run": text_loop_run, "is_text_loop": is_text_loop})
             if session_id:
                 _LOOP_SESSION_STATE[session_id] = {"level": loop_level, "triggers": session_loop.get("triggers", 0) + 1}
         else:
-            _mc_put("loop_detect", {"max_run": max_run})
+            _mc_put("loop_detect", {"max_run": max_run, "text_loop_run": text_loop_run, "is_text_loop": is_text_loop})
             if session_id and session_loop["level"] > 0 and max_run < PROXY_LOOP_THRESHOLD:
                 _LOOP_SESSION_STATE[session_id] = {"level": 0, "triggers": session_loop.get("triggers", 0)}
 

@@ -86,6 +86,37 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [0.5.3-text-loop-detection] - 2026-06-08
+
+### Status: 文本输出循环检测实现
+
+**范围**: 代理层新增对 assistant 纯文本输出的循环检测，解决模型重复输出相同文本的问题。
+
+### Added
+
+- **文本输出循环检测** (`_detect_text_loop`): 扫描最近 N 条 assistant 消息的纯文本内容，使用字符级 bigram Jaccard 相似度检测重复模式
+- **相似度计算函数** (`_compute_text_similarity`): 基于 bigram 的 Jaccard 相似度，对文本重复敏感且计算高效
+- **3 级文本循环干预**: 与工具循环共享阈值，但生成针对性的干预消息
+  - Level 1: 提示停止重复
+  - Level 2: 强烈警告
+  - Level 3: 剥夺所有工具，强制纯文本响应
+
+### Configuration
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_TEXT_LOOP_ENABLED` | `true` | 文本循环检测开关 |
+| `PROXY_TEXT_LOOP_THRESHOLD` | `3` | 连续相似文本触发阈值 |
+| `PROXY_TEXT_LOOP_MIN_CHARS` | `100` | 最小文本长度（短于此的消息不参与检测） |
+| `PROXY_TEXT_LOOP_SIMILARITY` | `0.85` | 相似度阈值 (0.0-1.0) |
+
+### Verified
+
+- 单元测试: 11 个新测试覆盖相似度计算、循环检测、干预消息生成
+- 总测试数: 182 → 193
+
+---
+
 ## [0.5.2-truncate-fix] - 2026-06-08
 
 ### Status: 死循环根因修复完成

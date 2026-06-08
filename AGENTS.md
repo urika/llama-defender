@@ -457,6 +457,10 @@ When a loop is detected, it applies 3 levels of intervention:
 |----------|---------|-------------|
 | `PROXY_LOOP_THRESHOLD` | `3` | Consecutive identical calls before Level 1 intervention |
 | `PROXY_LOOP_LEVEL2` | `6` | Threshold for Level 2 (defaults to `PROXY_LOOP_THRESHOLD * 2`) |
+| `PROXY_TEXT_LOOP_ENABLED` | `true` | Enable text output loop detection |
+| `PROXY_TEXT_LOOP_THRESHOLD` | `3` | Consecutive similar text messages before intervention |
+| `PROXY_TEXT_LOOP_MIN_CHARS` | `100` | Minimum text length to consider for loop detection |
+| `PROXY_TEXT_LOOP_SIMILARITY` | `0.85` | Text similarity threshold (0.0-1.0) for loop detection |
 
 ### Special handling
 

@@ -1459,6 +1459,128 @@ class TestLoopInterventionEnhanced(unittest.TestCase):
         self.assertEqual(max_run, 3)
         self.assertEqual(consecutive["Read:{\"file_path\": \"/x.py\"}"], 3)
 
+
+# =============================================================================
+# Text Output Loop Detection — _compute_text_similarity, _detect_text_loop
+# =============================================================================
+class TestTextLoopDetection(unittest.TestCase):
+    """Covers text output loop detection for repeated similar text in assistant messages."""
+
+    def test_compute_text_similarity_identical(self):
+        """Identical texts should have similarity 1.0."""
+        text = "This is a test message with enough characters to be meaningful."
+        self.assertEqual(proxy._compute_text_similarity(text, text), 1.0)
+
+    def test_compute_text_similarity_different(self):
+        """Completely different texts should have low similarity."""
+        text1 = "The quick brown fox jumps over the lazy dog."
+        text2 = "Lorem ipsum dolor sit amet consectetur adipiscing elit."
+        sim = proxy._compute_text_similarity(text1, text2)
+        self.assertLess(sim, 0.3)
+
+    def test_compute_text_similarity_similar(self):
+        """Texts with minor differences should have high similarity."""
+        text1 = "The minimax algorithm uses recursion to explore all possible moves."
+        text2 = "The minimax algorithm uses recursion to explore all possible outcomes."
+        sim = proxy._compute_text_similarity(text1, text2)
+        self.assertGreater(sim, 0.7)
+
+    def test_compute_text_similarity_empty(self):
+        """Empty texts should have similarity 0.0."""
+        self.assertEqual(proxy._compute_text_similarity("", "test"), 0.0)
+        self.assertEqual(proxy._compute_text_similarity("test", ""), 0.0)
+        self.assertEqual(proxy._compute_text_similarity("", ""), 0.0)
+
+    def test_detect_text_loop_no_loop(self):
+        """Short messages below threshold should not trigger detection."""
+        tail = [
+            {"role": "assistant", "content": [{"type": "text", "text": "Short msg"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Another msg"}]},
+        ]
+        run, is_loop = proxy._detect_text_loop(tail, threshold=3, min_chars=100)
+        self.assertEqual(run, 0)
+        self.assertFalse(is_loop)
+
+    def test_detect_text_loop_with_repeated_text(self):
+        """Repeated similar text should trigger detection."""
+        base_text = "The fix is simple: validMoves should be called for isMaximizing ? this.currentPlayer : this.getOpponent(), and stones should be placed as opponent. But this.currentPlayer itself doesn't change."
+        tail = [
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+        ]
+        run, is_loop = proxy._detect_text_loop(tail, threshold=3, min_chars=50, similarity_threshold=0.85)
+        self.assertGreaterEqual(run, 3)
+        self.assertTrue(is_loop)
+
+    def test_detect_text_loop_with_different_text(self):
+        """Different texts should not trigger detection."""
+        tail = [
+            {"role": "assistant", "content": [{"type": "text", "text": "First we need to analyze the board state carefully and consider all possible moves."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "After careful consideration, I believe the best approach is to implement alpha-beta pruning."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Let me check the implementation details and make sure everything is correct."}]},
+        ]
+        run, is_loop = proxy._detect_text_loop(tail, threshold=3, min_chars=50, similarity_threshold=0.85)
+        self.assertLess(run, 3)
+        self.assertFalse(is_loop)
+
+    def test_detect_text_loop_short_messages_break_chain(self):
+        """Short messages (tool-only) should break the similarity chain."""
+        base_text = "The minimax algorithm needs to track whose turn it is on the board parameter. The board in minimax represents the state after this.currentPlayer has just played."
+        tail = [
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]},  # No text
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+            {"role": "assistant", "content": [{"type": "text", "text": base_text}]},
+        ]
+        run, is_loop = proxy._detect_text_loop(tail, threshold=3, min_chars=100, similarity_threshold=0.85)
+        self.assertLess(run, 3)
+        self.assertFalse(is_loop)
+
+    def test_text_loop_intervention_level1(self):
+        """Level 1 text loop should inject hint message."""
+        msgs = [{"role": "user", "content": "test"}]
+        tools = [{"name": "Read", "description": "fake", "input_schema": {}}]
+        new_msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=msgs, raw_tools=tools, max_run=3, consecutive={},
+            threshold=3, is_text_loop=True, text_loop_run=3,
+        )
+        self.assertEqual(level, 1)
+        self.assertEqual(tool_name, "text_loop")
+        self.assertEqual(new_tools, tools)  # Tools not removed at level 1
+        text = new_msgs[-1]["content"][0]["text"]
+        self.assertIn("repeated similar text", text)
+
+    def test_text_loop_intervention_level2(self):
+        """Level 2 text loop should inject stronger warning."""
+        msgs = [{"role": "user", "content": "test"}]
+        tools = [{"name": "Read", "description": "fake", "input_schema": {}}]
+        new_msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=msgs, raw_tools=tools, max_run=6, consecutive={},
+            threshold=3, level2_threshold=6, is_text_loop=True, text_loop_run=6,
+        )
+        self.assertEqual(level, 2)
+        self.assertEqual(tool_name, "text_loop")
+        text = new_msgs[-1]["content"][0]["text"]
+        self.assertIn("stuck in a loop", text)
+
+    def test_text_loop_intervention_level3(self):
+        """Level 3 text loop should strip all tools."""
+        msgs = [{"role": "user", "content": "test"}]
+        tools = [{"name": "Read", "description": "fake", "input_schema": {}}]
+        new_msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=msgs, raw_tools=tools, max_run=9, consecutive={},
+            threshold=3, level2_threshold=6, level3_threshold=9,
+            is_text_loop=True, text_loop_run=9,
+        )
+        self.assertEqual(level, 3)
+        self.assertEqual(tool_name, "text_loop")
+        self.assertEqual(new_tools, [])  # All tools stripped
+        text = new_msgs[-1]["content"][0]["text"]
+        self.assertIn("text output loop", text)
+        self.assertIn("ALL tools have been DISABLED", text)
+
+
 # =============================================================================
 # R4.4 — _repair_truncated_json (7 cases)
 # =============================================================================
