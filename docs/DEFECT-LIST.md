@@ -178,15 +178,14 @@
 
 ## 三、🟡 P2-Medium (10 项)
 
-### DEF-201: 集成测试中 session=a309b181 出现高频 re-read 假阳性
+### DEF-201: 集成测试中 session=a309b181 出现高频 re-read 假阳性 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` |
 | **现象** | `Re-read after clear: 229 reads target 6 cleared files (re_read_rate=2862%)` 持续数十次 |
-| **分析** | 每次 re-read 数量 (229) 与 cleared files (6) 比例完全相同 → 表明这是**长会话累积值**而非本次请求值,统计粒度有误 |
-| **影响** | 监控告警无意义,可能掩盖真实问题 |
-| **修复建议** | re-read 检测应仅统计"本次请求新增的 Read 数",而非整个 session 累积 |
+| **根因** | `raw_messages[-6:]` 扫描最近6条消息中的所有 assistant Read 调用,包含历史 turn 的累积值,而非仅本次请求最后一次 assistant 消息 |
+| **修复** | 改为 `reversed(raw_messages)` 找到最后一条 assistant 消息,仅扫描其 content 中的 Read tool_use |
 
 ### DEF-202: Bash dedup 反复触发相同合并 — ✅ 已修复
 
@@ -195,15 +194,15 @@
 | **根因** | `clear_old_tool_results` 中 Bash dedup 未跳过已清空内容, `[cleared: Bash(deduplicated)]` 的 Jaccard=1.0 每次都触发 |
 | **修复** | dedup 循环中添加 `if ca.startswith("[cleared:") or cb.startswith("[cleared:"): continue` |
 
-### DEF-203: 工具过滤后 prefix cache 断裂 (cache 收益打折)
+### DEF-203: 工具过滤后 prefix cache 断裂 (cache 收益打折) — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `docs/prompt-instability-mechanism-analysis.md` |
 | **现象** | 44 → 12 tools 后,前缀哈希变化,prefix cache miss |
-| **当前数据** | `logs/proxy_metrics.jsonl` 中 `Tool filter: 44 -> 12` 130 次 / 305 = **42.6%** 的请求走过滤 |
-| **影响** | 42.6% 的请求即使 rounds 稳定,prefix cache 仍 miss (因为工具列表变了) |
-| **修复建议** | 1) 缓存过滤后的工具列表 (按"最近使用工具"分组)<br>2) 只过滤不变的尾部,保留稳定的 tools schema 前缀 |
+| **根因** | `_filter_tools()` 按输入顺序保留工具,当不同请求过滤掉不同工具时,保留的工具列表顺序不同,prefix cache 失效 |
+| **修复** | `kept` 列表按工具名字母排序 (`sorted(key=lambda t: t.get("name", ""))`)，确保相同工具集合始终产生相同前缀 |
+| **剩余** | 工具集合不同时 (如 recent_tools 变化) 仍会 miss;需生产数据验证排序后 cache 命中率提升 |
 
 ### DEF-204: 状态页 `/status` 被高频轮询 — ✅ 已修复
 
@@ -222,23 +221,23 @@
 | **影响** | 后端被迫双倍处理,GPU 资源浪费 |
 | **修复** | 代理层新增请求去重: `_check_dedup()` 基于 body hash + 时间窗口 (默认 2s)。重复请求返回 429 + Retry-After header。可通过 `PROXY_DEDUP_WINDOW` 配置窗口大小 |
 
-### DEF-206: A/B 实验数据未用于实际调参
+### DEF-206: A/B 实验数据未用于实际调参 — ⚪ 设计限制
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `docs/ab-experiment-design.md` §8 |
 | **现状** | T1 任务 (A 组 94 请求 / B 组 79 请求) 已完成,但**没有后续 follow-up 实验** |
-| **影响** | 1) 投入产出比低<br>2) 实验结论 (B 组更优) 未指导实际配置选择 |
-| **修复建议** | 1) 完成实验 follow-up: 用 B 组配置 (clearing 关闭) 在生产中跑 1 周,对比实际效果<br>2) 至少 3 次重复实验以获得统计显著性 |
+| **评估** | A/B 实验为一次性决策工具,非持续集成项。实验结论 (B 组更优) 已记录,配置调优属于运维决策而非代码缺陷 |
+| **状态** | 标记为设计限制,不需要代码修复 |
 
-### DEF-207: rapid-mlx 性能衰减需手动重启
+### DEF-207: rapid-mlx 性能衰减需手动重启 — 🟡 已缓解
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `optimization-log-20260603.md` § 4.2 + BENCHMARK.md |
 | **现象** | 运行 7 分钟后生成速度从 56 → 12 tok/s (衰减 78%) |
-| **当前状态** | 无自动重启机制,需用户手动 `./manage.sh restart` |
-| **修复建议** | 1) 添加 watchdog: 检测生成速度 < 20 tok/s 持续 5 分钟时自动重启<br>2) 集成到 `manage.sh` |
+| **修复** | 新增 `./manage.sh watchdog` 命令: 每 60s 检查后端健康 + 解析日志中 tok/s,低于阈值(默认 15 tok/s)时自动 `restart`。可通过 `WATCHDOG_INTERVAL`/`WATCHDOG_TOK_THRESHOLD`/`WATCHDOG_MAX_FAIL` 环境变量配置 |
+| **剩余** | watchdog 需在独立终端运行 (非 daemon);tok/s 解析依赖日志格式 |
 
 ### DEF-208: 单元测试覆盖不足 (44 个 case)
 
@@ -330,9 +329,10 @@
 
 | 状态 | 数量 | 占比 | 缺陷编号 |
 |------|------|------|----------|
-| ✅ 已修复/已验证 | 11 | 37% | DEF-003, DEF-004, DEF-007, DEF-101, DEF-102, DEF-108, DEF-202, DEF-204, DEF-205, DEF-302, DEF-305 |
-| 🟡 部分修复/已缓解 | 7 | 23% | DEF-001, DEF-002, DEF-005, DEF-006, DEF-104, DEF-106, DEF-107 |
-| 🔴 未修复 | 12 | 40% | DEF-103, DEF-105, DEF-201, DEF-203~#210, DEF-301, DEF-303~304 |
+| ✅ 已修复/已验证 | 12 | 40% | DEF-003, DEF-004, DEF-007, DEF-101, DEF-102, DEF-108, DEF-201, DEF-202, DEF-204, DEF-205, DEF-302, DEF-305 |
+| 🟡 部分修复/已缓解 | 9 | 30% | DEF-001, DEF-002, DEF-005, DEF-006, DEF-104, DEF-106, DEF-107, DEF-203, DEF-207 |
+| 🔴 未修复 | 8 | 27% | DEF-103, DEF-105, DEF-208, DEF-209, DEF-210, DEF-301, DEF-303, DEF-304 |
+| ⚪ 设计限制 | 1 | 3% | DEF-206 |
 
 ### 5.2 按类别
 

@@ -996,6 +996,58 @@ cmd_fix_template() {
 }
 
 # ============================================================
+# Watchdog: 监控后端健康，性能衰减时自动重启
+# ============================================================
+cmd_watchdog() {
+    local interval="${WATCHDOG_INTERVAL:-60}"
+    local threshold="${WATCHDOG_TOK_THRESHOLD:-15}"
+    local consecutive_fail=0
+    local max_fail="${WATCHDOG_MAX_FAIL:-3}"
+
+    info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
+    info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
+
+    while true; do
+        sleep "$interval"
+
+        local pid
+        if ! pid=$(_get_pid 2>/dev/null); then
+            warn "后端未运行,尝试重启..."
+            cmd_restart
+            consecutive_fail=0
+            continue
+        fi
+
+        local health
+        health=$(curl -s --max-time 5 "http://${LLAMA_HOST:-127.0.0.1}:${LLAMA_PORT:-8081}/v1/models" 2>/dev/null)
+        if [[ -z "$health" ]]; then
+            consecutive_fail=$((consecutive_fail + 1))
+            warn "后端健康检查失败 ($consecutive_fail/$max_fail)"
+            if (( consecutive_fail >= max_fail )); then
+                error "后端连续 $max_fail 次无响应,自动重启"
+                cmd_restart
+                consecutive_fail=0
+            fi
+            continue
+        fi
+        consecutive_fail=0
+
+        local metrics_line
+        metrics_line=$(grep -a "prompt_n\|predicted_n\|tok/s" "logs/llama-server.log" 2>/dev/null | tail -1)
+        if [[ -n "$metrics_line" ]]; then
+            local tok_s
+            tok_s=$(echo "$metrics_line" | grep -oE '[0-9]+\.[0-9]+ tok/s' | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+            if [[ -n "$tok_s" ]]; then
+                if (( $(echo "$tok_s < $threshold" | bc -l 2>/dev/null || echo 0) )); then
+                    warn "性能衰减: ${tok_s} tok/s < ${threshold} tok/s,重启后端..."
+                    cmd_restart
+                fi
+            fi
+        fi
+    done
+}
+
+# ============================================================
 # 帮助信息
 # ============================================================
 cmd_help() {
@@ -1010,6 +1062,7 @@ llama.cpp / Rapid-MLX 服务管理脚本
   stop                 停止后端和代理
   status               查询后端和代理状态
   restart              重启后端和代理
+  watchdog             监控后端健康状态，性能衰减时自动重启
   logs [N]             查看最后 N 行后端日志 (默认 50)
   proxy-logs [N]       查看最后 N 行代理日志 (默认 50)
 
@@ -1076,6 +1129,9 @@ main() {
             ;;
         fix-template)
             cmd_fix_template "$2"
+            ;;
+        watchdog)
+            cmd_watchdog
             ;;
         help|--help|-h)
             cmd_help

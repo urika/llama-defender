@@ -109,10 +109,14 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - **DEF-106** 🟡 — 非流式路径 JSON 修复：force_stopped 时回溯原始 tool_calls，调用 `_repair_truncated_json()`
 - **DEF-108** ✅ — Blocker 触发修复：Pipeline 顺序修正（blocker detection 移到 tool-result clearing 之前），清除操作不再覆盖错误标记
 
-#### P2-Medium（4 项修复 + 1 项缓解）
+#### P2-Medium（5 项修复 + 2 项缓解 + 1 项设计限制）
+- **DEF-201** ✅ — re-read 检测改为仅扫描最后一次 assistant 消息，消除历史累积假阳性
 - **DEF-202** ✅ — Bash dedup 跳过 `[cleared:...]` 内容，防止已清空结果反复触发 Jaccard 匹配
+- **DEF-203** 🟡 — 工具过滤后按名字母排序，稳定 prefix cache 命中
 - **DEF-204** ✅ — `/status` 端点不再产生日志噪音（GET /status 跳过 header logging）
 - **DEF-205** ✅ — 请求去重：`_check_dedup()` 基于 body hash + `PROXY_DEDUP_WINDOW`(2s) 窗口，重复请求返回 429 + Retry-After
+- **DEF-206** ⚪ — A/B 实验为运维决策工具，标记为设计限制
+- **DEF-207** 🟡 — 新增 `./manage.sh watchdog` 命令，自动检测性能衰减并重启
 - **DEF-104** 🟡 — 工具过滤日志增加 `filtered_out` 字段（被移除的工具名称排序列表），提升可观测性
 - **DEF-107** 🟡 — 截断丢弃率 > 85% 时注入 `[System: Context severely truncated]` 通知
 
@@ -127,7 +131,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ### Changed
 - **单元测试**: 78 → **124 cases**（+46），全部通过
-- **DEFECT-LIST.md**: 更新修复状态统计（11 已修复 / 7 部分修复 / 12 未修复）
+- **DEFECT-LIST.md**: 更新修复状态统计（12 已修复 / 9 部分修复 / 8 未修复 / 1 设计限制）
 
 ### Metrics (snapshot at 0.5.1-progress)
 

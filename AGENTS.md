@@ -186,6 +186,14 @@ Rapid-MLX specific variables:
 | `RAPID_MLX_KV_QUANT_BITS` | `8` | KV quant bits |
 | `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags |
 
+Watchdog variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WATCHDOG_INTERVAL` | `60` | Health check interval (seconds) |
+| `WATCHDOG_TOK_THRESHOLD` | `15` | Min tok/s before auto-restart |
+| `WATCHDOG_MAX_FAIL` | `3` | Consecutive health check failures before restart |
+
 Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 `CONFIG_MEMORY`) used by `manage.sh list` for human-readable display.
 

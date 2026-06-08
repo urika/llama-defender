@@ -2712,7 +2712,10 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
     if tool_choice_name:
         keep_set.add(tool_choice_name)
 
-    kept = [t for t in tools if isinstance(t, dict) and t.get("name", "") in keep_set]
+    kept = sorted(
+        [t for t in tools if isinstance(t, dict) and t.get("name", "") in keep_set],
+        key=lambda t: t.get("name", "")
+    )
 
     if len(kept) < 5:
         return tools, {"filtered": False, "reason": "too_few_after_filter"}
@@ -3267,16 +3270,18 @@ class Handler(BaseHTTPRequestHandler):
             if session_id and session_loop["level"] > 0 and max_run < PROXY_LOOP_THRESHOLD:
                 _LOOP_SESSION_STATE[session_id] = {"level": 0, "triggers": session_loop.get("triggers", 0)}
 
-        # Re-read detection: check if recent tool_uses target cleared files
+        # Re-read detection: check if LAST assistant message has Read targeting cleared files
         re_read_info = {"count": 0, "cleared_files": len(cleared_files), "rate_pct": 0.0}
         if cleared_files:
             re_read_count = 0
             re_read_targets = set()
-            recent_msgs = raw_messages[-6:]
-            for msg in recent_msgs:
-                if msg.get("role") != "assistant":
-                    continue
-                content = msg.get("content", "")
+            last_assistant = None
+            for msg in reversed(raw_messages):
+                if msg.get("role") == "assistant":
+                    last_assistant = msg
+                    break
+            if last_assistant:
+                content = last_assistant.get("content", "")
                 if isinstance(content, list):
                     for block in content:
                         if block.get("type") == "tool_use" and block.get("name") == "Read":
