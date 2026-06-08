@@ -280,14 +280,49 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 
 ### 3.1 循环检测 (Loop Detection)
 
-**检测方式**: 双重匹配
+**检测方式**: 三重匹配
 
 | 方式 | 匹配规则 | 示例 |
 |------|---------|------|
 | **精确匹配** | 相同工具名 + 相同参数 JSON | `Read({"file_path":"board.js"})` 连续出现 |
 | **模式匹配** | 相同文本(前200字) + 相同工具集合 | 每次回复 "让我重新读取" + Read |
+| **文本输出匹配** | 连续相似的纯文本输出 | 模型重复输出相同的分析段落 |
 
-**追踪逻辑**: 扫描所有 assistant 消息，维护 `consecutive` dict 和 `pattern_run` 计数器。遇到非 assistant 消息重置。
+**追踪逻辑**: 
+- 工具循环: 扫描最后 15 条 assistant 消息，维护 `consecutive` dict 和 `pattern_run` 计数器
+- 文本循环: 扫描最后 15 条 assistant 消息的纯文本内容，使用 bigram Jaccard 相似度检测
+
+### 3.1.1 文本输出循环检测 (v0.5.3)
+
+**背景**: 模型有时会陷入"解释模式"，不断重复输出相同的文本段落（如重复分析 minimax 算法），而没有工具调用。传统工具循环检测无法捕获这种情况。
+
+**检测算法**:
+```python
+def _compute_text_similarity(text1, text2):
+    """基于 bigram 的 Jaccard 相似度"""
+    bigrams1 = set(text1[i:i+2] for i in range(len(text1)-1))
+    bigrams2 = set(text2[i:i+2] for i in range(len(text2)-1))
+    intersection = len(bigrams1 & bigrams2)
+    union = len(bigrams1 | bigrams2)
+    return intersection / union if union > 0 else 0.0
+```
+
+**检测流程**:
+1. 提取最后 N 条 assistant 消息的纯文本内容
+2. 短于 `PROXY_TEXT_LOOP_MIN_CHARS` (默认 100) 的消息被视为断链点
+3. 计算相邻消息的文本相似度
+4. 相似度 >= `PROXY_TEXT_LOOP_SIMILARITY` (默认 0.85) 时增加连续计数
+5. 连续计数 >= `PROXY_TEXT_LOOP_THRESHOLD` (默认 3) 时触发干预
+
+**干预消息** (与工具循环共享阈值，但消息内容不同):
+- Level 1: "You have repeated similar text output N times. STOP repeating yourself."
+- Level 2: "You are stuck in a loop. STOP repeating the same explanation."
+- Level 3: "ALL tools have been DISABLED. Describe the problem you are stuck on."
+
+**局限性**:
+- 检测时机在**下一次请求**，当前请求无法中断
+- 用户需按 Ctrl+C 中断后发送新请求才能触发干预
+- 代理层是被动的，无法在模型生成过程中干预
 
 ### 3.2 升级干预 (Escalating Intervention)
 
@@ -349,6 +384,10 @@ re-reading.
 | `PROXY_LOOP_THRESHOLD` | 3 | Level 1 触发阈值 |
 | `PROXY_LOOP_LEVEL2` | 6 | Level 2 触发阈值 (threshold × 2) |
 | `PROXY_LOOP_LEVEL3` | 9 | Level 3 触发阈值 (threshold × 3) |
+| `PROXY_TEXT_LOOP_ENABLED` | true | 文本输出循环检测开关 |
+| `PROXY_TEXT_LOOP_THRESHOLD` | 3 | 连续相似文本触发阈值 |
+| `PROXY_TEXT_LOOP_MIN_CHARS` | 100 | 最小文本长度（短于此的消息不参与检测） |
+| `PROXY_TEXT_LOOP_SIMILARITY` | 0.85 | 文本相似度阈值 (0.0-1.0) |
 | `PROXY_BLOCKER_ENABLED` | true (local) / false (cloud) | 阻塞检测开关 |
 | `PROXY_BLOCKER_THRESHOLD` | 2 | 连续相同错误次数阈值 |
 
@@ -971,6 +1010,10 @@ max_tokens (请求值)
 | `PROXY_LOOP_THRESHOLD` | 3 | Level 1 阈值 |
 | `PROXY_LOOP_LEVEL2` | 6 | Level 2 阈值 |
 | `PROXY_LOOP_LEVEL3` | 9 | Level 3 阈值 |
+| `PROXY_TEXT_LOOP_ENABLED` | true | 文本输出循环检测开关 |
+| `PROXY_TEXT_LOOP_THRESHOLD` | 3 | 连续相似文本触发阈值 |
+| `PROXY_TEXT_LOOP_MIN_CHARS` | 100 | 最小文本长度 |
+| `PROXY_TEXT_LOOP_SIMILARITY` | 0.85 | 文本相似度阈值 (0.0-1.0) |
 | `PROXY_BLOCKER_ENABLED` | true / false | 阻塞检测开关 |
 | `PROXY_BLOCKER_THRESHOLD` | 2 | 连续错误阈值 |
 
