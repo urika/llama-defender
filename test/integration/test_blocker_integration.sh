@@ -77,6 +77,7 @@ send_request() {
       -H "Content-Type: application/json" \
       -H "x-api-key: test" \
       -H "anthropic-version: 2023-06-01" \
+      -H "x-claude-code-session-id: itest-blocker" \
       -d "$body" >"$LOG_DIR/resp.json" 2>"$LOG_DIR/curl.err"; then
     cat "$LOG_DIR/curl.err"
     return 1

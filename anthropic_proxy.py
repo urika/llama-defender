@@ -37,6 +37,7 @@ IS_CLOUD = BACKEND_TYPE == "cloud"
 # ---------------------------------------------------------------------------
 PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", "4" if IS_CLOUD else "1"))
 _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
+# TODO(roadmap-U6): Multi-model collaboration — small model for compression, large for main inference
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-v4-pro" if IS_CLOUD else "mlx-community/Qwen3.6-35B-A3B-4bit")
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,8 @@ TOOL_ALWAYS_KEEP = {
 # Keyword index (BM25 MVP): extract keywords from dropped messages and
 # inject relevant context into tail for better continuity.
 # ---------------------------------------------------------------------------
+# TODO(roadmap-U1): BM25 Phase 2 — Bigram tokenization + inverted index
+# TODO(roadmap-U1): BM25 Phase 3 — JSONL persistence for cross-session memory
 PROXY_HISTORY_INDEX = os.environ.get("PROXY_HISTORY_INDEX", "rule")
 PROXY_HISTORY_TOP_K = int(os.environ.get("PROXY_HISTORY_TOP_K", "5"))
 PROXY_HISTORY_MAX_CHARS = int(os.environ.get("PROXY_HISTORY_MAX_CHARS", "500"))
@@ -299,13 +302,33 @@ def _mask_sensitive(headers_dict):
     return masked
 
 
-def log(msg):
+LOG_SCHEMA_VERSION = "v2"
+
+
+def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     sess = getattr(_log_ctx, 'session_id', None)
     if sess:
-        line = f"[{ts}] [sess={sess}] {msg}"
+        line = f"[{ts}] [{level}] [sess={sess}] {msg}"
     else:
-        line = f"[{ts}] {msg}"
+        line = f"[{ts}] [{level}] {msg}"
+    print(line)
+    log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
+    try:
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def log_structured(event, **kwargs):
+    ts = datetime.now().strftime("%H:%M:%S")
+    sess = getattr(_log_ctx, 'session_id', None)
+    entry = {"schema": LOG_SCHEMA_VERSION, "ts": ts, "event": event}
+    if sess:
+        entry["session_id"] = sess
+    entry.update(kwargs)
+    line = json.dumps(entry, ensure_ascii=False)
     print(line)
     log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
     try:
@@ -1017,6 +1040,7 @@ def _extract_middle_summary_rules(messages):
     return header + "\n".join(parts)
 
 
+# TODO(roadmap-U2): Phase-aware compression — detect exploration/implementation/debug stages
 def _compress_middle_with_llm(messages, timeout=30):
     try:
         conversation_text = []
@@ -2655,6 +2679,7 @@ setInterval(function() {{
     return html
 
 
+# TODO(roadmap-U4): Auto-tune thresholds/budget from quality_flags history
 def _finalize_metrics(mc):
     pipeline = mc.get("pipeline", {})
     quality_flags = []
@@ -2939,7 +2964,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
+        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
+        _log_ctx.session_id = raw_sid or f"req_{os.urandom(4).hex()}"
         try:
             if self.path != "/status":
                 log(f"GET {self.path}")
@@ -2958,13 +2984,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("request-id", self._request_id)
                 self.end_headers()
                 self.wfile.write(html.encode("utf-8"))
+            elif self.path == "/metrics" or self.path.startswith("/metrics?"):
+                self._handle_metrics_endpoint()
             else:
                 self._respond_json({"detail": "Not found"}, 404)
         finally:
             _log_ctx.session_id = None
 
     def do_POST(self):
-        _log_ctx.session_id = self.headers.get("X-Claude-Code-Session-Id", "")[:8] or None
+        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
+        _log_ctx.session_id = raw_sid or f"req_{os.urandom(4).hex()}"
         if PROXY_METRICS_ENABLED:
             _metrics_ctx.mc = {
                 "ts": datetime.now().isoformat(),
@@ -3132,6 +3161,8 @@ class Handler(BaseHTTPRequestHandler):
         session_id = session_prefix
         total_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in body.get("messages", []))
         log(f"  [REQ_SUMMARY] chars={total_chars} tools={len(tools_list or [])}")
+        log_structured("REQ_SUMMARY", chars=total_chars, tools=len(tools_list or []),
+                       model=body.get("model", ""), stream=body.get("stream", False))
 
         if PROXY_METRICS_ENABLED:
             mc = getattr(_metrics_ctx, 'mc', None)
@@ -3271,6 +3302,7 @@ class Handler(BaseHTTPRequestHandler):
                 _LOOP_SESSION_STATE[session_id] = {"level": 0, "triggers": session_loop.get("triggers", 0)}
 
         # Re-read detection: check if LAST assistant message has Read targeting cleared files
+        # TODO(roadmap-U5): Hard-block re-reads — intercept and reject Read calls to cleared files
         re_read_info = {"count": 0, "cleared_files": len(cleared_files), "rate_pct": 0.0}
         if cleared_files:
             re_read_count = 0
@@ -3548,6 +3580,7 @@ class Handler(BaseHTTPRequestHandler):
         log(f"  <- Responding: {content_summary[:200]} (output_chars={output_chars})")
         self._respond_json(anthropic_resp)
 
+    # TODO(roadmap-U7): Stream reasoning progress — emit partial thinking events during long TTFT
     def _handle_streaming_response(self, resp, anthropic_body):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -3800,6 +3833,61 @@ class Handler(BaseHTTPRequestHandler):
         raw = json.dumps(data, ensure_ascii=False)
         log(f"  <- Response body: {raw[:500]}")
         self.wfile.write(raw.encode("utf-8"))
+
+    def _handle_metrics_endpoint(self):
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        last_n = int(params.get("n", ["100"])[0])
+        metrics_dir = os.environ.get("PROXY_METRICS_DIR", "logs")
+        metrics_path = os.path.join(metrics_dir, "proxy_metrics.jsonl")
+        records = []
+        try:
+            with open(metrics_path, "r") as f:
+                lines = f.readlines()
+            for line in lines[-last_n:]:
+                try:
+                    records.append(json.loads(line.strip()))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except (FileNotFoundError, OSError):
+            pass
+        total = len(records)
+        if total == 0:
+            self._respond_json({"schema": LOG_SCHEMA_VERSION, "total": 0})
+            return
+        status_counts = {}
+        quality_flag_counts = {}
+        tool_usage = {}
+        loop_triggered = 0
+        blocker_triggered = 0
+        truncation_triggered = 0
+        for r in records:
+            s = r.get("status", "unknown")
+            status_counts[s] = status_counts.get(s, 0) + 1
+            for qf in r.get("quality_flags", []):
+                quality_flag_counts[qf] = quality_flag_counts.get(qf, 0) + 1
+            pipeline = r.get("pipeline", {})
+            if pipeline.get("loop_detect", {}).get("max_run", 0) >= PROXY_LOOP_THRESHOLD:
+                loop_triggered += 1
+            if pipeline.get("blocker_detect", {}).get("triggered"):
+                blocker_triggered += 1
+            if pipeline.get("truncate", {}).get("triggered"):
+                truncation_triggered += 1
+            for t in r.get("tools", []):
+                tool_usage[t] = tool_usage.get(t, 0) + 1
+        top_tools = sorted(tool_usage.items(), key=lambda x: -x[1])[:10]
+        self._respond_json({
+            "schema": LOG_SCHEMA_VERSION,
+            "total": total,
+            "status": status_counts,
+            "quality_flags": quality_flag_counts,
+            "loop_triggered": loop_triggered,
+            "blocker_triggered": blocker_triggered,
+            "truncation_triggered": truncation_triggered,
+            "top_tools": [{"name": n, "count": c} for n, c in top_tools],
+            "last_n": last_n,
+        })
 
 
 def main():

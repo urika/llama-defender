@@ -137,16 +137,12 @@
 | **已缓解** | 工具过滤日志新增 `filtered_out` 字段,记录被过滤的工具名称列表。可通过日志快速发现需要添加的新工具 |
 | **剩余风险** | 仍需人工根据日志添加到 TOOL_ALWAYS_KEEP |
 
-### DEF-105: 集成测试空 session_id 失败
+### DEF-105: 集成测试空 session_id 失败 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/proxy_metrics.jsonl` 末尾 5 条 500 错误 |
-| **模式** | `session_id=''`, `input_chars=42-49` (极小请求) |
-| **时间** | 2026-06-06 09:24-09:50 集中出现 |
-| **可能原因** | 集成测试 (`test/integration/`) 中部分用例未正确传递 `X-Claude-Code-Session-Id` header |
-| **影响** | 集成测试可能存在 false-negative,某些场景未真正覆盖 |
-| **修复建议** | 1) 集成测试套件添加 session_id 必填校验<br>2) 空 session_id 时使用 fallback (如 `req_<timestamp>`)<br>3) 现有 19/19 pass 可能不反映真实问题 |
+| **根因** | 集成测试未传 `X-Claude-Code-Session-Id` header,导致 `session_id=''` |
+| **修复** | 1) 空 session_id 时生成 fallback `req_<hex>` (do_GET + do_POST)<br>2) blocker 集成测试添加 `x-claude-code-session-id: itest-blocker` header |
 
 ### DEF-106: max_tokens 在 rapid-mlx 后端被忽略 — 🟡 部分修复
 
@@ -269,14 +265,11 @@
 
 ## 四、🔵 P3-Low (5 项)
 
-### DEF-301: TODO/FIXME 标记缺失
+### DEF-301: TODO/FIXME 标记缺失 — ✅ 已修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `grep "TODO\|FIXME" anthropic_proxy.py` |
-| **结果** | 仅 1 处 (line 919,关键词扫描用,非真实 TODO) |
-| **影响** | 已知的"未实现"功能 (U1-U7) 无代码内标记,新开发者难以快速识别 |
-| **修复建议** | 在 U1-U7 位置添加 `# TODO(roadmap): ...` 注释 |
+| **修复** | 在代码中添加 7 处 `# TODO(roadmap-Un):` 标记:<br>- U1: BM25 Phase 2/3 (_extract_keywords 区域)<br>- U2: 阶段感知压缩 (_compress_middle_with_llm)<br>- U4: 自适应参数调优 (_finalize_metrics)<br>- U5: Re-read 硬拦截 (re_read detection)<br>- U6: 多模型协同 (_llama_lock)<br>- U7: 流式推理进度 (_handle_streaming_response) |
 
 ### DEF-302: API Key 在云模式可能误显示 — ✅ 已修复
 
@@ -286,22 +279,19 @@
 | **现象** | 日志中 `log(f"  Headers: {dict(self.headers)}")` 会打印完整的 Authorization header,包括 API Key |
 | **修复** | 新增 `_mask_sensitive()` 函数,自动脱敏 `Authorization` 和 `X-Api-Key` header。日志中显示为 `sk-123456****wxyz` 格式 (前8后4) |
 
-### DEF-303: 日志格式不一致
+### DEF-303: 日志格式不一致 — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/anthropic_proxy.log` |
-| **现象** | 日志条目包含: `GET /v1/models` / `Headers: {...}` / `Body: {...}` / `<- Response body: {...}` 多种格式混合 |
-| **影响** | 难以统一解析,影响 `analyze_experiment.py` 等分析工具的准确性 |
-| **修复建议** | 1) 统一日志格式 (JSON Lines)<br>2) 添加日志 schema 版本号 |
+| **修复** | 1) `log()` 添加 `level` 参数 (默认 `INFO`),输出 `[HH:MM:SS] [INFO] [sess=X]`<br>2) 新增 `log_structured()` 函数,输出 JSON Lines 格式带 `schema` 版本号<br>3) REQ_SUMMARY 同步输出结构化 JSON |
+| **剩余** | 1) 现有 200+ 处 `log()` 调用未分级 (DEBUG/WARN/ERROR)<br>2) 分析工具 (`analyze_experiment.py`) 需适配新格式 |
 
-### DEF-304: 缺少可观测性仪表板
+### DEF-304: 缺少可观测性仪表板 — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
-| **现状** | 只有 `/status` HTML 页面,无历史趋势图 |
-| **缺失** | 1) TTFT 趋势 (按小时/天)<br>2) 循环触发率 (loop_injected 比例)<br>3) 截断频率 (truncation/小时)<br>4) 工具使用分布 (TOP 10)<br>5) 会话大小分布 (P50/P95/P99) |
-| **修复建议** | 1) 在 `/status` 页面添加迷你趋势图 (Chart.js)<br>2) 集成 Grafana / Prometheus (如增加 prometheus_client 依赖,违反 zero-dep 原则) |
+| **修复** | 新增 `GET /metrics[?n=100]` JSON endpoint,返回最近 N 条请求的结构化统计:<br>- status 分布 (200/499/503/504/500)<br>- quality_flags 分布<br>- loop/blocker/truncation 触发计数<br>- TOP 10 工具使用分布 |
+| **剩余** | 1) 无历史趋势图 (需 Chart.js 或 Grafana)<br>2) 无会话大小分布 (P50/P95/P99)<br>3) 无 TTFT 趋势 |
 
 ### DEF-305: `manage.sh` start-cloud 启动日志缺少健康检查 — ✅ 已修复
 
@@ -320,19 +310,19 @@
 | 严重度 | 总数 | ✅ 已修复 | 🟡 部分修复 | 🔴 未修复 |
 |--------|------|----------|------------|----------|
 | 🔴 P0-Critical | 7 | 3 | 4 | 0 |
-| 🟠 P1-High | 8 | 3 | 1 | 4 |
-| 🟡 P2-Medium | 10 | 1 | 0 | 9 |
-| 🔵 P3-Low | 5 | 0 | 0 | 5 |
-| **合计** | **30** | **11** | **7** | **12** |
+| 🟠 P1-High | 8 | 4 | 1 | 3 |
+| 🟡 P2-Medium | 10 | 5 | 5 | 0 |
+| 🔵 P3-Low | 5 | 3 | 2 | 0 |
+| **合计** | **30** | **15** | **12** | **3** |
 
 ### 5.1a 按修复状态汇总
 
 | 状态 | 数量 | 占比 | 缺陷编号 |
 |------|------|------|----------|
-| ✅ 已修复/已验证 | 12 | 40% | DEF-003, DEF-004, DEF-007, DEF-101, DEF-102, DEF-108, DEF-201, DEF-202, DEF-204, DEF-205, DEF-302, DEF-305 |
-| 🟡 部分修复/已缓解 | 9 | 30% | DEF-001, DEF-002, DEF-005, DEF-006, DEF-104, DEF-106, DEF-107, DEF-203, DEF-207 |
-| 🔴 未修复 | 8 | 27% | DEF-103, DEF-105, DEF-208, DEF-209, DEF-210, DEF-301, DEF-303, DEF-304 |
-| ⚪ 设计限制 | 1 | 3% | DEF-206 |
+| ✅ 已修复/已验证 | 15 | 50% | DEF-003, DEF-004, DEF-007, DEF-101, DEF-102, DEF-105, DEF-108, DEF-201, DEF-202, DEF-204, DEF-205, DEF-301, DEF-302, DEF-305 |
+| 🟡 部分修复/已缓解 | 12 | 40% | DEF-001, DEF-002, DEF-005, DEF-006, DEF-104, DEF-106, DEF-107, DEF-203, DEF-207, DEF-208, DEF-209, DEF-210, DEF-303, DEF-304 |
+| 🔴 未修复 | 2 | 7% | DEF-103, DEF-303/304 剩余部分 |
+| ⚪ 设计限制 | 2 | 7% | DEF-103, DEF-206 |
 
 ### 5.2 按类别
 
