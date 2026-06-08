@@ -66,30 +66,46 @@ run_unit() {
 run_integration() {
   print_banner "Integration tests (test/integration/)"
   # Make sure no stale process holds the integration ports.
-  for port in 8089 4001; do
+  for port in 8089 8090 4001 4002; do
     if lsof -ti :"$port" >/dev/null 2>&1; then
       warn "port $port is busy; killing stale holder"
       lsof -ti :"$port" | xargs kill -9 2>/dev/null || true
       sleep 0.3
     fi
   done
-  local out
-  out=$(bash "$SCRIPT_DIR/integration/test_blocker_integration.sh" 2>&1)
-  local rc=$?
-  # Echo the last 25 lines so the user sees the summary.
-  echo "$out" | tail -25
-  if [[ $rc -ne 0 ]]; then
-    record "integration" "fail" "test_blocker_integration.sh exited $rc"
-    return
-  fi
-  # Strip ANSI escape codes before parsing numbers.
-  local passed failed
-  passed=$(echo "$out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
-  failed=$(echo "$out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
-  if [[ "${failed:-0}" == "0" ]]; then
-    record "integration" "ok" "all ${passed:-?} cases passed"
+
+  local blocker_rc=0 loop_rc=0 blocker_out loop_out
+
+  blocker_out=$(bash "$SCRIPT_DIR/integration/test_blocker_integration.sh" 2>&1)
+  blocker_rc=$?
+  echo "$blocker_out" | tail -25
+  if [[ $blocker_rc -ne 0 ]]; then
+    record "integration" "fail" "test_blocker_integration.sh exited $blocker_rc"
   else
-    record "integration" "fail" "$failed of ${passed:-?} cases failed"
+    local bp bf
+    bp=$(echo "$blocker_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    bf=$(echo "$blocker_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${bf:-0}" == "0" ]]; then
+      record "integration" "ok" "blocker: all ${bp:-?} cases passed"
+    else
+      record "integration" "fail" "blocker: $bf of ${bp:-?} cases failed"
+    fi
+  fi
+
+  loop_out=$(bash "$SCRIPT_DIR/integration/test_loop_integration.sh" 2>&1)
+  loop_rc=$?
+  echo "$loop_out" | tail -25
+  if [[ $loop_rc -ne 0 ]]; then
+    record "integration" "fail" "test_loop_integration.sh exited $loop_rc"
+  else
+    local lp lf
+    lp=$(echo "$loop_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    lf=$(echo "$loop_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${lf:-0}" == "0" ]]; then
+      record "integration" "ok" "loop: all ${lp:-?} cases passed"
+    else
+      record "integration" "fail" "loop: $lf of ${lp:-?} cases failed"
+    fi
   fi
 }
 

@@ -248,14 +248,14 @@
 | **新增覆盖** | `_mask_sensitive`, `convert_anthropic_tools_to_openai`, `convert_anthropic_tool_choice_to_openai`, `_has_thinking_content`, `_strip_thinking_from_msg`, `_is_pure_tool_use_msg`, `_is_cleared_tool_result_msg`, `compress_cleared_tool_results`, `_check_dedup`, `_filter_tools` sorting |
 | **剩余** | `convert_anthropic_messages_to_openai`, `_extract_middle_summary_rules`, `_compute_adaptive_rounds`, `strip_old_thinking_blocks` 等函数仍未覆盖 |
 
-### DEF-209: 集成测试 5 个场景未实际覆盖
+### DEF-209: 集成测试 5 个场景未实际覆盖 — 🟡 进行中
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `test/integration/test_blocker_integration.sh` |
-| **覆盖情况** | 1) 2× file_not_found (Read) ✅<br>2) 2× Wasted call (Read) ✅<br>3) 2× InputValidationError (Bash) ✅<br>4) 3× file_not_found (Read) ✅<br>5) 1× file_not_found (no trigger) ✅<br>6) mixed types (no trigger) ✅<br>7) 2 errors → 1 success → 1 error (no trigger) ✅ |
-| **缺失** | 1) 写操作认知循环 (Write 内容相似度 99% 重复)<br>2) Level 2 移除工具后用 Bash 重新循环<br>3) 跨请求循环追踪 |
-| **修复建议** | 扩展集成测试矩阵覆盖认知循环和跨请求场景 |
+| **数据源** | `test/integration/test_blocker_integration.sh`, `test/integration/test_loop_integration.sh` |
+| **覆盖情况** | Blocker 7 TC ✅ + Loop 5 TC (8 assertions) ✅ = **12 integration test cases** |
+| **新增覆盖** | 1) Level 1/2/3 循环检测升级 ✅<br>2) 跨请求 session 持久化 ✅<br>3) 阈值以下无干预 ✅ |
+| **剩余** | 1) Write 内容相似度 99% 重复循环<br>2) Level 2 后用 Bash 重新循环<br>3) 更复杂的跨请求降级场景 |
 
 ### DEF-210: 文档与代码脱节
 
