@@ -1815,5 +1815,254 @@ class TestOOMSafetyEstimation(unittest.TestCase):
         self.assertEqual(sys_chars, 0)
 
 
+class TestMaskSensitive(unittest.TestCase):
+    def test_masks_authorization(self):
+        result = proxy._mask_sensitive({"Authorization": "Bearer sk-abcdef1234567890wxyz"})
+        self.assertEqual(result["Authorization"], "Bearer s****wxyz")
+
+    def test_masks_x_api_key(self):
+        result = proxy._mask_sensitive({"X-Api-Key": "sk-longapikey1234567890"})
+        self.assertIn("****", result["X-Api-Key"])
+
+    def test_short_value_masks_partially(self):
+        result = proxy._mask_sensitive({"Authorization": "short"})
+        self.assertEqual(result["Authorization"], "shor****")
+
+    def test_non_sensitive_unchanged(self):
+        result = proxy._mask_sensitive({"Content-Type": "application/json"})
+        self.assertEqual(result["Content-Type"], "application/json")
+
+    def test_non_dict_passthrough(self):
+        self.assertIsNone(proxy._mask_sensitive(None))
+        self.assertEqual(proxy._mask_sensitive("string"), "string")
+
+    def test_non_string_value_unchanged(self):
+        result = proxy._mask_sensitive({"Authorization": 12345})
+        self.assertEqual(result["Authorization"], 12345)
+
+
+class TestConvertToolsToOpenAI(unittest.TestCase):
+    def test_none_returns_none(self):
+        self.assertIsNone(proxy.convert_anthropic_tools_to_openai(None))
+
+    def test_empty_list_returns_none(self):
+        self.assertIsNone(proxy.convert_anthropic_tools_to_openai([]))
+
+    def test_custom_type_tool(self):
+        tools = [{"type": "custom", "name": "Read", "description": "Read file", "input_schema": {"type": "object"}}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["function"]["name"], "Read")
+
+    def test_simple_name_tool(self):
+        tools = [{"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["function"]["name"], "Bash")
+
+    def test_parameters_fallback(self):
+        tools = [{"name": "X", "parameters": {"type": "object"}}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(result[0]["function"]["parameters"], {"type": "object"})
+
+    def test_tool_without_name_skipped(self):
+        tools = [{"type": "other", "description": "no name"}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertIsNone(result)
+
+    def test_mixed_tools(self):
+        tools = [
+            {"type": "custom", "name": "Read", "input_schema": {}},
+            {"name": "Write", "input_schema": {}},
+        ]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 2)
+
+
+class TestConvertToolChoice(unittest.TestCase):
+    def test_none_returns_none(self):
+        self.assertIsNone(proxy.convert_anthropic_tool_choice_to_openai(None))
+
+    def test_auto_string(self):
+        self.assertEqual(proxy.convert_anthropic_tool_choice_to_openai("auto"), "auto")
+
+    def test_any_string(self):
+        self.assertEqual(proxy.convert_anthropic_tool_choice_to_openai("any"), {"type": "function"})
+
+    def test_none_string(self):
+        self.assertEqual(proxy.convert_anthropic_tool_choice_to_openai("none"), "none")
+
+    def test_tool_dict(self):
+        result = proxy.convert_anthropic_tool_choice_to_openai({"type": "tool", "name": "Read"})
+        self.assertEqual(result, {"type": "function", "function": {"name": "Read"}})
+
+    def test_auto_dict(self):
+        self.assertEqual(proxy.convert_anthropic_tool_choice_to_openai({"type": "auto"}), "auto")
+
+    def test_unknown_returns_none(self):
+        self.assertIsNone(proxy.convert_anthropic_tool_choice_to_openai("unknown"))
+
+
+class TestThinkingBlocks(unittest.TestCase):
+    def test_has_thinking_list_with_thinking_block(self):
+        msg = {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]}
+        self.assertTrue(proxy._has_thinking_content(msg))
+
+    def test_has_thinking_list_with_tag(self):
+        msg = {"role": "assistant", "content": [{"type": "text", "text": "<thinking>inner</thinking>"}]}
+        self.assertTrue(proxy._has_thinking_content(msg))
+
+    def test_has_thinking_string(self):
+        msg = {"role": "assistant", "content": "<thinking>deep</thinking>"}
+        self.assertTrue(proxy._has_thinking_content(msg))
+
+    def test_no_thinking(self):
+        msg = {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+        self.assertFalse(proxy._has_thinking_content(msg))
+
+    def test_strip_thinking_removes_block(self):
+        msg = {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "deep"},
+            {"type": "text", "text": "answer"},
+        ]}
+        proxy._strip_thinking_from_msg(msg)
+        types = [b["type"] for b in msg["content"]]
+        self.assertNotIn("thinking", types)
+        self.assertIn("text", types)
+
+    def test_strip_thinking_removes_inline_tag(self):
+        msg = {"role": "assistant", "content": [
+            {"type": "text", "text": "<thinking>inner</thinking> answer"},
+        ]}
+        proxy._strip_thinking_from_msg(msg)
+        self.assertNotIn("<thinking>", msg["content"][0]["text"])
+        self.assertIn("answer", msg["content"][0]["text"])
+
+    def test_strip_thinking_string_content(self):
+        msg = {"role": "assistant", "content": "<thinking>deep</thinking> result"}
+        proxy._strip_thinking_from_msg(msg)
+        self.assertNotIn("<thinking>", msg["content"])
+
+
+class TestPureToolUseMsg(unittest.TestCase):
+    def test_pure_tool_use(self):
+        msg = {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]}
+        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
+
+    def test_mixed_text_and_tool(self):
+        msg = {"role": "assistant", "content": [
+            {"type": "text", "text": "let me read"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ]}
+        self.assertFalse(proxy._is_pure_tool_use_msg(msg))
+
+    def test_non_assistant_role(self):
+        msg = {"role": "user", "content": [{"type": "tool_use", "name": "Read", "input": {}}]}
+        self.assertFalse(proxy._is_pure_tool_use_msg(msg))
+
+    def test_empty_content(self):
+        msg = {"role": "assistant", "content": []}
+        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
+
+    def test_dict_content_tool_use(self):
+        msg = {"role": "assistant", "content": {"type": "tool_use", "name": "Read"}}
+        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
+
+
+class TestClearedToolResultMsg(unittest.TestCase):
+    def test_cleared_prefix(self):
+        msg = {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(file.py)]"}]}
+        self.assertTrue(proxy._is_cleared_tool_result_msg(msg))
+
+    def test_normal_tool_result(self):
+        msg = {"role": "user", "content": [{"type": "tool_result", "content": "file contents here"}]}
+        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
+
+    def test_mixed_cleared_and_normal(self):
+        msg = {"role": "user", "content": [
+            {"type": "tool_result", "content": "[cleared: Read(a)]"},
+            {"type": "text", "text": "hello"},
+        ]}
+        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
+
+    def test_non_user_role(self):
+        msg = {"role": "assistant", "content": [{"type": "tool_result", "content": "[cleared: Read(x)]"}]}
+        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
+
+
+class TestCompressClearedToolResults(unittest.TestCase):
+    def test_short_messages_passthrough(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        result, stats = proxy.compress_cleared_tool_results(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertFalse(stats.get("merged", False))
+
+    def test_merges_consecutive_cleared_cycles(self):
+        msgs = [
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(a)]"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Bash(ls)]"}]},
+        ]
+        result, stats = proxy.compress_cleared_tool_results(msgs)
+        self.assertTrue(stats.get("merged"))
+        self.assertEqual(stats["merged_cycles"], 1)
+        self.assertLess(len(result), len(msgs))
+
+    def test_single_cycle_no_merge(self):
+        msgs = [
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(a)]"}]},
+        ]
+        result, stats = proxy.compress_cleared_tool_results(msgs)
+        self.assertFalse(stats.get("merged", False))
+
+
+class TestDedup(unittest.TestCase):
+    def test_first_request_passes(self):
+        proxy._DEDUP_CACHE.clear()
+        result = proxy._check_dedup('{"messages": []}')
+        self.assertFalse(result)
+
+    def test_duplicate_within_window(self):
+        proxy._DEDUP_CACHE.clear()
+        body = '{"messages": [{"role": "user", "content": "hi"}]}'
+        proxy._check_dedup(body)
+        result = proxy._check_dedup(body)
+        self.assertTrue(result)
+
+    def test_different_body_passes(self):
+        proxy._DEDUP_CACHE.clear()
+        proxy._check_dedup('{"messages": [{"role": "user", "content": "a"}]}')
+        result = proxy._check_dedup('{"messages": [{"role": "user", "content": "b"}]}')
+        self.assertFalse(result)
+
+
+class TestFilterToolsSorting(unittest.TestCase):
+    def test_output_is_alphabetically_sorted(self):
+        tools = [
+            {"name": "Zebra", "type": "custom", "input_schema": {}},
+            {"name": "Alpha", "type": "custom", "input_schema": {}},
+            {"name": "Middle", "type": "custom", "input_schema": {}},
+            {"name": "Beta", "type": "custom", "input_schema": {}},
+            {"name": "Gamma", "type": "custom", "input_schema": {}},
+            {"name": "Delta", "type": "custom", "input_schema": {}},
+        ]
+        messages = [{"role": "assistant", "content": [{"type": "tool_use", "name": "Alpha"}]}]
+        original_max = proxy.PROXY_TOOL_FILTER_MAX
+        original_keep = proxy.TOOL_ALWAYS_KEEP.copy()
+        proxy.PROXY_TOOL_FILTER_MAX = 5
+        proxy.TOOL_ALWAYS_KEEP.update({"Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"})
+        try:
+            kept, stats = proxy._filter_tools(tools, messages, recent_rounds=5)
+            self.assertTrue(stats.get("filtered"), f"Expected filtering, got {stats}")
+            names = [t["name"] for t in kept]
+            self.assertEqual(names, sorted(names))
+        finally:
+            proxy.PROXY_TOOL_FILTER_MAX = original_max
+            proxy.TOOL_ALWAYS_KEEP.clear()
+            proxy.TOOL_ALWAYS_KEEP.update(original_keep)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

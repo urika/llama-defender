@@ -239,14 +239,14 @@
 | **修复** | 新增 `./manage.sh watchdog` 命令: 每 60s 检查后端健康 + 解析日志中 tok/s,低于阈值(默认 15 tok/s)时自动 `restart`。可通过 `WATCHDOG_INTERVAL`/`WATCHDOG_TOK_THRESHOLD`/`WATCHDOG_MAX_FAIL` 环境变量配置 |
 | **剩余** | watchdog 需在独立终端运行 (非 daemon);tok/s 解析依赖日志格式 |
 
-### DEF-208: 单元测试覆盖不足 (44 个 case)
+### DEF-208: 单元测试覆盖不足 (44 个 case) — 🟡 进行中
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `logs/unit_test.log` |
-| **现状** | 44 tests, 全部通过, 0.003s |
-| **缺失覆盖** | 1) 截断策略 (rounds/fifo/char) 各场景<br>2) 三级压缩链 (LLM/Rules/Static) 各场景<br>3) 循环检测 (Level 1/2/3) 边界条件<br>4) 工具过滤的"最近使用"扫描<br>5) 大 payload (>500K chars) 不抛异常<br>6) 跨请求循环追踪 (R2.1 文档要求) |
-| **修复建议** | 单元测试目标 ≥ 200 case,覆盖率 > 80% |
+| **数据源** | `test/unit/test_proxy_fallback.py` |
+| **现状** | **167 tests**, 全部通过, 0.01s (从 44 增长至 167) |
+| **新增覆盖** | `_mask_sensitive`, `convert_anthropic_tools_to_openai`, `convert_anthropic_tool_choice_to_openai`, `_has_thinking_content`, `_strip_thinking_from_msg`, `_is_pure_tool_use_msg`, `_is_cleared_tool_result_msg`, `compress_cleared_tool_results`, `_check_dedup`, `_filter_tools` sorting |
+| **剩余** | `convert_anthropic_messages_to_openai`, `_extract_middle_summary_rules`, `_compute_adaptive_rounds`, `strip_old_thinking_blocks` 等函数仍未覆盖 |
 
 ### DEF-209: 集成测试 5 个场景未实际覆盖
 
