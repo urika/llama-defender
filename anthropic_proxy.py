@@ -1073,256 +1073,34 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
 
 def clear_old_tool_results(messages, tools_list=None, clear_zone_pct=None):
     """
-    Proxy-side tool-result clearing with semantic priority scoring and
-    Frozen Zone protection.
+    Legacy wrapper around _compress_content_pass.
 
-    When clear_zone_pct is set (0.0-1.0), only tool_results in the oldest
-    `clear_zone_pct` portion of the dynamic zone are eligible for clearing.
-    This implements progressive tail-priority: lighter stages clear only
-    the oldest portion; heavier stages clear the entire dynamic zone.
-    0.4 = oldest 40%, 0.6 = oldest 60%, 1.0 = all dynamic.
-
-    When PROXY_FROZEN_HEAD > 0, the first N messages are NEVER modified,
-    preserving prefix KV cache stability across requests.
-    Returns (messages, stats_dict).
+    Originally a standalone 250-line implementation, now delegates to the
+    unified single-pass compressor to eliminate duplication.  Preserves the
+    original return signature (messages, flat_stats_dict) so existing unit
+    tests and documentation continue to work.
     """
-    if not PROXY_CLEAR_ENABLED:
-        return messages, {"enabled": False}
-
     total_chars = _estimate_message_chars(messages)
-    if total_chars < PROXY_CLEAR_THRESHOLD:
-        return messages, {
-            "enabled": True,
-            "skipped": True,
-            "reason": "below_threshold",
-            "chars": total_chars,
-            "frozen_used": 0,
-        }
-
-    # Determine Frozen Zone boundary
-    frozen_head = PROXY_FROZEN_HEAD
-    frozen_used = frozen_head  # track for stats
-
-    # Locate every tool_result block: (message_index, block_index)
-    all_tool_result_indices = []
-    for msg_idx, msg in enumerate(messages):
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for block_idx, block in enumerate(content):
-                if block.get("type") == "tool_result":
-                    all_tool_result_indices.append((msg_idx, block_idx))
-
-    if not all_tool_result_indices:
-        return messages, {
-            "enabled": True,
-            "skipped": True,
-            "reason": "no_tool_results",
-            "frozen_used": 0,
-        }
-
-    # Filter to dynamic zone (skip frozen messages)
-    if frozen_head > 0:
-        tool_result_indices = [
-            (msg_idx, block_idx)
-            for msg_idx, block_idx in all_tool_result_indices
-            if msg_idx >= frozen_head
-        ]
-    else:
-        tool_result_indices = list(all_tool_result_indices)
-
-    # Apply zone-pct filter: only the oldest clear_zone_pct portion of
-    # dynamic tool_results is eligible. The tail portion is ALWAYS preserved.
-    # None = clear all dynamic (backward-compatible), 0.4 = oldest 40%, etc.
-    _total_dynamic_before_zone = len(tool_result_indices)
-    if clear_zone_pct is not None and clear_zone_pct < 1.0 and tool_result_indices:
-        eligible_count = max(1, int(len(tool_result_indices) * clear_zone_pct))
-        tool_result_indices = tool_result_indices[:eligible_count]
-        log(f"  -> Clear zone filter: {clear_zone_pct*100:.0f}% → {len(tool_result_indices)}/{_total_dynamic_before_zone} tool_results")
-
-    # If dynamic zone has too few tool_results, try reducing frozen_head
-    if len(tool_result_indices) <= PROXY_TOOL_KEEP and frozen_head > 0:
-        reduced_frozen = max(0, frozen_head // 2)
-        tool_result_indices = [
-            (msg_idx, block_idx)
-            for msg_idx, block_idx in all_tool_result_indices
-            if msg_idx >= reduced_frozen
-        ]
-        if len(tool_result_indices) > PROXY_TOOL_KEEP:
-            frozen_head = reduced_frozen
-            frozen_used = frozen_head
-            log(f"  -> Frozen Zone reduced: {PROXY_FROZEN_HEAD} -> {frozen_head} (too few tool_results in dynamic zone)")
-
-    if len(tool_result_indices) <= PROXY_TOOL_KEEP:
-        return messages, {
-            "enabled": True,
-            "skipped": True,
-            "reason": "few_tool_results",
-            "count": len(tool_result_indices),
-            "frozen_used": frozen_used,
-            "frozen_head": frozen_head,
-        }
-
-    # Dynamic KEEP: detect sub-agent by checking tool set
-    keep = PROXY_TOOL_KEEP
-    if tools_list is not None:
-        has_agent = any(t == "Agent" or t == "EnterPlanMode" for t in tools_list)
-        if not has_agent and len(tools_list) > 0:
-            keep = max(PROXY_TOOL_KEEP, 15)
-            log(f"  -> Sub-agent detected ({len(tools_list)} tools, no Agent/Plan), dynamic KEEP={keep}")
-
-    total_tool_results = len(tool_result_indices)
-    recent_cutoff = max(0, total_tool_results - 6)
-
-    # Score each tool_result by semantic priority
-    scored = []
-    for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
-        block = messages[msg_idx]["content"][block_idx]
-        tool_use_id = block.get("tool_use_id", "")
-        content_str = str(block.get("content", ""))
-        score = 0
-
-        # Find the paired tool_use to get tool name
-        tool_name = ""
-        for m_idx in range(msg_idx - 1, -1, -1):
-            m = messages[m_idx]
-            if m.get("role") == "assistant":
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    for b in c:
-                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
-                            tool_name = b.get("name", "")
-                            break
-                if tool_name:
-                    break
-
-        score += TOOL_SEMANTIC_PRIORITY.get(tool_name, 1)
-        for pat, pts in TOOL_RESULT_HIGH_VALUE_PATTERNS:
-            if pat.search(content_str[:500]):
-                score += pts
-
-        # Boost recent Read results to prevent re-read loops
-        if tool_name == "Read" and idx_pos >= recent_cutoff:
-            score += 5
-
-        # P0-FIX: Preserve error-translation results so Claude sees the hints
-        if "[System:" in content_str and (
-            "未发生变化" in content_str
-            or "文件不存在" in content_str
-            or "参数错误" in content_str
-        ):
-            score += 10
-
-        scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
-
-    # Sort by score descending, keep top N by score (prefer high-value)
-    scored.sort(key=lambda x: (-x[0], -x[1]))
-    keep_positions = set(x[1] for x in scored[:keep])
-
-    # Build set of tool_use indices to scan for file_path metadata
-    cleared_files = set()
-    cleared_count = 0
-    cleared_chars = 0
-    high_prio_count = 0
-
-    for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
-        if idx_pos in keep_positions:
-            score_entry = next((x for x in scored if x[1] == idx_pos), None)
-            if score_entry and score_entry[0] >= 3:
-                high_prio_count += 1
-            continue
-        block = messages[msg_idx]["content"][block_idx]
-        original = block.get("content", "")
-        original_len = len(str(original)) if original else 0
-
-        # Extract file path from paired tool_use
-        tool_use_id = block.get("tool_use_id", "")
-        meta_info = ""
-        for m_idx in range(msg_idx - 1, -1, -1):
-            m = messages[m_idx]
-            if m.get("role") == "assistant":
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    for b in c:
-                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
-                            inp = b.get("input", {})
-                            if isinstance(inp, dict):
-                                fp = inp.get("file_path", inp.get("path", ""))
-                                cmd = inp.get("command", "")
-                                if fp:
-                                    meta_info = f" file={fp}"
-                                    cleared_files.add(fp)
-                                elif cmd:
-                                    meta_info = f" cmd={cmd[:60]}"
-                            break
-                if meta_info:
-                    break
-
-        # Find paired tool_use to get tool_name for deterministic summary
-        tool_name = ""
-        for m_idx in range(msg_idx - 1, -1, -1):
-            m = messages[m_idx]
-            if m.get("role") == "assistant":
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    for b in c:
-                        if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
-                            tool_name = b.get("name", "")
-                            break
-                if tool_name:
-                    break
-
-        summary = _generate_tool_summary(tool_name, meta_info)
-        # For Read tool results, keep a preview to reduce re-read desire
-        if tool_name == "Read" and PROXY_REREAD_PREVIEW_CHARS > 0:
-            preview = content_str[:PROXY_REREAD_PREVIEW_CHARS]
-            if len(content_str) > PROXY_REREAD_PREVIEW_CHARS:
-                preview += "..."
-            block["content"] = f"[cleared: {summary}]\n{preview}"
-        else:
-            block["content"] = f"[cleared: {summary}]"
-        cleared_count += 1
-        cleared_chars += original_len
-
-    # Bash dedup among kept results: merge consecutive similar Bash outputs
-    dedup_bash = 0
-    dedup_chars = 0
-    kept_indices = [tool_result_indices[i] for i in sorted(keep_positions)]
-    for ki in range(len(kept_indices) - 1):
-        msg_idx_a, block_idx_a = kept_indices[ki]
-        msg_idx_b, block_idx_b = kept_indices[ki + 1]
-        ca = str(messages[msg_idx_a]["content"][block_idx_a].get("content", ""))
-        cb = str(messages[msg_idx_b]["content"][block_idx_b].get("content", ""))
-        if not ca or not cb:
-            continue
-        if ca.startswith("[cleared:") or cb.startswith("[cleared:"):
-            continue
-        lines_a = set(ca.splitlines())
-        lines_b = set(cb.splitlines())
-        if not lines_a or not lines_b:
-            continue
-        intersection = lines_a & lines_b
-        union = lines_a | lines_b
-        jaccard = len(intersection) / len(union) if union else 0
-        if jaccard >= 0.7:
-            # Deterministic placeholder for deduplicated Bash
-            messages[msg_idx_b]["content"][block_idx_b]["content"] = "[cleared: Bash(deduplicated)]"
-            dedup_bash += 1
-            dedup_chars += len(cb)
-
-    return messages, {
-        "enabled": True,
-        "cleared": True,
-        "cleared_tool_results": cleared_count,
-        "cleared_chars": cleared_chars,
-        "kept": keep,
-        "high_prio": high_prio_count,
-        "cleared_files": list(cleared_files),
-        "dedup_bash": dedup_bash,
-        "dedup_chars_saved": dedup_chars,
-        "total_chars_before": total_chars,
-        "frozen_used": frozen_used,
-        "frozen_head": frozen_head,
+    stage_config = {
+        "stage": "legacy",
+        "total_chars": total_chars,
+        "frozen_head": PROXY_FROZEN_HEAD,
+        "clear_zone_pct": clear_zone_pct,
+        "thinking_keep": 0,
+        "truncate_rounds": None,
+        "oom_safety": False,
     }
+    messages, combined = _compress_content_pass(
+        messages, tools_list=tools_list, stage_config=stage_config
+    )
+    clear_stats = combined.get("clear", {})
+    # Map nested format back to the flat dict expected by legacy callers/tests
+    stats = dict(clear_stats)
+    stats.setdefault("high_prio", 0)
+    stats.setdefault("dedup_bash", 0)
+    stats.setdefault("dedup_chars_saved", 0)
+    stats.setdefault("frozen_head", stage_config["frozen_head"])
+    return messages, stats
 
 
 def _compute_adaptive_rounds(messages, base_rounds):
@@ -1485,13 +1263,14 @@ def _compress_middle_with_llm(messages, timeout=30):
             "stream": False,
         }
         req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{LLAMA_BASE}/chat/completions",
-            data=req_data,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+        with _llama_lock:
+            req = urllib.request.Request(
+                f"{LLAMA_BASE}/chat/completions",
+                data=req_data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
         text = ""
         for choice in result.get("choices", []):
             msg = choice.get("message", {})
@@ -1526,13 +1305,14 @@ def _merge_summaries_with_llm(old_summary, new_summary, timeout=15):
             "stream": False,
         }
         req_data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{LLAMA_BASE}/chat/completions",
-            data=req_data,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+        with _llama_lock:
+            req = urllib.request.Request(
+                f"{LLAMA_BASE}/chat/completions",
+                data=req_data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
         text = ""
         for choice in result.get("choices", []):
             msg = choice.get("message", {})
