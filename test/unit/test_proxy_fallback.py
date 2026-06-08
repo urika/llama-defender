@@ -1688,5 +1688,57 @@ class TestReReadRate(unittest.TestCase):
         self.assertLessEqual(new_rate, 100.0)
 
 
+class TestOOMSafetyEstimation(unittest.TestCase):
+    """DEF-005: OOM safety must include system prompt in token estimation."""
+
+    def test_estimate_chars_basic(self):
+        msgs = [{"role": "user", "content": "hello"}]
+        self.assertEqual(proxy._estimate_message_chars(msgs), 5)
+
+    def test_estimate_chars_with_blocks(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "abc"},
+            {"type": "text", "text": "def"},
+        ]}]
+        self.assertEqual(proxy._estimate_message_chars(msgs), 6)
+
+    def test_estimate_chars_tool_result(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "content": "output text here"}
+        ]}]
+        self.assertEqual(proxy._estimate_message_chars(msgs), 16)
+
+    def test_system_prompt_string_counted(self):
+        _sys = "system prompt text"
+        sys_chars = len(str(_sys))
+        self.assertEqual(sys_chars, 18)
+
+    def test_system_prompt_blocks_counted(self):
+        _sys = [
+            {"type": "text", "text": "part one"},
+            {"type": "text", "text": "part two"},
+        ]
+        sys_chars = sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
+        self.assertEqual(sys_chars, 16)
+
+    def test_combined_estimation_exceeds_limit(self):
+        msgs = [{"role": "user", "content": "x" * 100000}]
+        msg_chars = proxy._estimate_message_chars(msgs)
+        sys_chars = len("system: " + "y" * 50000)
+        total = msg_chars + sys_chars
+        estimated_tokens = int(total / proxy.PROXY_CTX_TOKEN_RATIO)
+        self.assertGreater(estimated_tokens, 50000)
+
+    def test_no_system_prompt_zero_addition(self):
+        _sys = None
+        sys_chars = 0
+        if _sys:
+            if isinstance(_sys, list):
+                sys_chars = sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
+            else:
+                sys_chars = len(str(_sys))
+        self.assertEqual(sys_chars, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

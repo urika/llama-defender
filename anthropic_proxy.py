@@ -3325,6 +3325,12 @@ class Handler(BaseHTTPRequestHandler):
         # all pipeline steps, force aggressive FIFO truncation to prevent Metal OOM.
         if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD:
             est_chars = _estimate_message_chars(raw_messages)
+            _sys = body.get("system")
+            if _sys:
+                if isinstance(_sys, list):
+                    est_chars += sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
+                else:
+                    est_chars += len(str(_sys))
             est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
             if est_tokens > PROXY_OOM_SAFE_TOKENS:
                 keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 10)

@@ -388,7 +388,10 @@ _start_rapid_mlx() {
         local gpu_mem_val
         gpu_mem_val=$(echo "$RAPID_MLX_EXTRA_ARGS" | grep -oE '\-\-gpu-memory-utilization[[:space:]]+([0-9.]+)' | grep -oE '[0-9.]+$' || true)
         if [[ -n "$gpu_mem_val" ]]; then
-            if (( $(echo "$gpu_mem_val > 0.85" | bc -l 2>/dev/null || echo 0) )); then
+            if ! command -v bc &>/dev/null; then
+                warn "DEF-006: bc 未安装，无法验证 --gpu-memory-utilization=$gpu_mem_val"
+                warn "  brew install bc 可启用自动检查 (推荐 ≤ 0.80)"
+            elif (( $(echo "$gpu_mem_val > 0.85" | bc -l 2>/dev/null || echo 0) )); then
                 error "DEF-006 安全检查: --gpu-memory-utilization=$gpu_mem_val > 0.85"
                 error "超过 0.85 可能触发 macOS kernel panic (Apple Silicon firmware 限制)"
                 error "请在配置文件中降低 --gpu-memory-utilization 的值 (推荐 ≤ 0.80)"
@@ -406,6 +409,25 @@ _start_rapid_mlx() {
     info "  地址: $LLAMA_HOST:$LLAMA_PORT"
     info "  工具解析: $RAPID_MLX_TOOL_PARSER"
     info "  推理解析: $RAPID_MLX_REASONING_PARSER"
+
+    # DEF-007: 自动检测 chat_template 是否需要修复
+    if [[ "$LLAMA_MODEL" == *"/"* ]]; then
+        local _model_slug
+        _model_slug=$(echo "$LLAMA_MODEL" | tr '/' '--')
+        local _cache_base="$HOME/.cache/huggingface/hub/models--${_model_slug}/snapshots"
+        if [[ -d "$_cache_base" ]]; then
+            for _snap_dir in "$_cache_base"/*/; do
+                local _tpl="$_snap_dir/chat_template.jinja"
+                if [[ -f "$_tpl" ]]; then
+                    if ! grep -q "is_system_content" "$_tpl" 2>/dev/null; then
+                        warn "DEF-007: 检测到未修复的 chat_template"
+                        warn "  路径: ${_snap_dir%/}"
+                        warn "  运行: ./manage.sh fix-template ${_snap_dir%/}"
+                    fi
+                fi
+            done
+        fi
+    fi
     if [[ "$RAPID_MLX_KV_QUANTIZATION" == "true" ]]; then
         info "  KV 量化: ${GREEN}启用${NC} ($RAPID_MLX_KV_QUANT_BITS-bit)"
     else

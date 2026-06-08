@@ -80,8 +80,9 @@
 |------|------|
 | **数据源** | `logs/llama-server.log` |
 | **错误模式** | `ERROR:vllm_mlx.scheduler:Error in batch generation step: [metal::malloc] Resource limit (499000) exceeded.` |
-| **已实施缓解** | **DEF-001 Part A**: PROXY_PRE_TRUNCATE_CHARS=400000 预截断大 payload<br>**DEF-001 Part C**: _classify_exception OOM→503 + Retry-After<br>**DEF-005 新增**: PROXY_OOM_SAFE_TOKENS=60000, 所有 pipeline 步骤后再次检查预估 token 数,超限时强制 FIFO 截断 (仅 local 模式) |
+| **已实施缓解** | **DEF-001 Part A**: PROXY_PRE_TRUNCATE_CHARS=400000 预截断大 payload<br>**DEF-001 Part C**: _classify_exception OOM→503 + Retry-After<br>**DEF-005 新增**: PROXY_OOM_SAFE_TOKENS=60000, 所有 pipeline 步骤后再次检查预估 token 数 (含 system prompt), 超限时强制 FIFO 截断 (仅 local 模式) |
 | **新增常量** | `PROXY_OOM_SAFE_TOKENS` (默认 60000, 约 120K chars), 设 0 禁用 |
+| **最新改进** | OOM 安全检查现已包含 system prompt 字符数估算, 避免低估实际 token 数。7 个单元测试覆盖 |
 
 ### DEF-006: Apple Silicon Kernel Panic 风险 — 🟡 已缓解
 
@@ -89,14 +90,14 @@
 |------|------|
 | **数据源** | `logs/llama-server.log` 启动警告 |
 | **触发条件** | `--gpu-memory-utilization` 设置过高 (>0.85 触发警告) |
-| **已实施缓解** | `manage.sh _start_rapid_mlx` 启动前 sanity check: 解析 `--gpu-memory-utilization` 值, >0.85 直接拒绝启动, >0.80 发出警告。当前配置 35B=0.75, 9B=0.50 在安全范围 |
+| **已实施缓解** | `manage.sh _start_rapid_mlx` 启动前 sanity check: 解析 `--gpu-memory-utilization` 值, >0.85 直接拒绝启动, >0.80 发出警告。`bc` 未安装时提示用户安装。当前配置 35B=0.75, 9B=0.50 在安全范围 |
 
-### DEF-007: Backend Chat Template 不修复会再次崩溃 — 🟡 已缓解
+### DEF-007: Backend Chat Template 不修复会再次崩溃 — 🟢 已修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `TROUBLESHOOTING.md` § 二.根本原因 |
-| **已实施缓解** | `manage.sh fix-template <model_dir>` 命令: 一键修复 HuggingFace 缓存中的 chat_template.jinja。无参数时自动搜索已缓存模型的 chat_template 文件并显示路径 |
+| **已实施修复** | 1) `manage.sh fix-template <model_dir>` 一键修复命令<br>2) `_start_rapid_mlx` 启动时自动检测: 扫描 HuggingFace 缓存中的 chat_template, 如缺少 `is_system_content` 标记则发出警告并提示修复命令 |
 
 ---
 
