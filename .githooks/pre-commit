@@ -2,10 +2,13 @@
 # ============================================================
 # Pre-commit hook: run fast unit tests before allowing commit.
 #
-# Why --unit only:
-#   - unit tests are <1s, no infrastructure, no network
-#   - integration tests boot a mock + proxy (~5s, mostly fine but slower)
-#   - e2e tests require a real proxy + backend, can't run in arbitrary envs
+# What runs:
+#   1. --unit  (<1s, no infrastructure)
+#   2. --promptfoo fast mode (only if proxy is already running; ~40s, core 5 tests)
+#
+# Why conditional promptfoo:
+#   - pre-commit must stay fast when no proxy is running
+#   - if proxy IS running, fast mode runs core 5 tests (~40s) instead of full 9 (~80s)
 #
 # Skip mechanisms (use sparingly):
 #   SKIP_TESTS=1 git commit -m "..."    # explicit env-var skip
@@ -71,4 +74,31 @@ fi
 
 echo ""
 echo "✅ pre-commit: unit tests passed."
+
+# ------------------------------------------------------------
+# Optional: Promptfoo regression tests (only if proxy is running)
+# ------------------------------------------------------------
+PROXY_URL="${PROXY_BASE:-http://127.0.0.1:4000}"
+if curl -sf --max-time 2 "$PROXY_URL/v1/models" >/dev/null 2>&1; then
+  echo ""
+  echo "pre-commit: proxy detected at $PROXY_URL — running Promptfoo regression tests (fast mode)..."
+  echo ""
+  PROMPTFOO_FAST=1 bash "$RUNNER" --promptfoo
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    echo "❌ pre-commit: Promptfoo regression tests failed." >&2
+    echo "  • Fix the failures and amend:    git commit --amend" >&2
+    echo "  • Or skip (use sparingly):       SKIP_TESTS=1 git commit -m '...'" >&2
+    echo "  • Or bypass all hooks:           git commit --no-verify" >&2
+    exit 1
+  fi
+  echo ""
+  echo "✅ pre-commit: Promptfoo regression tests passed."
+else
+  echo ""
+  echo "ℹ️  pre-commit: proxy not running at $PROXY_URL — skipping Promptfoo regression tests"
+  echo "   (start proxy with: ./manage.sh start)"
+fi
+
 exit 0

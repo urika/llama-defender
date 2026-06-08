@@ -94,7 +94,91 @@ run_integration() {
 }
 
 # ------------------------------------------------------------
-# Tier 3: e2e tests (requires running proxy + backend)
+# Tier 3: Promptfoo regression tests (requires running proxy)
+# ------------------------------------------------------------
+run_promptfoo() {
+  print_banner "Promptfoo regression tests (test/promptfoo/)"
+
+  local promptfoo_bin="$REPO_ROOT/node_modules/.bin/promptfoo"
+  if [[ ! -x "$promptfoo_bin" ]]; then
+    warn "Promptfoo not installed — skipping promptfoo tier"
+    warn "install with: cd $REPO_ROOT && npm install promptfoo @libsql/darwin-arm64"
+    record "promptfoo" "skip" "Promptfoo not installed"
+    return 0
+  fi
+
+  # Preflight: proxy must be reachable.
+  local proxy="${PROXY_BASE:-http://127.0.0.1:4000}"
+  if ! curl -sf --max-time 5 "$proxy/v1/models" >/dev/null 2>&1; then
+    warn "proxy not reachable at $proxy — skipping promptfoo tier"
+    warn "start it with: ./manage.sh start   (or)   ./manage.sh start-cloud"
+    record "promptfoo" "skip" "proxy not reachable at $proxy"
+    return 0
+  fi
+
+  local log="$REPO_ROOT/logs/promptfoo_test.log"
+  local json_out="$REPO_ROOT/logs/promptfoo_test.json"
+  mkdir -p "$REPO_ROOT/logs"
+
+  local extra_args=()
+  if [[ "${PROMPTFOO_FAST:-0}" == "1" ]]; then
+    extra_args+=(--filter-first-n 5)
+    echo "PROMPTFOO_FAST=1 — running core 5 tests only (~40s)"
+  fi
+
+  local out rc
+  out=$(cd "$REPO_ROOT" && "$promptfoo_bin" eval \
+      --config promptfooconfig.yaml \
+      --no-cache \
+      --no-share \
+      --max-concurrency 1 \
+      --output "$json_out" \
+      --description "run_tests.sh regression" \
+      "${extra_args[@]}" \
+      2>&1)
+  rc=$?
+  echo "$out" | tail -15 | tee "$log"
+
+  if [[ $rc -ne 0 ]]; then
+    record "promptfoo" "fail" "promptfoo eval exited $rc (see logs/promptfoo_test.log)"
+    return
+  fi
+
+  # Parse results from JSON.
+  local total passed failed
+  total=$(python3 -c "
+import json, sys
+try:
+    with open('$json_out') as f: d = json.load(f)
+    print(len(d.get('results', {}).get('results', [])))
+except: print('?')
+" 2>/dev/null || echo "?")
+  passed=$(python3 -c "
+import json, sys
+try:
+    with open('$json_out') as f: d = json.load(f)
+    results = d.get('results', {}).get('results', [])
+    print(sum(1 for r in results if r.get('success')))
+except: print('?')
+" 2>/dev/null || echo "?")
+  failed=$(python3 -c "
+import json, sys
+try:
+    with open('$json_out') as f: d = json.load(f)
+    results = d.get('results', {}).get('results', [])
+    print(sum(1 for r in results if not r.get('success')))
+except: print('?')
+" 2>/dev/null || echo "?")
+
+  if [[ "$failed" == "0" ]]; then
+    record "promptfoo" "ok" "$passed/$total tests passed"
+  else
+    record "promptfoo" "fail" "$failed of $total tests failed"
+  fi
+}
+
+# ------------------------------------------------------------
+# Tier 4: e2e tests (requires running proxy + backend)
 # ------------------------------------------------------------
 run_e2e() {
   print_banner "End-to-end tests (test/e2e/)"
@@ -183,6 +267,7 @@ Usage: bash test/run_tests.sh [TIER]
 Tiers:
   --unit          Pure logic tests (default if no flag given)
   --integration   Boots a mock backend, no LLM needed
+  --promptfoo     Promptfoo fixed-prompt regression tests (requires proxy)
   --e2e           Requires a running proxy + backend
   --trace         Requirement traceability matrix (docs/requirements.yaml)
   --all           Run all tiers in order
@@ -193,6 +278,7 @@ Environment:
   PROXY_BASE      Override proxy URL (default: http://127.0.0.1:4000)
   BACKEND_URL     Override backend URL (default: http://127.0.0.1:8081)
   SKIP_E2E=1      Skip the e2e tier when using --all
+  SKIP_PROMPTFOO=1  Skip the promptfoo tier when using --all
 USAGE
 }
 
@@ -203,12 +289,20 @@ main() {
     -h|--help) usage; exit 0 ;;
     --unit)         run_unit ;;
     --integration)  run_integration ;;
+    --promptfoo)    run_promptfoo ;;
     --e2e)          run_e2e ;;
     --trace)        run_trace ;;
     --all)
       run_unit
       echo ""
       run_integration
+      echo ""
+      if [[ "${SKIP_PROMPTFOO:-0}" == "1" ]]; then
+        warn "SKIP_PROMPTFOO=1 — skipping promptfoo tier"
+        record "promptfoo" "skip" "SKIP_PROMPTFOO=1"
+      else
+        run_promptfoo
+      fi
       echo ""
       if [[ "${SKIP_E2E:-0}" == "1" ]]; then
         warn "SKIP_E2E=1 — skipping e2e tier"

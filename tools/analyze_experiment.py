@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Analyze experiment logs from anthropic_proxy.py.
-Supports two modes:
-  1. Single log analysis: --log --output --group --task --exp-id
-  2. A/B comparison:     --a --b --report
+
+注意：A/B 对比报告已迁移到 Promptfoo。
+本脚本仅保留单日志解析功能，供 collect 阶段和 Promptfoo 集成使用。
+
+用法：
+  python3 analyze_experiment.py --log <logfile> --output <json> --group A --task '...' --exp-id '...'
 """
 import argparse
 import json
@@ -138,123 +141,37 @@ def summarize(data, label):
     return result
 
 
-def compare(a_data, b_data):
-    print(f"\n{'='*60}")
-    print(f"  A vs B 对比")
-    print(f"{'='*60}")
-
-    a_reqs = a_data["reqs"]
-    b_reqs = b_data["reqs"]
-
-    if a_reqs and b_reqs:
-        a_chars = [r["chars"] for r in a_reqs]
-        b_chars = [r["chars"] for r in b_reqs]
-        print(
-            f"  请求数:          A={len(a_reqs)}  B={len(b_reqs)}  "
-            f"差异={len(b_reqs) - len(a_reqs):+d}"
-        )
-        print(
-            f"  平均请求大小:    A={sum(a_chars) // len(a_reqs)}  "
-            f"B={sum(b_chars) // len(b_reqs)}"
-        )
-        print(f"  最大请求:        A={max(a_chars):,}  B={max(b_chars):,}")
-
-    a_clears = len(a_data["clears"])
-    b_clears = len(b_data["clears"])
-    print(f"  工具清理次数:    A={a_clears}  B={b_clears}  差异={b_clears - a_clears:+d}")
-
-    a_cleared = sum(c["chars"] for c in a_data["clears"])
-    b_cleared = sum(c["chars"] for c in b_data["clears"])
-    print(f"  累计清理字符:    A={a_cleared:,}  B={b_cleared:,}  差异={b_cleared - a_cleared:+d}")
-
-    a_errors = len(a_data["errors"])
-    b_errors = len(b_data["errors"])
-    print(f"  错误数:          A={a_errors}  B={b_errors}  差异={b_errors - a_errors:+d}")
-
-
-def generate_report(a_analysis, b_analysis, a_log, b_log, report_path):
-    with open(report_path, "w") as f:
-        f.write("# A/B 对比实验报告\n\n")
-        f.write(f"生成时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-        f.write("## A 组（本地后端）\n\n")
-        f.write(f"```json\n{json.dumps(a_analysis, indent=2, ensure_ascii=False)}\n```\n\n")
-
-        f.write("## B 组（DeepSeek 云端）\n\n")
-        f.write(f"```json\n{json.dumps(b_analysis, indent=2, ensure_ascii=False)}\n```\n\n")
-
-        f.write("## 对比摘要\n\n")
-        f.write("| 指标 | A 组 | B 组 | 差异 |\n")
-        f.write("|------|------|------|------|\n")
-
-        report_keys = [
-            ("total_requests", "总请求数"),
-            ("avg_chars", "平均请求大小(chars)"),
-            ("max_chars", "最大请求(chars)"),
-            ("req_size_growth", "平均每轮增长(chars)"),
-            ("tool_clears", "工具清理次数"),
-            ("cleared_chars_total", "累计清理字符"),
-            ("truncations", "上下文截断次数"),
-            ("errors", "错误数"),
-        ]
-        for key, label in report_keys:
-            a_val = a_analysis.get(key, 0)
-            b_val = b_analysis.get(key, 0)
-            diff = b_val - a_val
-            f.write(f"| {label} | {a_val} | {b_val} | {diff:+} |\n")
-
-        f.write("\n## 原始日志\n\n")
-        f.write(f"- A 组: `{a_log}`\n")
-        f.write(f"- B 组: `{b_log}`\n")
-
-    print(f"Report written to {report_path}")
+# A/B 对比报告已迁移到 Promptfoo。详见 tools/promptfoo_eval.sh
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze experiment proxy logs")
-    parser.add_argument("--log", help="Single log file to analyze")
-    parser.add_argument("--output", help="Output JSON file for single analysis")
+    parser = argparse.ArgumentParser(
+        description="Parse single proxy log and output metrics JSON."
+    )
+    parser.add_argument("--log", required=True, help="Single log file to analyze")
+    parser.add_argument("--output", help="Output JSON file")
     parser.add_argument("--group", help="Experiment group label (A/B)")
     parser.add_argument("--task", help="Task description")
     parser.add_argument("--exp-id", help="Experiment ID")
-    parser.add_argument("--a", help="Log file for group A")
-    parser.add_argument("--b", help="Log file for group B")
-    parser.add_argument("--report", help="Output markdown report path")
     args = parser.parse_args()
 
-    if args.log:
-        # Single log analysis mode
-        data = parse_log(args.log)
-        summary = summarize(data, f"组 {args.group or '?'} ({args.exp_id or 'unknown'})")
-        if args.output:
-            with open(args.output, "w") as f:
-                json.dump(
-                    {
-                        "group": args.group,
-                        "task": args.task,
-                        "exp_id": args.exp_id,
-                        "summary": summary,
-                    },
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            print(f"Analysis saved to {args.output}")
-        return
-
-    if args.a and args.b:
-        a_data = parse_log(args.a)
-        b_data = parse_log(args.b)
-        summarize(a_data, "A 组（本地后端）")
-        summarize(b_data, "B 组（DeepSeek 云端）")
-        compare(a_data, b_data)
-        if args.report:
-            a_analysis = summarize(a_data, "A 组（本地后端）")
-            b_analysis = summarize(b_data, "B 组（DeepSeek 云端）")
-            generate_report(a_analysis, b_analysis, args.a, args.b, args.report)
-        return
-
-    parser.print_help()
+    data = parse_log(args.log)
+    summary = summarize(data, f"组 {args.group or '?'} ({args.exp_id or 'unknown'})")
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(
+                {
+                    "group": args.group,
+                    "task": args.task,
+                    "exp_id": args.exp_id,
+                    "summary": summary,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        print(f"Analysis saved to {args.output}")
+    return summary
 
 
 if __name__ == "__main__":

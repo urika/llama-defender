@@ -134,14 +134,43 @@ json.dump(d,open('$META_FILE','w'),indent=2,ensure_ascii=False)
 
 cmd_report() {
     info "生成 A/B 对比报告..."
+
+    # 优先使用 Promptfoo 结果
+    local a_promptfoo b_promptfoo
+    a_promptfoo=$(ls -t "$EXPERIMENT_DIR"/promptfoo-A-*.json 2>/dev/null | head -1)
+    b_promptfoo=$(ls -t "$EXPERIMENT_DIR"/promptfoo-B-*.json 2>/dev/null | head -1)
+
+    if [[ -n "$a_promptfoo" && -n "$b_promptfoo" ]]; then
+        info "使用 Promptfoo 结果生成报告..."
+        "$SCRIPT_DIR/promptfoo_eval.sh" compare
+        info "✅ Promptfoo 报告已生成"
+    fi
+
+    # 同时保留代理日志指标报告（向后兼容）
     local a_analysis b_analysis
-    a_analysis=$(ls -t "$EXPERIMENT_DIR"/A-*.json 2>/dev/null | head -1)
-    b_analysis=$(ls -t "$EXPERIMENT_DIR"/B-*.json 2>/dev/null | head -1)
-    if [[ -z "$a_analysis" ]]; then error "未找到 A 组分析数据"; exit 1; fi
-    if [[ -z "$b_analysis" ]]; then error "未找到 B 组分析数据"; exit 1; fi
-    local report_file="$EXPERIMENT_DIR/ab_report_$(date +%Y%m%d-%H%M%S).md"
-    python3 "$SCRIPT_DIR/analyze_experiment.py" --a "$a_analysis" --b "$b_analysis" --report "$report_file"
-    info "✅ 报告已生成: $report_file"
+    a_analysis=$(ls -t "$EXPERIMENT_DIR"/A-*.json 2>/dev/null | grep -v promptfoo | head -1)
+    b_analysis=$(ls -t "$EXPERIMENT_DIR"/B-*.json 2>/dev/null | grep -v promptfoo | head -1)
+
+    if [[ -n "$a_analysis" && -n "$b_analysis" ]]; then
+        local report_file="$EXPERIMENT_DIR/ab_report_$(date +%Y%m%d-%H%M%S).md"
+        info "同时生成代理指标报告..."
+        python3 "$SCRIPT_DIR/promptfoo_report_merge.py" \
+            --promptfoo "${a_promptfoo:-$b_promptfoo}" \
+            --log "${a_analysis%.json}.log" \
+            --output "$report_file" \
+            2>/dev/null || warn "合并报告失败"
+        if [[ -f "$report_file" ]]; then
+            info "✅ 代理指标报告已生成: $report_file"
+        fi
+    fi
+
+    # 如果没有任何结果，报错
+    if [[ -z "$a_promptfoo" && -z "$a_analysis" ]]; then
+        error "未找到 A 组任何数据（Promptfoo 或代理日志）"; exit 1
+    fi
+    if [[ -z "$b_promptfoo" && -z "$b_analysis" ]]; then
+        error "未找到 B 组任何数据（Promptfoo 或代理日志）"; exit 1
+    fi
 }
 
 cmd_exp_status() {

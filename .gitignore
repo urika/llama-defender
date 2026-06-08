@@ -34,3 +34,5 @@ kimi-export-*.md
 *.bak.*
 *.bak
 configs/*.bak.*
+node_modules/
+package-lock.json
