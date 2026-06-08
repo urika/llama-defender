@@ -86,6 +86,88 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [0.5.2-truncate-fix] - 2026-06-08
+
+### Status: 死循环根因修复完成
+
+**范围**: 代理层报文处理逻辑重构，彻底消除 `wasted` 错误死循环。
+
+### Root Cause Analysis
+
+**死循环完整因果链（已验证）:**
+```
+Claude Read file → tool_result 存入 context
+        ↓
+Tool Clearing 清理旧 tool_result → [cleared: ...] 占位符
+        ↓
+Claude 需要综合分析 → 重新 Read 被清理文件
+        ↓
+后端返回 "Wasted call"（文件未变化）
+        ↓
+Error translation 翻译为中文提示
+        ↓
+Tool Clearing 清理掉翻译结果（提示丢失）
+        ↓
+Truncate 丢弃更多消息 → Claude "失忆"
+        ↓
+Loop/Blocker/HARD BLOCK 干预注入
+        ↓
+Truncate 丢弃干预消息 → 干预无效
+        ↓
+循环加剧: context 250K+ / wasted 13+ / loop 4
+```
+
+**根因**: Tool Clearing 的 `[cleared: ...]` 对 Claude 语义模糊。Claude 无法区分 "内容被清理" 和 "读取失败"，必然尝试 re-read。后端返回 "Wasted call" 后，Error translation 的提示又被 Tool Clearing 清理，形成闭环。
+
+### Fixed
+
+#### 致命缺陷修复
+- **Tool Clearing 关闭** (`PROXY_CLEAR_ENABLED=false`): 完全停止语义清理，所有 tool_result 完整保留
+- **Truncate 智能保留 Read 结果** (`_apply_rounds_truncation`): 在 rounds 策略下，从 dropped 区域提取 Read 的 tool_result 完整保留，只压缩非 Read 消息
+  - 丢弃率从 **80%** 降至 **20%**
+  - 文件内容不再丢失，Claude 无需 re-read
+- **Error translation 高优先级保留** (`clear_old_tool_results` scoring): 翻译后的 `[System: ...]` 提示获得 `score += 10`，不被清理
+- **Re-read HARD BLOCK** (`_handle_messages`): 检测到最后 assistant 消息在 Read 已清理文件时，注入 `[System: HARD BLOCK...]` user 消息强制阻断
+- **`kept_names` NameError** (`_filter_tools`): 修复 `kept_names` 在 `_sort_key` 闭包中引用前未定义的问题，消除 4 次 500 错误
+- **`auto_keep` 累积失效移除** (`_filter_tools`): 删除 `_tool_freq` 全局计数器（永不重置、计数对象错误），改为 `TOOL_ALWAYS_KEEP | recent_tools | tool_choice_name` 静态策略
+
+#### Metrics 完整性修复
+- 所有 pipeline 步骤统一写入 `applied: True/False` 标志，消除字段缺失
+
+### Verified
+
+| 指标 | 旧会话 (`Tool Clearing ON`) | 新会话 (`Tool Clearing OFF + 智能保留`) |
+|------|---------------------------|----------------------------------------|
+| `wasted` | 7→9→11→13 持续增长 | **0** (全程) |
+| `loop` | 3→4 | **1** (低于阈值 3) |
+| `reread` | 1-2/轮 | **0** |
+| `truncate` 丢弃 | 91-106 条 (80%) | **5-7 条 (20%)** |
+| `qf` | `loop_injected, high_drop_ratio` | **[]** |
+| 模型产出 | 0-500 chars (哑巴) | 10K+ chars (正常) |
+| 会话消息数 | 120+ (循环膨胀) | 34 (正常增长) |
+| 状态 | 死循环至断开 | **稳定 30+ 分钟** |
+
+### Changed
+- **配置** (`configs/rapid-mlx-35b.conf`): `PROXY_CLEAR_ENABLED=true` → `false`
+- **代码行数** (`anthropic_proxy.py`): ~3,700 → ~4,050 (+~350)
+
+### Known Issues
+- **Context 增长速度**: Tool Clearing OFF 后，context 从 26K→66K 增长更快（全部保留）。但在 34 条消息时触发温和 truncate（丢弃 7 条），仍在可控范围
+- **极端场景**: 若 Claude 读取 50+ 文件，context 可能难以控制。当前方案通过智能保留 Read 结果 + Truncate 压缩非 Read 内容来平衡
+
+### Recommendation
+
+**生产环境配置（当前）:**
+```bash
+PROXY_CLEAR_ENABLED=false           # 关闭 Tool Clearing
+PROXY_CTX_TRUNCATE_STRATEGY=rounds  # 保留 rounds 策略
+PROXY_TOOL_KEEP=8                   # 保持默认值
+```
+
+**Tool Clearing 不推荐在当前架构下启用**，除非后端支持 "文件未变化" 的显式语义（而非 "Wasted call" 错误）。
+
+---
+
 ## [0.5.1-progress] - 2026-06-08
 
 ### Status: P0 修复冲刺中（v0.6.0 前置）

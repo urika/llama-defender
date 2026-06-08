@@ -50,6 +50,23 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-v4-pro" if IS_CLOUD else "ml
 PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
 PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", "30000" if IS_CLOUD else "15000"))  # chars, not tokens
 PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", "10" if IS_CLOUD else "2"))  # keep last N tool_use/tool_result pairs
+
+# ---------------------------------------------------------------------------
+# Frozen Zone: protect the first N messages from L2/L4 modification to
+# preserve prefix KV cache stability across consecutive requests.
+# - Local: 12 messages (~5-8K tokens of stable prefix)
+# - Cloud: 0 (disabled, 1M+ context means low marginal cache value)
+# Override via env vars:
+# ---------------------------------------------------------------------------
+PROXY_FROZEN_HEAD = int(os.environ.get("PROXY_FROZEN_HEAD", "0" if IS_CLOUD else "12"))
+
+# ---------------------------------------------------------------------------
+# Tail-first clearing: when enabled, L2 clear_old_tool_results() operates
+# from tail to head in the dynamic zone. The newest tool_results get
+# cleared first, protecting the prefix's cache stability.
+# ---------------------------------------------------------------------------
+PROXY_CLEAR_TAIL_FIRST = os.environ.get("PROXY_CLEAR_TAIL_FIRST", "true").lower() in ("1", "true", "yes")
+
 CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", "true").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
@@ -67,6 +84,32 @@ PROXY_CTX_KEEP_ROUNDS = int(os.environ.get("PROXY_CTX_KEEP_ROUNDS", "10"))
 PROXY_CTX_KEEP_MESSAGES = int(os.environ.get("PROXY_CTX_KEEP_MESSAGES", "40"))  # fifo strategy: total messages to keep
 PROXY_CTX_TOKEN_BUDGET = int(os.environ.get("PROXY_CTX_TOKEN_BUDGET", "30000"))
 PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
+
+# ---------------------------------------------------------------------------
+# Unified char-based lifecycle stage thresholds.
+# All size thresholds use _estimate_message_chars() as the single metric.
+# Stages are strictly monotonic by char count — lighter compression at
+# lower thresholds, heavier at higher thresholds.
+#
+#   INIT       < PROXY_CLEAR_THRESHOLD           (15K)  — no compression
+#   GROWTH     < PROXY_CHARS_GROWTH              (40K)  — tail-40% clearing
+#   EXPANSION  < PROXY_CHARS_EXPANSION           (90K)  — tail-60% clearing + think strip
+#   SATURATION < PROXY_CHARS_SATURATION          (180K) — full-dynamic clear + merge + trunc
+#   OOM_DANGER < PROXY_CHARS_OOM_DANGER          (350K) — no frozen + hard truncation
+#   PRE_TRUNC  ≥ PROXY_PRE_TRUNCATE_CHARS         (400K) — keep_rounds=2
+#
+# Deprecated aliases (auto-fallback if new var not set):
+#   PROXY_CTX_CHARS_LIMIT → PROXY_CHARS_SATURATION
+# ---------------------------------------------------------------------------
+PROXY_CHARS_GROWTH = int(os.environ.get(
+    "PROXY_CHARS_GROWTH", "80000" if IS_CLOUD else "40000"))
+PROXY_CHARS_EXPANSION = int(os.environ.get(
+    "PROXY_CHARS_EXPANSION", "200000" if IS_CLOUD else "90000"))
+PROXY_CHARS_SATURATION = int(os.environ.get(
+    "PROXY_CHARS_SATURATION",
+    os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000")))
+PROXY_CHARS_OOM_DANGER = int(os.environ.get(
+    "PROXY_CHARS_OOM_DANGER", "1000000" if IS_CLOUD else "350000"))
 
 # ---------------------------------------------------------------------------
 # Output token control: prevent rapid-mlx from generating unbounded output
@@ -753,12 +796,294 @@ def _generate_tool_summary(tool_name, meta_info):
     return tool_name
 
 
-def clear_old_tool_results(messages, tools_list=None):
+def _classify_lifecycle_stage(messages):
     """
-    Proxy-side tool-result clearing with semantic priority scoring.
-    Replaces old tool_result contents with a placeholder, keeping the most
-    important tool_results based on tool name + content patterns.
-    Operates on Anthropic-format messages in-place.
+    Classify the current request into a lifecycle stage based on total chars.
+    All thresholds are in chars (from _estimate_message_chars), guaranteeing
+    monotonic escalation: lighter compression at lower stages, heavier at
+    higher stages.
+
+    Returns a dict:
+      {
+        "stage": "init"|"growth"|"expansion"|"saturation"|"oom_danger"|"pre_trunc",
+        "total_chars": int,
+        "frozen_head": int,          # Frozen Zone protection
+        "clear_zone_pct": float|None, # tail-clear zone (None=skip)
+        "thinking_keep": int,         # thinking keep_recent (0=skip)
+        "truncate_rounds": int|None,  # L5 rounds (None=skip truncation)
+        "oom_safety": bool,           # Enable OOM safety iterative FIFO
+      }
+    """
+    total_chars = _estimate_message_chars(messages)
+    cloud = IS_CLOUD
+
+    # Defaults per stage — ordered by increasing severity
+    if total_chars < PROXY_CLEAR_THRESHOLD:
+        return {
+            "stage": "init", "total_chars": total_chars,
+            "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
+            "clear_zone_pct": None, "thinking_keep": 0,
+            "truncate_rounds": None, "oom_safety": False,
+        }
+    elif total_chars < PROXY_CHARS_GROWTH:
+        return {
+            "stage": "growth", "total_chars": total_chars,
+            "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
+            "clear_zone_pct": 0.4, "thinking_keep": 0,
+            "truncate_rounds": None, "oom_safety": False,
+        }
+    elif total_chars < PROXY_CHARS_EXPANSION:
+        return {
+            "stage": "expansion", "total_chars": total_chars,
+            "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
+            "clear_zone_pct": 0.6, "thinking_keep": 5,
+            "truncate_rounds": PROXY_CTX_KEEP_ROUNDS, "oom_safety": False,
+        }
+    elif total_chars < PROXY_CHARS_SATURATION:
+        return {
+            "stage": "saturation", "total_chars": total_chars,
+            "frozen_head": max(2, (PROXY_FROZEN_HEAD if not cloud else 0) // 2),
+            "clear_zone_pct": 1.0, "thinking_keep": 3,
+            "truncate_rounds": PROXY_CTX_KEEP_ROUNDS, "oom_safety": False,
+        }
+    elif total_chars < PROXY_CHARS_OOM_DANGER:
+        return {
+            "stage": "oom_danger", "total_chars": total_chars,
+            "frozen_head": 0, "clear_zone_pct": 1.0, "thinking_keep": 1,
+            "truncate_rounds": 3, "oom_safety": not cloud,
+        }
+    else:
+        return {
+            "stage": "pre_trunc", "total_chars": total_chars,
+            "frozen_head": 0, "clear_zone_pct": 1.0, "thinking_keep": 1,
+            "truncate_rounds": 2, "oom_safety": not cloud,
+        }
+
+
+def _compress_content_pass(messages, tools_list=None, stage_config=None):
+    """
+    Single-pass content compression: combines L2 tool-result clearing and
+    L4 thinking block stripping into one traversal.
+
+    Scans messages once to locate all tool_results and thinking blocks,
+    then applies semantic clearing and thinking stripping in a second pass.
+    Both operations respect Frozen Zone protection — messages before
+    frozen_head are never modified.
+
+    Returns (messages, combined_stats_dict).
+    """
+    if stage_config is None:
+        stage_config = _classify_lifecycle_stage(messages)
+
+    frozen_head = stage_config.get("frozen_head", PROXY_FROZEN_HEAD)
+    clear_zone_pct = stage_config.get("clear_zone_pct")
+    thinking_keep = stage_config.get("thinking_keep", 3)
+    total_chars = stage_config.get("total_chars", _estimate_message_chars(messages))
+
+    # ---- Phase 1: collect indices (single scan) ----
+    all_tool_result_indices = []
+    thinking_indices = []
+
+    for msg_idx, msg in enumerate(messages):
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block_idx, block in enumerate(content):
+            bt = block.get("type", "")
+            if bt == "tool_result":
+                all_tool_result_indices.append((msg_idx, block_idx))
+            elif bt == "thinking" and msg.get("role") == "assistant":
+                if msg_idx not in thinking_indices:
+                    thinking_indices.append(msg_idx)
+        # Also check for inline <thinking> tags in text blocks
+        if msg.get("role") == "assistant":
+            for block in content:
+                if block.get("type") == "text":
+                    txt = block.get("text", "")
+                    if "<thinking>" in txt or "</thinking>" in txt:
+                        if msg_idx not in thinking_indices:
+                            thinking_indices.append(msg_idx)
+                        break
+
+    # ---- Phase 2a: tool-result clearing logic ----
+    clear_stats = {"enabled": False, "skipped": True, "reason": "disabled"}
+    cleared_files = []
+    if PROXY_CLEAR_ENABLED and total_chars >= PROXY_CLEAR_THRESHOLD:
+        # Filter to dynamic zone
+        if frozen_head > 0:
+            tool_result_indices = [(mi, bi) for mi, bi in all_tool_result_indices if mi >= frozen_head]
+        else:
+            tool_result_indices = list(all_tool_result_indices)
+
+        # Apply zone-pct filter
+        if clear_zone_pct is not None and clear_zone_pct < 1.0 and tool_result_indices:
+            eligible_count = max(1, int(len(tool_result_indices) * clear_zone_pct))
+            tool_result_indices = tool_result_indices[:eligible_count]
+            # log handled by caller
+
+        # Reduce frozen if too few
+        _frozen = frozen_head
+        if len(tool_result_indices) <= PROXY_TOOL_KEEP and _frozen > 0:
+            _frozen = max(0, _frozen // 2)
+            tool_result_indices = [(mi, bi) for mi, bi in all_tool_result_indices if mi >= _frozen]
+
+        if len(tool_result_indices) > PROXY_TOOL_KEEP:
+            keep = PROXY_TOOL_KEEP
+            if tools_list is not None:
+                has_agent = any(t == "Agent" or t == "EnterPlanMode" for t in tools_list)
+                if not has_agent and len(tools_list) > 0:
+                    keep = max(PROXY_TOOL_KEEP, 15)
+
+            total_tr = len(tool_result_indices)
+            recent_cutoff = max(0, total_tr - 6)
+            keep_positions = set()
+            cleared_files_set = set()
+
+            # Score and keep
+            scored = []
+            for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
+                block = messages[msg_idx]["content"][block_idx]
+                tool_use_id = block.get("tool_use_id", "")
+                content_str = str(block.get("content", ""))
+                score = 0
+                tool_name = ""
+                for m_idx in range(msg_idx - 1, -1, -1):
+                    m = messages[m_idx]
+                    if m.get("role") == "assistant":
+                        c = m.get("content", "")
+                        if isinstance(c, list):
+                            for b in c:
+                                if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                                    tool_name = b.get("name", "")
+                                    break
+                        if tool_name:
+                            break
+                score += TOOL_SEMANTIC_PRIORITY.get(tool_name, 1)
+                for pat, pts in TOOL_RESULT_HIGH_VALUE_PATTERNS:
+                    if pat.search(content_str[:500]):
+                        score += pts
+                if tool_name == "Read" and idx_pos >= recent_cutoff:
+                    score += 5
+                if "[System:" in content_str and any(kw in content_str for kw in ("未发生变化", "文件不存在", "参数错误")):
+                    score += 10
+                scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
+
+            scored.sort(key=lambda x: (-x[0], -x[1]))
+            keep_positions = set(x[1] for x in scored[:keep])
+
+            # Apply clearing
+            cleared_count = 0
+            cleared_chars = 0
+            for idx_pos, (msg_idx, block_idx) in enumerate(tool_result_indices):
+                if idx_pos in keep_positions:
+                    continue
+                block = messages[msg_idx]["content"][block_idx]
+                original = block.get("content", "")
+                original_len = len(str(original)) if original else 0
+                tool_use_id = block.get("tool_use_id", "")
+                # Extract meta_info
+                meta_info = ""
+                for m_idx in range(msg_idx - 1, -1, -1):
+                    m = messages[m_idx]
+                    if m.get("role") == "assistant":
+                        c = m.get("content", "")
+                        if isinstance(c, list):
+                            for b in c:
+                                if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                                    inp = b.get("input", {})
+                                    if isinstance(inp, dict):
+                                        fp = inp.get("file_path", inp.get("path", ""))
+                                        cmd = inp.get("command", "")
+                                        if fp:
+                                            meta_info = f" file={fp}"
+                                            cleared_files_set.add(fp)
+                                        elif cmd:
+                                            meta_info = f" cmd={cmd[:60]}"
+                                    break
+                        if meta_info:
+                            break
+                # Tool name for summary
+                tool_name = ""
+                for m_idx in range(msg_idx - 1, -1, -1):
+                    m = messages[m_idx]
+                    if m.get("role") == "assistant":
+                        c = m.get("content", "")
+                        if isinstance(c, list):
+                            for b in c:
+                                if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                                    tool_name = b.get("name", "")
+                                    break
+                        if tool_name:
+                            break
+                summary = _generate_tool_summary(tool_name, meta_info)
+                if tool_name == "Read" and PROXY_REREAD_PREVIEW_CHARS > 0:
+                    preview = str(original)[:PROXY_REREAD_PREVIEW_CHARS]
+                    if len(str(original)) > PROXY_REREAD_PREVIEW_CHARS:
+                        preview += "..."
+                    block["content"] = f"[cleared: {summary}]\n{preview}"
+                else:
+                    block["content"] = f"[cleared: {summary}]"
+                cleared_count += 1
+                cleared_chars += original_len
+
+            cleared_files = list(cleared_files_set)
+            clear_stats = {
+                "enabled": True, "cleared": True,
+                "cleared_tool_results": cleared_count,
+                "cleared_chars": cleared_chars, "kept": keep,
+                "cleared_files": cleared_files,
+                "total_chars_before": total_chars,
+                "frozen_used": _frozen,
+            }
+        else:
+            clear_stats = {
+                "enabled": True, "skipped": True,
+                "reason": "few_tool_results",
+                "count": len(tool_result_indices),
+                "frozen_used": _frozen,
+            }
+    elif not PROXY_CLEAR_ENABLED:
+        clear_stats = {"enabled": False}
+    else:
+        clear_stats = {"enabled": True, "skipped": True, "reason": "below_threshold", "chars": total_chars}
+
+    # ---- Phase 2b: thinking block stripping ----
+    think_stats = {"enabled": True, "skipped": True, "reason": "stage_skip"}
+    if thinking_keep > 0 and thinking_indices:
+        dynamic_thinking = [idx for idx in thinking_indices if idx >= frozen_head]
+        if len(dynamic_thinking) > thinking_keep:
+            keep_set = set(dynamic_thinking[-thinking_keep:])
+            stripped = 0
+            for idx in dynamic_thinking:
+                if idx not in keep_set:
+                    _strip_thinking_from_msg(messages[idx])
+                    stripped += 1
+            think_stats = {
+                "enabled": True, "stripped": True,
+                "stripped_count": stripped, "kept": thinking_keep,
+                "total_thinking": len(thinking_indices),
+                "frozen_thinking_count": len(thinking_indices) - len(dynamic_thinking),
+            }
+        elif dynamic_thinking:
+            think_stats = {"enabled": True, "skipped": True, "reason": "few_dynamic_thinking",
+                           "count": len(dynamic_thinking)}
+
+    return messages, {"clear": clear_stats, "think": think_stats}
+
+
+def clear_old_tool_results(messages, tools_list=None, clear_zone_pct=None):
+    """
+    Proxy-side tool-result clearing with semantic priority scoring and
+    Frozen Zone protection.
+
+    When clear_zone_pct is set (0.0-1.0), only tool_results in the oldest
+    `clear_zone_pct` portion of the dynamic zone are eligible for clearing.
+    This implements progressive tail-priority: lighter stages clear only
+    the oldest portion; heavier stages clear the entire dynamic zone.
+    0.4 = oldest 40%, 0.6 = oldest 60%, 1.0 = all dynamic.
+
+    When PROXY_FROZEN_HEAD > 0, the first N messages are NEVER modified,
+    preserving prefix KV cache stability across requests.
     Returns (messages, stats_dict).
     """
     if not PROXY_CLEAR_ENABLED:
@@ -771,16 +1096,61 @@ def clear_old_tool_results(messages, tools_list=None):
             "skipped": True,
             "reason": "below_threshold",
             "chars": total_chars,
+            "frozen_used": 0,
         }
 
+    # Determine Frozen Zone boundary
+    frozen_head = PROXY_FROZEN_HEAD
+    frozen_used = frozen_head  # track for stats
+
     # Locate every tool_result block: (message_index, block_index)
-    tool_result_indices = []
+    all_tool_result_indices = []
     for msg_idx, msg in enumerate(messages):
         content = msg.get("content", "")
         if isinstance(content, list):
             for block_idx, block in enumerate(content):
                 if block.get("type") == "tool_result":
-                    tool_result_indices.append((msg_idx, block_idx))
+                    all_tool_result_indices.append((msg_idx, block_idx))
+
+    if not all_tool_result_indices:
+        return messages, {
+            "enabled": True,
+            "skipped": True,
+            "reason": "no_tool_results",
+            "frozen_used": 0,
+        }
+
+    # Filter to dynamic zone (skip frozen messages)
+    if frozen_head > 0:
+        tool_result_indices = [
+            (msg_idx, block_idx)
+            for msg_idx, block_idx in all_tool_result_indices
+            if msg_idx >= frozen_head
+        ]
+    else:
+        tool_result_indices = list(all_tool_result_indices)
+
+    # Apply zone-pct filter: only the oldest clear_zone_pct portion of
+    # dynamic tool_results is eligible. The tail portion is ALWAYS preserved.
+    # None = clear all dynamic (backward-compatible), 0.4 = oldest 40%, etc.
+    _total_dynamic_before_zone = len(tool_result_indices)
+    if clear_zone_pct is not None and clear_zone_pct < 1.0 and tool_result_indices:
+        eligible_count = max(1, int(len(tool_result_indices) * clear_zone_pct))
+        tool_result_indices = tool_result_indices[:eligible_count]
+        log(f"  -> Clear zone filter: {clear_zone_pct*100:.0f}% → {len(tool_result_indices)}/{_total_dynamic_before_zone} tool_results")
+
+    # If dynamic zone has too few tool_results, try reducing frozen_head
+    if len(tool_result_indices) <= PROXY_TOOL_KEEP and frozen_head > 0:
+        reduced_frozen = max(0, frozen_head // 2)
+        tool_result_indices = [
+            (msg_idx, block_idx)
+            for msg_idx, block_idx in all_tool_result_indices
+            if msg_idx >= reduced_frozen
+        ]
+        if len(tool_result_indices) > PROXY_TOOL_KEEP:
+            frozen_head = reduced_frozen
+            frozen_used = frozen_head
+            log(f"  -> Frozen Zone reduced: {PROXY_FROZEN_HEAD} -> {frozen_head} (too few tool_results in dynamic zone)")
 
     if len(tool_result_indices) <= PROXY_TOOL_KEEP:
         return messages, {
@@ -788,6 +1158,8 @@ def clear_old_tool_results(messages, tools_list=None):
             "skipped": True,
             "reason": "few_tool_results",
             "count": len(tool_result_indices),
+            "frozen_used": frozen_used,
+            "frozen_head": frozen_head,
         }
 
     # Dynamic KEEP: detect sub-agent by checking tool set
@@ -831,6 +1203,14 @@ def clear_old_tool_results(messages, tools_list=None):
         # Boost recent Read results to prevent re-read loops
         if tool_name == "Read" and idx_pos >= recent_cutoff:
             score += 5
+
+        # P0-FIX: Preserve error-translation results so Claude sees the hints
+        if "[System:" in content_str and (
+            "未发生变化" in content_str
+            or "文件不存在" in content_str
+            or "参数错误" in content_str
+        ):
+            score += 10
 
         scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
 
@@ -940,6 +1320,8 @@ def clear_old_tool_results(messages, tools_list=None):
         "dedup_bash": dedup_bash,
         "dedup_chars_saved": dedup_chars,
         "total_chars_before": total_chars,
+        "frozen_used": frozen_used,
+        "frozen_head": frozen_head,
     }
 
 
@@ -1204,7 +1586,7 @@ def _incremental_compress(dropped, session_id):
     return compressed_text, cache is not None
 
 
-def truncate_messages_if_needed(messages, session_id=None):
+def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
     """
     Proxy-side message truncation with dual strategy support.
 
@@ -1213,6 +1595,11 @@ def truncate_messages_if_needed(messages, session_id=None):
 
     Strategy 'rounds': keep only the most recent N assistant rounds,
     replacing dropped messages with a lightweight placeholder.
+    When keep_rounds is provided (from lifecycle stage config), it overrides
+    the default adaptive_rounds computation.
+
+    Char-based budget: uses PROXY_CHARS_EXPANSION (chars) as the unified
+    trigger threshold, replacing the old token-budget PROXY_CTX_TOKEN_BUDGET.
     Operates on Anthropic-format messages in-place.
     Returns (messages, stats_dict).
     """
@@ -1221,30 +1608,47 @@ def truncate_messages_if_needed(messages, session_id=None):
 
     # ---------- rounds strategy ----------
     if PROXY_CTX_TRUNCATE_STRATEGY == "rounds":
-        # Token budget check: skip if already within budget
-        estimated_tokens = _estimate_message_chars(messages) * PROXY_CTX_TOKEN_RATIO
-        if estimated_tokens <= PROXY_CTX_TOKEN_BUDGET and len(messages) <= PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_ROUNDS * 3:
+        # keep_rounds=None: stage says skip truncation entirely
+        if keep_rounds is None:
+            return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "stage_skip"}
+        total_chars = _estimate_message_chars(messages)
+        # Char-based budget check: skip if within PROXY_CHARS_EXPANSION
+        if total_chars <= PROXY_CHARS_EXPANSION:
             return messages, {
                 "enabled": True, "strategy": "rounds", "skipped": True,
                 "reason": "below_budget",
-                "estimated_tokens": int(estimated_tokens),
-                "budget": PROXY_CTX_TOKEN_BUDGET,
+                "chars": total_chars,
+                "budget_chars": PROXY_CHARS_EXPANSION,
             }
 
-        # Adaptive rounds + LLM/rule compression
-        adaptive_rounds = _compute_adaptive_rounds(messages, PROXY_CTX_KEEP_ROUNDS)
+        # Use stage-config keep_rounds if provided, else adaptive
         min_rounds = 2
-        for rounds in range(adaptive_rounds, min_rounds - 1, -1):
-            result, stats = _apply_rounds_truncation(messages, rounds, session_id=session_id)
+        if keep_rounds is not None:
+            adaptive_rounds = keep_rounds
+            # Single-pass with stage-specified rounds
+            result, stats = _apply_rounds_truncation(messages, keep_rounds, session_id=session_id)
             if not stats.get("truncated"):
                 return result, stats
-            result_tokens = _estimate_message_chars(result) * PROXY_CTX_TOKEN_RATIO
-            if result_tokens <= PROXY_CTX_TOKEN_BUDGET or rounds == min_rounds:
-                stats["estimated_tokens"] = int(result_tokens)
-                stats["budget"] = PROXY_CTX_TOKEN_BUDGET
-                stats["actual_keep_rounds"] = rounds
-                stats["adaptive_rounds"] = adaptive_rounds
-                return result, stats
+            result_chars = _estimate_message_chars(result)
+            stats["chars"] = result_chars
+            stats["budget_chars"] = PROXY_CHARS_EXPANSION
+            stats["actual_keep_rounds"] = keep_rounds
+            stats["stage_keep_rounds"] = keep_rounds
+            return result, stats
+        else:
+            # Backward-compatible: adaptive rounds + LLM/rule compression
+            adaptive_rounds = _compute_adaptive_rounds(messages, PROXY_CTX_KEEP_ROUNDS)
+            for rounds in range(adaptive_rounds, min_rounds - 1, -1):
+                result, stats = _apply_rounds_truncation(messages, rounds, session_id=session_id)
+                if not stats.get("truncated"):
+                    return result, stats
+                result_chars = _estimate_message_chars(result)
+                if result_chars <= PROXY_CHARS_EXPANSION or rounds == min_rounds:
+                    stats["chars"] = result_chars
+                    stats["budget_chars"] = PROXY_CHARS_EXPANSION
+                    stats["actual_keep_rounds"] = rounds
+                    stats["adaptive_rounds"] = adaptive_rounds
+                    return result, stats
 
         return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "no_reduction"}
 
@@ -1448,6 +1852,21 @@ def _build_blocker_message(tool_name, error_type, run_length):
     }
 
 
+def _build_tool_use_map(messages):
+    """Build a mapping from tool_use_id to tool name across all messages."""
+    tool_map = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                tool_map[b.get("id", "")] = b.get("name", "")
+    return tool_map
+
+
 def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
     head = messages[:PROXY_CTX_KEEP_HEAD]
 
@@ -1465,6 +1884,29 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
         return messages, {"enabled": True, "strategy": "rounds", "skipped": True}
 
     dropped = messages[PROXY_CTX_KEEP_HEAD : len(messages) - len(tail)]
+
+    # NEW: Preserve Read tool_results from the dropped zone to prevent re-read loops.
+    # Read tool_results contain file contents that LLM summaries cannot replace.
+    tool_map = _build_tool_use_map(messages)
+    read_results = []
+    remaining_dropped = []
+    for m in dropped:
+        is_read_result = False
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                for b in content:
+                    if b.get("type") == "tool_result":
+                        if tool_map.get(b.get("tool_use_id", "")) == "Read":
+                            is_read_result = True
+                            break
+        if is_read_result:
+            read_results.append(m)
+        else:
+            remaining_dropped.append(m)
+
+    dropped = remaining_dropped
+    dropped_count = len(dropped)
 
     tool_count = 0
     for m in dropped:
@@ -1526,17 +1968,34 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
         if keyword_ctx:
             compressed_text += "\n\n" + keyword_ctx
 
-    if tail and tail[0].get("role") == "user":
-        tail_content = tail[0].get("content", [])
-        summary_block = {"type": "text", "text": compressed_text}
-        if isinstance(tail_content, list):
-            tail[0]["content"] = [summary_block] + tail_content
+    # Assemble result with preserved Read results inserted between summary and tail
+    result = list(head)
+
+    if compressed_text:
+        if tail and tail[0].get("role") == "user":
+            # Copy first tail msg to avoid mutating original messages list
+            modified_tail0 = dict(tail[0])
+            tail_content = modified_tail0.get("content", [])
+            summary_block = {"type": "text", "text": compressed_text}
+            if isinstance(tail_content, list):
+                modified_tail0["content"] = [summary_block] + list(tail_content)
+            else:
+                modified_tail0["content"] = [summary_block, {"type": "text", "text": str(tail_content)}]
+            result.append(modified_tail0)
+            result.extend(tail[1:])
         else:
-            tail[0]["content"] = [summary_block, {"type": "text", "text": str(tail_content)}]
-        result = head + tail
+            summary = {"role": "user", "content": [{"type": "text", "text": compressed_text}]}
+            result.append(summary)
+            result.extend(tail)
     else:
-        summary = {"role": "user", "content": [{"type": "text", "text": compressed_text}]}
-        result = head + [summary] + tail
+        result.extend(tail)
+
+    # Insert preserved Read results between head/summary and tail
+    tail_start_in_result = len(head)
+    if not (tail and tail[0].get("role") == "user") and compressed_text:
+        tail_start_in_result += 1
+    if read_results:
+        result = result[:tail_start_in_result] + read_results + result[tail_start_in_result:]
 
     return result, {
         "enabled": True,
@@ -1649,15 +2108,27 @@ def _strip_thinking_from_msg(msg):
         msg["content"] = content
 
 
-def strip_old_thinking_blocks(messages, keep_recent=3):
+def strip_old_thinking_blocks(messages, keep_recent=3, frozen_head=None):
     """
     Remove thinking/reasoning content from old assistant messages.
     Keeps the most recent keep_recent assistant messages with thinking intact.
+    Set keep_recent=0 to skip thinking stripping entirely (INIT/GROWTH stages).
+    When frozen_head > 0, the first N messages are scanned but their thinking
+    blocks are NEVER stripped — this preserves prefix KV cache stability.
+    Only thinking blocks in the dynamic zone (messages frozen_head+) are
+    eligible for stripping (oldest dynamic thinking stripped first).
     Returns (messages, stats_dict).
     """
     if not messages:
         return messages, {"enabled": False}
+    if frozen_head is None:
+        frozen_head = PROXY_FROZEN_HEAD
 
+    # keep_recent=0 means skip entirely (lightweight stages)
+    if keep_recent <= 0:
+        return messages, {"enabled": True, "skipped": True, "reason": "stage_skip", "keep_recent": 0}
+
+    # Find all assistant messages with thinking, but only strip in dynamic zone
     thinking_indices = []
     for idx, msg in enumerate(messages):
         if msg.get("role") == "assistant" and _has_thinking_content(msg):
@@ -1666,12 +2137,24 @@ def strip_old_thinking_blocks(messages, keep_recent=3):
     if not thinking_indices:
         return messages, {"enabled": True, "skipped": True, "reason": "no_thinking_found"}
 
-    if len(thinking_indices) <= keep_recent:
-        return messages, {"enabled": True, "skipped": True, "reason": "few_thinking", "count": len(thinking_indices)}
+    # Filter to dynamic zone indices (those in frozen zone are protected)
+    dynamic_thinking = [idx for idx in thinking_indices if idx >= frozen_head]
+    frozen_thinking = [idx for idx in thinking_indices if idx < frozen_head]
 
-    keep_set = set(thinking_indices[-keep_recent:])
+    if len(dynamic_thinking) <= keep_recent:
+        return messages, {
+            "enabled": True,
+            "skipped": True,
+            "reason": "few_dynamic_thinking",
+            "count": len(dynamic_thinking),
+            "frozen_thinking_count": len(frozen_thinking),
+            "frozen_head": frozen_head,
+        }
+
+    # Keep the most recent `keep_recent` dynamic thinking messages
+    keep_set = set(dynamic_thinking[-keep_recent:])
     stripped_count = 0
-    for idx in thinking_indices:
+    for idx in dynamic_thinking:
         if idx in keep_set:
             continue
         _strip_thinking_from_msg(messages[idx])
@@ -1683,157 +2166,12 @@ def strip_old_thinking_blocks(messages, keep_recent=3):
         "stripped_count": stripped_count,
         "kept": keep_recent,
         "total_thinking": len(thinking_indices),
+        "frozen_thinking_count": len(frozen_thinking),
+        "frozen_head": frozen_head,
     }
 
 
 # ---------------------------------------------------------------------------
-# Cleared tool-result compression: merge consecutive user messages that
-# contain only cleared tool_results into a single user message.
-# Reduces per-message JSON structural overhead (~50-100 tokens each).
-# ---------------------------------------------------------------------------
-def _is_pure_tool_use_msg(msg):
-    """Check if an assistant message contains only tool_use blocks (no text)."""
-    if msg.get("role") != "assistant":
-        return False
-    content = msg.get("content", "")
-    if isinstance(content, list):
-        if not content:
-            return True
-        for block in content:
-            if block.get("type") != "tool_use":
-                return False
-        return True
-    elif isinstance(content, dict):
-        return content.get("type") == "tool_use"
-    return False
-
-
-# Prefixes used by cleared tool_results (supports old and new formats)
-_CLEARED_PREFIXES = ("[cleared:", "[cleared to save context:", "[Result of tool call hidden]")
-
-
-def _is_cleared_tool_result_msg(msg):
-    """Check if a user message contains only cleared tool_results."""
-    if msg.get("role") != "user":
-        return False
-    content = msg.get("content", "")
-    if isinstance(content, list):
-        if not content:
-            return False
-        for block in content:
-            if block.get("type") != "tool_result":
-                return False
-            block_content = str(block.get("content", ""))
-            if not any(p in block_content for p in _CLEARED_PREFIXES):
-                return False
-        return True
-    elif isinstance(content, dict):
-        if content.get("type") != "tool_result":
-            return False
-        block_content = str(content.get("content", ""))
-        return any(p in block_content for p in _CLEARED_PREFIXES)
-    return False
-
-
-def compress_cleared_tool_results(messages):
-    """
-    Compress tool-use cycles where the assistant message is a pure tool_use
-    (no explanatory text) and the following user message contains only cleared
-    tool_results. Consecutive such cycles are merged into a single lightweight
-    assistant+user placeholder pair, saving ~50-100 tokens of JSON structural
-    overhead per eliminated message.
-
-    Also merges consecutive user messages that contain only cleared tool_results
-    into a single user message.
-    Returns (messages, stats_dict).
-    """
-    if len(messages) < 4:
-        return messages, {"enabled": False}
-
-    compressed = []
-    stats = {"merged_cycles": 0, "merged_msgs": 0, "saved_overhead": 0}
-    i = 0
-
-    while i < len(messages):
-        # Pattern: assistant(pure tool_use) + user(cleared tool_result)
-        if (i + 1 < len(messages) and
-                _is_pure_tool_use_msg(messages[i]) and
-                _is_cleared_tool_result_msg(messages[i + 1])):
-
-            # Look ahead for consecutive cycles
-            cycles = [(messages[i], messages[i + 1])]
-            j = i + 2
-            while (j + 1 < len(messages) and
-                   _is_pure_tool_use_msg(messages[j]) and
-                   _is_cleared_tool_result_msg(messages[j + 1])):
-                cycles.append((messages[j], messages[j + 1]))
-                j += 2
-
-            if len(cycles) > 1:
-                tool_names = []
-                for assistant_msg, _ in cycles:
-                    content = assistant_msg.get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if block.get("type") == "tool_use":
-                                tool_names.append(block.get("name", "?"))
-                    elif isinstance(content, dict) and content.get("type") == "tool_use":
-                        tool_names.append(content.get("name", "?"))
-
-                # Use sorted unique tool names for deterministic output
-                tool_names_sorted = sorted(set(tool_names))
-                compressed.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": f"[Previous tool calls: {', '.join(tool_names_sorted)}]"}],
-                })
-                compressed.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": "[tool results cleared]"}],
-                })
-                stats["merged_cycles"] += len(cycles) - 1
-                stats["merged_msgs"] += len(cycles) * 2 - 2
-                stats["saved_overhead"] += (len(cycles) * 2 - 2) * 50
-                i = j
-                continue
-
-        # Fallback: merge consecutive user messages with only cleared tool_results
-        if _is_cleared_tool_result_msg(messages[i]):
-            cleared_run = [messages[i]]
-            j = i + 1
-            while j < len(messages) and _is_cleared_tool_result_msg(messages[j]):
-                cleared_run.append(messages[j])
-                j += 1
-
-            if len(cleared_run) > 1:
-                merged_blocks = []
-                for m in cleared_run:
-                    content = m.get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if block.get("type") == "tool_result":
-                                merged_blocks.append(block)
-                    elif isinstance(content, dict) and content.get("type") == "tool_result":
-                        merged_blocks.append(content)
-
-                merged_msg = {
-                    "role": "user",
-                    "content": merged_blocks,
-                }
-                compressed.append(merged_msg)
-                stats["merged_cycles"] += len(cleared_run) - 1
-                stats["merged_msgs"] += len(cleared_run) - 1
-                stats["saved_overhead"] += (len(cleared_run) - 1) * 50
-                i = j
-                continue
-
-        compressed.append(messages[i])
-        i += 1
-
-    if stats["merged_cycles"] > 0:
-        return compressed, {"enabled": True, "merged": True, **stats}
-    return messages, {"enabled": True, "merged": False}
-
-
 def convert_anthropic_messages_to_openai(messages):
     """Convert Anthropic message format to OpenAI message format."""
     openai_messages = []
@@ -3191,6 +3529,16 @@ class Handler(BaseHTTPRequestHandler):
         # Backend timeout & output token limit logging
         log(f"  -> Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
 
+        # Unified lifecycle stage classification: determines compression intensity
+        # based on total chars. Guarantees monotonic escalation.
+        stage_config = _classify_lifecycle_stage(body.get("messages", []))
+        log(f"  -> Stage: {stage_config['stage']} (chars={stage_config['total_chars']:,}, "
+            f"frozen={stage_config['frozen_head']}, clear_zone={stage_config['clear_zone_pct']}, "
+            f"thinking_keep={stage_config['thinking_keep']}, "
+            f"truncate_rounds={stage_config['truncate_rounds']}, oom_safety={stage_config['oom_safety']})")
+        if PROXY_METRICS_ENABLED:
+            _mc_put("lifecycle_stage", stage_config)
+
         # max_tokens override
         if PROXY_MAX_TOKENS_OVERRIDE > 0 and max_tokens_orig > PROXY_MAX_TOKENS_OVERRIDE:
             body["max_tokens"] = PROXY_MAX_TOKENS_OVERRIDE
@@ -3221,40 +3569,45 @@ class Handler(BaseHTTPRequestHandler):
             ))
         _mc_put("blocker_detect", blocker_info)
 
-        # Proxy-side tool-result clearing with semantic priority
-        raw_messages, clear_stats = clear_old_tool_results(raw_messages, tools_list=tools_list)
+        # Single-pass content compression (L2 tool clearing + L4 thinking strip)
+        raw_messages, compress_stats = _compress_content_pass(
+            raw_messages, tools_list=tools_list, stage_config=stage_config,
+        )
+        clear_stats = compress_stats.get("clear", {})
+        think_stats = compress_stats.get("think", {})
         cleared_files = clear_stats.get("cleared_files", [])
+
+        # Log and metrics for tool clearing
         if PROXY_METRICS_ENABLED:
             _mc_put("tool_clear", {
                 "applied": clear_stats.get("cleared", False),
                 "cleared": clear_stats.get("cleared_tool_results", 0),
                 "kept": clear_stats.get("kept", 0),
                 "chars_freed": clear_stats.get("cleared_chars", 0),
-                "high_prio": clear_stats.get("high_prio", 0),
-                "cleared_files_count": len(cleared_files),
                 "total_chars_before": clear_stats.get("total_chars_before", 0),
-                "dedup_bash": clear_stats.get("dedup_bash", 0),
-                "dedup_chars_saved": clear_stats.get("dedup_chars_saved", 0),
+                "cleared_files_count": len(cleared_files),
                 "enabled": clear_stats.get("enabled", True),
                 "skipped": clear_stats.get("skipped", False),
                 "reason": clear_stats.get("reason", ""),
             })
-            if clear_stats.get("dedup_bash", 0) > 0:
-                _mc_put("bash_dedup", {
-                    "applied": True,
-                    "merged": clear_stats.get("dedup_bash", 0),
-                    "chars_saved": clear_stats.get("dedup_chars_saved", 0),
-                })
         if clear_stats.get("cleared"):
             log(f"  -> Tool clearing: {clear_stats['cleared_tool_results']} tool_results cleared, "
-                f"{clear_stats['cleared_chars']:,} chars freed (kept {clear_stats['kept']}, high_prio={clear_stats.get('high_prio', 0)})")
-            if clear_stats.get("dedup_bash", 0) > 0:
-                log(f"  -> Bash dedup: {clear_stats['dedup_bash']} similar results merged, "
-                    f"{clear_stats['dedup_chars_saved']} chars saved")
+                f"{clear_stats['cleared_chars']:,} chars freed (kept {clear_stats['kept']})")
         elif not clear_stats.get("enabled"):
             log(f"  -> Tool clearing: disabled ({BACKEND_TYPE} backend)")
         elif clear_stats.get("enabled") and not clear_stats.get("skipped"):
             log(f"  -> Tool clearing: active (threshold={PROXY_CLEAR_THRESHOLD}, keep={PROXY_TOOL_KEEP})")
+
+        # Log and metrics for thinking strip
+        if think_stats.get("stripped"):
+            log(f"  -> Thinking stripped: {think_stats['stripped_count']} old assistant messages cleaned (kept last {think_stats['kept']})")
+            _mc_put("think_strip", {"stripped": think_stats["stripped_count"]})
+        elif think_stats.get("enabled") and not think_stats.get("skipped"):
+            reason = think_stats.get("reason", "")
+            if reason == "stage_skip":
+                log(f"  -> Thinking strip: skipped (stage={stage_config['stage']})")
+            else:
+                log(f"  -> Thinking strip: active (keep_recent={stage_config['thinking_keep']})")
 
         # DEF-002: Loop detection — tail-based scan (no cross-request double-counting)
         # Scan last N assistant messages for exact (tool, args) and pattern repeats.
@@ -3362,6 +3715,18 @@ class Handler(BaseHTTPRequestHandler):
                 re_read_info = {"count": re_read_count, "cleared_files": len(cleared_files), "re_read_files": len(re_read_targets), "rate_pct": round(rate, 1)}
                 log(f"  -> Re-read detected: {re_read_count} Read calls targeting {len(re_read_targets)}/{len(cleared_files)} cleared files "
                     f"(rate={rate:.1f}%)")
+                # P0-FIX: Hard-block re-reads by injecting a rejection message
+                blocked_files = ", ".join(sorted(re_read_targets))
+                raw_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text":
+                        f"[System: HARD BLOCK — Read calls to the following files were intercepted "
+                        f"because their contents were previously cleared and have not changed: {blocked_files}. "
+                        f"DO NOT attempt to read these files again. Use your existing knowledge or "
+                        f"proceed without re-reading. If you need file content, ask the user explicitly.]"
+                    }]
+                })
+                log(f"  -> Re-read HARD BLOCK injected for: {blocked_files}")
         _mc_put("re_read", re_read_info)
 
         # Normalize system-reminder date to stabilize prefix for KV cache hits
@@ -3381,32 +3746,11 @@ class Handler(BaseHTTPRequestHandler):
                     raw_messages[0]["content"] = new_content
                     log(f"  -> Standardized date in msg0")
 
-        # Proxy-side thinking block stripping
-        raw_messages, think_stats = strip_old_thinking_blocks(raw_messages, keep_recent=3)
-        if think_stats.get("stripped"):
-            log(f"  -> Thinking stripped: {think_stats['stripped_count']} old assistant messages cleaned (kept last {think_stats['kept']})")
-            _mc_put("think_strip", {"stripped": think_stats["stripped_count"]})
-        elif think_stats.get("enabled") and not think_stats.get("skipped"):
-            log(f"  -> Thinking strip: active (keep_recent=3)")
-
-        # Proxy-side cleared tool-result compression
-        raw_messages, compress_stats = compress_cleared_tool_results(raw_messages)
-        if compress_stats.get("merged"):
-            log(f"  -> Tool-result compression: {compress_stats['merged_cycles']} cycles merged, {compress_stats['merged_msgs']} msgs removed (saved ~{compress_stats['saved_overhead']} tokens overhead)")
-            _mc_put("compress", {
-                "applied": True,
-                "merged_cycles": compress_stats["merged_cycles"],
-                "msgs_removed": compress_stats["merged_msgs"],
-                "saved_overhead": compress_stats.get("saved_overhead", 0),
-            })
-        elif compress_stats.get("enabled") and not compress_stats.get("merged"):
-            log(f"  -> Tool-result compression: no consecutive cleared cycles to merge")
-            _mc_put("compress", {"applied": False, "merged_cycles": 0, "msgs_removed": 0})
-
-        # Context truncation
+        # Context truncation (stage-driven)
         raw_messages, trunc_stats = truncate_messages_if_needed(
             raw_messages,
             session_id=getattr(_log_ctx, 'session_id', None),
+            keep_rounds=stage_config["truncate_rounds"],
         )
         if trunc_stats.get("truncated"):
             strategy = trunc_stats.get("strategy", "char")
@@ -3418,15 +3762,17 @@ class Handler(BaseHTTPRequestHandler):
                 "kept": trunc_stats.get("kept_messages", 0),
             }
             if strategy == "rounds":
-                est_tok = trunc_stats.get("estimated_tokens", "?")
+                chars_after = trunc_stats.get("chars", trunc_stats.get("estimated_tokens", "?"))
                 actual_r = trunc_stats.get("actual_keep_rounds", "?")
                 comp = trunc_stats.get("compression", "folded")
                 adaptive = trunc_stats.get("adaptive_rounds", "")
+                stage_r = trunc_stats.get("stage_keep_rounds", "")
                 extra_info = f", adaptive={adaptive}" if adaptive else ""
-                log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{est_tok} tokens, budget={PROXY_CTX_TOKEN_BUDGET}, compress={comp}{extra_info})")
+                extra_info += f", stage_rounds={stage_r}" if stage_r else ""
+                log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{chars_after} chars, budget={PROXY_CHARS_EXPANSION:,}, compress={comp}{extra_info})")
                 trunc_metrics["compression"] = comp
-                trunc_metrics["est_tokens_after"] = trunc_stats.get("estimated_tokens", 0)
-                trunc_metrics["budget"] = PROXY_CTX_TOKEN_BUDGET
+                trunc_metrics["chars_after"] = trunc_stats.get("chars", 0)
+                trunc_metrics["budget_chars"] = PROXY_CHARS_EXPANSION
                 trunc_metrics["rounds"] = actual_r
                 trunc_metrics["adaptive_rounds"] = adaptive
             elif strategy == "fifo":
@@ -3472,9 +3818,9 @@ class Handler(BaseHTTPRequestHandler):
             h1 = _msg_hash(raw_messages[1]) if len(raw_messages) > 1 else "none"
             log(f"  -> Msg hashes: msg0={h0}, msg1={h1}, total_msgs={len(raw_messages)}")
 
-        # DEF-005: OOM safety — if estimated tokens still exceed safe limit after
-        # all pipeline steps, force aggressive FIFO truncation to prevent Metal OOM.
-        if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD and PROXY_CTX_TRUNCATE_STRATEGY != "rounds":
+        # DEF-005: OOM safety — stage-gated iterative FIFO truncation to prevent Metal OOM.
+        # Only enabled at OOM_DANGER and PRE_TRUNC stages.
+        if stage_config["oom_safety"] and not IS_CLOUD and PROXY_CTX_TRUNCATE_STRATEGY != "rounds":
             _sys = body.get("system")
             _tools = body.get("tools")
             static_chars = 0
@@ -3488,21 +3834,20 @@ class Handler(BaseHTTPRequestHandler):
             _iteration = 0
             while True:
                 est_chars = _estimate_message_chars(raw_messages) + static_chars
-                est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
-                if est_tokens <= PROXY_OOM_SAFE_TOKENS or len(raw_messages) <= 4:
+                if est_chars <= PROXY_CHARS_OOM_DANGER or len(raw_messages) <= 4:
                     break
                 _iteration += 1
                 keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 4)
                 if len(raw_messages) > keep:
                     dropped = len(raw_messages) - keep
                     raw_messages[:] = raw_messages[:PROXY_CTX_KEEP_HEAD] + raw_messages[-(keep - PROXY_CTX_KEEP_HEAD):]
-                    log(f"  -> OOM safety (iter {_iteration}): est_tokens={est_tokens}, "
+                    log(f"  -> OOM safety (iter {_iteration}): est_chars={est_chars}, "
                         f"dropped {dropped} msgs, kept {len(raw_messages)}")
                 else:
                     break
             if _iteration > 0:
-                _mc_put("oom_safety", {"triggered": True, "est_tokens": est_tokens,
-                                       "limit": PROXY_OOM_SAFE_TOKENS,
+                _mc_put("oom_safety", {"triggered": True, "chars": est_chars,
+                                       "limit_chars": PROXY_CHARS_OOM_DANGER,
                                        "iterations": _iteration, "final_msgs": len(raw_messages)})
 
         # Convert messages

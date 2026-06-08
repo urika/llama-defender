@@ -238,7 +238,7 @@ mode based on `LLAMA_BASE_URL`:
 | `PROXY_MAX_CONCURRENT` | Default `1` (prevents OOM on 48GB) | Default `4` (cloud handles concurrency) |
 | Concurrency control | `threading.Semaphore` around local backend | `threading.Semaphore` around cloud API |
 | Token counting | Uses `timings.prompt_n` / `predicted_n` (llama-server) or `usage.*` | Uses `usage.prompt_tokens` / `completion_tokens` (OpenAI/DeepSeek) |
-| Tool clearing | **Enabled** by default (threshold=15K, keep=2) | **Disabled** by default (1M+ token context) |
+| Tool clearing | **Disabled** by default (see warning below) | **Disabled** by default (1M+ token context) |
 | Context limit | **Enabled** by default (limit=180K chars) | **Disabled** by default |
 | Status page | Shows PID, memory, cache stats | Shows endpoint, model, masked API key |
 
@@ -287,6 +287,25 @@ The proxy performs bidirectional translation between Anthropic and OpenAI format
 
 ### Proxy-side tool-result clearing
 
+> ⚠️ **WARNING: Tool Clearing is NOT recommended for local backends**
+>
+> Tool Clearing replaces old `tool_result` contents with `[cleared: ...]`
+> placeholders. Claude cannot distinguish "content was cleared" from "read
+> failed", and will re-read the file. When the backend returns `"Wasted call"`
+> (file unchanged), this creates a death loop:
+> ```
+> Read → cleared → re-read → "Wasted call" → error translation → cleared → ...
+> ```
+>
+> **Verified impact**: With Tool Clearing ON, `wasted` errors grew 7→9→11→13,
+> context ballooned to 250K+, and the session entered a death loop.
+> With Tool Clearing OFF + Truncate smart-preserving Read results,
+> `wasted=0`, context stayed at 66K, and the session ran stable for 30+ min.
+>
+> **Current recommendation**: Keep `PROXY_CLEAR_ENABLED=false` for local
+> backends. Context growth is controlled by Truncate (rounds strategy) which
+> intelligently preserves Read tool_results instead of clearing them.
+
 To prevent long agentic sessions from exhausting context window, the proxy
 can truncate old `tool_result` contents while keeping the most recent
 `PROXY_TOOL_KEEP` pairs intact. This mimics Anthropic's context management
@@ -316,6 +335,33 @@ Environment variables:
 | `PROXY_PRE_TRUNCATE_CHARS` | `400000` | Pre-truncate very large payloads to prevent OOM/timeout |
 | `PROXY_RETRY_AFTER_SECONDS` | `30` | Retry-After header value (seconds) for 503/504 responses |
 | `PROXY_DEDUP_WINDOW` | `2` | Deduplication window (seconds) for detecting duplicate POST requests via body hash |
+
+### Truncate smart-preserving Read results (v0.5.2)
+
+When the `rounds` truncation strategy is active, the proxy does **not**
+blindly drop middle messages. Instead, it scans the "dropped zone" and
+**extracts all `Read` tool_results** (file contents) to preserve them intact.
+Only non-Read messages are compressed into a summary.
+
+This prevents the death loop caused by Tool Clearing + Truncate:
+
+```
+Without smart preserve:              With smart preserve (v0.5.2):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+head (6 msgs)                        head (6 msgs)
+summary (1 msg)                      summary (1 msg, non-Read only)
+tail (16 msgs)                →      Read results (N msgs, full content)
+                                     tail (16 msgs)
+```
+
+**Measured impact**:
+- Drop ratio: **80% → 20%**
+- `wasted` errors: **13 → 0**
+- `quality_flags`: `loop_injected, high_drop_ratio` → **[]**
+
+The preserved Read results are inserted chronologically between the summary
+and the tail, so Claude can reference any previously-read file without
+re-executing `Read`.
 
 ### Proxy-side error classification and retry (DEF-001)
 

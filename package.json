@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "promptfoo": "^0.121.15"
+  },
+  "devDependencies": {
+    "@libsql/darwin-arm64": "^0.5.29"
+  }
+}

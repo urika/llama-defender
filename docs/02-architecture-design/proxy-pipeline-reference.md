@@ -1,8 +1,8 @@
 # 代理层请求处理管线参考文档
 
-> 状态: 与 anthropic_proxy.py (3534 lines) 同步  
-> 日期: 2026-06-05  
-> 版本: v1
+> 状态: 与 anthropic_proxy.py 同步
+> 日期: 2026-06-08
+> 版本: v3（统一 char 阈值 + 生命周期阶段 + L2/L4 合并为 _compress_content_pass + 移除 cleared merge）
 
 ---
 
@@ -22,8 +22,9 @@ Claude Code (Anthropic SDK)
 │  └────────────────────┬─────────────────────────────┘   │
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
-│  │ Layer 2: 语义预处理 (Semantic Rewrite)            │   │
-│  │   - 错误翻译、工具内容清除、占位保留               │   │
+│  │ Layer 2: 内容压缩 (Content Compression)           │   │
+│  │   - 错误翻译、工具内容清除、Thinking 剥离、占位保留│   │
+│  │     (合并为单次 _compress_content_pass)            │   │
 │  └────────────────────┬─────────────────────────────┘   │
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
@@ -33,7 +34,7 @@ Claude Code (Anthropic SDK)
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
 │  │ Layer 4: 缓存优化 (Cache Optimizer)               │   │
-│  │   - 日期标准化、Thinking清除、Cleared压缩          │   │
+│  │   - 日期标准化                                     │   │
 │  └────────────────────┬─────────────────────────────┘   │
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
@@ -43,7 +44,7 @@ Claude Code (Anthropic SDK)
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
 │  │ Layer 6: 格式转换与转发 (Format & Forward)        │   │
-│  │   - Anthropic→OpenAI、工具过滤、转发、响应控制     │   │
+│  │   - Anthropic→OpenAI、工具过滤、转发               │   │
 │  └──────────────────────────────────────────────────┘   │
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
@@ -55,6 +56,14 @@ Claude Code (Anthropic SDK)
 │  │ Layer 8: 可观测性 (Observability)                  │   │
 │  │   - Metrics记录、JSONL日志                         │   │
 │  └──────────────────────────────────────────────────┘   │
+│                                                          │
+│  ┌──── lifecycle stage ────────────────────────────┐   │
+│  │ _classify_lifecycle_stage()                     │   │
+│  │   统一 char 阈值，单调递增:                       │   │
+│  │   INIT(15K) → GROWTH(40K) → EXPANSION(90K)     │   │
+│  │   → SATURATION(180K) → OOM_DANGER(350K)         │   │
+│  │   → PRE_TRUNC(400K)                              │   │
+│  └─────────────────────────────────────────────────┘   │
 │                                                          │
 └─────────────────────────────────────────────────────────┘
        │
@@ -70,7 +79,7 @@ Claude Code (Anthropic SDK)
 
 **职责**: 接收 HTTP 请求，解析 JSON，管理会话和日志上下文。
 
-**入口**: `Handler.do_POST()` (line 2751)
+**入口**: `Handler.do_POST()` (line 3017)
 
 ### 1.1 路由
 
@@ -91,10 +100,13 @@ do_POST()
   ├─ 读取 + 解析 JSON body
   ├─ 请求去重检查 _check_dedup(body) → 429 (重复请求, DEF-205)
   ├─ 写入 /tmp/anthropic_request_body.json (调试)
-  ├─ 调用 _handle_messages(body)          ← 核心管线
-  ├─ 成功: log_request() + log_metrics()
-  ├─ 失败: _classify_exception(e) → 503/504/500 + Retry-After (retryable)
-  └─ finally: 清理 _log_ctx, _metrics_ctx
+  │
+  ├─ [DEF-001] Pre-truncation: total_chars > 400K 时强制 keep_rounds=2
+  │
+  └─ 调用 _handle_messages(body)          ← 核心管线 (2-8层)
+       ├─ 成功: log_request() + log_metrics()
+       ├─ 失败: _classify_exception(e) → 503/504/500 + Retry-After (retryable)
+       └─ finally: 清理 _log_ctx, _metrics_ctx
 ```
 
 ### 1.3 会话跟踪
@@ -121,13 +133,42 @@ _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 
 ---
 
-## 2. Layer 2: 语义预处理 (Semantic Rewrite)
+## 2. Layer 2: 内容压缩 (Content Compression)
 
-**职责**: 在保持消息结构不变的前提下，修改消息内容以提高模型理解度和减少 token 消耗。
+**职责**: 单次遍历完成工具内容清除和 Thinking 剥离，由 lifecycle stage 决定压缩力度。合并了 v2 的 L2（工具清除）和 L4（Thinking 清除）。
 
-**入口**: `_handle_messages()` 前段 (line 2847-2907)
+**核心函数**: `_compress_content_pass()` — 合并了 `clear_old_tool_results()` 和 `strip_old_thinking_blocks()` 的逻辑。
 
-### 2.1 max_tokens 覆盖
+**入口**: `_handle_messages()` 中段
+
+### 2.1 生命周期阶段驱动
+
+所有压缩参数由 `_classify_lifecycle_stage()` 统一判定。报文越大，阶段越高，压缩力度越强。
+
+| 阶段 | 触发 chars | Frozen | 清除范围 | Thinking keep |
+|------|:---:|:---:|------|:---:|
+| INIT | < 15K | 12 | 跳过 | 0 (跳过) |
+| GROWTH | 15K-40K | 12 | 尾 40% dynamic | 0 (跳过) |
+| EXPANSION | 40K-90K | 12 | 尾 60% dynamic | 5 |
+| SATURATION | 90K-180K | 6 | 全 dynamic | 3 |
+| OOM_DANGER | 180K-350K | 0 | 全量 | 1 |
+| PRE_TRUNC | > 350K | 0 | 全量 | 1 |
+
+### 2.2 Pre-truncation (DEF-001)
+
+**触发条件**: `total_chars > PROXY_PRE_TRUNCATE_CHARS=400000`
+
+**处理**: 在 `_handle_messages` 调用前，直接用 `keep_rounds=2` 强制截断原始消息列表，防止 rapid-mlx OOM。
+
+```
+if total_chars > 400K:
+    msgs_truncated, pre_stats = _apply_rounds_truncation(msgs, keep_rounds=2, session_id=session_id)
+    if pre_stats.get("truncated"):
+        parsed["messages"] = msgs_truncated
+        # 记录 pre_truncate metrics
+```
+
+### 2.3 max_tokens 覆盖
 
 ```
 输入: body.max_tokens = 16384 (Claude Code 默认)
@@ -135,7 +176,7 @@ _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 目的: 限制本地模型输出长度，防止 rapid-mlx 忽略 max_tokens 问题
 ```
 
-### 2.2 错误翻译 (Error Translation)
+### 2.4 错误翻译 (Error Translation)
 
 **原理**: 将后端返回的英文/技术性错误信息翻译为中文自然语言提示，帮助 Qwen 模型理解错误含义。
 
@@ -147,31 +188,57 @@ _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 
 **实现**: 遍历 user 消息中的 tool_result blocks，子串匹配 + 替换 content。
 
-### 2.3 工具内容清除 (Tool-Result Clearing)
+### 2.5 工具内容清除 (Tool-Result Clearing)
 
-**核心函数**: `clear_old_tool_results()` (line 658)
+**核心函数**: `clear_old_tool_results()` (line 756)
 
 **目的**: 用轻量占位文本替换旧 tool_result 的完整内容，释放 token 空间。
+
+**Frozen Zone 保护**:
+前 `PROXY_FROZEN_HEAD` (默认 12) 条消息受 Frozen Zone 保护，其中的 tool_result 不会被清除。只有在 dynamic zone (frozen 之后的消息) 中的 tool_result 才参与评分和清除。如果 dynamic zone 中可清除的 tool_result 太少，会尝试将 Frozen Zone 缩小一半重试一次，否则跳过本次清除。
 
 **处理流程**:
 
 ```
 输入: N 条消息
   │
+  ├─ 0. 分区: frozen = messages[:PROXY_FROZEN_HEAD], dynamic = 剩余
+  │
   ├─ 1. 计算 total_chars → 低于阈值则跳过
-  ├─ 2. 定位所有 tool_result blocks
-  ├─ 3. 动态 KEEP: 检测子代理(auto=15) vs 主代理(default=2)
-  ├─ 4. 语义评分 (每条 tool_result):
+  ├─ 2. 仅在 dynamic zone 中定位所有 tool_result blocks
+  ├─ 3. 若 dynamic zone 中 tool_result 太少且 frozen > 0:
+  │     → 将 frozen_head 缩小一半，重新扫描
+  ├─ 4. 动态 KEEP: 检测子代理(auto=15) vs 主代理(default=2)
+  ├─ 5. 语义评分 (每条 tool_result, 仅 dynamic):
   │     ├─ 工具优先级: Read=3, Agent=3, WebFetch=2, Bash=1
   │     ├─ 内容模式: 代码结构+3, 错误信息+2, Wasted=0
   │     └─ 近期 Read 加分: 最近 6 条 Read 结果额外 +5
-  ├─ 5. 按分数排序，保留 top KEEP 条
-  ├─ 6. 清除低分 tool_result:
+  ├─ 6. 按分数排序，保留 top KEEP 条
+  ├─ 7. 清除低分 tool_result (仅 dynamic zone):
   │     ├─ Read: 保留 200 字符预览 (防重读)
   │     ├─ 其他: 替换为 [cleared: ToolName("file")] (Prefix Cache 友好)
   │     └─ 记录 cleared_files 集合
-  ├─ 7. Bash 去重: Jaccard >= 0.7 的连续 Bash 输出合并
-  └─ 8. 返回 (messages, stats_dict)
+  ├─ 8. Bash 去重: Jaccard >= 0.7 的连续 Bash 输出合并
+  └─ 9. 返回 (messages, stats_dict, frozen_used)
+```
+
+**Frozen Zone 示意图**:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Frozen Zone (前 12 条)            Dynamic Zone        │
+│  ← NEVER modified →              ← 可清除/压缩 →      │
+│                                                       │
+│  system msg                                           │
+│  msg0: "Today's date is..." (日期标准化仍生效)        │
+│  msg1-3: 初始工具调用/读取                            │
+│  msg4-11: 早期交互                                    │
+│                       ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│
+│                                     tool_result #12+  │
+│                                     可被清除           │
+│                                                       │
+│  prefix cache 稳定命中 ←────────────────→             │
+└──────────────────────────────────────────────────────┘
 ```
 
 **语义评分表示例**:
@@ -191,7 +258,7 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 ```
 这显著降低了模型因"看不到文件内容"而触发重读循环的概率。
 
-### 2.4 配置参数
+### 2.6 配置参数
 
 | 参数 | 默认值 (local/cloud) | 说明 |
 |------|---------------------|------|
@@ -200,6 +267,8 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 | `PROXY_CLEAR_THRESHOLD` | 15000 / 30000 | 触发清除的字符阈值 |
 | `PROXY_TOOL_KEEP` | 2 / 10 | 保留的最近 tool_result 数量 |
 | `PROXY_REREAD_PREVIEW_CHARS` | 200 | Read 清除时保留的预览字符数 |
+| `PROXY_FROZEN_HEAD` | 12 / 0 | Frozen Zone 保护的前 N 条消息 |
+| `PROXY_CLEAR_TAIL_FIRST` | true | 尾优先清除 (从尾部向前扫描) |
 
 ---
 
@@ -207,7 +276,7 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 
 **职责**: 检测模型陷入重复行为模式的场景，并施加递进式干预。
 
-**入口**: `_handle_messages()` 中段 (line 2909-3069)
+**入口**: `_handle_messages()` 中段 (line 3267-3385)
 
 ### 3.1 循环检测 (Loop Detection)
 
@@ -260,11 +329,18 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 
 ### 3.4 Re-read 检测
 
-**目的**: 观测性指标 — 检测模型是否在被清除的文件上发起 Read。
+**目的**: 检测模型是否在被清除的文件上发起 Read。
 
-**实现**: 检查最近 6 条消息中是否有 Read tool_use 指向 `cleared_files` 集合中的文件。
+**实现**: 检查最后一条 assistant 消息中是否有 Read tool_use 指向 `cleared_files` 集合中的文件。
 
-**当前状态**: 纯 log warning，不干预。（未来可扩展为 Fix 1: 拦截并替换 Read tool_use）
+**干预**: 若检测到 re-read，注入 HARD BLOCK user message，告知模型文件已被清除，禁止重新读取。（P0 fix）
+
+```
+[HARD BLOCK] — Read calls to the following files were intercepted because
+their contents were previously cleared: file1.js, file2.py. DO NOT attempt
+to read these files again. Use your existing knowledge or proceed without
+re-reading.
+```
 
 ### 3.5 配置参数
 
@@ -280,9 +356,9 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 
 ## 4. Layer 4: 缓存优化 (Cache Optimizer)
 
-**职责**: 优化消息结构以提高 Rapid-MLX prefix cache 命中率，并压缩冗余消息。
+**职责**: 优化消息以提升 Rapid-MLX prefix cache 命中率。Thinking 剥离已合并至 Layer 2 的 `_compress_content_pass()` 中。
 
-**入口**: `_handle_messages()` 中段 (line 3071-3102)
+**入口**: `_handle_messages()` 中段
 
 ### 4.1 日期标准化 (Date Normalization)
 
@@ -299,33 +375,18 @@ After:  "Today's date is DATE_PLACEHOLDER."
 
 ### 4.2 Thinking Block 清除
 
-**核心函数**: `strip_old_thinking_blocks()` (line 1530)
+**核心函数**: `strip_old_thinking_blocks()` (line 1715)
 
 **原理**: Qwen 模型在 assistant 消息中产生 `thinking`/`reasoning_content` blocks，占据大量 token 但对后续推理无价值。
 
+**Frozen Zone 保护**:
+扫描所有消息但只清除 `dynamic zone` (messages[PROXY_FROZEN_HEAD:]) 中的 thinking blocks。Frozen Zone 内的 thinking blocks 不受影响，确保 prefix cache 稳定性。
+
 **处理**:
-- 保留最近 3 条 assistant 消息的 thinking blocks
-- 清除更早的 thinking blocks
+- 仅扫描 dynamic zone 中的 assistant 消息
+- 保留最近 3 条 dynamic zone thinking（最旧的一条优先被清除）
+- Frozen Zone 内的 thinking 永不触及
 - 返回 (messages, stats)
-
-### 4.3 Cleared Tool-Result 压缩
-
-**核心函数**: `compress_cleared_tool_results()` (line 1616)
-
-**原理**: 连续多个 `[cleared: ...]` 的 user 消息可以合并为单条消息，减少消息数和 JSON 结构开销。
-
-**示例**:
-```
-Before (4 messages):
-  assistant: [tool_use: Read("a.py")]
-  user: [tool_result: [cleared: Read("a.py")]]
-  assistant: [tool_use: Read("b.py")]
-  user: [tool_result: [cleared: Read("b.py")]]
-
-After (2 messages):
-  assistant: [tool_use: Read("a.py")], [tool_use: Read("b.py")]
-  user: [tool_result: [cleared: Read("a.py")]], [tool_result: [cleared: Read("b.py")]]
-```
 
 ---
 
@@ -333,7 +394,7 @@ After (2 messages):
 
 **职责**: 当消息总量超过预算时，主动截断旧消息并生成压缩摘要。
 
-**核心函数**: `truncate_messages_if_needed()` (line 1106)
+**核心函数**: `truncate_messages_if_needed()` (line 1227)
 
 ### 5.1 三种策略
 
@@ -345,49 +406,52 @@ After (2 messages):
 
 ### 5.2 Rounds 策略详解
 
+Round 策略由 lifecycle stage 的 `truncate_rounds` 字段驱动。当 `_classify_lifecycle_stage()` 判定进入 EXPANSION 阶段 (chars ≥ `PROXY_CHARS_EXPANSION`, 默认 90K) 时启用。
+
 ```
 输入: 93 条消息
   │
-  ├─ 1. Token 预算检查: chars × ratio > budget?
-  │     budget = PROXY_CTX_TOKEN_BUDGET (默认 30000)
-  │     ratio = PROXY_CTX_TOKEN_RATIO (默认 2.0)
+   ├─ 1. Char 预算检查: total_chars > PROXY_CHARS_EXPANSION?
+   │     低于预算 → 跳过截断
+   │     超过预算 → 进入截断流程
   │
-  ├─ 2. 自适应保留轮数: _compute_adaptive_rounds()
-  │     base = PROXY_CTX_KEEP_ROUNDS (默认 10)
-  │     +1: user 消息含 error/traceback
-  │     +1: assistant 消息含 >2 个 Write/Edit
-  │     上限: base × 2
+   ├─ 2. 保留轮数: 优先使用 stage_config["truncate_rounds"]
+   │     ├─ INIT/GROWTH: None → 跳过截断
+   │     ├─ EXPANSION/SATURATION: PROXY_CTX_KEEP_ROUNDS (10)
+   │     ├─ OOM_DANGER: 3
+   │     └─ PRE_TRUNC: 2
+   │     无 stage 值时 fallback 到自适应 _compute_adaptive_rounds()
+   │
+   ├─ 3. 消息分离:
+   │     HEAD (前 PROXY_CTX_KEEP_HEAD 条, system context) — 固定保留
+   │     TAIL (最近 N 轮 assistant 对话) — 保留
+   │     MIDDLE (其余) — 被截断
   │
-  ├─ 3. 消息分离:
-  │     HEAD (前2条, system context) — 固定保留
-  │     TAIL (最近 N 轮 assistant 对话) — 保留
-  │     MIDDLE (其余) — 被截断
-  │
-  ├─ 4. 三级压缩链 (MIDDLE → 压缩摘要):
-  │     ├─ Level 1: 增量压缩 (_incremental_compress)
-  │     │   ├─ 检查 _summary_cache 命中?
-  │     │   ├─ 命中: 只压缩新增消息 → 合并缓存摘要
-  │     │   └─ 未命中: 走全量压缩
-  │     ├─ Level 2: LLM 压缩 (_compress_middle_with_llm)
-  │     │   ├─ dropped >= 10 条时触发
-  │     │   ├─ 调用本地 LLM 生成结构化摘要
-  │     │   └─ 30s 超时，失败降级
-  │     ├─ Level 3: 规则压缩 (_extract_middle_summary_rules)
-  │     │   ├─ 提取: 错误/代码变更/文件状态/决策
-  │     │   └─ 结构化 XML 输出
-  │     └─ Level 4: 静态折叠
-  │         └─ "[Context folded: N messages dropped]"
+   ├─ 4. 三级压缩链 (MIDDLE → 压缩摘要):
+   │     ├─ Level 1: 增量压缩 (_incremental_compress)
+   │     │   ├─ 检查 session 级 _summary_cache 命中?
+   │     │   ├─ 命中: 只压缩新增消息 → 合并缓存摘要
+   │     │   └─ 未命中: 走后续 fallback
+   │     ├─ Level 2: LLM 压缩 (_compress_middle_with_llm)
+   │     │   ├─ dropped >= 10 条时触发
+   │     │   ├─ 调用本地 LLM 生成结构化摘要
+   │     │   └─ 30s 超时，失败降级
+   │     ├─ Level 3: 规则压缩 (_extract_middle_summary_rules)
+   │     │   ├─ 提取: 错误/代码变更/文件状态/决策
+   │     │   └─ 结构化文本输出
+   │     └─ Level 4: 静态折叠
+   │         └─ "[Context folded: N messages dropped]"
   │
   ├─ 5. 关键词索引注入 (P1-1)
   │     ├─ 从 dropped 消息提取: 文件名/错误类型/函数名
   │     └─ 在 TAIL 中子串匹配 → 注入相关历史
   │
-  └─ 6. 重组: HEAD + 摘要消息 + TAIL
+  └─ 6. 重组: HEAD + 摘要消息 + Read 保留 + TAIL
 ```
 
 ### 5.3 增量压缩 (Incremental Compress)
 
-**核心函数**: `_incremental_compress()` (line 1063)
+**核心函数**: `_incremental_compress()` (line 1172)
 
 **原理**: 避免每次全量重压缩。维护会话级摘要缓存 `_summary_cache`。
 
@@ -410,7 +474,7 @@ Session 第 5 次请求:
 
 ### 5.4 LLM 压缩
 
-**核心函数**: `_compress_middle_with_llm()` (line 948)
+**核心函数**: `_compress_middle_with_llm()` (line 1057)
 
 **调用方式**: `POST /chat/completions` 到本地后端 (同模型)
 
@@ -428,15 +492,19 @@ Session 第 5 次请求:
 
 ### 5.5 配置参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| 参数 | 默认值 (local/cloud) | 说明 |
+|------|---------------------|------|
 | `PROXY_CTX_LIMIT_ENABLED` | true (local) / false (cloud) | 截断开关 |
 | `PROXY_CTX_TRUNCATE_STRATEGY` | char | 截断策略: rounds / fifo / char |
-| `PROXY_CTX_KEEP_ROUNDS` | 10 | Rounds 策略保留轮数 |
-| `PROXY_CTX_TOKEN_BUDGET` | 30000 | Token 预算上限 (rounds) |
-| `PROXY_CTX_TOKEN_RATIO` | 2.0 | 字符→token 估算比率 |
+| `PROXY_CTX_KEEP_ROUNDS` | 10 | Rounds 策略保留轮数（EXPANSION/SATURATION） |
+| `PROXY_CTX_KEEP_HEAD` | 2 | FIFO/char 保留头部消息数 |
+| `PROXY_CTX_KEEP_TAIL` | 4 | FIFO/char 保留尾部消息数 |
 | `PROXY_CTX_KEEP_MESSAGES` | 40 | FIFO 策略保留消息数 |
-| `PROXY_CTX_CHARS_LIMIT` | 180000 | Char 策略字符上限 |
+| `PROXY_CHARS_EXPANSION` | 90000 / 200000 | **Char 预算** — 触发截断的字符阈值 |
+| `PROXY_CHARS_SATURATION` | 180000 / 500000 | SATURATION 阈值 (fallback: `PROXY_CTX_CHARS_LIMIT`) |
+| `PROXY_CTX_TOKEN_BUDGET` | 30000 | ⚠️ Deprecated — 用 `PROXY_CHARS_EXPANSION` |
+| `PROXY_CTX_TOKEN_RATIO` | 2.0 | ⚠️ 仅估算辅助，不用于阈值比较 |
+| `PROXY_CTX_CHARS_LIMIT` | 180000 / 500000 | ⚠️ Deprecated — 用 `PROXY_CHARS_SATURATION` |
 | `PROXY_HISTORY_INDEX` | rule | 关键词索引模式: off / rule |
 | `PROXY_HISTORY_TOP_K` | 5 | 注入关键词条目数 |
 | `PROXY_HISTORY_MAX_CHARS` | 500 | 注入文本最大字符数 |
@@ -447,7 +515,7 @@ Session 第 5 次请求:
 
 **职责**: 将 Anthropic 格式转换为 OpenAI 格式，优化工具定义，发送到后端。
 
-**入口**: `_handle_messages()` 后段 (line 3152-3222)
+**入口**: `_handle_messages()` 后段 (line 3528-3584)
 
 ### 6.1 工具定义过滤 (Tool Filter)
 
@@ -521,7 +589,7 @@ urllib.request.urlopen(
 
 ### 7.1 流式响应 (Streaming)
 
-**函数**: `Handler._handle_streaming_response()` (line 3265)
+**函数**: `Handler._handle_streaming_response()` (line 3600+)
 
 **SSE 事件序列**:
 ```
@@ -542,7 +610,7 @@ event: message_stop       → 消息结束
 
 ### 7.2 非流式响应 (Non-Streaming)
 
-**函数**: `Handler._handle_non_streaming_response()` (line 3224)
+**函数**: `Handler._handle_non_streaming_response()` (line 3598)
 
 **处理**: 一次性读取完整响应 → `convert_openai_response_to_anthropic()` → 返回 JSON。
 
@@ -563,7 +631,7 @@ max_tokens (请求值)
 
 ### 7.4 JSON 修复
 
-**函数**: `_repair_truncated_json()` (line 284)
+**函数**: `_repair_truncated_json()` (line 282)
 
 **场景**: FORCE_STOPPED 截断了 tool_call 的 arguments JSON（如 `"file_path": "/src/boar`）。
 
@@ -571,7 +639,7 @@ max_tokens (请求值)
 
 ### 7.5 XML→JSON 回退
 
-**函数**: `parse_tool_arguments()` (line 338)
+**函数**: `parse_tool_arguments()` (line 336)
 
 **场景**: Qwen 模型偶尔以 XML 格式输出 tool_call 参数，而非标准 JSON。
 
@@ -661,57 +729,57 @@ max_tokens (请求值)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `convert_anthropic_messages_to_openai()` | 1715 | Anthropic 消息 → OpenAI 消息 |
-| `convert_anthropic_tools_to_openai()` | 571 | Anthropic 工具 → OpenAI 工具 |
-| `convert_anthropic_tool_choice_to_openai()` | 600 | Anthropic tool_choice → OpenAI |
-| `convert_openai_response_to_anthropic()` | 1794 | OpenAI 响应 → Anthropic 响应 |
-| `parse_tool_arguments()` | 338 | JSON/XML/混合 → dict |
-| `_extract_content_tool_calls()` | 417 | `<tools>` 文本提取 |
-| `_StreamingToolsExtractor` | 465 | 流式 `<tools>` 状态机 |
-| `_repair_truncated_json()` | 284 | 截断 JSON 修复 |
+| `convert_anthropic_messages_to_openai()` | 1683 | Anthropic 消息 → OpenAI 消息 |
+| `convert_anthropic_tools_to_openai()` | 540 | Anthropic 工具 → OpenAI 工具 |
+| `convert_anthropic_tool_choice_to_openai()` | 569 | Anthropic tool_choice → OpenAI |
+| `convert_openai_response_to_anthropic()` | 1758 | OpenAI 响应 → Anthropic 响应 |
+| `parse_tool_arguments()` | 336 | JSON/XML/混合 → dict |
+| `_extract_content_tool_calls()` | 415 | `<tools>` 文本提取 |
+| `_StreamingToolsExtractor` | 463 | 流式 `<tools>` 状态机 |
+| `_repair_truncated_json()` | 282 | 截断 JSON 修复 |
 
 ### 上下文管理 (Layer 2-5)
 
-| 函数 | 行号 | 用途 |
-|------|------|------|
-| `clear_old_tool_results()` | 658 | 语义优先级工具内容清除 |
-| `_generate_tool_summary()` | 643 | 确定性清除摘要 (Cache 友好) |
-| `_estimate_message_chars()` | 627 | 字符级 token 估算 |
-| `_compute_adaptive_rounds()` | 846 | 自适应保留轮数 |
-| `truncate_messages_if_needed()` | 1106 | 统一截断入口 |
-| `_apply_rounds_truncation()` | 1329 | Rounds 策略实现 |
-| `_compress_middle_with_llm()` | 948 | LLM 压缩摘要 |
-| `_extract_middle_summary_rules()` | 882 | 规则压缩摘要 |
-| `_incremental_compress()` | 1063 | 增量压缩 (缓存) |
-| `_merge_summaries_with_llm()` | 1030 | LLM 合并两个摘要 |
-| `_extract_keywords()` | 2626 | 关键词提取 (BM25 MVP) |
-| `_inject_keyword_context()` | 2667 | 关键词匹配注入 |
-| `strip_old_thinking_blocks()` | 1530 | Thinking block 清除 |
-| `compress_cleared_tool_results()` | 1616 | Cleared 消息合并 |
+| 函数 | 用途 |
+|------|------|
+| `_classify_lifecycle_stage()` | 统一 char 阈值阶段判定 → 返回 stage_config |
+| `_compress_content_pass()` | 合并 L2+L4 thinking 单次内容压缩 |
+| `clear_old_tool_results()` | 语义优先级工具内容清除（legacy） |
+| `_generate_tool_summary()` | 确定性清除摘要 (Cache 友好) |
+| `_estimate_message_chars()` | 字符级 token 估算 |
+| `truncate_messages_if_needed()` | 统一截断入口 (char-budget + keep_rounds) |
+| `_apply_rounds_truncation()` | Rounds 策略实现 |
+| `_extract_middle_summary_rules()` | 规则压缩摘要 |
+| `_compress_middle_with_llm()` | LLM 压缩摘要 |
+| `_merge_summaries_with_llm()` | LLM 合并两个摘要 |
+| `_incremental_compress()` | 增量压缩 (缓存) |
+| `_extract_keywords()` | 关键词提取 (TF-IDF MVP) |
+| `_inject_keyword_context()` | 关键词匹配注入 |
+| `strip_old_thinking_blocks()` | Thinking block 清除（legacy） |
 
 ### 检测与干预 (Layer 3)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `_detect_blocker_pattern()` | 1229 | 连续错误检测 |
-| `_build_blocker_message()` | 1307 | 阻塞干预消息生成 |
+| `_detect_blocker_pattern()` | 1354 | 连续错误检测 |
+| `_build_blocker_message()` | 1437 | 阻塞干预消息生成 |
 
 ### 工具过滤 (Layer 6)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `_filter_tools()` | 2591 | 动态工具定义过滤 |
+| `_filter_tools()` | 2732 | 动态工具定义过滤 |
 
 ### 可观测性 (Layer 8)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `log()` | 232 | 文本日志输出 |
-| `log_request()` | 178 | JSONL 请求日志 |
-| `log_metrics()` | 221 | JSONL Metrics 日志 |
-| `_finalize_metrics()` | 2555 | 质量标记生成 |
-| `_mc_put()` | 2585 | Metrics 数据安全追加 |
-| `_build_status_html()` | 2313 | 状态页面 HTML |
+| `log()` | 309 | 文本日志输出 |
+| `log_request()` | 236 | JSONL 请求日志 |
+| `log_metrics()` | 279 | JSONL Metrics 日志 |
+| `_finalize_metrics()` | 2696 | 质量标记生成 |
+| `_mc_put()` | 2726 | Metrics 数据安全追加 |
+| `_build_status_html()` | 2453 | 状态页面 HTML |
 
 ---
 
@@ -725,10 +793,11 @@ max_tokens (请求值)
   ├─ Layer 2: Error translation
   │   2 条 tool_result 错误翻译为中文提示
   │
-  ├─ Layer 2: Tool clearing
+  ├─ Layer 2: Content compression (_compress_content_pass)
   │   37 个 tool_result 清除, 释放 12000 chars
   │   Read("board.js") → [cleared: Read("board.js")]\nimport React... (200 chars preview)
   │   cleared_files = {"board.js", "utils.py", ...}
+  │   3 条旧 thinking blocks 剥离
   │
   ├─ Layer 3: Loop detection
   │   max_run = 2 (< threshold=3, 不触发)
@@ -742,21 +811,9 @@ max_tokens (请求值)
   ├─ Layer 4: Date normalization
   │   "2026/06/05" → "DATE_PLACEHOLDER"
   │
-  ├─ Layer 4: Thinking strip
-  │   清除 3 条旧 thinking blocks
-  │
-  ├─ Layer 4: Cleared compression
-  │   合并 2 个连续 cleared 循环, 减少 4 条消息
-  │
   ├─ Layer 5: Rounds truncation
-  │   Token 预算: 43160 × 2.0 = 86320 > 30000 → 触发
-  │   自适应轮数: base=10 + 1(error) = 11
-  │   分离: HEAD(2) + MIDDLE(61) + TAIL(26)
-  │   增量压缩: cache miss → 全量压缩
-  │     → dropped=61 >= 10 → LLM 压缩 → 生成结构化摘要
-  │   关键词索引: 提取 "board.js", "TypeError" 等 → 无匹配(不在 TAIL 中)
-  │   重组: 2 + 1(摘要) + 26 = 29 条
-  │   Token 估算: ~27000 < 30000 ✓
+  │   Lifecycle stage: EXPANSION (chars=43160, budget=PROXY_CHARS_EXPANSION=90000)
+  │   → 低于 budget，跳过截断
   │
   ├─ Layer 6: Tool filter
   │   44 → 15 tools (保留白名单 + 最近使用)
@@ -903,6 +960,8 @@ max_tokens (请求值)
 | `PROXY_CLEAR_THRESHOLD` | 15000 / 30000 | 字符阈值 |
 | `PROXY_TOOL_KEEP` | 2 / 10 | 保留数量 |
 | `PROXY_REREAD_PREVIEW_CHARS` | 200 | Read 预览长度 |
+| `PROXY_FROZEN_HEAD` | 12 / 0 | Frozen Zone 保护前 N 条消息 |
+| `PROXY_CLEAR_TAIL_FIRST` | true | 尾优先清除 |
 | `PROXY_CONTENT_TOOLS_FALLBACK` | true | `<tools>` 回退 |
 
 #### 循环与阻塞检测
@@ -915,17 +974,46 @@ max_tokens (请求值)
 | `PROXY_BLOCKER_ENABLED` | true / false | 阻塞检测开关 |
 | `PROXY_BLOCKER_THRESHOLD` | 2 | 连续错误阈值 |
 
+#### 统一生命周期阶段阈值 (char-based)
+
+> **所有空间阈值统一使用 `_estimate_message_chars()` 为度量。**
+> 阈值严格递增，保证报文增长时压缩力度单调加强。
+
+| 参数 | 默认 (local/cloud) | 阶段 | 自动启用的策略 |
+|------|-------------------|------|--------------|
+| `PROXY_CLEAR_THRESHOLD` | 15000 / 30000 | INIT→GROWTH | L2 尾 40% 清除 |
+| `PROXY_CHARS_GROWTH` | 40000 / 80000 | GROWTH→EXPANSION | L2 尾 60% + L4 thinking keep=5 |
+| `PROXY_CHARS_EXPANSION` | 90000 / 200000 | EXPANSION→SATURATION | L2 全动态 + L4 keep=3 + L5 截断 |
+| `PROXY_CHARS_SATURATION` | 180000 / 500000 | SATURATION→OOM_DANGER | Frozen 缩半 + 高丢率通知 |
+| `PROXY_CHARS_OOM_DANGER` | 350000 / 1000000 | OOM_DANGER→PRE_TRUNC | Frozen=0 + hard truncation keep=3 |
+| `PROXY_PRE_TRUNCATE_CHARS` | 400000 / — | PRE_TRUNC | keep_rounds=2 + OOM Safety |
+
+**生命周期阶梯**:
+
+```
+chars →    15K       40K        90K        180K       350K     400K
+           │         │          │           │          │        │
+Stage:   INIT     GROWTH    EXPANSION   SATURATION  OOM_DANGER  PRE_TRUNC
+L2+L4:   跳过    尾40%清除   尾60%清除+   全dynamic+   全量+      全量+
+                 (无think)  think=5    think=3     think=1    think=1
+L5截断:   关       关       预算触发    rounds=8   rounds=3  rounds=2
+Frozen:   全12     12条       12条        6条         0条       0条
+```
+L5截断:   关       关       预算触发    rounds=8   rounds=3  rounds=2
+Frozen:   全12     12条       12条        6条         0条       0条
+```
+
 #### 上下文截断
 
 | 参数 | 默认 (local/cloud) | 说明 |
 |------|-------------------|------|
 | `PROXY_CTX_LIMIT_ENABLED` | true / false | 截断开关 |
 | `PROXY_CTX_TRUNCATE_STRATEGY` | char | 策略选择 |
-| `PROXY_CTX_KEEP_ROUNDS` | 10 | Rounds 保留轮数 |
-| `PROXY_CTX_TOKEN_BUDGET` | 30000 | Token 预算 |
-| `PROXY_CTX_TOKEN_RATIO` | 2.0 | 字符/token 比率 |
-| `PROXY_CTX_KEEP_MESSAGES` | 40 | FIFO 保留数 |
-| `PROXY_CTX_CHARS_LIMIT` | 180000 / 500000 | Char 上限 |
+| `PROXY_CTX_KEEP_ROUNDS` | 8 | Rounds 保留轮数 |
+| `PROXY_CTX_TOKEN_BUDGET` | 30000 | ⚠️ Deprecated — 使用 PROXY_CHARS_EXPANSION |
+| `PROXY_CTX_TOKEN_RATIO` | 2.0 | 字符/token 比率（仅估算辅助） |
+| `PROXY_CTX_KEEP_MESSAGES` | 30 | FIFO 保留数 |
+| `PROXY_CTX_CHARS_LIMIT` | 150000 / 500000 | ⚠️ Deprecated — 使用 PROXY_CHARS_SATURATION |
 
 #### 工具过滤
 

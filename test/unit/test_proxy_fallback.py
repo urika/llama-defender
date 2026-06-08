@@ -610,6 +610,8 @@ class TestToolClearing(unittest.TestCase):
             patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0),
             patch.object(proxy, "PROXY_TOOL_KEEP", 2),
             patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
+            # Frozen Zone disabled for backward-compatible tests
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 0),
         ]
         for p in self._patches:
             p.start()
@@ -1942,80 +1944,6 @@ class TestThinkingBlocks(unittest.TestCase):
         self.assertNotIn("<thinking>", msg["content"])
 
 
-class TestPureToolUseMsg(unittest.TestCase):
-    def test_pure_tool_use(self):
-        msg = {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]}
-        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
-
-    def test_mixed_text_and_tool(self):
-        msg = {"role": "assistant", "content": [
-            {"type": "text", "text": "let me read"},
-            {"type": "tool_use", "name": "Read", "input": {}},
-        ]}
-        self.assertFalse(proxy._is_pure_tool_use_msg(msg))
-
-    def test_non_assistant_role(self):
-        msg = {"role": "user", "content": [{"type": "tool_use", "name": "Read", "input": {}}]}
-        self.assertFalse(proxy._is_pure_tool_use_msg(msg))
-
-    def test_empty_content(self):
-        msg = {"role": "assistant", "content": []}
-        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
-
-    def test_dict_content_tool_use(self):
-        msg = {"role": "assistant", "content": {"type": "tool_use", "name": "Read"}}
-        self.assertTrue(proxy._is_pure_tool_use_msg(msg))
-
-
-class TestClearedToolResultMsg(unittest.TestCase):
-    def test_cleared_prefix(self):
-        msg = {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(file.py)]"}]}
-        self.assertTrue(proxy._is_cleared_tool_result_msg(msg))
-
-    def test_normal_tool_result(self):
-        msg = {"role": "user", "content": [{"type": "tool_result", "content": "file contents here"}]}
-        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
-
-    def test_mixed_cleared_and_normal(self):
-        msg = {"role": "user", "content": [
-            {"type": "tool_result", "content": "[cleared: Read(a)]"},
-            {"type": "text", "text": "hello"},
-        ]}
-        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
-
-    def test_non_user_role(self):
-        msg = {"role": "assistant", "content": [{"type": "tool_result", "content": "[cleared: Read(x)]"}]}
-        self.assertFalse(proxy._is_cleared_tool_result_msg(msg))
-
-
-class TestCompressClearedToolResults(unittest.TestCase):
-    def test_short_messages_passthrough(self):
-        msgs = [{"role": "user", "content": "hi"}]
-        result, stats = proxy.compress_cleared_tool_results(msgs)
-        self.assertEqual(len(result), 1)
-        self.assertFalse(stats.get("merged", False))
-
-    def test_merges_consecutive_cleared_cycles(self):
-        msgs = [
-            {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(a)]"}]},
-            {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Bash(ls)]"}]},
-        ]
-        result, stats = proxy.compress_cleared_tool_results(msgs)
-        self.assertTrue(stats.get("merged"))
-        self.assertEqual(stats["merged_cycles"], 1)
-        self.assertLess(len(result), len(msgs))
-
-    def test_single_cycle_no_merge(self):
-        msgs = [
-            {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "content": "[cleared: Read(a)]"}]},
-        ]
-        result, stats = proxy.compress_cleared_tool_results(msgs)
-        self.assertFalse(stats.get("merged", False))
-
-
 class TestDedup(unittest.TestCase):
     def test_first_request_passes(self):
         proxy._DEDUP_CACHE.clear()
@@ -2185,6 +2113,304 @@ class TestWriteSimilarityLoopKey(unittest.TestCase):
         key_1 = f"{name}:{args_1}"
         key_2 = f"{name}:{args_2}"
         self.assertEqual(key_1, key_2)
+
+
+class TestFrozenZoneToolClearing(unittest.TestCase):
+    """Tests for Frozen Zone protection in clear_old_tool_results.
+
+    When PROXY_FROZEN_HEAD > 0 (default 12 for local), the first N
+    messages must NEVER be modified by L2 clearing. Only tool_results
+    in the dynamic zone (messages[PROXY_FROZEN_HEAD:]) are eligible.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
+            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0),
+            patch.object(proxy, "PROXY_TOOL_KEEP", 2),
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 12),
+            patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _msgs_with_frozen(self, n_frozen_reads=3, n_dynamic_reads=6):
+        """Build messages with some in the Frozen Zone and some in dynamic."""
+        msgs = []
+        # Frozen zone reads (should NEVER be cleared)
+        for i in range(n_frozen_reads):
+            path = f"/frozen/file_{i}.py"
+            content = f"FROZEN_{i}_MARKER " + "frozen data here. " * 15  # ~300 chars
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": f"tu_f{i}",
+                              "name": "Read", "input": {"file_path": path}}],
+            })
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": f"tu_f{i}",
+                              "content": content}],
+            })
+        # Pad some non-tool messages to fill up to PROXY_FROZEN_HEAD
+        filler_needed = proxy.PROXY_FROZEN_HEAD - len(msgs)
+        for i in range(filler_needed):
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "text", "text": f"filler message {i}"}],
+            })
+        # Dynamic zone reads (eligible for clearing)
+        for i in range(n_dynamic_reads):
+            path = f"/dynamic/file_{i}.py"
+            content = f"DYNAMIC_{i}_MARKER " + "dynamic data here. " * 20  # ~400 chars
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": f"tu_d{i}",
+                              "name": "Read", "input": {"file_path": path}}],
+            })
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": f"tu_d{i}",
+                              "content": content}],
+            })
+        return msgs
+
+    def test_frozen_zone_tool_results_untouched(self):
+        """Frozen zone Read results are NEVER cleared. Only dynamic zone
+        tool_results are eligible."""
+        msgs = self._msgs_with_frozen(n_frozen_reads=3, n_dynamic_reads=6)
+        # Total: 3 frozen reads + 12 filler + 6 dynamic reads = 21 messages
+        # KEEP=2 → only 2 dynamic tool_results survive
+        result, stats = proxy.clear_old_tool_results(msgs)
+        self.assertTrue(stats["cleared"])
+        self.assertEqual(stats["frozen_used"], 12)
+
+        # Check frozen zone tool_results still have their original content
+        for i in range(3):
+            user_msg_idx = 2 * i + 1  # assistant + user per read
+            block = result[user_msg_idx]["content"][0]
+            content = str(block.get("content", ""))
+            self.assertIn(f"FROZEN_{i}_MARKER", content,
+                          f"Frozen zone Read #{i} was incorrectly cleared")
+            self.assertNotIn("[cleared:", content,
+                             f"Frozen zone Read #{i} has [cleared:] marker")
+
+    def test_dynamic_zone_cleared(self):
+        """Dynamic zone tool_results are cleared as expected, leaving
+        only KEEP=2 surviving."""
+        msgs = self._msgs_with_frozen(n_frozen_reads=3, n_dynamic_reads=6)
+        result, stats = proxy.clear_old_tool_results(msgs)
+
+        # Count cleared items in dynamic zone
+        dynamic_cleared = 0
+        for idx, m in enumerate(result):
+            if idx < proxy.PROXY_FROZEN_HEAD:
+                continue  # skip frozen zone
+            content = m.get("content", "")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        c = str(b.get("content", ""))
+                        if c.startswith("[cleared:"):
+                            dynamic_cleared += 1
+
+        # 6 dynamic reads, KEEP=2 → at least 4 cleared
+        self.assertGreaterEqual(dynamic_cleared, 4,
+                                "Expected at least 4 dynamic tool_results cleared")
+
+    def test_frozen_zone_reduced_on_few_dynamic(self):
+        """When dynamic zone has too few tool_results, frozen_head should
+        be reduced to allow some clearing."""
+        msgs = self._msgs_with_frozen(n_frozen_reads=3, n_dynamic_reads=1)
+        # Only 1 dynamic Read + KEEP=2 → not enough
+        result, stats = proxy.clear_old_tool_results(msgs)
+        # Should have skipped (reason: few_tool_results) OR reduced frozen
+        # Either way, at least frozen zone is partially protected
+        self.assertIn("frozen_head", stats)
+        self.assertIn("frozen_used", stats)
+
+    def test_frozen_zero_clears_all(self):
+        """When PROXY_FROZEN_HEAD=0, all tool_results are eligible."""
+        with patch.object(proxy, "PROXY_FROZEN_HEAD", 0):
+            msgs = self._msgs_with_frozen(n_frozen_reads=2, n_dynamic_reads=4)
+            result, stats = proxy.clear_old_tool_results(msgs)
+            self.assertEqual(stats["frozen_used"], 0)
+            # Total 6 reads, KEEP=2 → at least 4 cleared total
+            self.assertGreaterEqual(stats["cleared_tool_results"], 4)
+
+
+class TestFrozenZoneThinkingStrip(unittest.TestCase):
+    """Tests for Frozen Zone protection in strip_old_thinking_blocks.
+
+    Thinking blocks in the Frozen Zone must NEVER be stripped.
+    Only thinking content in messages[PROXY_FROZEN_HEAD:] is eligible.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 12),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _build_msgs_with_thinking(self, n_frozen=4, n_dynamic=8):
+        """Build messages with thinking blocks in frozen and dynamic zones."""
+        msgs = []
+        # Frozen zone: assistant msgs with thinking
+        for i in range(n_frozen):
+            msgs.append({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": f"frozen thinking {i}"},
+                    {"type": "text", "text": f"Frozen response {i}"},
+                ],
+            })
+        # Fillers to reach PROXY_FROZEN_HEAD
+        while len(msgs) < proxy.PROXY_FROZEN_HEAD:
+            msgs.append({"role": "user", "content": [{"type": "text", "text": "filler"}]})
+        # Dynamic zone: assistant msgs with thinking
+        for i in range(n_dynamic):
+            msgs.append({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": f"dynamic thinking {i}"},
+                    {"type": "text", "text": f"Dynamic response {i}"},
+                ],
+            })
+        return msgs
+
+    def _has_thinking(self, msg):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for b in content:
+                if b.get("type") == "thinking":
+                    return True
+        return False
+
+    def test_frozen_zone_thinking_preserved(self):
+        """Frozen zone thinking blocks survive strip_old_thinking_blocks."""
+        msgs = self._build_msgs_with_thinking(n_frozen=4, n_dynamic=8)
+        result, stats = proxy.strip_old_thinking_blocks(msgs, keep_recent=3)
+        self.assertTrue(stats["stripped"])
+        # All frozen zone messages should still have thinking
+        for i in range(4):
+            self.assertTrue(self._has_thinking(result[i]),
+                            f"Frozen zone msg {i} had thinking stripped")
+        # Some dynamic zone thinking should be stripped
+        dynamic_stripped = 0
+        for i in range(proxy.PROXY_FROZEN_HEAD, len(result)):
+            if not self._has_thinking(result[i]):
+                dynamic_stripped += 1
+        self.assertGreater(dynamic_stripped, 0,
+                           "Expected some dynamic thinking stripped")
+
+    def test_dynamic_keeps_recent_thinking(self):
+        """The most recent `keep_recent` dynamic thinking messages survive."""
+        msgs = self._build_msgs_with_thinking(n_frozen=4, n_dynamic=5)
+        result, stats = proxy.strip_old_thinking_blocks(msgs, keep_recent=2)
+        self.assertTrue(stats["stripped"])
+        # Find dynamic messages with thinking still present
+        dynamic_thinking_alive = 0
+        for i in range(proxy.PROXY_FROZEN_HEAD, len(result)):
+            if self._has_thinking(result[i]):
+                dynamic_thinking_alive += 1
+        # At most keep_recent=2 should survive in dynamic
+        self.assertGreaterEqual(dynamic_thinking_alive, 1)
+
+
+class TestLifecycleStage(unittest.TestCase):
+    """Tests for _classify_lifecycle_stage — unified char-based thresholds."""
+
+    def _msgs_chars(self, target_chars):
+        """Build message list with approximately target_chars total."""
+        msgs = []
+        remaining = target_chars
+        i = 0
+        while remaining > 0:
+            chunk = min(remaining, 5000)
+            msgs.append({
+                "role": "user",
+                "content": [{"type": "text", "text": "x" * chunk}],
+            })
+            remaining -= chunk
+            i += 1
+        return msgs
+
+    def test_init_stage(self):
+        """Below PROXY_CLEAR_THRESHOLD → stage=init, no compression."""
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000):
+            msgs = self._msgs_chars(10000)
+            stage = proxy._classify_lifecycle_stage(msgs)
+            self.assertEqual(stage["stage"], "init")
+            self.assertIsNone(stage["clear_zone_pct"])
+            self.assertIsNone(stage["truncate_rounds"])
+            self.assertFalse(stage["oom_safety"])
+
+    def test_growth_stage(self):
+        """PROXY_CLEAR_THRESHOLD ≤ chars < PROXY_CHARS_GROWTH → growth."""
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000):
+            with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000):
+                msgs = self._msgs_chars(25000)
+                stage = proxy._classify_lifecycle_stage(msgs)
+                self.assertEqual(stage["stage"], "growth")
+                self.assertEqual(stage["clear_zone_pct"], 0.4)
+                self.assertEqual(stage["thinking_keep"], 0)
+                self.assertIsNone(stage["truncate_rounds"])
+
+    def test_expansion_stage(self):
+        """PROXY_CHARS_GROWTH ≤ chars < PROXY_CHARS_EXPANSION → expansion."""
+        with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000):
+            with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000):
+                msgs = self._msgs_chars(60000)
+                stage = proxy._classify_lifecycle_stage(msgs)
+                self.assertEqual(stage["stage"], "expansion")
+                self.assertEqual(stage["clear_zone_pct"], 0.6)
+                self.assertEqual(stage["thinking_keep"], 5)
+                self.assertIsNotNone(stage["truncate_rounds"])
+
+    def test_saturation_stage(self):
+        """PROXY_CHARS_EXPANSION ≤ chars < PROXY_CHARS_SATURATION."""
+        with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000):
+            with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000):
+                msgs = self._msgs_chars(120000)
+                stage = proxy._classify_lifecycle_stage(msgs)
+                self.assertEqual(stage["stage"], "saturation")
+                self.assertEqual(stage["clear_zone_pct"], 1.0)
+
+    def test_oom_danger_stage(self):
+        """PROXY_CHARS_SATURATION ≤ chars < PROXY_CHARS_OOM_DANGER."""
+        with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000):
+            with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000):
+                msgs = self._msgs_chars(250000)
+                stage = proxy._classify_lifecycle_stage(msgs)
+                self.assertEqual(stage["stage"], "oom_danger")
+                self.assertEqual(stage["frozen_head"], 0)
+                self.assertEqual(stage["thinking_keep"], 1)
+                self.assertTrue(stage["oom_safety"])
+
+    def test_pre_trunc_stage(self):
+        """chars ≥ PROXY_CHARS_OOM_DANGER → pre_trunc."""
+        with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000):
+            msgs = self._msgs_chars(500000)
+            stage = proxy._classify_lifecycle_stage(msgs)
+            self.assertEqual(stage["stage"], "pre_trunc")
+            self.assertEqual(stage["truncate_rounds"], 2)
+
+    def test_stages_monotonic(self):
+        """Stage transitions are strictly monotonic: init→growth→expansion→saturation→oom_danger→pre_trunc."""
+        thresholds = [proxy.PROXY_CLEAR_THRESHOLD, proxy.PROXY_CHARS_GROWTH,
+                      proxy.PROXY_CHARS_EXPANSION, proxy.PROXY_CHARS_SATURATION,
+                      proxy.PROXY_CHARS_OOM_DANGER, proxy.PROXY_PRE_TRUNCATE_CHARS]
+        for i in range(len(thresholds) - 1):
+            self.assertLess(thresholds[i], thresholds[i + 1],
+                            f"Threshold {i} ({thresholds[i]}) >= threshold {i+1} ({thresholds[i+1]})")
 
 
 if __name__ == "__main__":

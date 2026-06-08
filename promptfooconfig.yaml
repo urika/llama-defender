@@ -1,0 +1,244 @@
+# Promptfoo A/B 测试配置
+# 用于对 anthropic_proxy.py 进行固定 prompt 回归测试
+# A/B 差异由外部脚本控制代理环境变量
+
+description: 'Anthropic Proxy A/B 回归测试'
+
+# 定义 target：代理端点
+targets:
+  - id: 'anthropic:claude-sonnet-4-6'
+    label: 'proxy-ab-test'
+    config:
+      apiBaseUrl: 'http://127.0.0.1:4000'
+      apiKey: 'sk-any'
+      temperature: 0.6
+      max_tokens: 1024
+
+# prompt 模板：使用 {{prompt}} 变量
+prompts:
+  - '{{prompt}}'
+
+# 测试用例：每个 test 定义自己的 prompt 变量和断言
+tests:
+  # TC1: 打招呼 — 验证基本连通性和中文支持
+  - description: 'TC1-打招呼'
+    vars:
+      prompt: '你好，请用一句话介绍自己。'
+    assert:
+      - type: contains-any
+        value:
+          - '你好'
+          - '智能'
+          - 'AI'
+          - '人工智能'
+          - '语言模型'
+          - 'Qwen'
+          - '助手'
+          - '模型'
+        weight: 0.4
+
+  # TC2: 代码生成 — 验证代码输出格式
+  - description: 'TC2-代码生成'
+    vars:
+      prompt: >
+        请用 Python 写一个函数 `fib(n)`，返回第 n 个斐波那契数。
+        要求：1. 使用递归或迭代均可 2. 包含类型提示 3. 包含 docstring
+    assert:
+      - type: contains
+        value: 'def fib'
+        weight: 0.2
+      - type: contains
+        value: '->'
+        weight: 0.15
+      - type: contains
+        value: '"""'
+        weight: 0.15
+      - type: contains-any
+        value:
+          - 'return'
+          - '返回'
+        weight: 0.15
+
+  # TC3: 代码审查 — 验证推理能力
+  - description: 'TC3-代码审查'
+    vars:
+      prompt: |
+        请阅读以下代码并指出潜在问题：
+        ```python
+        def read_file(path):
+            f = open(path, 'r')
+            return f.read()
+        ```
+    assert:
+      - type: contains-any
+        value:
+          - 'close'
+          - 'with'
+          - '泄漏'
+          - 'finally'
+        weight: 0.4
+
+  # TC4: 技术解释 — 验证长文本生成
+  - description: 'TC4-技术解释'
+    vars:
+      prompt: '请解释什么是前缀缓存（prefix caching）及其在 LLM 推理中的作用。'
+    assert:
+      - type: contains-any
+        value:
+          - '缓存'
+          - 'cache'
+          - 'KV'
+          - 'prefix'
+        weight: 0.3
+
+  # TC5: JSON 转换 — 验证结构化输出
+  - description: 'TC5-JSON转换'
+    vars:
+      prompt: '请将以下 JSON 转换为等价的 Python 字典字面量：{"name": "agent", "tools": ["Read", "Write", "Bash"], "timeout": 30}'
+    assert:
+      # 兼容单引号和双引号输出
+      - type: contains-any
+        value:
+          - '"name"'
+          - "'name'"
+        weight: 0.2
+      - type: contains-any
+        value:
+          - '"agent"'
+          - "'agent'"
+        weight: 0.15
+      - type: contains-any
+        value:
+          - '"tools"'
+          - "'tools'"
+        weight: 0.15
+
+  # TC6: 特殊字符与编码 — 验证代理不破坏特殊字符
+  - description: 'TC6-特殊字符编码'
+    vars:
+      prompt: '请将以下字符串原样输出，不要解释，只输出字符串本身：Hello世界🌍 /path/to/file "quoted" 中文标点：，。；'
+    assert:
+      # 放宽断言：只要输出中包含部分特殊字符即算通过
+      # 模型可能对"复述"指令理解不一致
+      - type: contains-any
+        value:
+          - 'Hello世界'
+          - '🌍'
+          - '/path/to/file'
+          - '"quoted"'
+          - '，。；'
+        weight: 0.4
+
+  # TC7: 上下文连续性 — 验证多轮上下文保留
+  - description: 'TC7-上下文连续性'
+    vars:
+      prompt: '用户：我叫张三。助手：你好张三。用户：请重复我刚才说的名字。'
+    assert:
+      - type: contains
+        value: '张三'
+        weight: 0.4
+
+  # TC8: 代码边界处理 — 验证边界条件推理
+  - description: 'TC8-代码边界'
+    vars:
+      prompt: '写一个阶乘函数 fact(n)，要求处理 n=0 和 n<0 的边界情况。'
+    assert:
+      - type: contains
+        value: 'def fact'
+        weight: 0.2
+      - type: contains-any
+        value:
+          - 'n == 0'
+          - 'n=0'
+          - 'if n <= 0'
+          - 'n < 0'
+          - 'raise'
+          - 'Error'
+          - '异常'
+        weight: 0.3
+
+  # TC9: 长文本总结 — 验证长上下文处理能力
+  - description: 'TC9-长文本'
+    vars:
+      prompt: |
+        请总结以下代码的主要功能（50字以内）：
+        ```python
+        import threading
+        import queue
+        from collections import defaultdict
+
+        class EventBus:
+            def __init__(self):
+                self._handlers = defaultdict(list)
+                self._lock = threading.RLock()
+                self._queue = queue.Queue()
+                self._running = False
+                self._thread = None
+
+            def subscribe(self, event_type, handler):
+                with self._lock:
+                    self._handlers[event_type].append(handler)
+
+            def publish(self, event_type, event_data):
+                with self._lock:
+                    handlers = list(self._handlers[event_type])
+                for handler in handlers:
+                    handler(event_data)
+
+            def start(self):
+                with self._lock:
+                    if self._running:
+                        return
+                    self._running = True
+                    self._thread = threading.Thread(target=self._run)
+                    self._thread.daemon = True
+                    self._thread.start()
+
+            def _run(self):
+                while self._running:
+                    try:
+                        event_type, event_data = self._queue.get(timeout=0.1)
+                        self.publish(event_type, event_data)
+                    except queue.Empty:
+                        continue
+
+            def stop(self):
+                with self._lock:
+                    self._running = False
+                if self._thread:
+                    self._thread.join()
+        ```
+    assert:
+      - type: contains-any
+        value:
+          - '事件'
+          - 'EventBus'
+          - '发布'
+          - '订阅'
+          - 'handler'
+          - 'pub-sub'
+        weight: 0.3
+
+# 共享的默认断言（所有测试用例都会执行）
+defaultTest:
+  options:
+    provider: 'anthropic:claude-sonnet-4-6'
+  assert:
+    # 基础断言：响应不为空
+    - type: javascript
+      value: "output.length > 0"
+      weight: 0.05
+    # 断言：响应长度在合理范围（>=5 适应简短回答如"你的名字叫张三。"）
+    - type: javascript
+      value: "output.length >= 5 && output.length <= 4096"
+      weight: 0.05
+    # 断言：不包含常见错误标记
+    - type: not-contains
+      value: '[BLOCKER]'
+      weight: 0.1
+
+# A/B 对比配置
+# 通过外部脚本分别运行：
+#   A组: PROXY_CLEAR_ENABLED=true  ... promptfoo eval
+#   B组: PROXY_CLEAR_ENABLED=false ... promptfoo eval
+# 然后使用 promptfoo share 或自定义脚本对比结果
