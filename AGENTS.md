@@ -254,7 +254,7 @@ Switching between local and cloud models is done by:
 The proxy processes every request through an 8-layer pipeline (documented in
 `docs/02-architecture-design/proxy-pipeline-reference.md`):
 
-1. **Request Entry** (`Handler.do_POST`) — routing, JSON parse, session tracking, metrics init
+1. **Request Entry** (`Handler.do_POST`) — routing, header masking, request dedup, JSON parse, session tracking, metrics init
 2. **Semantic Preprocessing** — error translation, tool-result clearing, placeholder preservation
 3. **Loop & Blocker Guard** — exact/pattern loop detection, escalating intervention, re-read detection
 4. **Cache Optimizer** — date normalization, thinking clearing, cleared-content compression
@@ -307,6 +307,7 @@ Environment variables:
 | `PROXY_BACKEND_TIMEOUT` | `300` | Backend request timeout in seconds |
 | `PROXY_PRE_TRUNCATE_CHARS` | `400000` | Pre-truncate very large payloads to prevent OOM/timeout |
 | `PROXY_RETRY_AFTER_SECONDS` | `30` | Retry-After header value (seconds) for 503/504 responses |
+| `PROXY_DEDUP_WINDOW` | `2` | Deduplication window (seconds) for detecting duplicate POST requests via body hash |
 
 ### Proxy-side error classification and retry (DEF-001)
 
@@ -425,6 +426,10 @@ When a loop is detected, it applies 3 levels of intervention:
 - **Tool IDs**: Some backends omit `tool_call_id` in streaming; the proxy
   generates synthetic IDs (`call_<hex>`) to satisfy Anthropic SDK requirements.
 - **Error translation**: Known backend error patterns (`Wasted call`, `File does not exist`, `InputValidationError`) are rewritten into natural-language Chinese hints with solution suggestions.
+- **Request deduplication** (`_check_dedup`, DEF-205): Hash-based dedup with `PROXY_DEDUP_WINDOW` (default 2s) window. Duplicate POSTs receive 429 + Retry-After. Prevents double-forwarding from client retries.
+- **Sensitive header masking** (`_mask_sensitive`, DEF-302): `Authorization` and `X-Api-Key` headers are automatically masked (first 8 + last 4 chars) in all log output. Prevents API key leakage to log files.
+- **Context-loss notice** (DEF-107): When truncation drops > 85% of messages, a `[System: Context severely truncated]` user message is injected to warn the model that earlier context is lost.
+- **Tool filter observability** (DEF-104): `_filter_tools()` logs the `filtered_out` field (sorted list of removed tool names) for debugging whitelist effectiveness.
 
 ---
 
@@ -682,6 +687,9 @@ for agent context:
 - In **cloud mode**, the proxy forwards the **real `LLAMA_API_KEY`** to the cloud
   API provider. Ensure `LLAMA_API_KEY` is properly protected (e.g., via env vars,
   not hard-coded in config files checked into git).
+- **Sensitive header masking** (DEF-302): `_mask_sensitive()` automatically redacts
+  `Authorization` and `X-Api-Key` headers in all log output, displaying them as
+  `sk-123456****wxyz` (first 8 + last 4 chars).
 
 ---
 

@@ -86,20 +86,83 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [0.5.1-progress] - 2026-06-08
+
+### Status: P0 修复冲刺中（v0.6.0 前置）
+
+**范围**: 6 个 commit，修复/缓解 12 项缺陷（7 项完全修复 + 5 项部分修复）。
+
+### Fixed
+
+#### P0-Critical（7 项中 3 项完全修复，4 项部分修复）
+- **DEF-001** 🟡 — 500 错误率缓解：预截断 (400K chars) + 503/504/499 错误分类 + Retry-After header + BrokenPipe→499 client_closed
+- **DEF-002** 🟡 — 循环检测大修：移除 LOOP_CONSECUTIVE 双重计数（tail 扫描替代全量继承）+ 新增 Level 3（强制纯文本）+ Level 2 多工具移除 + `_LOOP_SESSION_STATE` 跨请求持久化
+- **DEF-003** ✅ — re_read_rate 公式修正：`re_read_files / cleared_files * 100`，cap 100%。新增 `pipeline.re_read` 指标 + 5 个单测
+- **DEF-004** ✅ — 工具过滤 recent 扫描验证非 bug：增强 observability（recent_tools 名称列表 + scanned_assistant 轮数）
+- **DEF-005** 🟡 — OOM 缓解：`PROXY_OOM_SAFE_TOKENS=60000`，pipeline 后二次 token 检查（含 system prompt），超限强制 FIFO 截断
+- **DEF-006** 🟡 — Kernel Panic 防御：`manage.sh` 启动前 sanity check，`--gpu-memory-utilization >0.85` 拒绝启动，`>0.80` 警告
+- **DEF-007** ✅ — Chat template 工具化：`manage.sh fix-template <dir>` 一键修复 + 启动时自动检测 HuggingFace 缓存中的模板
+
+#### P1-High（3 项完全修复 + 1 项部分修复）
+- **DEF-101** ✅ — BrokenPipe/ConnectionResetError → 499 (client_closed)，不再返回 500
+- **DEF-102** ✅ — fifo 策略确认为有意配置（利于 prefix cache 稳定，Plan 2D）
+- **DEF-106** 🟡 — 非流式路径 JSON 修复：force_stopped 时回溯原始 tool_calls，调用 `_repair_truncated_json()`
+- **DEF-108** ✅ — Blocker 触发修复：Pipeline 顺序修正（blocker detection 移到 tool-result clearing 之前），清除操作不再覆盖错误标记
+
+#### P2-Medium（4 项修复 + 1 项缓解）
+- **DEF-202** ✅ — Bash dedup 跳过 `[cleared:...]` 内容，防止已清空结果反复触发 Jaccard 匹配
+- **DEF-204** ✅ — `/status` 端点不再产生日志噪音（GET /status 跳过 header logging）
+- **DEF-205** ✅ — 请求去重：`_check_dedup()` 基于 body hash + `PROXY_DEDUP_WINDOW`(2s) 窗口，重复请求返回 429 + Retry-After
+- **DEF-104** 🟡 — 工具过滤日志增加 `filtered_out` 字段（被移除的工具名称排序列表），提升可观测性
+- **DEF-107** 🟡 — 截断丢弃率 > 85% 时注入 `[System: Context severely truncated]` 通知
+
+#### P3-Low（2 项修复）
+- **DEF-302** ✅ — `_mask_sensitive()` 自动脱敏 `Authorization` / `X-Api-Key` 日志（首8+末4字符）
+- **DEF-305** ✅ — `manage.sh start-cloud` 新增云 API `/models` 健康检查
+
+### Added
+- **Promptfoo 回归测试** (`promptfooconfig.yaml` + `tools/promptfoo_eval.sh`): 9 个固定 prompt 自动验证核心能力，集成到 `test/run_tests.sh --promptfoo`
+- **pre-commit 分层触发**: 代理运行时自动跑 Promptfoo 快速模式（5 个核心测试），未运行时仅跑 unit tests
+- **Langfuse sidecar** (`langfuse/docker-compose.yml`): 旁路观测基础设施就绪
+
+### Changed
+- **单元测试**: 78 → **124 cases**（+46），全部通过
+- **DEFECT-LIST.md**: 更新修复状态统计（11 已修复 / 7 部分修复 / 12 未修复）
+
+### Metrics (snapshot at 0.5.1-progress)
+
+| 指标 | 数值 |
+|------|------|
+| 总 commits | 39 (+6) |
+| 代码行数 (`anthropic_proxy.py`) | ~3,700 (+~90) |
+| 单元测试 | 124 cases (+46) |
+| 缺陷修复 | 12 项（7 完全 + 5 部分） |
+| Promptfoo 回归测试 | 9 cases |
+
+---
+
 ## Future Releases
 
 ### [Unreleased] - target v0.6.0
 
-**主题**: P0 缺陷修复 + Langfuse 集成
+**主题**: P0 遗留验证 + Langfuse 上线 + 剩余 P1/P2 修复
 
 待办 (来自 DEFECT-LIST):
-- ~~- 修复 DEF-001 (500 错误率降至 < 2%)~~ → **已部分修复**: 预截断 + `_classify_exception` (503/504/500) + `Retry-After` header (详见 AGENTS.md "Proxy-side error classification and retry")
-- 修复 DEF-002 (循环注入率降至 < 20%)
-- 修复 DEF-003 (re_read_rate 公式)
-- 修复 DEF-004 (工具过滤 recent 扫描)
-- 修复 DEF-005 至 DEF-007
+- ~~DEF-001~~ 🟡 部分修复 — 需生产验证 500 错误率 < 2%
+- ~~DEF-002~~ 🟡 部分修复 — 需生产验证 loop_injected < 20%；Write 内容相似度检测未实施
+- ~~DEF-003~~ ✅ 已修复
+- ~~DEF-004~~ ✅ 已验证
+- ~~DEF-005~~ 🟡 已缓解 — 需生产验证 OOM 减少
+- ~~DEF-006~~ 🟡 已缓解 — 建议升级 rapid-mlx v0.6.71
+- ~~DEF-007~~ ✅ 已修复
 - 部署 Langfuse sidecar (3000 端口)
 - 实施 `docs/proxy-prefix-cache-design.md` Phase 1-2
+- 修复 DEF-107 (high_drop_ratio 干预)
+- 修复 DEF-104 (白名单自动扩展)
+- ~~DEF-204~~ ✅ 已修复
+- ~~DEF-205~~ ✅ 已修复
+- ~~DEF-302~~ ✅ 已修复
+- ~~DEF-305~~ ✅ 已修复
 
 ### [Unreleased] - target v1.0.0
 

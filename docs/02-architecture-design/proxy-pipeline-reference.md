@@ -87,7 +87,9 @@ Claude Code (Anthropic SDK)
 do_POST()
   ├─ 解析 session_id (X-Claude-Code-Session-Id header, 前8位)
   ├─ 初始化 _metrics_ctx.mc (结构化 metrics dict)
+  ├─ Headers 日志脱敏 _mask_sensitive() (DEF-302)
   ├─ 读取 + 解析 JSON body
+  ├─ 请求去重检查 _check_dedup(body) → 429 (重复请求, DEF-205)
   ├─ 写入 /tmp/anthropic_request_body.json (调试)
   ├─ 调用 _handle_messages(body)          ← 核心管线
   ├─ 成功: log_request() + log_metrics()
@@ -115,6 +117,7 @@ _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 |------|---------------------|------|
 | `PROXY_MAX_CONCURRENT` | 1 / 4 | 最大并发请求数 |
 | `PROXY_BACKEND_TIMEOUT` | 300 | 后端超时(秒) |
+| `PROXY_DEDUP_WINDOW` | 2 | 请求去重时间窗口(秒) |
 
 ---
 
@@ -639,7 +642,7 @@ max_tokens (请求值)
 **质量标记自动生成**:
 | Flag | 触发条件 |
 |------|---------|
-| `high_drop_ratio` | dropped / (dropped + kept) > 0.7 |
+| `high_drop_ratio` | dropped / (dropped + kept) > 0.7; 当 > 0.85 时注入 `[System: Context severely truncated]` 通知 (DEF-107) |
 | `llm_compress_failed` | 压缩方式为 rules/folded 且 dropped >= 10 |
 | `budget_overflow` | 截断后估算 token > budget × 1.1 |
 | `loop_injected` | loop_detect.max_run >= threshold |
