@@ -13,6 +13,7 @@ test/
 │   └── test_proxy_fallback.py
 ├── integration/                # boots a mock backend, no real LLM, ~5s
 │   ├── test_blocker_integration.sh
+│   ├── test_loop_integration.sh
 │   └── mock_backend.py         # shared OpenAI-compatible mock fixture
 ├── e2e/                        # requires a running proxy + backend, ~30-60s
 │   ├── test_proxy_integration.py

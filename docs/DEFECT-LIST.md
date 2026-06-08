@@ -257,13 +257,13 @@
 | **新增覆盖** | 1) Level 1/2/3 循环检测升级 ✅<br>2) 跨请求 session 持久化 ✅<br>3) 阈值以下无干预 ✅ |
 | **剩余** | 1) Write 内容相似度 99% 重复循环<br>2) Level 2 后用 Bash 重新循环<br>3) 更复杂的跨请求降级场景 |
 
-### DEF-210: 文档与代码脱节
+### DEF-210: 文档与代码脱节 — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | 多文档交叉检查 |
-| **具体脱节** | 1) `proxy-context-window-design.md` 称 `rounds` 为主策略,但生产跑的是 `fifo` (DEF-102)<br>2) `system-requirements-analysis.md` 100% 覆盖率,实际 re-read 监控失效 (DEF-003)<br>3) `AGENTS.md` 列出 25+ 参数,但 docs 中未给出推荐组合<br>4) `PRD-anthropic-proxy.md` v3.0 中"Phase 5 测试"声称三层测试体系完成,但 unit test 仅 44 case,实际覆盖率不足 (DEF-208) |
-| **修复建议** | 1) 文档与代码双重维护机制<br>2) CI 中添加文档/代码一致性检查 |
+| **已修复** | 1) `PRD` unit test 数量更新 (28→167)<br>2) `test/README.md` 添加 `test_loop_integration.sh` |
+| **剩余** | 1) `proxy-context-window-design.md` 仍以 `rounds` 为主策略,生产跑 `fifo` (DEF-102)<br>2) `system-requirements-analysis.md` 100% 覆盖率未标注 DEF-003 修复<br>3) `AGENTS.md` 25+ 参数缺少推荐组合 |
 
 ---
 

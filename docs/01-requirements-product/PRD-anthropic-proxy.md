@@ -618,7 +618,7 @@ _extract_content_tool_calls (line 417)  # 非流式
 5. **Re-read 硬拦截** (U5): 流式响应中拦截重复 Read
 6. **自适应参数** (U4): 基于 Metrics 自动调阈值
 7. **BM25 Phase 2** (U1 前置): Bigram 分词 + 倒排索引
-8. 扩展测试覆盖 (当前仅 28 个 unit test)
+8. 扩展测试覆盖 (当前 167 个 unit test, 从 28 持续增长)
 
 ### 长期 (探索, 季度级)
 9. **多模型协同** (U6): 9B 做压缩,35B 做主推理
