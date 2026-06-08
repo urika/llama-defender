@@ -172,8 +172,7 @@ TOOL_ALWAYS_KEEP = {
     "EnterPlanMode", "ExitPlanMode",
     "AskUserQuestion",
 }
-TOOL_AUTO_PROMOTE_THRESHOLD = int(os.environ.get("TOOL_AUTO_PROMOTE_THRESHOLD", "3"))
-_tool_freq = {}
+
 
 # ---------------------------------------------------------------------------
 # Keyword index (BM25 MVP): extract keywords from dropped messages and
@@ -2739,13 +2738,7 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
             if assistant_count >= recent_rounds:
                 break
 
-    for t in tools:
-        if isinstance(t, dict):
-            name = t.get("name", "")
-            _tool_freq[name] = _tool_freq.get(name, 0) + 1
-    auto_keep = {name for name, count in _tool_freq.items() if count >= TOOL_AUTO_PROMOTE_THRESHOLD}
-
-    keep_set = TOOL_ALWAYS_KEEP | recent_tools | auto_keep
+    keep_set = TOOL_ALWAYS_KEEP | recent_tools
     if tool_choice_name:
         keep_set.add(tool_choice_name)
 
@@ -2758,6 +2751,7 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
         return tools, {"filtered": False, "reason": "too_few_after_filter"}
 
     if len(kept) < PROXY_TOOL_FILTER_MAX:
+        kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
         remaining = sorted(
             [t for t in tools if isinstance(t, dict) and t.get("name", "") not in kept_names],
             key=lambda t: t.get("name", "")
@@ -2765,8 +2759,9 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
         kept.extend(remaining[:PROXY_TOOL_FILTER_MAX - len(kept)])
         kept.sort(key=lambda t: t.get("name", ""))
 
-    all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
+
+    all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     filtered_out = sorted(all_names - kept_names)
 
     return kept, {
@@ -3479,7 +3474,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # DEF-005: OOM safety — if estimated tokens still exceed safe limit after
         # all pipeline steps, force aggressive FIFO truncation to prevent Metal OOM.
-        if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD:
+        if PROXY_OOM_SAFE_TOKENS > 0 and not IS_CLOUD and PROXY_CTX_TRUNCATE_STRATEGY != "rounds":
             _sys = body.get("system")
             _tools = body.get("tools")
             static_chars = 0

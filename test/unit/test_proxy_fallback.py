@@ -1178,8 +1178,6 @@ class TestToolFilter(unittest.TestCase):
     aggressive filter falls back to the full list."""
 
     def setUp(self):
-        # Lower the threshold so small tests can still exercise the
-        # filter path without building 44+ tool definitions.
         self._patches = [
             patch.object(proxy, "PROXY_TOOL_FILTER_MAX", 5),
         ]
