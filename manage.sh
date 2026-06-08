@@ -1003,6 +1003,8 @@ cmd_watchdog() {
     local threshold="${WATCHDOG_TOK_THRESHOLD:-15}"
     local consecutive_fail=0
     local max_fail="${WATCHDOG_MAX_FAIL:-3}"
+    local restart_count=0
+    local restart_window=$(date +%s)
 
     info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
     info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
@@ -1010,10 +1012,22 @@ cmd_watchdog() {
     while true; do
         sleep "$interval"
 
+        local now
+        now=$(date +%s)
+        if (( now - restart_window > 3600 )); then
+            restart_count=0
+            restart_window=$now
+        fi
+
         local pid
         if ! pid=$(_get_pid 2>/dev/null); then
+            if (( restart_count >= 6 )); then
+                error "每小时重启超过 6 次，停止 watchdog"
+                break
+            fi
             warn "后端未运行,尝试重启..."
             cmd_restart
+            restart_count=$((restart_count + 1))
             consecutive_fail=0
             continue
         fi
@@ -1024,8 +1038,13 @@ cmd_watchdog() {
             consecutive_fail=$((consecutive_fail + 1))
             warn "后端健康检查失败 ($consecutive_fail/$max_fail)"
             if (( consecutive_fail >= max_fail )); then
+                if (( restart_count >= 6 )); then
+                    error "每小时重启超过 6 次，停止 watchdog"
+                    break
+                fi
                 error "后端连续 $max_fail 次无响应,自动重启"
                 cmd_restart
+                restart_count=$((restart_count + 1))
                 consecutive_fail=0
             fi
             continue
@@ -1039,8 +1058,13 @@ cmd_watchdog() {
             tok_s=$(echo "$metrics_line" | grep -oE '[0-9]+\.[0-9]+ tok/s' | grep -oE '[0-9]+\.[0-9]+' | tail -1)
             if [[ -n "$tok_s" ]]; then
                 if (( $(echo "$tok_s < $threshold" | bc -l 2>/dev/null || echo 0) )); then
+                    if (( restart_count >= 6 )); then
+                        error "每小时重启超过 6 次，停止 watchdog"
+                        break
+                    fi
                     warn "性能衰减: ${tok_s} tok/s < ${threshold} tok/s,重启后端..."
                     cmd_restart
+                    restart_count=$((restart_count + 1))
                 fi
             fi
         fi

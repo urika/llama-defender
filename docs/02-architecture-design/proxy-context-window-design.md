@@ -97,6 +97,10 @@ Claude Code 发送 93 条消息
 
 ### 3.2 算法流程
 
+> **当前生产配置**: `PROXY_CTX_TRUNCATE_STRATEGY=fifo` (DEF-102)。`rounds` 策略已完整实现，
+> 但因 turn boundary 不稳定导致 prefix cache 命中率下降，暂时未启用。下文以 `rounds` 为
+> 主进行设计说明，`fifo` 策略见 § 3.4。
+
 不新增独立函数，而是**增强现有 `truncate_messages_if_needed`**，添加 `rounds` 截断策略。
 
 ```python

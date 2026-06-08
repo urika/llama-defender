@@ -172,6 +172,8 @@ TOOL_ALWAYS_KEEP = {
     "EnterPlanMode", "ExitPlanMode",
     "AskUserQuestion",
 }
+TOOL_AUTO_PROMOTE_THRESHOLD = int(os.environ.get("TOOL_AUTO_PROMOTE_THRESHOLD", "3"))
+_tool_freq = {}
 
 # ---------------------------------------------------------------------------
 # Keyword index (BM25 MVP): extract keywords from dropped messages and
@@ -375,13 +377,13 @@ def _extract_xml_tool_name(raw: str) -> str:
 
 
 def _repair_truncated_json(raw: str) -> str:
-    """Attempt to repair truncated JSON by closing open strings/braces."""
+    """Attempt to repair truncated JSON by closing open strings/braces/brackets."""
     if not raw or not raw.strip():
         return "{}"
     s = raw.strip()
     in_string = False
     escape_next = False
-    depth = 0
+    bracket_stack = []
     i = 0
     while i < len(s):
         c = s[i]
@@ -401,16 +403,18 @@ def _repair_truncated_json(raw: str) -> str:
         if in_string:
             i += 1
             continue
-        if c in ('{', '['):
-            depth += 1
+        if c == '{':
+            bracket_stack.append('}')
+        elif c == '[':
+            bracket_stack.append(']')
         elif c in ('}', ']'):
-            depth -= 1
+            if bracket_stack:
+                bracket_stack.pop()
         i += 1
     if in_string:
         s += '"'
-    while depth > 0:
-        s += '}'
-        depth -= 1
+    while bracket_stack:
+        s += bracket_stack.pop()
     return s
 
 
@@ -728,6 +732,8 @@ def _estimate_message_chars(messages):
                     total += len(block.get("text", ""))
                 elif block.get("type") == "tool_result":
                     total += len(str(block.get("content", "")))
+                elif block.get("type") == "tool_use":
+                    total += len(json.dumps(block.get("input", {}), ensure_ascii=False))
         else:
             total += len(str(content))
     return total
@@ -2733,7 +2739,13 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
             if assistant_count >= recent_rounds:
                 break
 
-    keep_set = TOOL_ALWAYS_KEEP | recent_tools
+    for t in tools:
+        if isinstance(t, dict):
+            name = t.get("name", "")
+            _tool_freq[name] = _tool_freq.get(name, 0) + 1
+    auto_keep = {name for name, count in _tool_freq.items() if count >= TOOL_AUTO_PROMOTE_THRESHOLD}
+
+    keep_set = TOOL_ALWAYS_KEEP | recent_tools | auto_keep
     if tool_choice_name:
         keep_set.add(tool_choice_name)
 
@@ -2744,6 +2756,14 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
 
     if len(kept) < 5:
         return tools, {"filtered": False, "reason": "too_few_after_filter"}
+
+    if len(kept) < PROXY_TOOL_FILTER_MAX:
+        remaining = sorted(
+            [t for t in tools if isinstance(t, dict) and t.get("name", "") not in kept_names],
+            key=lambda t: t.get("name", "")
+        )
+        kept.extend(remaining[:PROXY_TOOL_FILTER_MAX - len(kept)])
+        kept.sort(key=lambda t: t.get("name", ""))
 
     all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
@@ -3245,6 +3265,10 @@ class Handler(BaseHTTPRequestHandler):
                         tool_names_in_msg.append(name)
                         inp = block.get("input", {})
                         args_str = json.dumps(inp, sort_keys=True, ensure_ascii=False) if isinstance(inp, dict) else str(inp)
+                        if name in ("Write", "Edit") and isinstance(inp, dict):
+                            fp = inp.get("file_path") or inp.get("path") or ""
+                            if fp:
+                                args_str = f"file={fp}"
                         key = f"{name}:{args_str}"
                         consecutive[key] = consecutive.get(key, 0) + 1
                         max_run = max(max_run, consecutive[key])
@@ -3437,6 +3461,9 @@ class Handler(BaseHTTPRequestHandler):
                     est_chars += sum(len(b.get("text", "")) for b in _sys if b.get("type") == "text")
                 else:
                     est_chars += len(str(_sys))
+            _tools = body.get("tools")
+            if _tools:
+                est_chars += sum(len(json.dumps(t, ensure_ascii=False)) for t in _tools if isinstance(t, dict))
             est_tokens = int(est_chars / PROXY_CTX_TOKEN_RATIO)
             if est_tokens > PROXY_OOM_SAFE_TOKENS:
                 keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 10)

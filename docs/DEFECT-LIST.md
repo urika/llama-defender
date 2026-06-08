@@ -39,7 +39,7 @@
 | **影响** | 用户感知: 22% 的请求直接失败,agent 行为中断 |
 | **根因分析** | 极可能 `truncate_messages_if_needed` / `_handle_messages` 处理大 payload 时抛异常未被捕获 |
 | **修复建议** | 1) 在 `_handle_messages` 入口添加 try/except 兜底<br>2) 对 input_chars > 400K 的请求提前截断<br>3) 单元测试添加大 payload 场景 |
-| **已实施修复** | **Part A** (commit 9758a6c): `PROXY_PRE_TRUNCATE_CHARS=400000` 预截断 + `do_POST` try/except 兜底<br>**Part B**: `_respond_json` 替换 `raise`,返回结构化 JSON 500<br>**Part C**: `_classify_exception()` 错误分类 (OOM→503, timeout→504, programming→500) + `Retry-After` header + `retryable` 字段<br>**测试**: 10 个新单元测试 (`TestClassifyException`) + 3 个预截断测试 (`TestDef001PreTruncation`) |
+| **已实施修复** | **Part A**: `PROXY_PRE_TRUNCATE_CHARS=400000` 预截断 + `do_POST` try/except 兜底<br>**Part B**: `_respond_json` 替换 `raise`,返回结构化 JSON 500<br>**Part C**: `_classify_exception()` 错误分类 (OOM→503, timeout→504, programming→500) + `Retry-After` header<br>**Part D**: `_estimate_message_chars` 增加 `tool_use` input 和 tool schema 字符估算 |
 | **剩余工作** | 1) 生产环境验证 500 错误率是否降至 < 2%<br>2) 根因仍可能是 `_handle_messages` 内部逻辑错误,预截断仅为缓解措施 |
 
 ### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环 — 🟡 部分修复
@@ -51,7 +51,7 @@
 | **根因** | 1) **LOOP_CONSECUTIVE 双重计数**: 继承上次请求计数 + 重新扫描全部消息 → max_run 虚高 (3→38)<br>2) **无 Level 3**: Level 2 只移除一个工具,模型切换到其他工具继续循环<br>3) **Level 2 单工具移除**: 只移除第一个高计数工具,其余循环工具保留<br>4) **跨请求状态丢失**: 每次请求从 Level 0 开始 |
 | **已实施修复** | **修复 1**: 移除 LOOP_CONSECUTIVE 继承,改为 tail 扫描 (最后 15 条 assistant 消息),消除双重计数<br>**修复 2**: 新增 Level 3 (`PROXY_LOOP_LEVEL3=9`): 移除全部工具,强制纯文本响应<br>**修复 3**: Level 2 改为 multi-tool: 移除所有达阈值的工具 (而非仅第一个)<br>**修复 4**: `_LOOP_SESSION_STATE` 跨请求持久化: 记住 session 的 loop level,下次请求自动注入警告<br>**新增常量**: `PROXY_LOOP_LEVEL3` (默认 9), `_LOOP_SESSION_STATE` |
 | **新增测试** | `TestLoopInterventionEnhanced` (5 个: Level 3, multi-tool L2, threshold 默认值, 单工具 L2, 无双重计数) |
-| **遗留** | 1) Write 内容相似度检测未实施 (Jaccard > 0.8)<br>2) 生产环境验证 loop_injected 率是否下降<br>3) tail 窗口大小 (15) 可能需根据实际效果调整 |
+| **遗留** | 1) 生产环境验证 loop_injected 率是否下降<br>2) tail 窗口大小 (15) 可能需根据实际效果调整 |
 
 ### DEF-003: re_read_rate 计算公式错误 (2862%, 3271%) — ✅ 已修复
 
@@ -134,8 +134,8 @@
 | **数据源** | git commit `8ce382e` "extend TOOL_ALWAYS_KEEP with newer Claude Code tools" |
 | **现象** | Claude Code 升级后,新工具未在白名单 → 被过滤 → 调用失败 → 用户报告 → 添加白名单 |
 | **影响** | 1) 每次 Claude Code 更新都可能引入新工具失败<br>2) 修复方式为被动扩展,无主动发现机制 |
-| **已缓解** | 工具过滤日志新增 `filtered_out` 字段,记录被过滤的工具名称列表。可通过日志快速发现需要添加的新工具 |
-| **剩余风险** | 仍需人工根据日志添加到 TOOL_ALWAYS_KEEP |
+| **已缓解** | 1) 工具过滤日志新增 `filtered_out` 字段,记录被过滤的工具名称列表<br>2) `_tool_freq` 跨请求频率计数: 使用 ≥3 次的工具自动加入 keep 集合 (`TOOL_AUTO_PROMOTE_THRESHOLD=3`) |
+| **剩余风险** | 首次使用的工具仍可能被过滤 (需 3 次请求后自动保留) |
 
 ### DEF-105: 集成测试空 session_id 失败 — ✅ 已修复
 
@@ -149,7 +149,8 @@
 | 项 | 内容 |
 |------|------|
 | **已修复** | 非流式路径新增 JSON 修复: `force_stopped` 时回溯 OpenAI 原始 `tool_calls` 参数,对截断 JSON 调用 `_repair_truncated_json()` 修复后重新解析 |
-| **遗留** | 1) 根因是 rapid-mlx 忽略 max_tokens (v0.6.30 bug), 需升级到 v0.6.71<br>2) 流式路径已有修复 (line 3591), 非流式现已补齐 |
+| **已增强** | `_repair_truncated_json` 改用 `bracket_stack` 跟踪开闭括号类型,正确处理 `[]` 截断 (之前只会 `}}`) |
+| **遗留** | 根因是 rapid-mlx 忽略 max_tokens (v0.6.30 bug), 需升级到 v0.6.71 |
 
 ### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高 — 🟡 已缓解
 
@@ -197,8 +198,8 @@
 | **数据源** | `docs/prompt-instability-mechanism-analysis.md` |
 | **现象** | 44 → 12 tools 后,前缀哈希变化,prefix cache miss |
 | **根因** | `_filter_tools()` 按输入顺序保留工具,当不同请求过滤掉不同工具时,保留的工具列表顺序不同,prefix cache 失效 |
-| **修复** | `kept` 列表按工具名字母排序 (`sorted(key=lambda t: t.get("name", ""))`)，确保相同工具集合始终产生相同前缀 |
-| **剩余** | 工具集合不同时 (如 recent_tools 变化) 仍会 miss;需生产数据验证排序后 cache 命中率提升 |
+| **修复** | 1) `kept` 列表按工具名字母排序 (`sorted(key=lambda t: t.get("name", ""))`)<br>2) 补齐到 `PROXY_TOOL_FILTER_MAX` 个工具 (低优先级工具填充),减少工具数变化频率 |
+| **剩余** | 工具集合完全不同时 (新 session) 仍会 miss |
 
 ### DEF-204: 状态页 `/status` 被高频轮询 — ✅ 已修复
 
@@ -232,7 +233,7 @@
 |------|------|
 | **数据源** | `optimization-log-20260603.md` § 4.2 + BENCHMARK.md |
 | **现象** | 运行 7 分钟后生成速度从 56 → 12 tok/s (衰减 78%) |
-| **修复** | 新增 `./manage.sh watchdog` 命令: 每 60s 检查后端健康 + 解析日志中 tok/s,低于阈值(默认 15 tok/s)时自动 `restart`。可通过 `WATCHDOG_INTERVAL`/`WATCHDOG_TOK_THRESHOLD`/`WATCHDOG_MAX_FAIL` 环境变量配置 |
+| **修复** | 新增 `./manage.sh watchdog` 命令: 每 60s 检查后端健康 + 解析日志中 tok/s,低于阈值(默认 15 tok/s)时自动 `restart`。每小时最多重启 6 次,防止无限循环 |
 | **剩余** | watchdog 需在独立终端运行 (非 daemon);tok/s 解析依赖日志格式 |
 
 ### DEF-208: 单元测试覆盖不足 (44 个 case) — 🟡 进行中
@@ -240,9 +241,9 @@
 | 项 | 内容 |
 |------|------|
 | **数据源** | `test/unit/test_proxy_fallback.py` |
-| **现状** | **167 tests**, 全部通过, 0.01s (从 44 增长至 167) |
-| **新增覆盖** | `_mask_sensitive`, `convert_anthropic_tools_to_openai`, `convert_anthropic_tool_choice_to_openai`, `_has_thinking_content`, `_strip_thinking_from_msg`, `_is_pure_tool_use_msg`, `_is_cleared_tool_result_msg`, `compress_cleared_tool_results`, `_check_dedup`, `_filter_tools` sorting |
-| **剩余** | `convert_anthropic_messages_to_openai`, `_extract_middle_summary_rules`, `_compute_adaptive_rounds`, `strip_old_thinking_blocks` 等函数仍未覆盖 |
+| **现状** | **181 tests**, 全部通过 (从 44 增长至 181) |
+| **新增覆盖** | `convert_anthropic_messages_to_openai` (7), `_repair_truncated_json` brackets (4), `_estimate_message_chars` tool_use (2), Write similarity key (1) |
+| **剩余** | `_extract_middle_summary_rules`, `_compute_adaptive_rounds`, `strip_old_thinking_blocks`, `_extract_xml_params` 等函数仍未覆盖 |
 
 ### DEF-209: 集成测试 5 个场景未实际覆盖 — 🟡 进行中
 

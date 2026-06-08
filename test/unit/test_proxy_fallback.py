@@ -2064,5 +2064,130 @@ class TestFilterToolsSorting(unittest.TestCase):
             proxy.TOOL_ALWAYS_KEEP.update(original_keep)
 
 
+class TestConvertAnthropicMessagesToOpenAI(unittest.TestCase):
+    def test_plain_text_user_message(self):
+        msgs = [{"role": "user", "content": "hello"}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertEqual(result[0]["content"], "hello")
+
+    def test_plain_text_assistant_message(self):
+        msgs = [{"role": "assistant", "content": "hi there"}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "assistant")
+        self.assertEqual(result[0]["content"], "hi there")
+
+    def test_tool_use_message(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/foo/bar.py"}}
+        ]}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "assistant")
+        self.assertIn("tool_calls", result[0])
+        self.assertEqual(result[0]["tool_calls"][0]["function"]["name"], "Read")
+
+    def test_tool_result_message(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "file contents here"}
+        ]}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertTrue(any(m["role"] == "tool" for m in result))
+        tool_msg = [m for m in result if m["role"] == "tool"][0]
+        self.assertEqual(tool_msg["tool_call_id"], "tu_1")
+        self.assertEqual(tool_msg["content"], "file contents here")
+
+    def test_mixed_text_and_tool_use(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "text", "text": "Let me read that file."},
+            {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/a.py"}}
+        ]}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "assistant")
+        self.assertIn("content", result[0])
+        self.assertIn("tool_calls", result[0])
+        self.assertEqual(result[0]["content"], "Let me read that file.")
+
+    def test_string_content_fallback(self):
+        msgs = [{"role": "user", "content": "just a string"}]
+        result = proxy.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(result[0]["content"], "just a string")
+
+    def test_empty_messages_list(self):
+        result = proxy.convert_anthropic_messages_to_openai([])
+        self.assertEqual(result, [])
+
+
+class TestRepairTruncatedJsonBrackets(unittest.TestCase):
+    def test_array_truncation(self):
+        result = proxy._repair_truncated_json('{"items": [1, 2, 3')
+        parsed = json.loads(result)
+        self.assertEqual(parsed["items"], [1, 2, 3])
+
+    def test_nested_mixed_truncation(self):
+        result = proxy._repair_truncated_json('{"a": [1, {"b": 2')
+        parsed = json.loads(result)
+        self.assertIsInstance(parsed["a"], list)
+        self.assertIsInstance(parsed["a"][1], dict)
+
+    def test_multiple_open_brackets(self):
+        result = proxy._repair_truncated_json('{"x": [[1, 2')
+        parsed = json.loads(result)
+        self.assertEqual(parsed["x"], [[1, 2]])
+
+    def test_already_complete_json(self):
+        original = '{"items": [1, 2, 3]}'
+        result = proxy._repair_truncated_json(original)
+        self.assertEqual(json.loads(result), json.loads(original))
+
+
+class TestEstimateMessageCharsToolUse(unittest.TestCase):
+    def test_counts_tool_use_input(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "/a.py", "content": "x" * 100}}
+        ]}]
+        result = proxy._estimate_message_chars(msgs)
+        self.assertGreater(result, 100)
+
+    def test_counts_all_block_types(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/x.py"}},
+            {"type": "tool_result", "content": "file content", "tool_use_id": "tu1"}
+        ]}]
+        result = proxy._estimate_message_chars(msgs)
+        self.assertGreater(result, 20)
+
+
+class TestWriteSimilarityLoopKey(unittest.TestCase):
+    def test_write_same_file_different_content_same_key(self):
+        import anthropic_proxy as proxy
+        msgs_1 = [{"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "/foo.py", "content": "v1"}}
+        ]}]
+        msgs_2 = [{"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "/foo.py", "content": "v2"}}
+        ]}]
+        inp_1 = msgs_1[0]["content"][0]["input"]
+        inp_2 = msgs_2[0]["content"][0]["input"]
+        args_1 = json.dumps(inp_1, sort_keys=True, ensure_ascii=False)
+        args_2 = json.dumps(inp_2, sort_keys=True, ensure_ascii=False)
+        name = "Write"
+        if name in ("Write", "Edit") and isinstance(inp_1, dict):
+            fp = inp_1.get("file_path") or inp_1.get("path") or ""
+            if fp:
+                args_1 = f"file={fp}"
+        if name in ("Write", "Edit") and isinstance(inp_2, dict):
+            fp = inp_2.get("file_path") or inp_2.get("path") or ""
+            if fp:
+                args_2 = f"file={fp}"
+        key_1 = f"{name}:{args_1}"
+        key_2 = f"{name}:{args_2}"
+        self.assertEqual(key_1, key_2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
