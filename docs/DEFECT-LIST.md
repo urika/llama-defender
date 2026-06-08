@@ -42,17 +42,16 @@
 | **已实施修复** | **Part A** (commit 9758a6c): `PROXY_PRE_TRUNCATE_CHARS=400000` 预截断 + `do_POST` try/except 兜底<br>**Part B**: `_respond_json` 替换 `raise`,返回结构化 JSON 500<br>**Part C**: `_classify_exception()` 错误分类 (OOM→503, timeout→504, programming→500) + `Retry-After` header + `retryable` 字段<br>**测试**: 10 个新单元测试 (`TestClassifyException`) + 3 个预截断测试 (`TestDef001PreTruncation`) |
 | **剩余工作** | 1) 生产环境验证 500 错误率是否降至 < 2%<br>2) 根因仍可能是 `_handle_messages` 内部逻辑错误,预截断仅为缓解措施 |
 
-### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环
+### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环 — 🟡 部分修复
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/proxy_metrics.jsonl` quality_flags 统计 |
-| **指标** | `loop_injected: 113/305 = 37.0%` |
-| **同期 high_drop_ratio** | 66/305 = 21.6% |
-| **关联 commit** | `4e4e3e6` (模式循环检测)、`4bdf309` (阻塞检测) |
-| **现象** | 37% 的请求触发了循环注入。`logs/anthropic_proxy.log` 中 `LOOP LEVEL 3: Bash called 9 times` 反复出现,且**同一 session 内连续触发 5+ 次** |
-| **未解决场景** | 1) **跨请求循环**: `LOOP LEVEL 3` 注入后,下一轮模型又回到相同循环 (16:02 → 16:06 → 16:09 → 16:12 持续 4 轮)<br>2) **认知驱动循环**: Write 工具循环 (16:02-16:23) 持续 21 分钟,Level 3 仅当次有效,跨请求失效 |
-| **修复建议** | 1) 实现跨请求循环追踪 (累计 max_run 趋势)<br>2) 实现 Write 内容相似度检测 (Jaccard > 0.8 视为重复)<br>3) 文档已知 (`docs/claude-behavior-semantic-analysis-v2.md` §7.6),但未实施 |
+| **原始指标** | `loop_injected: 113/305 = 37.0%` (旧 metrics), `122/571 = 21.4%` (全量) |
+| **根因** | 1) **LOOP_CONSECUTIVE 双重计数**: 继承上次请求计数 + 重新扫描全部消息 → max_run 虚高 (3→38)<br>2) **无 Level 3**: Level 2 只移除一个工具,模型切换到其他工具继续循环<br>3) **Level 2 单工具移除**: 只移除第一个高计数工具,其余循环工具保留<br>4) **跨请求状态丢失**: 每次请求从 Level 0 开始 |
+| **已实施修复** | **修复 1**: 移除 LOOP_CONSECUTIVE 继承,改为 tail 扫描 (最后 15 条 assistant 消息),消除双重计数<br>**修复 2**: 新增 Level 3 (`PROXY_LOOP_LEVEL3=9`): 移除全部工具,强制纯文本响应<br>**修复 3**: Level 2 改为 multi-tool: 移除所有达阈值的工具 (而非仅第一个)<br>**修复 4**: `_LOOP_SESSION_STATE` 跨请求持久化: 记住 session 的 loop level,下次请求自动注入警告<br>**新增常量**: `PROXY_LOOP_LEVEL3` (默认 9), `_LOOP_SESSION_STATE` |
+| **新增测试** | `TestLoopInterventionEnhanced` (5 个: Level 3, multi-tool L2, threshold 默认值, 单工具 L2, 无双重计数) |
+| **遗留** | 1) Write 内容相似度检测未实施 (Jaccard > 0.8)<br>2) 生产环境验证 loop_injected 率是否下降<br>3) tail 窗口大小 (15) 可能需根据实际效果调整 |
 
 ### DEF-003: re_read_rate 计算公式错误 (2862%, 3271%) — ✅ 已修复
 

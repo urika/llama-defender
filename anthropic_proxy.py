@@ -93,6 +93,8 @@ PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"
 # ---------------------------------------------------------------------------
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
 PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
+PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
+_LOOP_SESSION_STATE = {}
 
 
 def _classify_exception(e):
@@ -1063,7 +1065,6 @@ def _compress_middle_with_llm(messages, timeout=30):
 
 _summary_cache = {}
 _summary_cache_lock = threading.Lock()
-LOOP_CONSECUTIVE = {}
 _SUMMARY_CACHE_MAX_SESSIONS = 10
 _SUMMARY_CACHE_MAX_CHARS = 3000
 
@@ -2823,7 +2824,7 @@ def _translate_tool_result_errors(messages):
 def _apply_loop_intervention(
     raw_messages, raw_tools, max_run, consecutive,
     threshold=PROXY_LOOP_THRESHOLD, level2_threshold=PROXY_LOOP_LEVEL2,
-    pattern_tool_name=None,
+    level3_threshold=PROXY_LOOP_LEVEL3, pattern_tool_name=None,
 ):
     """Escalating loop intervention (R2.1). Returns (messages, tools, level, tool_name).
 
@@ -2832,9 +2833,9 @@ def _apply_loop_intervention(
     them back to body["messages"]/body["tools"] and emitting the metrics step.
 
     - max_run < threshold          → no-op, returns (raw_messages, raw_tools, 0, "")
-    - threshold <= max_run < L2    → Level 1: append a [System notice: ... STOP using ...] user message
-    - max_run >= L2                → Level 2: remove the looping tool from raw_tools
-                                              + append a [IMPORTANT: ... REMOVED ...] user message
+    - threshold <= max_run < L2    → Level 1: append hint user message
+    - L2 <= max_run < L3           → Level 2: remove ALL high-count tools from raw_tools
+    - max_run >= L3                → Level 3: strip ALL tools (force plain text)
 
     The function is intentionally pure (does not call log/_mc_put) so unit tests
     can assert on its output without spinning up a handler.
@@ -2843,7 +2844,38 @@ def _apply_loop_intervention(
         return raw_messages, raw_tools, 0, ""
 
     loop_keys = [k for k, v in consecutive.items() if v >= threshold]
-    tool_name = loop_keys[0].split(":")[0] if loop_keys else (pattern_tool_name or "unknown")
+    high_count_tools = sorted(set(k.split(":")[0] for k in loop_keys))
+    tool_name = high_count_tools[0] if high_count_tools else (pattern_tool_name or "unknown")
+
+    if max_run >= level3_threshold:
+        restricted = sorted(set(t.get("name", "") for t in (raw_tools or []) if isinstance(t, dict)))
+        new_messages = list(raw_messages) + [{
+            "role": "user",
+            "content": [{"type": "text", "text":
+                f"[CRITICAL: You have been looping for {max_run} repetitions across tools "
+                f"({', '.join(restricted[:5])}). ALL tools have been DISABLED for this turn. "
+                f"You MUST respond with plain text only. "
+                f"Describe the problem you are stuck on and what you have tried. "
+                f"Do NOT attempt to call any tools.]"
+            }]
+        }]
+        return new_messages, [], 3, tool_name
+
+    if max_run >= level2_threshold:
+        remove_set = set(high_count_tools)
+        new_tools = [t for t in (raw_tools or [])
+                     if not (isinstance(t, dict) and t.get("name", "") in remove_set)]
+        removed_names = ", ".join(sorted(remove_set))
+        new_messages = list(raw_messages) + [{
+            "role": "user",
+            "content": [{"type": "text", "text":
+                f"[IMPORTANT: You have called tools {max_run} times with no progress. "
+                f"The following tools have been REMOVED: {removed_names}. "
+                f"You MUST use a completely different approach. "
+                f"If you are stuck, describe the problem and ask for guidance.]"
+            }]
+        }]
+        return new_messages, new_tools, 2, tool_name
 
     new_messages = list(raw_messages) + [{
         "role": "user",
@@ -2854,28 +2886,6 @@ def _apply_loop_intervention(
             f"If file content was cleared, assume the file is unchanged and work from memory.]"
         }]
     }]
-
-    if max_run >= level2_threshold:
-        # Level 2: drop the looping tool from the tool list.
-        new_tools = []
-        for t in raw_tools or []:
-            if isinstance(t, dict) and t.get("name", "") == tool_name:
-                continue
-            new_tools.append(t)
-        # Overwrite the last user message with the "REMOVED" variant — it carries
-        # the stronger wording and tells the model the tool is gone.
-        new_messages[-1] = {
-            "role": "user",
-            "content": [{"type": "text", "text":
-                f"[IMPORTANT: You have called '{tool_name}' {max_run} times in a row with no progress. "
-                f"This tool has been temporarily REMOVED from your available tools. "
-                f"You MUST use a different approach. "
-                f"If you need file content, use Bash with cat/head/tail. "
-                f"If you are stuck, describe the problem and ask for guidance.]"
-            }]
-        }
-        return new_messages, new_tools, 2, tool_name
-
     return new_messages, raw_tools, 1, tool_name
 
 
@@ -3138,18 +3148,15 @@ class Handler(BaseHTTPRequestHandler):
         elif clear_stats.get("enabled") and not clear_stats.get("skipped"):
             log(f"  -> Tool clearing: active (threshold={PROXY_CLEAR_THRESHOLD}, keep={PROXY_TOOL_KEEP})")
 
-        # Consecutive calls tracking (max_run)
-        # Track both: (A) identical args per tool, (B) same text+tool_name pattern
-        # Scans ALL messages in raw_messages (full session history) to accumulate
-        # across requests within the same session.
-        consecutive = dict(LOOP_CONSECUTIVE.get(session_id, {}))
+        # DEF-002: Loop detection — tail-based scan (no cross-request double-counting)
+        # Scan last N assistant messages for exact (tool, args) and pattern repeats.
+        consecutive = {}
         max_run = 0
         pattern_run = 0
         last_pattern = None
         pattern_tool_name = None
-        for msg in raw_messages:
-            if msg.get("role") != "assistant":
-                continue
+        tail_assistant = [m for m in raw_messages if m.get("role") == "assistant"][-15:]
+        for msg in tail_assistant:
             content = msg.get("content", "")
             if isinstance(content, list):
                 tool_names_in_msg = []
@@ -3171,15 +3178,6 @@ class Handler(BaseHTTPRequestHandler):
                     if pattern_run > max_run:
                         max_run = pattern_run
                         pattern_tool_name = tool_names_in_msg[0] if tool_names_in_msg else "unknown"
-                    # pattern_tool_name is only assigned when pattern_run
-                    # exceeds max_run. max_run can carry a higher value from
-                    # the inherited `consecutive` dict (prior session state),
-                    # leaving pattern_tool_name as None here. In that case
-                    # we have no pattern to filter by, so skip the cleanup.
-                    if pattern_tool_name is not None:
-                        for k in list(consecutive.keys()):
-                            if not k.startswith(pattern_tool_name + ":"):
-                                del consecutive[k]
                 else:
                     pattern_run = 1
                     last_pattern = pattern
@@ -3188,31 +3186,42 @@ class Handler(BaseHTTPRequestHandler):
                 pattern_run = 0
                 last_pattern = None
         if max_run > 1:
-            log(f"  -> Consecutive calls: max_run={max_run} (tools tracked)")
+            log(f"  -> Loop scan: max_run={max_run} (tail={len(tail_assistant)} msgs)")
         _mc_put("loop_detect", {"max_run": max_run})
 
-        # Loop detection: escalating intervention based on severity.
-        # Pure logic delegated to _apply_loop_intervention() — see that function
-        # for the level-mapping rules and the rationale for keeping the caller
-        # responsible for body["messages"] / body["tools"] mutation + metrics.
+        # Session-level loop state: persist level across requests for early intervention
+        session_loop = _LOOP_SESSION_STATE.get(session_id, {"level": 0, "triggers": 0})
+        if session_loop["level"] >= 2 and max_run < PROXY_LOOP_THRESHOLD:
+            log(f"  -> Session had Level {session_loop['level']}, injecting persistent warning (max_run={max_run})")
+            raw_messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[System: You were previously looping and had tools restricted. "
+                    f"Continue with a DIFFERENT approach. Do NOT repeat previous actions.]"
+                }]
+            })
+
         new_messages, new_tools, loop_level, loop_tool_name = _apply_loop_intervention(
             raw_messages, raw_tools, max_run, consecutive,
             pattern_tool_name=pattern_tool_name,
         )
         if loop_level >= 1:
-            if loop_level == 2 and raw_tools is not None and new_tools != raw_tools:
-                # Level 2 actually removed a tool — persist the filtered list.
+            if loop_level >= 2 and raw_tools is not None and new_tools != raw_tools:
                 body["tools"] = new_tools
-            raw_messages[:] = new_messages  # in-place extend (preserves the alias the caller holds)
-            log(f"  -> LOOP LEVEL {loop_level}: tool={loop_tool_name} max_run={max_run} consecutive={dict(consecutive)}")
+            raw_messages[:] = new_messages
+            log(f"  -> LOOP LEVEL {loop_level}: tool={loop_tool_name} max_run={max_run} consecutive={{k: v for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD}}")
             if loop_level == 2:
-                log(f"    removed {loop_tool_name} from tools list ({len(new_tools)} remaining)")
+                removed = sorted(set(k.split(":")[0] for k, v in consecutive.items() if v >= PROXY_LOOP_THRESHOLD))
+                log(f"    removed tools: {removed} ({len(new_tools)} remaining)")
+            elif loop_level == 3:
+                log(f"    ALL tools stripped — force plain text response")
             _mc_put("loop_detect", {"max_run": max_run, "level": loop_level, "tool": loop_tool_name})
+            if session_id:
+                _LOOP_SESSION_STATE[session_id] = {"level": loop_level, "triggers": session_loop.get("triggers", 0) + 1}
         else:
             _mc_put("loop_detect", {"max_run": max_run})
-        if session_id:
-            LOOP_CONSECUTIVE[session_id] = dict(consecutive)
-            log(f"  -> Loop counts persisted for session: {dict(consecutive)}")
+            if session_id and session_loop["level"] > 0 and max_run < PROXY_LOOP_THRESHOLD:
+                _LOOP_SESSION_STATE[session_id] = {"level": 0, "triggers": session_loop.get("triggers", 0)}
 
         # Re-read detection: check if recent tool_uses target cleared files
         re_read_info = {"count": 0, "cleared_files": len(cleared_files), "rate_pct": 0.0}

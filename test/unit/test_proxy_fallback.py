@@ -1361,7 +1361,7 @@ class TestLoopIntervention(unittest.TestCase):
         text = msgs[-1]["content"][0]["text"]
         self.assertIn("REMOVED", text)
         self.assertIn("Read", text)
-        self.assertIn("MUST use a different approach", text)
+        self.assertIn("completely different approach", text)
         # Original message preserved.
         self.assertEqual(msgs[0], {"role": "user", "content": "do the thing"})
 
@@ -1383,6 +1383,81 @@ class TestLoopIntervention(unittest.TestCase):
         self.assertEqual(msgs, [{"role": "user", "content": "hi"}])
         self.assertEqual(new_tools, tools)
 
+
+# =============================================================================
+# DEF-002: Enhanced loop intervention (Level 3 + multi-tool Level 2)
+# =============================================================================
+class TestLoopInterventionEnhanced(unittest.TestCase):
+    """Covers DEF-002 fixes: Level 3, multi-tool Level 2, tail scan."""
+
+    def _tool(self, name):
+        return {"name": name, "description": "fake", "input_schema": {"type": "object"}}
+
+    def test_level3_strips_all_tools(self):
+        consecutive = {"Read:{\"/x.py\"}": 9}
+        tools = [self._tool("Read"), self._tool("Bash")]
+        msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=[], raw_tools=tools, max_run=9,
+            consecutive=consecutive, threshold=3, level2_threshold=6, level3_threshold=9,
+        )
+        self.assertEqual(level, 3)
+        self.assertEqual(new_tools, [])
+        text = msgs[-1]["content"][0]["text"]
+        self.assertIn("ALL tools have been DISABLED", text)
+        self.assertIn("plain text only", text)
+
+    def test_multi_tool_level2_removes_all_high_count_tools(self):
+        consecutive = {
+            "Read:{\"/x.py\"}": 6,
+            "Bash:{\"ls\"}": 6,
+        }
+        tools = [self._tool("Read"), self._tool("Bash"), self._tool("Glob")]
+        msgs, new_tools, level, tool_name = proxy._apply_loop_intervention(
+            raw_messages=[], raw_tools=tools, max_run=6,
+            consecutive=consecutive, threshold=3, level2_threshold=6, level3_threshold=9,
+        )
+        self.assertEqual(level, 2)
+        self.assertEqual([t["name"] for t in new_tools], ["Glob"])
+        text = msgs[-1]["content"][0]["text"]
+        self.assertIn("Read", text)
+        self.assertIn("Bash", text)
+
+    def test_level3_threshold_default(self):
+        self.assertEqual(proxy.PROXY_LOOP_LEVEL3, proxy.PROXY_LOOP_THRESHOLD * 3)
+
+    def test_level2_only_removes_tools_at_threshold(self):
+        consecutive = {
+            "Read:{\"/x.py\"}": 6,
+            "Bash:{\"ls\"}": 2,
+        }
+        tools = [self._tool("Read"), self._tool("Bash"), self._tool("Glob")]
+        _, new_tools, level, _ = proxy._apply_loop_intervention(
+            raw_messages=[], raw_tools=tools, max_run=6,
+            consecutive=consecutive, threshold=3, level2_threshold=6, level3_threshold=9,
+        )
+        self.assertEqual(level, 2)
+        self.assertEqual([t["name"] for t in new_tools], ["Bash", "Glob"])
+
+    def test_no_double_counting_fresh_consecutive(self):
+        tools = [self._tool("Read")]
+        msgs = []
+        for i in range(3):
+            msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/x.py"}}
+            ]})
+            msgs.append({"role": "user", "content": "ok"})
+        consecutive = {}
+        max_run = 0
+        for msg in msgs:
+            if msg.get("role") != "assistant":
+                continue
+            for block in msg.get("content", []):
+                if block.get("type") == "tool_use":
+                    key = f"{block['name']}:{json.dumps(block['input'], sort_keys=True)}"
+                    consecutive[key] = consecutive.get(key, 0) + 1
+                    max_run = max(max_run, consecutive[key])
+        self.assertEqual(max_run, 3)
+        self.assertEqual(consecutive["Read:{\"file_path\": \"/x.py\"}"], 3)
 
 # =============================================================================
 # R4.4 — _repair_truncated_json (7 cases)
