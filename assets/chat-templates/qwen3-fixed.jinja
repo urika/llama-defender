@@ -1,4 +1,4 @@
-{#- Qwen3 vllm-mlx 兼容版 chat template (DEF-007 修复)
+{#- Qwen3 vllm-mlx 兼容版 chat template (最小模板)
 适用范围: Qwen3.5 / Qwen3.6 等非 Coder 系列模型
 Fixes:
   1. 移除 <think>/</think> 输出（vllm-mlx bug: 特殊 token 导致立即 EOS）
@@ -7,8 +7,8 @@ Fixes:
   4. |items → 直接 key 迭代（C++ Jinja 不支持 |items）
   5. is sequence → is iterable
   6. developer role + raise_exception 降级
-  7. system/developer 消息支持任意位置（DEF-007）
-  8. 不注入工具调用格式指令（模型依赖自身训练）
+  7. 不注入工具调用格式指令（模型依赖自身训练）
+  8. system/developer 消息支持任意位置（DEF-007）
 -#}
 
 {%- macro render_content(content, is_system_content=false) %}

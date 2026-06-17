@@ -96,7 +96,7 @@ PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
 #   EXPANSION  < PROXY_CHARS_EXPANSION           (90K)  — tail-60% clearing + think strip
 #   SATURATION < PROXY_CHARS_SATURATION          (180K) — full-dynamic clear + merge + trunc
 #   OOM_DANGER < PROXY_CHARS_OOM_DANGER          (350K) — no frozen + hard truncation
-#   PRE_TRUNC  ≥ PROXY_PRE_TRUNCATE_CHARS         (400K) — keep_rounds=2
+#   PRE_TRUNC  ≥ PROXY_OOM_SAFE_CHARS            (200K) — keep_rounds=2
 #
 # Deprecated aliases (auto-fallback if new var not set):
 #   PROXY_CTX_CHARS_LIMIT → PROXY_CHARS_SATURATION
@@ -119,10 +119,20 @@ PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0")
 PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
 PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
 
-# DEF-001: pre-truncate very large payloads to prevent rapid-mlx OOM/timeout.
-# Default 400K chars ≈ 130K tokens (assuming chars*0.33 ratio for code/tools JSON).
-# Tune via PROXY_PRE_TRUNCATE_CHARS env var; set very high (e.g. 10000000) to disable.
-PROXY_PRE_TRUNCATE_CHARS = int(os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "400000"))
+# DEF-001: hard ceiling for total payload size to prevent rapid-mlx OOM/timeout.
+# When a request exceeds this char count, the proxy force-truncates to
+# keep_rounds=2 BEFORE any other processing. Default lowered 400K → 200K
+# (Phase 1 of proxy-truncation-agent-scenario.md) because multi-round agent
+# sessions can compose 80K history + 80K new content = 160K; the old 400K
+# ceiling left no headroom for the actual LLM call after pipeline overhead.
+# Tune via PROXY_OOM_SAFE_CHARS env var; set very high (e.g. 10000000) to
+# disable. PROXY_PRE_TRUNCATE_CHARS is the legacy name, kept for compat.
+PROXY_OOM_SAFE_CHARS = int(os.environ.get(
+    "PROXY_OOM_SAFE_CHARS",
+    os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "200000"),
+))
+# Legacy alias for any external consumers (status page, metrics, tests).
+PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS
 
 # DEF-005: estimated prompt token limit to prevent Metal OOM.
 # After all pipeline steps, if estimated tokens exceed this, force aggressive FIFO.
@@ -147,11 +157,24 @@ PROXY_TEXT_LOOP_SIMILARITY = float(os.environ.get("PROXY_TEXT_LOOP_SIMILARITY", 
 
 _LOOP_SESSION_STATE = {}
 
+# Phase 1 (改进3): session request counter for continuation detection.
+# When a session has ≥ PROXY_SESSION_CONTINUATION_MIN_REQUESTS prior
+# requests AND the current payload is in saturation/expansion territory,
+# _classify_lifecycle_stage returns an aggressive config (frozen_head=2,
+# truncate_rounds=max(3, base//2)) to prevent OOM in long agent sessions.
+_SESSION_REQUEST_COUNT = {}
+PROXY_SESSION_CONTINUATION_ENABLED = os.environ.get(
+    "PROXY_SESSION_CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes")
+PROXY_SESSION_CONTINUATION_MIN_REQUESTS = int(os.environ.get(
+    "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", "2"))
+
 PROXY_DEDUP_WINDOW = int(os.environ.get("PROXY_DEDUP_WINDOW", "2"))
 _DEDUP_CACHE = {}
 
 def _check_dedup(body_str):
-    h = hash(body_str)
+    """Hash-based request dedup with TTL.
+    Uses MD5 instead of Python hash() for cross-process stability and collision resistance."""
+    h = hashlib.md5(body_str.encode("utf-8")).hexdigest()
     now = datetime.now().timestamp()
     for k in list(_DEDUP_CACHE):
         if now - _DEDUP_CACHE[k] > PROXY_DEDUP_WINDOW:
@@ -531,6 +554,31 @@ def _repair_truncated_json(raw: str) -> str:
     return s
 
 
+def _is_truncated_json(raw: str) -> bool:
+    """Check if raw string is an *incomplete* JSON (truncated) vs. a malformed one."""
+    s = raw.strip() if raw else ""
+    if not s:
+        return False
+    # Single-char openers – clear truncation
+    if s in ("{", "[", "{"):
+        return True
+    # Unclosed string
+    if s.count('"') % 2 == 1:
+        return True
+    # Unmatched braces / brackets
+    open_braces = s.count('{') - s.count('}')
+    open_brackets = s.count('[') - s.count(']')
+    if open_braces > 0 or open_brackets > 0:
+        return True
+    # Ends mid-value / mid-key (common truncation patterns)
+    s_end = s.rstrip()
+    if s_end.endswith('":') or s_end.endswith('",') or s_end.endswith(':'):
+        return True
+    if s_end.endswith(',') or s_end.endswith('"'):
+        return True
+    return False
+
+
 def _coerce_booleans(obj):
     """Recursively coerce stringified booleans ('True'/'False'/'true'/'false') to bool."""
     if isinstance(obj, dict):
@@ -545,11 +593,54 @@ def _coerce_booleans(obj):
     return obj
 
 
+def _unescape_double_escaped_json(obj):
+    """Recursively unescape double-escaped JSON strings.
+    Qwen3.6 with qwen3_coder_xml parser occasionally emits arguments where
+    array/object values are wrapped as strings, e.g.:
+        {"questions": "[{\\\"question\\\": \\\"...\\\"}]"}
+    After outer json.loads, the inner value becomes a string like
+    '[{"question": "..."}]'.  This helper detects such string-wrapped
+    JSON and turns it back into real nested structures.
+    """
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            unescaped = _unescape_double_escaped_json(v)
+            result[k] = unescaped
+        return result
+    if isinstance(obj, list):
+        return [_unescape_double_escaped_json(v) for v in obj]
+    if isinstance(obj, str):
+        stripped = obj.strip()
+        if (stripped.startswith('[') and stripped.endswith(']')) or \
+           (stripped.startswith('{') and stripped.endswith('}')):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                # Try repair for truncated inner JSON
+                repaired = _repair_truncated_json(stripped)
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+    return obj
+
+
+def _finalize_parsed_args(parsed):
+    """Apply post-parse fixes: unescape double-escaped JSON, then coerce booleans."""
+    if not isinstance(parsed, dict):
+        return {}
+    parsed = _unescape_double_escaped_json(parsed)
+    return _coerce_booleans(parsed)
+
+
 def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     """
     Parse tool arguments from backend response.
     Falls back from JSON -> XML extraction -> empty dict.
     Stringified booleans are coerced to real bools to satisfy client validation.
+    Detects truncated JSON vs. malformed JSON and logs explicitly.
+    Also unescapes double-escaped JSON arrays/objects (Qwen3.6 qwen3_coder_xml bug).
     """
     raw = raw.strip() if raw else ""
     if not raw:
@@ -559,36 +650,50 @@ def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            return _coerce_booleans(parsed)
+            return _finalize_parsed_args(parsed)
         return {}
     except json.JSONDecodeError:
         pass
 
-    # 2. Try to find a JSON object embedded inside the text
+    # 2. Attempt repair unconditionally — _is_truncated_json misses cases where
+    # the JSON ends with } but inner structures are truncated (rapid-mlx
+    # qwen3_coder_xml output: {"questions": "[{\\\"q\\\": \\\"...\\\"}]")
+    repaired = _repair_truncated_json(raw)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict):
+            if repaired != raw:
+                log(f"  [JSON_REPAIRED] tool={tool_name_hint}, {len(raw)} -> {len(repaired)} chars")
+            return _finalize_parsed_args(parsed)
+    except json.JSONDecodeError:
+        if repaired != raw:
+            log(f"  [JSON_TRUNCATED_REPAIR_FAILED] tool={tool_name_hint}, repaired={repaired[:200]!r}")
+
+    # 3. Try to find a JSON object embedded inside the text
     brace_start = raw.find("{")
     brace_end = raw.rfind("}")
     if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
         try:
             parsed = json.loads(raw[brace_start:brace_end + 1])
             if isinstance(parsed, dict):
-                return _coerce_booleans(parsed)
+                return _finalize_parsed_args(parsed)
         except json.JSONDecodeError:
             pass
 
-    # 3. XML fallback
+    # 4. XML fallback
     xml_params = _extract_xml_params(raw)
     if xml_params:
         log(f"  [XML_FALLBACK] extracted {len(xml_params)} params from XML for tool={tool_name_hint}")
-        return _coerce_booleans(xml_params)
+        return _finalize_parsed_args(xml_params)
 
-    # 4. Last resort: treat the whole string as a single "command" or "query" param
+    # 5. Last resort: treat the whole string as a single "command" or "query" param
     # based on common tool patterns
     if tool_name_hint in ("exec", "bash", "shell"):
         return {"command": raw.strip("`\n ")}
     if tool_name_hint in ("read", "view", "file"):
         return {"file_path": raw.strip("`\n ")}
 
-    log(f"  [XML_FALLBACK] failed to parse args for tool={tool_name_hint}, raw={raw[:200]!r}")
+    log(f"  [JSON_MALFORMED] failed to parse args for tool={tool_name_hint}, raw={raw[:200]!r}")
     return {}
 
 
@@ -867,12 +972,19 @@ def _generate_tool_summary(tool_name, meta_info):
     return tool_name
 
 
-def _classify_lifecycle_stage(messages):
+def _classify_lifecycle_stage(messages, session_id=None):
     """
     Classify the current request into a lifecycle stage based on total chars.
     All thresholds are in chars (from _estimate_message_chars), guaranteeing
     monotonic escalation: lighter compression at lower stages, heavier at
     higher stages.
+
+    Phase 1 改进3: When session_id is provided AND the session has already
+    accumulated >= PROXY_SESSION_CONTINUATION_MIN_REQUESTS prior requests
+    (i.e. this is a continuation, not the first call) AND the payload is
+    past PROXY_CHARS_EXPANSION, the function returns an aggressive config
+    even if the raw char count would map to a milder stage. This addresses
+    the "agent 累积后大请求" 盲区 in proxy-truncation-agent-scenario.md.
 
     Returns a dict:
       {
@@ -883,10 +995,40 @@ def _classify_lifecycle_stage(messages):
         "thinking_keep": int,         # thinking keep_recent (0=skip)
         "truncate_rounds": int|None,  # L5 rounds (None=skip truncation)
         "oom_safety": bool,           # Enable OOM safety iterative FIFO
+        "is_continuation": bool,      # True when session_id is a known continuation
+        "request_count": int,         # # of prior requests in this session
       }
     """
     total_chars = _estimate_message_chars(messages)
     cloud = IS_CLOUD
+
+    # Phase 1: detect session continuation. The increment happens here so the
+    # counter advances exactly once per request, atomically w.r.t. the
+    # classification decision.
+    is_continuation = False
+    request_count = 0
+    if PROXY_SESSION_CONTINUATION_ENABLED and session_id:
+        request_count = _SESSION_REQUEST_COUNT.get(session_id, 0)
+        is_continuation = request_count >= PROXY_SESSION_CONTINUATION_MIN_REQUESTS
+        _SESSION_REQUEST_COUNT[session_id] = request_count + 1
+
+    # Aggressive branch: continuation + above-EXPANSION payload. Return a
+    # saturation-grade config regardless of the raw stage mapping. This
+    # catches the "agent 多轮累积后大请求" case where the in-memory history
+    # alone is > 90K chars but hasn't yet tripped the OOM_DANGER threshold.
+    if is_continuation and total_chars > PROXY_CHARS_EXPANSION:
+        aggressive_rounds = max(3, PROXY_CTX_KEEP_ROUNDS // 2)
+        return {
+            "stage": "saturation",
+            "total_chars": total_chars,
+            "frozen_head": 2,
+            "clear_zone_pct": 1.0,
+            "thinking_keep": 3,
+            "truncate_rounds": aggressive_rounds,
+            "oom_safety": not cloud,
+            "is_continuation": True,
+            "request_count": request_count,
+        }
 
     # Defaults per stage — ordered by increasing severity
     if total_chars < PROXY_CLEAR_THRESHOLD:
@@ -895,6 +1037,7 @@ def _classify_lifecycle_stage(messages):
             "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
             "clear_zone_pct": None, "thinking_keep": 0,
             "truncate_rounds": None, "oom_safety": False,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
     elif total_chars < PROXY_CHARS_GROWTH:
         return {
@@ -902,6 +1045,7 @@ def _classify_lifecycle_stage(messages):
             "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
             "clear_zone_pct": 0.4, "thinking_keep": 0,
             "truncate_rounds": None, "oom_safety": False,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
     elif total_chars < PROXY_CHARS_EXPANSION:
         return {
@@ -909,6 +1053,7 @@ def _classify_lifecycle_stage(messages):
             "frozen_head": PROXY_FROZEN_HEAD if not cloud else 0,
             "clear_zone_pct": 0.6, "thinking_keep": 5,
             "truncate_rounds": PROXY_CTX_KEEP_ROUNDS, "oom_safety": False,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
     elif total_chars < PROXY_CHARS_SATURATION:
         return {
@@ -916,18 +1061,21 @@ def _classify_lifecycle_stage(messages):
             "frozen_head": max(2, (PROXY_FROZEN_HEAD if not cloud else 0) // 2),
             "clear_zone_pct": 1.0, "thinking_keep": 3,
             "truncate_rounds": PROXY_CTX_KEEP_ROUNDS, "oom_safety": False,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
     elif total_chars < PROXY_CHARS_OOM_DANGER:
         return {
             "stage": "oom_danger", "total_chars": total_chars,
             "frozen_head": 0, "clear_zone_pct": 1.0, "thinking_keep": 1,
             "truncate_rounds": 3, "oom_safety": not cloud,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
     else:
         return {
             "stage": "pre_trunc", "total_chars": total_chars,
             "frozen_head": 0, "clear_zone_pct": 1.0, "thinking_keep": 1,
             "truncate_rounds": 2, "oom_safety": not cloud,
+            "is_continuation": is_continuation, "request_count": request_count,
         }
 
 
@@ -1437,6 +1585,142 @@ def _incremental_compress(dropped, session_id):
     return compressed_text, cache is not None
 
 
+def _is_tool_result_message(msg):
+    """Return True iff `msg` is a user message whose content contains at
+    least one `tool_result` block. Used by the smart strategy to classify
+    messages that should never be dropped/compressed (their content is the
+    high-value file/exec output the model will re-read if lost)."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content", [])
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return False
+
+
+def _compress_assistant_message(msg):
+    """Return a copy of an assistant message with non-tool_use text blocks
+    replaced by a fixed placeholder. Tool_use blocks are kept verbatim
+    because the model's subsequent tool_result depends on the tool name +
+    args. The fixed placeholder text preserves prefix-cache stability."""
+    content = msg.get("content", [])
+    if isinstance(content, list):
+        compressed_blocks = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                compressed_blocks.append(b)
+            else:
+                compressed_blocks.append({"type": "text", "text": "[reasoning omitted]"})
+        return {**msg, "content": compressed_blocks}
+    if isinstance(content, str):
+        return {**msg, "content": "[reasoning omitted]"}
+    return msg
+
+
+def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
+    """Phase 2 改进2 (proxy-truncation-agent-scenario.md): role+content-aware
+    truncation. Preserves high-value content (system, tool_result, recent
+    user turns) verbatim; compresses assistant reasoning text into a fixed
+    placeholder. Iterates from newest to oldest, fitting each message into
+    the char budget and falling back to a compressed form for assistant
+    messages when the original would overflow.
+
+    Priority (high → low):
+      1. system messages           — always kept
+      2. tool_result messages      — always kept (file contents survive)
+      3. user messages (no tool)   — newest first, then older
+      4. assistant messages        — newest first; reasoning compressed
+                                     if original doesn't fit, dropped if
+                                     compressed form still doesn't fit
+
+    Returns (result_messages, stats_dict). The stats dict has:
+      strategy='smart', truncated, dropped_messages, kept_messages,
+      compressed_assistants, kept_chars, budget_chars
+    """
+    if budget_chars is None:
+        budget_chars = PROXY_CHARS_EXPANSION
+
+    total_input_chars = _estimate_message_chars(messages)
+    # Below budget: nothing to do.
+    if total_input_chars <= budget_chars:
+        return messages, {
+            "enabled": True,
+            "strategy": "smart",
+            "skipped": True,
+            "reason": "below_budget",
+            "chars": total_input_chars,
+            "budget_chars": budget_chars,
+        }
+
+    # Step 1: classify. Use id-based sets to avoid relying on dict equality
+    # (Anthropic SDK message dicts are not hashable, so `m in system`
+    # would also be O(n²) and unreliable for nested mutations).
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    system_ids = {id(m) for m in system_msgs}
+    tool_result_msgs = [m for m in messages if id(m) not in system_ids and _is_tool_result_message(m)]
+    tool_result_ids = {id(m) for m in tool_result_msgs}
+    other_msgs = [m for m in messages
+                  if id(m) not in system_ids and id(m) not in tool_result_ids]
+
+    # Step 2: always keep system + tool_result; measure their cost.
+    kept = list(system_msgs) + list(tool_result_msgs)
+    kept_chars = _estimate_message_chars(kept)
+
+    # If the must-keep set alone exceeds budget, we still have to keep
+    # them (otherwise the model would lose file contents and trigger a
+    # re-read loop). The caller is expected to catch this with the
+    # OOM_SAFE hard ceiling before reaching here.
+    if kept_chars > budget_chars:
+        return kept, {
+            "enabled": True,
+            "strategy": "smart",
+            "truncated": True,
+            "dropped_messages": len(other_msgs),
+            "kept_messages": len(kept),
+            "compressed_assistants": 0,
+            "kept_chars": kept_chars,
+            "budget_chars": budget_chars,
+            "reason": "must_keep_exceeds_budget",
+        }
+
+    # Step 3: walk other_msgs newest-first. For each message, try to keep
+    # it as-is. If it doesn't fit and is an assistant, try the compressed
+    # form. Otherwise drop.
+    compressed_count = 0
+    dropped_count = 0
+    # Insert in chronological order, so we prepend and reverse at the end.
+    chosen = []
+    for msg in reversed(other_msgs):
+        msg_chars = _estimate_message_chars([msg])
+        if kept_chars + msg_chars <= budget_chars:
+            chosen.append(msg)
+            kept_chars += msg_chars
+            continue
+        if msg.get("role") == "assistant":
+            compressed = _compress_assistant_message(msg)
+            comp_chars = _estimate_message_chars([compressed])
+            if kept_chars + comp_chars <= budget_chars:
+                chosen.append(compressed)
+                kept_chars += comp_chars
+                compressed_count += 1
+                continue
+        dropped_count += 1
+
+    # Reverse `chosen` to restore chronological order, then assemble.
+    chosen.reverse()
+    result = kept + chosen
+    return result, {
+        "enabled": True,
+        "strategy": "smart",
+        "truncated": dropped_count > 0 or compressed_count > 0,
+        "dropped_messages": dropped_count,
+        "kept_messages": len(result),
+        "compressed_assistants": compressed_count,
+        "kept_chars": kept_chars,
+        "budget_chars": budget_chars,
+    }
+
+
 def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
     """
     Proxy-side message truncation with dual strategy support.
@@ -1472,20 +1756,28 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
                 "budget_chars": PROXY_CHARS_EXPANSION,
             }
 
-        # Use stage-config keep_rounds if provided, else adaptive
+        # Use stage-config keep_rounds if provided, else adaptive.
+        # P0 fix: both branches iterate down from the initial rounds to fit
+        # the char budget. Previously the stage-specified branch did a single
+        # pass and returned even if the result was still over budget — which
+        # let oversized agent sessions (50+ msgs/round, 200+ rounds) leak
+        # through with hundreds of thousands of chars.
         min_rounds = 2
         if keep_rounds is not None:
             adaptive_rounds = keep_rounds
-            # Single-pass with stage-specified rounds
-            result, stats = _apply_rounds_truncation(messages, keep_rounds, session_id=session_id)
-            if not stats.get("truncated"):
-                return result, stats
-            result_chars = _estimate_message_chars(result)
-            stats["chars"] = result_chars
-            stats["budget_chars"] = PROXY_CHARS_EXPANSION
-            stats["actual_keep_rounds"] = keep_rounds
-            stats["stage_keep_rounds"] = keep_rounds
-            return result, stats
+            for rounds in range(keep_rounds, min_rounds - 1, -1):
+                result, stats = _apply_rounds_truncation(messages, rounds, session_id=session_id)
+                if not stats.get("truncated"):
+                    return result, stats
+                result_chars = _estimate_message_chars(result)
+                if result_chars <= PROXY_CHARS_EXPANSION or rounds == min_rounds:
+                    stats["chars"] = result_chars
+                    stats["budget_chars"] = PROXY_CHARS_EXPANSION
+                    stats["actual_keep_rounds"] = rounds
+                    stats["stage_keep_rounds"] = keep_rounds
+                    stats["adaptive_rounds"] = adaptive_rounds
+                    stats["budget_iterations"] = keep_rounds - rounds
+                    return result, stats
         else:
             # Backward-compatible: adaptive rounds + LLM/rule compression
             adaptive_rounds = _compute_adaptive_rounds(messages, PROXY_CTX_KEEP_ROUNDS)
@@ -1584,12 +1876,26 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
             "file_mentions": len(file_mentions),
         }
 
+    # ---------- smart strategy (Phase 2 改进2) ----------
+    # Role+content-aware truncation. Keeps system + tool_result verbatim
+    # (preserves file contents to avoid re-read loops), then keeps newer
+    # user/assistant messages in reverse-chronological order until the
+    # PROXY_CHARS_EXPANSION budget is filled. Assistant messages that
+    # don't fit are first attempted in compressed form (tool_use blocks
+    # kept, reasoning text replaced by a stable placeholder) before being
+    # dropped entirely.
+    if PROXY_CTX_TRUNCATE_STRATEGY == "smart":
+        return _apply_smart_truncation(
+            messages, budget_chars=PROXY_CHARS_EXPANSION, session_id=session_id,
+        )
+
     # ---------- char strategy (and any other unhandled strategy) ----------
     # Falls back to no-op truncation when strategy is "char" or anything other
-    # than rounds/fifo. The actual char-window implementation lives (misnamed)
-    # inside _apply_rounds_truncation above and is currently only invoked
-    # through that path. Returning a no-op stats dict here prevents the caller
-    # from hitting `TypeError: cannot unpack non-iterable NoneType object`.
+    # than rounds/fifo/smart. The actual char-window implementation lives
+    # (misnamed) inside _apply_rounds_truncation above and is currently only
+    # invoked through that path. Returning a no-op stats dict here prevents
+    # the caller from hitting `TypeError: cannot unpack non-iterable
+    # NoneType object`.
     return messages, {
         "enabled": True,
         "strategy": PROXY_CTX_TRUNCATE_STRATEGY,
@@ -1858,61 +2164,6 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
          "file_mentions": len(file_mentions),
          "compression": "llm" if "LLM" in compressed_text else ("rules" if "rule-based" in compressed_text else "folded"),
      }
-
-    # ---------- char strategy (existing logic) ----------
-    total_chars = _estimate_message_chars(messages)
-    if total_chars < PROXY_CTX_CHARS_LIMIT:
-        return messages, {
-            "enabled": True,
-            "strategy": "char",
-            "skipped": True,
-            "reason": "below_limit",
-            "chars": total_chars,
-        }
-
-    n = len(messages)
-    if n <= PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL:
-        return messages, {
-            "enabled": True,
-            "strategy": "char",
-            "skipped": True,
-            "reason": "too_few_messages",
-            "count": n,
-            "chars": total_chars,
-        }
-
-    preserved = set(range(PROXY_CTX_KEEP_HEAD))
-    preserved.update(range(n - PROXY_CTX_KEEP_TAIL, n))
-    deletable = [i for i in range(PROXY_CTX_KEEP_HEAD, n - PROXY_CTX_KEEP_TAIL)]
-
-    dropped_count = 0
-    dropped_chars = 0
-    current_chars = total_chars
-
-    for idx in deletable:
-        if idx in preserved:
-            continue
-        msg = messages[idx]
-        msg_chars = _estimate_message_chars([msg])
-        current_chars -= msg_chars
-        dropped_count += 1
-        dropped_chars += msg_chars
-        messages[idx] = None
-        if current_chars < PROXY_CTX_CHARS_LIMIT:
-            break
-
-    messages = [m for m in messages if m is not None]
-
-    return messages, {
-        "enabled": True,
-        "strategy": "char",
-        "truncated": True,
-        "dropped_messages": dropped_count,
-        "dropped_chars": dropped_chars,
-        "chars_before": total_chars,
-        "chars_after": current_chars,
-        "limit": PROXY_CTX_CHARS_LIMIT,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -3281,8 +3532,8 @@ class Handler(BaseHTTPRequestHandler):
                 # OOM and 500 errors. Evidence: 65/67 of v0.5.0-baseline 500s came
                 # from input_chars > 400K (session a309b181). Force rounds truncation
                 # with tight budget when payload exceeds threshold.
-                if total_chars > PROXY_PRE_TRUNCATE_CHARS and msgs:
-                    log(f"  -> Pre-truncation triggered: {total_chars:,} chars > {PROXY_PRE_TRUNCATE_CHARS:,} threshold")
+                if total_chars > PROXY_OOM_SAFE_CHARS and msgs:
+                    log(f"  -> OOM safety pre-truncation triggered: {total_chars:,} chars > {PROXY_OOM_SAFE_CHARS:,} threshold")
                     pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
                     msgs_truncated, pre_stats = _apply_rounds_truncation(
                         msgs, keep_rounds=2, session_id=pre_session_id
@@ -3379,6 +3630,39 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception as respond_err:
                             log(f"  -> CRITICAL: failed to send error response: {respond_err}")
                     # No raise — let the connection close cleanly
+            elif self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
+                # OpenAI-compatible chat completions endpoint for Open WebUI
+                # Forward directly to backend
+                log(f"  -> Forwarding to {LLAMA_BASE}/chat/completions (passthrough)")
+                try:
+                    req = urllib.request.Request(
+                        f"{LLAMA_BASE}/chat/completions",
+                        data=body.encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLAMA_API_KEY}"},
+                        method="POST"
+                    )
+                    with _llama_lock:
+                        resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
+                    resp_body = resp.read().decode("utf-8")
+                    self.send_response(resp.status)
+                    resp_body_bytes = resp_body.encode("utf-8")
+                    for header, value in resp.getheaders():
+                        hl = header.lower()
+                        if hl not in ("transfer-encoding", "connection", "keep-alive", "content-length"):
+                            self.send_header(header, value)
+                    self.send_header("Content-Length", str(len(resp_body_bytes)))
+                    self.end_headers()
+                    self.wfile.write(resp_body_bytes)
+                    log(f"  <- Response: {resp.status}")
+                except Exception as e:
+                    log(f"  -> Error: {e}")
+                    status_code, error_type, retryable = _classify_exception(e)
+                    hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
+                    self._respond_json(
+                        {"error": {"type": error_type, "message": str(e)[:500], "retryable": retryable}},
+                        status_code,
+                        extra_headers=hdrs,
+                    )
             else:
                 log(f"  -> 404 (unknown path)")
                 self._respond_json({"detail": "Not found"}, 404)
@@ -3419,11 +3703,18 @@ class Handler(BaseHTTPRequestHandler):
 
         # Unified lifecycle stage classification: determines compression intensity
         # based on total chars. Guarantees monotonic escalation.
-        stage_config = _classify_lifecycle_stage(body.get("messages", []))
+        # Phase 1 改进3: pass session_id so the function can detect multi-round
+        # agent continuations and return an aggressive config for large payloads.
+        stage_config = _classify_lifecycle_stage(
+            body.get("messages", []),
+            session_id=getattr(_log_ctx, 'session_id', None),
+        )
         log(f"  -> Stage: {stage_config['stage']} (chars={stage_config['total_chars']:,}, "
             f"frozen={stage_config['frozen_head']}, clear_zone={stage_config['clear_zone_pct']}, "
             f"thinking_keep={stage_config['thinking_keep']}, "
-            f"truncate_rounds={stage_config['truncate_rounds']}, oom_safety={stage_config['oom_safety']})")
+            f"truncate_rounds={stage_config['truncate_rounds']}, oom_safety={stage_config['oom_safety']}, "
+            f"continuation={stage_config.get('is_continuation', False)}, "
+            f"req_count={stage_config.get('request_count', 0)})")
         if PROXY_METRICS_ENABLED:
             _mc_put("lifecycle_stage", stage_config)
 
@@ -3674,16 +3965,27 @@ class Handler(BaseHTTPRequestHandler):
                 comp = trunc_stats.get("compression", "folded")
                 adaptive = trunc_stats.get("adaptive_rounds", "")
                 stage_r = trunc_stats.get("stage_keep_rounds", "")
+                budget_iter = trunc_stats.get("budget_iterations", 0)
                 extra_info = f", adaptive={adaptive}" if adaptive else ""
                 extra_info += f", stage_rounds={stage_r}" if stage_r else ""
+                extra_info += f", budget_iter={budget_iter}" if budget_iter else ""
                 log(f"  -> Context truncation (rounds): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (rounds={actual_r}, ~{chars_after} chars, budget={PROXY_CHARS_EXPANSION:,}, compress={comp}{extra_info})")
                 trunc_metrics["compression"] = comp
                 trunc_metrics["chars_after"] = trunc_stats.get("chars", 0)
                 trunc_metrics["budget_chars"] = PROXY_CHARS_EXPANSION
                 trunc_metrics["rounds"] = actual_r
                 trunc_metrics["adaptive_rounds"] = adaptive
+                trunc_metrics["budget_iterations"] = budget_iter
             elif strategy == "fifo":
                 log(f"  -> Context truncation (fifo): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept (limit={PROXY_CTX_KEEP_MESSAGES})")
+            elif strategy == "smart":
+                smart_compressed = trunc_stats.get("compressed_assistants", 0)
+                smart_kept_chars = trunc_stats.get("kept_chars", 0)
+                smart_budget = trunc_stats.get("budget_chars", PROXY_CHARS_EXPANSION)
+                log(f"  -> Context truncation (smart): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats.get('kept_messages', '?')} kept, {smart_compressed} assistant reasoning compressed ({smart_kept_chars:,} chars, budget={smart_budget:,})")
+                trunc_metrics["compressed_assistants"] = smart_compressed
+                trunc_metrics["chars_after"] = smart_kept_chars
+                trunc_metrics["budget_chars"] = smart_budget
             else:
                 log(f"  -> Context truncation (char): {trunc_stats['dropped_messages']} messages dropped, {trunc_stats['dropped_chars']:,} chars removed ({trunc_stats['chars_before']:,} -> {trunc_stats['chars_after']:,})")
             _mc_put("truncate", trunc_metrics)
@@ -3781,6 +4083,10 @@ class Handler(BaseHTTPRequestHandler):
             openai_body["top_p"] = body["top_p"]
         if "stop_sequences" in body:
             openai_body["stop"] = body["stop_sequences"]
+
+        # DeepSeek flash model: disable thinking mode for direct content response
+        if IS_CLOUD and "flash" in MODEL_NAME.lower():
+            openai_body["thinking"] = {"type": "disabled"}
 
         # Handle tools
         raw_tools = body.get("tools")
@@ -3880,6 +4186,7 @@ class Handler(BaseHTTPRequestHandler):
                             break
 
         content_summary = ""
+        output_chars = 0
         for block in anthropic_resp.get("content", []):
             if block.get("type") == "text":
                 content_summary += block.get("text", "")[:100]
@@ -4034,27 +4341,45 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 content_tools_pending.append(value)
 
-        # Prefer structured tool_calls; only inject content-extracted tools if buffer is empty.
-        if content_tools_pending and not tool_calls_buffer:
-            for i, t in enumerate(content_tools_pending):
-                tool_calls_buffer[i] = {
-                    "id": f"call_{os.urandom(8).hex()}",
-                    "type": "function",
-                    "function": {"name": t["name"], "arguments": json.dumps(t["arguments"])},
-                }
+        # Prefer structured tool_calls; fallback to content-extracted tools if buffer is empty
+        # or if structured args are empty/incomplete (Qwen3.6 qwen3_coder_xml parser bug).
+        if content_tools_pending:
+            if not tool_calls_buffer:
+                for i, t in enumerate(content_tools_pending):
+                    tool_calls_buffer[i] = {
+                        "id": f"call_{os.urandom(8).hex()}",
+                        "type": "function",
+                        "function": {"name": t["name"], "arguments": json.dumps(t["arguments"])},
+                    }
+            else:
+                # Replace empty/incomplete structured args with content-extracted ones
+                for idx in list(tool_calls_buffer.keys()):
+                    raw_args = tool_calls_buffer[idx]["function"].get("arguments", "")
+                    parsed = parse_tool_arguments(raw_args, tool_calls_buffer[idx]["function"].get("name", ""))
+                    if not parsed:
+                        for t in content_tools_pending:
+                            if t["name"] == tool_calls_buffer[idx]["function"].get("name"):
+                                tool_calls_buffer[idx]["function"]["arguments"] = json.dumps(t["arguments"])
+                                log(f"  [CONTENT_TOOLS_FALLBACK] replaced empty args for {t['name']} from content text")
+                                break
 
-        # Repair truncated JSON in tool_call arguments if FORCE_STOPPED
-        if output_force_stopped:
-            for idx in tool_calls_buffer:
-                tc = tool_calls_buffer[idx]
-                raw_args = tc["function"].get("arguments", "{}")
+        # Repair truncated JSON in tool_call arguments unconditionally
+        for idx in tool_calls_buffer:
+            tc = tool_calls_buffer[idx]
+            raw_args = tc["function"].get("arguments", "{}")
+            try:
+                json.loads(raw_args)
+            except json.JSONDecodeError:
+                if _is_truncated_json(raw_args):
+                    log(f"  [JSON_TRUNCATED] streamed tool={tc['function'].get('name', '?')}, raw={raw_args[:200]!r}")
+                repaired = _repair_truncated_json(raw_args)
+                tc["function"]["arguments"] = repaired
+                tool_name = tc["function"].get("name", "?")
                 try:
-                    json.loads(raw_args)
+                    json.loads(repaired)
+                    log(f"  [JSON_REPAIRED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
                 except json.JSONDecodeError:
-                    repaired = _repair_truncated_json(raw_args)
-                    tc["function"]["arguments"] = repaired
-                    tool_name = tc["function"].get("name", "?")
-                    log(f"  -> Repaired truncated JSON for tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+                    log(f"  [JSON_TRUNCATED_REPAIR_FAILED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
 
         # Send content_block_stop for text (only if text was output)
         if text_block_started:
@@ -4131,8 +4456,11 @@ class Handler(BaseHTTPRequestHandler):
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
     def _respond_json(self, data, status=200, extra_headers=None):
+        raw = json.dumps(data, ensure_ascii=False)
+        raw_bytes = raw.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw_bytes)))
         self.send_header("Access-Control-Allow-Origin", "*")
         if not getattr(self, "_request_id", None):
             self._request_id = f"req_{os.urandom(8).hex()}"
@@ -4141,9 +4469,8 @@ class Handler(BaseHTTPRequestHandler):
             for k, v in extra_headers.items():
                 self.send_header(k, str(v))
         self.end_headers()
-        raw = json.dumps(data, ensure_ascii=False)
         log(f"  <- Response body: {raw[:500]}")
-        self.wfile.write(raw.encode("utf-8"))
+        self.wfile.write(raw_bytes)
 
     def _handle_metrics_endpoint(self):
         from urllib.parse import parse_qs, urlparse
@@ -4216,6 +4543,8 @@ def main():
         _trunc_info += f", rounds={PROXY_CTX_KEEP_ROUNDS}, budget={PROXY_CTX_TOKEN_BUDGET}"
     elif PROXY_CTX_TRUNCATE_STRATEGY == "fifo":
         _trunc_info += f", keep_messages={PROXY_CTX_KEEP_MESSAGES}"
+    elif PROXY_CTX_TRUNCATE_STRATEGY == "smart":
+        _trunc_info += f", budget_chars={PROXY_CHARS_EXPANSION}"
     else:
         _trunc_info += f", limit={PROXY_CTX_CHARS_LIMIT}"
     log(f"Context limit: {'enabled (' + _trunc_info + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")

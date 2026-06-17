@@ -48,15 +48,23 @@ Three core pieces:
 
 Startup polls `http://host:port/v1/models` for up to 60 s to confirm readiness, then writes the PID file.
 
+Additional commands (see `./manage.sh help`):
+
+```bash
+./manage.sh watchdog              # Monitor backend health, auto-restart on degradation
+./manage.sh fix-template <dir>    # Repair Qwen chat_template (DEF-007: prevents system message crashes)
+```
+
 ## Available configurations
 
 Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` is a symlink to the currently active one.
 
 | Config | Backend | Model | Context | Memory | Use case |
 |--------|---------|-------|---------|--------|----------|
-| `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-pro` | (API limit) | N/A | Cloud API, no local backend |
-| `qwen3.6-27b-mtp` | llama-server | Qwen3.6-27B-MTP UD-Q4_K_XL | 131072 | ~19–20 GB | MTP Dense 27B, ~1.4× speedup |
-| `rapid-mlx-35b` | rapid-mlx | Qwen3.6-35B-A3B 4bit MLX | (model max) | ~16–17 GB | 36% faster than llama-server, **concurrency=1 required** |
+| `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | (API limit) | N/A | Cloud API, no local backend |
+| `rapid-mlx-35b` | rapid-mlx | Qwen3.6-35B-A3B 4bit MLX | (model max) | ~14–18 GB | Programming, 36% faster than llama-server, **concurrency=1 required** |
+| `rapid-mlx-9b` | rapid-mlx | Qwen3.6-9B-A3B 4bit MLX | (model max) | ~8–10 GB | Lighter alternative for constrained memory |
+| `gemma4-26b` | rapid-mlx | gemma-4-26b-it | (model max) | ~26 GB | Gemma 4 26B via rapid-mlx |
 
 > **⚠️ rapid-mlx OOM 防范** (48GB unified memory):
 > - `PROXY_MAX_CONCURRENT=1` — 两个 38K+ token 请求并发必然 OOM
@@ -121,10 +129,54 @@ When using DeepSeek's Anthropic-compatible endpoint, `claude-opus` maps to
 | Script | Purpose |
 |--------|---------|
 | `tools/bench_mtp.py` | MTP model performance benchmark (local + HF models, draft-n sweep) |
+| `tools/bench_agent.py` | Agentic workload performance benchmark (tool-call round-trip latency) |
+| `tools/bench_rapidmlx.py` | Rapid-MLX specific throughput/latency benchmark |
+| `tools/bench_quality.py` | Model quality evaluation (code generation, math reasoning, instruction following) |
+| `tools/bench_compress.py` | Compression strategy benchmark (LLM compression vs rule-based vs static) |
+| `tools/stress_test.py` | Stress test: sustained concurrent requests against the proxy |
+| `tools/context_stress_test.py` | Context-stress test: escalating payload sizes to test OOM boundaries |
+| `tools/cache_analyzer.py` | Prefix cache efficiency analysis (hit rate, miss patterns) |
+| `tools/monitor.py` | Periodic performance monitoring + Claude semantic action analysis |
+| `tools/trace_requirements.py` | Trace which requirements (R1-R7) are exercised by live traffic |
+| `tools/monitor_proxy_live.sh` | Live HTTP traffic monitor for the proxy |
+| `tools/analyze_claude_semantics.py` | Claude Code semantic behavior analysis from logged requests |
+| `tools/analyze_experiment.py` | A/B experiment result analyzer |
+| `tools/promptfoo_eval.sh` | Promptfoo-based regression test runner |
+| `tools/promptfoo_report_merge.py` | Merge multiple promptfoo report JSONs |
 | `tools/logview.sh` | Unified log viewer for backend and proxy logs |
 | `tools/sysmon.sh` | System monitoring (memory, CPU, disk, processes) |
 | `tools/modelmon.sh` | Model service monitoring (process, download, API health) |
 | `tools/memcheck.sh` | Detailed memory analysis (`vm_stat` breakdown) |
+| `tools/run_experiment.sh` | A/B experiment orchestration script |
+
+## Documentation
+
+Documents are organized under `docs/` in 6 categories (see `docs/README.md` for full index):
+
+| Category | Subdirectory | What it contains |
+|----------|-------------|------------------|
+| Requirements | `01-requirements-product/` | PRD, system requirements analysis |
+| Architecture | `02-architecture-design/` | Pipeline design, context window design, design reviews |
+| Testing | `03-experiments-testing/` | A/B experiment guides, test strategy, benchmark methodology |
+| Analysis | `04-analysis-diagnostics/` | Dead-loop analysis, cache analysis, prompt instability, message analysis |
+| Operations | `05-operations-changelog/` | Optimization logs, config change records, monitoring reports |
+| Metrics | `06-reference-metrics/` | KPI definitions, structured summary evaluation |
+
+Key reference files outside `docs/`:
+- `AGENTS.md` — Full reference for config variables, format conversion details, known issues, security notes
+- `TROUBLESHOOTING.md` — Known issues and workarounds (chat template, tool calling, OOM diagnostics)
+- `BENCHMARK.md` — Performance baseline measurements (M5 Pro 48GB)
+- `CHANGELOG.md` — Release history with P0-P3 defect tracking
+- `promptfooconfig.yaml` — Promptfoo regression test suite configuration
+
+## Performance monitoring
+
+The proxy logs structured metrics to `logs/proxy_metrics.jsonl` (one JSON line per request):
+```json
+{"status":200, "duration_ms":12345, "input_chars":56000, "output_chars":1200, "pipeline":{...}, "quality_flags":[...]}
+```
+
+Use `tools/monitor.py` to generate summary reports with p50/p90/p99 latency, truncation rates, blocker triggers, and quality flag distributions. Request payloads are logged to `logs/proxy_requests.jsonl` for post-hoc analysis (enabled via `PROXY_SAVE_REQUESTS`).
 
 All automated tests live under `test/` (see `test/README.md`); the pre-commit hook
 at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.

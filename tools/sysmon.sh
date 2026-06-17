@@ -41,10 +41,12 @@ inactive = pages.get('Pages inactive', 0) * ps / (1024**3)
 wired = pages.get('Pages wired down', 0) * ps / (1024**3)
 comp = pages.get('Pages occupied by compressor', 0) * ps / (1024**3)
 free = pages.get('Pages free', 0) * ps / (1024**3)
-used = active + inactive + wired + comp
+used = active + wired + comp
+available = free + inactive
 
 print(f'总内存:    {total:.1f} GB')
 print(f'已用:      {used:.1f} GB ({used/total*100:.1f}%)')
+print(f'可用:      {available:.1f} GB')
 print(f'空闲:      {free:.1f} GB')
 print(f'活跃:      {active:.1f} GB')
 print(f'非活跃:    {inactive:.1f} GB')

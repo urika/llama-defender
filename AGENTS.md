@@ -184,6 +184,20 @@ Rapid-MLX specific variables:
 | `RAPID_MLX_ENABLE_PREFIX_CACHE` | `true` | Enable prefix cache |
 | `RAPID_MLX_KV_QUANTIZATION` | `false` | Enable KV quantization |
 | `RAPID_MLX_KV_QUANT_BITS` | `8` | KV quant bits |
+
+> ⚠️ **WARNING: `--kv-cache-turboquant` breaks prefix cache persistence**
+> The `--kv-cache-turboquant` CLI flag (used in `RAPID_MLX_EXTRA_ARGS`) enables
+> `TurboQuantKVCache` which lacks a `state` attribute required by `cache_persist`.
+> This causes **all cache saves to fail** on shutdown:
+> ```
+> WARNING: ... failed to save entry 0: 'TurboQuantKVCache' object has no attribute 'state'
+> WARNING: ... no entries saved successfully, aborting
+> ```
+> After Deep reset on restart, only stale/old caches are loaded, making prefix cache
+> effectively useless across restarts. **Solution**: remove `--kv-cache-turboquant`
+> and `--kv-cache-turboquant-bits` from `RAPID_MLX_EXTRA_ARGS`. FP16 KV cache for
+> 84K tokens uses ~3.8GB, well within the ~14GB available on a 48GB Mac.
+> See `configs/rapid-mlx-35b.conf` for the corrected configuration.
 | `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags |
 
 Watchdog variables:

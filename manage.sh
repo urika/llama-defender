@@ -59,7 +59,7 @@ _load_config
 
 # Rapid-MLX 默认参数
 : "${RAPID_MLX_TOOL_PARSER:=qwen3_coder_xml}"
-: "${RAPID_MLX_REASONING_PARSER:=qwen3}"
+: "${RAPID_MLX_REASONING_PARSER=qwen3}"
 : "${RAPID_MLX_ENABLE_PREFIX_CACHE:=true}"
 : "${RAPID_MLX_KV_QUANTIZATION:=false}"
 : "${RAPID_MLX_KV_QUANT_BITS:=8}"
@@ -403,7 +403,7 @@ _start_rapid_mlx() {
         fi
     fi
 
-    info "启动 Rapid-MLX..."
+    info "启动 ${LLAMA_SERVER_BIN:-rapid-mlx}..."
     info "  配置: ${CYAN}$(_current_config_name)${NC}"
     info "  模型: $LLAMA_MODEL"
     info "  地址: $LLAMA_HOST:$LLAMA_PORT"
@@ -440,7 +440,14 @@ _start_rapid_mlx() {
         --port "$LLAMA_PORT"
         --enable-auto-tool-choice
         --tool-call-parser "$RAPID_MLX_TOOL_PARSER"
-        --reasoning-parser "$RAPID_MLX_REASONING_PARSER"
+    )
+
+    # Coder 模型不需要 reasoning parser（空字符串时跳过）
+    if [[ -n "${RAPID_MLX_REASONING_PARSER:-}" ]]; then
+        args+=(--reasoning-parser "$RAPID_MLX_REASONING_PARSER")
+    fi
+
+    args+=(
         --no-thinking
         --log-level INFO
     )
@@ -463,7 +470,7 @@ _start_rapid_mlx() {
         args+=("${extra[@]}")
     fi
 
-    nohup rapid-mlx "${args[@]}" >> "$LOGFILE" 2>&1 &
+    nohup ${LLAMA_SERVER_BIN:-rapid-mlx} "${args[@]}" >> "$LOGFILE" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PIDFILE"
 
@@ -490,6 +497,13 @@ _start_proxy() {
     info "  地址: $PROXY_HOST:$PROXY_PORT"
     info "  后端: $base_url"
 
+    # PROXY_* env vars below follow a 3-tier priority chain (highest first):
+    #   1. Active config file (configs/<active>.conf), sourced earlier
+    #   2. Manage.sh defaults (this block, after the `:-` operator)
+    #   3. anthropic_proxy.py module-level defaults (os.environ.get fallback)
+    # This is the Phase 2 cleanup of the original "manage.sh default=char vs
+    # conf sets fifo/rounds" priority ambiguity. The alias LLAMA_CTX_STRATEGY
+    # is supported as a more semantic name for the same env var.
     LLAMA_BASE_URL="$base_url" \
     LLAMA_API_KEY="${LLAMA_API_KEY:-sk-1234}" \
     MODEL_NAME="${MODEL_NAME:-$LLAMA_MODEL}" \
@@ -502,7 +516,7 @@ _start_proxy() {
     PROXY_TOOL_KEEP="${PROXY_TOOL_KEEP:-5}" \
     PROXY_CTX_LIMIT_ENABLED="${PROXY_CTX_LIMIT_ENABLED:-true}" \
     PROXY_CTX_CHARS_LIMIT="${PROXY_CTX_CHARS_LIMIT:-350000}" \
-    PROXY_CTX_TRUNCATE_STRATEGY="${PROXY_CTX_TRUNCATE_STRATEGY:-char}" \
+    PROXY_CTX_TRUNCATE_STRATEGY="${PROXY_CTX_TRUNCATE_STRATEGY:-${LLAMA_CTX_STRATEGY:-char}}" \
     PROXY_CTX_KEEP_ROUNDS="${PROXY_CTX_KEEP_ROUNDS:-10}" \
     PROXY_CTX_TOKEN_BUDGET="${PROXY_CTX_TOKEN_BUDGET:-30000}" \
     PROXY_CTX_TOKEN_RATIO="${PROXY_CTX_TOKEN_RATIO:-0.2}" \
@@ -515,6 +529,10 @@ _start_proxy() {
     PROXY_MAX_TOKENS_OVERRIDE="${PROXY_MAX_TOKENS_OVERRIDE:-0}" \
     PROXY_OUTPUT_TOKEN_LIMIT_RATIO="${PROXY_OUTPUT_TOKEN_LIMIT_RATIO:-1.5}" \
     PROXY_BACKEND_TIMEOUT="${PROXY_BACKEND_TIMEOUT:-300}" \
+    PROXY_OOM_SAFE_CHARS="${PROXY_OOM_SAFE_CHARS:-${PROXY_PRE_TRUNCATE_CHARS:-200000}}" \
+    PROXY_SESSION_CONTINUATION_ENABLED="${PROXY_SESSION_CONTINUATION_ENABLED:-true}" \
+    PROXY_SESSION_CONTINUATION_MIN_REQUESTS="${PROXY_SESSION_CONTINUATION_MIN_REQUESTS:-2}" \
+    PROXY_CHARS_EXPANSION="${PROXY_CHARS_EXPANSION:-90000}" \
     nohup python3 "$SCRIPT_DIR/anthropic_proxy.py" > /dev/null 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PROXY_PIDFILE"
@@ -584,7 +602,7 @@ cmd_start() {
     fi
 
     case "$LLAMA_BACKEND" in
-        rapid-mlx)
+        rapid-mlx|vllm-mlx)
             _start_rapid_mlx || true
             ;;
         cloud|deepseek-cloud|openai-cloud)
@@ -954,24 +972,88 @@ cmd_current() {
 }
 
 # ============================================================
+# 检测模型家族（Coder vs 通用 Qwen）
+# ============================================================
+_detect_model_family() {
+    local model_dir="$1"
+
+    # 1. 检查目录名（不区分大小写）
+    if echo "$model_dir" | grep -qi 'coder'; then
+        echo "coder"
+        return
+    fi
+
+    # 2. 检查 tokenizer_config.json 中的模型名
+    local tc="$model_dir/tokenizer_config.json"
+    if [[ -f "$tc" ]]; then
+        if grep -qi 'coder' "$tc" 2>/dev/null; then
+            echo "coder"
+            return
+        fi
+    fi
+
+    # 3. 默认通用 Qwen
+    echo "qwen"
+}
+
+# ============================================================
 # 修复 Chat Template (DEF-007)
+# 用法:
+#   ./manage.sh fix-template <model_dir>           自动检测模型类型
+#   ./manage.sh fix-template <model_dir> --coder    强制 Coder 完整模板
+#   ./manage.sh fix-template <model_dir> --minimal  强制通用最小模板
+#   ./manage.sh fix-template                        列出已缓存的模型
 # ============================================================
 cmd_fix_template() {
     local model_dir="${1:-}"
+    local type_flag="${2:-}"
+
     if [[ -z "$model_dir" ]]; then
-        error "用法: ./manage.sh fix-template <model_dir>"
+        error "用法: ./manage.sh fix-template <model_dir> [--coder|--minimal]"
         error "  model_dir: HuggingFace 模型目录 (如 ~/.cache/huggingface/hub/models--*/snapshots/*)"
         info ""
         info "搜索已缓存的 Qwen 模型:"
         find ~/.cache/huggingface/hub -name "chat_template.jinja" -type f 2>/dev/null | while read -r f; do
-            local dir
+            local dir family
             dir=$(dirname "$f")
-            echo "  $dir"
+            family=$(_detect_model_family "$dir")
+            if [[ "$family" == "coder" ]]; then
+                echo "  ${CYAN}[Coder]${NC} $dir"
+            else
+                echo "  [Qwen] $dir"
+            fi
         done
         return 1
     fi
 
-    local template_src="$_SCRIPT_DIR/assets/chat-templates/qwen-fixed-chat-template.jinja"
+    # 确定模型家族
+    local family
+    case "$type_flag" in
+        --coder)   family="coder" ;;
+        --minimal) family="qwen" ;;
+        "")
+            family=$(_detect_model_family "$model_dir")
+            ;;
+        *)
+            error "未知选项: $type_flag"
+            error "支持: --coder (Coder完整模板), --minimal (通用最小模板)"
+            return 1
+            ;;
+    esac
+
+    # 选择模板文件
+    local template_src template_name
+    case "$family" in
+        coder)
+            template_src="$SCRIPT_DIR/assets/chat-templates/qwen3-coder-fixed.jinja"
+            template_name="qwen3-coder-fixed.jinja (Coder 完整版: tools + vision + 错误检测)"
+            ;;
+        qwen|*)
+            template_src="$SCRIPT_DIR/assets/chat-templates/qwen3-fixed.jinja"
+            template_name="qwen3-fixed.jinja (通用最小版: system/developer 修复)"
+            ;;
+    esac
+
     if [[ ! -f "$template_src" ]]; then
         error "修复模板不存在: $template_src"
         return 1
@@ -981,6 +1063,11 @@ cmd_fix_template() {
     if [[ ! -e "$target" ]]; then
         warn "目标文件不存在: $target"
         info "将创建新文件"
+    else
+        # 创建备份
+        local backup="${target}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$target" "$backup"
+        info "已备份: $backup"
     fi
 
     # 如果是软链接，先删除
@@ -991,7 +1078,8 @@ cmd_fix_template() {
 
     cp "$template_src" "$target"
     info "已修复: $target"
-    info "模板: qwen-fixed-chat-template.jinja (支持 mid-conversation system, developer role)"
+    info "模板类型: ${CYAN}${family}${NC}"
+    info "模板文件: $template_name"
     info "请重启服务以生效: ./manage.sh restart"
 }
 
