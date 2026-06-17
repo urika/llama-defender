@@ -64,6 +64,13 @@ _load_config
 : "${RAPID_MLX_KV_QUANTIZATION:=false}"
 : "${RAPID_MLX_KV_QUANT_BITS:=8}"
 
+# MLX-VLM 默认参数
+: "${MLX_VLM_KV_BITS:=4}"
+: "${MLX_VLM_ENABLE_THINKING:=false}"
+: "${MLX_VLM_DRAFT_MODEL:=}"
+: "${MLX_VLM_DRAFT_KIND:=}"
+: "${MLX_VLM_MAX_KV_SIZE:=}"
+
 # 代理并发控制
 : "${PROXY_MAX_CONCURRENT:=1}"
 
@@ -105,8 +112,11 @@ _current_backend() {
             if [[ "$comm" == "llama-server" ]]; then
                 echo "llama-server"
                 return 0
-            elif [[ "$comm" == "rapid-mlx" ]]; then
+            elif [[ "$comm" == "rapid-mlx" || "$comm" == "vllm-mlx" ]]; then
                 echo "rapid-mlx"
+                return 0
+            elif [[ "$comm" == "mlx_vlm" ]]; then
+                echo "mlx_vlm"
                 return 0
             fi
         fi
@@ -114,6 +124,9 @@ _current_backend() {
     # fallback: search process
     if pgrep -f "rapid-mlx" >/dev/null 2>&1; then
         echo "rapid-mlx"
+        return 0
+    elif pgrep -f "mlx_vlm" >/dev/null 2>&1; then
+        echo "mlx_vlm"
         return 0
     elif pgrep -x "llama-server" >/dev/null 2>&1; then
         echo "llama-server"
@@ -167,8 +180,10 @@ _get_pid() {
     
     # fallback: search by backend name
     local pid
-    if [[ "$backend" == "rapid-mlx" ]]; then
+    if [[ "$backend" == "rapid-mlx" || "$backend" == "vllm-mlx" ]]; then
         pid=$(pgrep -f "rapid-mlx" 2>/dev/null | head -1)
+    elif [[ "$backend" == "mlx_vlm" ]]; then
+        pid=$(pgrep -f "mlx_vlm" 2>/dev/null | head -1)
     else
         pid=$(pgrep -x "$backend" 2>/dev/null | head -1)
     fi
@@ -447,8 +462,11 @@ _start_rapid_mlx() {
         args+=(--reasoning-parser "$RAPID_MLX_REASONING_PARSER")
     fi
 
+    if [[ "${LLAMA_THINKING:-false}" != "true" ]]; then
+        args+=(--no-thinking)
+    fi
+
     args+=(
-        --no-thinking
         --log-level INFO
     )
 
@@ -476,6 +494,71 @@ _start_rapid_mlx() {
 
     info "进程已启动 (PID: $new_pid)，等待就绪..."
     _wait_for_ready "$new_pid" "Rapid-MLX"
+}
+
+# ============================================================
+# 启动 MLX-VLM (Vision Language Model 推理服务)
+# ============================================================
+_start_mlx_vlm() {
+    _check_port "$LLAMA_PORT" || return 1
+
+    # 确定二进制
+    local bin="${LLAMA_SERVER_BIN:-mlx_vlm}"
+
+    info "启动 ${bin}..."
+    info "  配置: ${CYAN}$(_current_config_name)${NC}"
+    info "  模型: $LLAMA_MODEL"
+    info "  地址: $LLAMA_HOST:$LLAMA_PORT"
+
+    local args=(
+        --model "$LLAMA_MODEL"
+        --host "$LLAMA_HOST"
+        --port "$LLAMA_PORT"
+        --log-level INFO
+    )
+
+    # KV cache 量化
+    if [[ -n "${MLX_VLM_KV_BITS:-}" ]]; then
+        args+=(--kv-bits "$MLX_VLM_KV_BITS")
+        info "  KV 量化: ${MLX_VLM_KV_BITS}-bit"
+    fi
+
+    # Thinking mode
+    if [[ "${MLX_VLM_ENABLE_THINKING:-false}" == "true" ]]; then
+        args+=(--enable-thinking)
+        info "  Thinking: ${GREEN}启用${NC}"
+    else
+        info "  Thinking: 关闭"
+    fi
+
+    # 推测解码
+    if [[ -n "${MLX_VLM_DRAFT_MODEL:-}" ]]; then
+        args+=(--draft-model "$MLX_VLM_DRAFT_MODEL")
+        info "  Draft model: $MLX_VLM_DRAFT_MODEL"
+        if [[ -n "${MLX_VLM_DRAFT_KIND:-}" ]]; then
+            args+=(--draft-kind "$MLX_VLM_DRAFT_KIND")
+            info "  Draft kind: $MLX_VLM_DRAFT_KIND"
+        fi
+    fi
+
+    # Max KV size
+    if [[ -n "${MLX_VLM_MAX_KV_SIZE:-}" ]]; then
+        args+=(--max-kv-size "$MLX_VLM_MAX_KV_SIZE")
+        info "  Max KV size: $MLX_VLM_MAX_KV_SIZE"
+    fi
+
+    # 额外参数
+    if [[ -n "${MLX_VLM_EXTRA_ARGS:-}" ]]; then
+        read -ra extra <<< "$MLX_VLM_EXTRA_ARGS"
+        args+=("${extra[@]}")
+    fi
+
+    nohup ${bin} "${args[@]}" >> "$LOGFILE" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+
+    info "进程已启动 (PID: $new_pid)，等待就绪..."
+    _wait_for_ready "$new_pid" "MLX-VLM"
 }
 
 # ============================================================
@@ -604,6 +687,9 @@ cmd_start() {
     case "$LLAMA_BACKEND" in
         rapid-mlx|vllm-mlx)
             _start_rapid_mlx || true
+            ;;
+        mlx_vlm|mlx-vlm)
+            _start_mlx_vlm || true
             ;;
         cloud|deepseek-cloud|openai-cloud)
             # 云模式：直接启动代理，不启动本地后端
@@ -1045,8 +1131,14 @@ cmd_fix_template() {
     local template_src template_name
     case "$family" in
         coder)
-            template_src="$SCRIPT_DIR/assets/chat-templates/qwen3-coder-fixed.jinja"
-            template_name="qwen3-coder-fixed.jinja (Coder 完整版: tools + vision + 错误检测)"
+            # Qwen3.6 需要 thinking 开关逻辑，使用专用模板
+            if echo "$model_dir" | grep -qi '3\.6\|3_6\|36'; then
+                template_src="$SCRIPT_DIR/assets/chat-templates/qwen3.6-fixed.jinja"
+                template_name="qwen3.6-fixed.jinja (3.6 专用: thinking开关 + tools + vision)"
+            else
+                template_src="$SCRIPT_DIR/assets/chat-templates/qwen3-coder-fixed.jinja"
+                template_name="qwen3-coder-fixed.jinja (Coder 完整版: tools + vision + 错误检测)"
+            fi
             ;;
         qwen|*)
             template_src="$SCRIPT_DIR/assets/chat-templates/qwen3-fixed.jinja"
@@ -1240,7 +1332,7 @@ main() {
             cmd_current
             ;;
         fix-template)
-            cmd_fix_template "$2"
+            cmd_fix_template "$2" "$3"
             ;;
         watchdog)
             cmd_watchdog

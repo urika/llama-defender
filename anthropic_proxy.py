@@ -2365,7 +2365,7 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
         content_text = reasoning.strip()
 
     content = []
-    existing_tool_calls = msg.get("tool_calls", [])
+    existing_tool_calls = msg.get("tool_calls") or []
     synthesized = False
 
     # Content-text fallback for Qwen2.5-Coder: <tools>{...}</tools> in plain text.
@@ -4173,7 +4173,7 @@ class Handler(BaseHTTPRequestHandler):
             for block in anthropic_resp.get("content", []):
                 if block.get("type") == "tool_use" and block.get("input") == {}:
                     tool_name = block.get("name", "")
-                    for tc in openai_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls", []):
+                    for tc in (openai_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []):
                         if tc.get("function", {}).get("name") == tool_name:
                             raw_args = tc["function"].get("arguments", "{}")
                             try:
