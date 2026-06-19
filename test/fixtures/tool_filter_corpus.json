@@ -1,0 +1,95 @@
+{
+  "tool_catalog": {
+    "read": {"name": "Read", "description": "Read a file from the filesystem", "always_keep": true},
+    "write": {"name": "Write", "description": "Write content to a file", "always_keep": true},
+    "edit": {"name": "Edit", "description": "Edit a file using replacement patterns", "always_keep": true},
+    "bash": {"name": "Bash", "description": "Execute a shell command", "always_keep": true},
+    "glob": {"name": "Glob", "description": "List files matching a glob pattern", "always_keep": true},
+    "grep": {"name": "Grep", "description": "Search file contents with regex", "always_keep": true},
+    "ls": {"name": "LS", "description": "List directory contents", "always_keep": true},
+    "task": {"name": "Task", "description": "Create a sub-task", "always_keep": true},
+    "web_fetch": {"name": "WebFetch", "description": "Fetch a URL and return content", "always_keep": true},
+    "web_search": {"name": "WebSearch", "description": "Search the web", "always_keep": true},
+    "todo_read": {"name": "TodoRead", "description": "Read the todo list", "always_keep": true},
+    "todo_write": {"name": "TodoWrite", "description": "Update the todo list", "always_keep": true},
+    "skill": {"name": "Skill", "description": "Invoke a skill", "always_keep": true},
+    "agent": {"name": "Agent", "description": "Spawn a sub-agent", "always_keep": true},
+    "notebook_edit": {"name": "NotebookEdit", "description": "Edit a Jupyter notebook cell", "always_keep": true},
+    "enter_plan_mode": {"name": "EnterPlanMode", "description": "Enter plan mode", "always_keep": true},
+    "exit_plan_mode": {"name": "ExitPlanMode", "description": "Exit plan mode", "always_keep": true},
+    "ask_user": {"name": "AskUserQuestion", "description": "Ask the user a question", "always_keep": true},
+    "think": {"name": "Think", "description": "Think step by step", "always_keep": false},
+    "create": {"name": "Create", "description": "Create a new file", "always_keep": false},
+    "delete": {"name": "Delete", "description": "Delete a file", "always_keep": false},
+    "rename": {"name": "Rename", "description": "Rename a file", "always_keep": false},
+    "copy": {"name": "Copy", "description": "Copy a file", "always_keep": false},
+    "move": {"name": "Move", "description": "Move a file", "always_keep": false},
+    "search": {"name": "Search", "description": "Search for content", "always_keep": false},
+    "replace": {"name": "Replace", "description": "Replace text in file", "always_keep": false},
+    "insert": {"name": "Insert", "description": "Insert text at line", "always_keep": false},
+    "patch": {"name": "Patch", "description": "Apply a diff patch", "always_keep": false},
+    "diff": {"name": "Diff", "description": "Show diff between files", "always_keep": false},
+    "commit": {"name": "Commit", "description": "Git commit changes", "always_keep": false},
+    "push": {"name": "Push", "description": "Git push changes", "always_keep": false},
+    "pull": {"name": "Pull", "description": "Git pull changes", "always_keep": false},
+    "branch": {"name": "Branch", "description": "Git branch operations", "always_keep": false},
+    "merge": {"name": "Merge", "description": "Git merge branches", "always_keep": false},
+    "rebase": {"name": "Rebase", "description": "Git rebase", "always_keep": false},
+    "status": {"name": "Status", "description": "Show git status", "always_keep": false},
+    "log": {"name": "Log", "description": "Show git log", "always_keep": false},
+    "diff_file": {"name": "DiffFile", "description": "Show file diff", "always_keep": false},
+    "view": {"name": "View", "description": "View file content", "always_keep": false},
+    "list": {"name": "List", "description": "List directory", "always_keep": false},
+    "chat": {"name": "Chat", "description": "Chat with assistant", "always_keep": false},
+    "summarize": {"name": "Summarize", "description": "Summarize content", "always_keep": false},
+    "explain": {"name": "Explain", "description": "Explain code", "always_keep": false},
+    "refactor": {"name": "Refactor", "description": "Refactor code", "always_keep": false}
+  },
+  "scenarios": {
+    "fresh_session": {
+      "tool_choice": "auto",
+      "recent_used": [],
+      "expected_tools_approx": 18,
+      "description": "新会话：保留 always_keep 工具 + 无近期使用工具"
+    },
+    "recent_3_tools": {
+      "tool_choice": "auto",
+      "recent_used": ["create", "delete", "rename"],
+      "expected_tools_approx": 21,
+      "description": "近期使用 3 个工具：保留 always_keep + 近期工具"
+    },
+    "tool_choice_any": {
+      "tool_choice": {"type": "any"},
+      "recent_used": [],
+      "expected_tools_approx": 44,
+      "description": "tool_choice=any：应返回全部工具"
+    },
+    "tool_choice_specific": {
+      "tool_choice": {"type": "tool", "name": "read"},
+      "recent_used": [],
+      "expected_tools_approx": 1,
+      "description": "tool_choice=tool/read：应只返回 read"
+    },
+    "tool_choice_none": {
+      "tool_choice": "none",
+      "recent_used": [],
+      "expected_tools_approx": 0,
+      "description": "tool_choice=none：不应返回任何工具"
+    },
+    "recent_all_44": {
+      "tool_choice": "auto",
+      "recent_used": ["think", "create", "delete", "rename", "copy", "move", "search",
+                       "replace", "insert", "patch", "diff", "commit", "push", "pull",
+                       "branch", "merge", "rebase", "status", "log", "diff_file",
+                       "view", "list", "chat", "summarize", "explain", "refactor"],
+      "expected_tools_approx": 44,
+      "description": "近期使用了几乎所有可过滤工具"
+    },
+    "no_recent_empty_history": {
+      "tool_choice": "auto",
+      "recent_used": [],
+      "expected_tools_approx": 18,
+      "description": "空历史记录"
+    }
+  }
+}

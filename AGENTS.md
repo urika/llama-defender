@@ -128,13 +128,44 @@ etc.). The project is a collection of runnable scripts and configuration files.
 ./manage.sh start-cloud        # Start proxy only, forwarding to cloud API (DeepSeek/OpenAI)
 ./manage.sh stop               # Graceful stop (fallback to kill -9)
 ./manage.sh status             # PID, memory, API health, current model, proxy status
-./manage.sh restart            # Stop + start
+./manage.sh restart            # Stop + start (restarts proxy AND local backend)
+./manage.sh reload             # Hot-reload proxy config via SIGHUP (~0.5s, no process restart)
+./manage.sh start-backend      # Start local model only (independent of proxy, for hot-switch)
+./manage.sh stop-backend       # Stop local model only (frees GPU memory)
 ./manage.sh logs [N]           # Tail last N lines of backend log (default 50)
 ./manage.sh proxy-logs [N]     # Tail last N lines of proxy log (default 50)
 ./manage.sh list               # List all available configs
-./manage.sh switch <name>      # Symlink active.conf to <name>.conf
+./manage.sh switch <name>      # Symlink active.conf to <name>.conf (non-interactive safe)
 ./manage.sh current            # Show current config details
 ```
+
+### Hot-reload (SIGHUP) vs restart
+
+`reload` sends SIGHUP to the proxy process, triggering `_reload_config()`
+in `anthropic_proxy.py` which re-reads `configs/active.conf` and updates
+all module-level config via `setattr` — **without restarting the process**.
+
+| Aspect | `restart` | `reload` |
+|--------|-----------|----------|
+| Proxy process | Killed + restarted | **Stays alive** (PID unchanged) |
+| Local model | Stopped + restarted | Unaffected (independent) |
+| Switching time | 8-60s (model reload) | **~0.5s** (config parse + setattr) |
+| In-flight requests | Interrupted | Unaffected (reload at request boundary) |
+| Config scope | All | All except PORT/HOST and thread-local session state |
+
+**Hot-switch workflow (local ↔ cloud, no proxy restart)**:
+```bash
+./manage.sh switch deepseek-chat && ./manage.sh reload   # local → cloud
+./manage.sh stop-backend                                  # optional: free GPU memory
+./manage.sh switch rapid-mlx-35b && ./manage.sh reload   # cloud → local
+./manage.sh start-backend                                 # start local model
+```
+
+Reload updates: backend routing (LLAMA_BASE_URL, BACKEND_TYPE, MODEL_NAME),
+concurrency (PROXY_MAX_CONCURRENT + Semaphore rebuild), context management
+(clearing/truncation/lifecycle thresholds), tool filtering, loop/blocker
+detection. PORT/HOST (socket-bound) and per-session state
+(_SESSION_REQUEST_COUNT, _DEDUP_CACHE) are not reloaded.
 
 ### Configuration system
 
@@ -185,6 +216,17 @@ Rapid-MLX specific variables:
 | `RAPID_MLX_KV_QUANTIZATION` | `false` | Enable KV quantization |
 | `RAPID_MLX_KV_QUANT_BITS` | `8` | KV quant bits |
 
+> ⚠️ **WARNING: `--gpu-memory-utilization > 0.85` triggers kernel panic risk**
+>
+> On 48GB Macs, setting `--gpu-memory-utilization` above 0.85 (~38.2GB) can
+> trigger Apple Silicon kernel panics when KV cache and activations overshoot
+> the allocation limit. The default is 0.90 (36.2GB), which leaves only ~3.6GB
+> headroom and can reach 87%+ utilization in production.
+>
+> **Recommendation**: Set `--gpu-memory-utilization 0.80` (32.2GB) for 27B
+> models on 48GB machines. This provides ~4GB safety margin while maintaining
+> full performance. Verfied in `configs/mlx_vlm-27b.conf`.
+
 > ⚠️ **WARNING: `--kv-cache-turboquant` breaks prefix cache persistence**
 > The `--kv-cache-turboquant` CLI flag (used in `RAPID_MLX_EXTRA_ARGS`) enables
 > `TurboQuantKVCache` which lacks a `state` attribute required by `cache_persist`.
@@ -198,7 +240,7 @@ Rapid-MLX specific variables:
 > and `--kv-cache-turboquant-bits` from `RAPID_MLX_EXTRA_ARGS`. FP16 KV cache for
 > 84K tokens uses ~3.8GB, well within the ~14GB available on a 48GB Mac.
 > See `configs/rapid-mlx-35b.conf` for the corrected configuration.
-| `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags |
+| `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags. <br>Common values:<br>`--use-paged-cache` — enable PagedCacheManager block-level KV cache (vllm-mlx BatchedEngine)<br>`--gpu-memory-utilization 0.80` — cap Metal memory at 80% of total<br>`--continuous-batching` — redundant (BatchedEngine is default in v0.6.71+) |
 
 Watchdog variables:
 
@@ -222,6 +264,20 @@ Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 6. Starts `anthropic_proxy.py` if not already running, writes PID to
    `anthropic_proxy.pid`.
 
+> ⚠️ **IMPORTANT: `HF_HUB_OFFLINE=1` is REQUIRED for `vllm-mlx` backend**
+> 
+> `vllm-mlx` v0.6.71 tries to connect to `huggingface.co` on every startup to
+> validate model configuration. If the network is unavailable, it enters a
+> `ConnectTimeout` retry loop and hangs at `MLX step thread initialized`
+> indefinitely — **no error message, just a deadlock**.
+> 
+> **Fix**: Add `export HF_HUB_OFFLINE=1` to the config file (see
+> `configs/mlx_vlm-27b.conf`). The config is bash-sourcable, so `manage.sh`
+> will export it automatically via `_load_config()`.
+> 
+> This only affects the `vllm-mlx` binary. `llama-server` and `rapid-mlx`
+> (rapid-mlx.com) backends don't have this issue.
+
 ---
 
 ## Proxy (`anthropic_proxy.py`)
@@ -236,6 +292,12 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 The proxy listens on `HOST:PORT` (default `127.0.0.1:4000`) and forwards to
 `LLAMA_BASE_URL` (default `http://127.0.0.1:8081/v1`).
+
+On startup, the proxy registers a SIGHUP handler (`_reload_config`) that
+re-reads `configs/active.conf` and updates all module-level config via
+`setattr` — see "Hot-reload (SIGHUP) vs restart" above. This enables
+`./manage.sh reload` to switch backends (local↔cloud) in ~0.5s without
+restarting the proxy process.
 
 ### Dual-mode design (local vs cloud)
 
@@ -274,7 +336,9 @@ Switching between local and cloud models is done by:
 ### 8-layer request pipeline
 
 The proxy processes every request through an 8-layer pipeline (documented in
-`docs/02-architecture-design/proxy-pipeline-reference.md`):
+`docs/02-architecture-design/proxy-pipeline-reference.md`). The context
+compression management strategy across Phase 1-3 is summarized in
+`docs/research-context-optimization/06-context-compression-strategy.md`.
 
 1. **Request Entry** (`Handler.do_POST`) — routing, header masking, request dedup, JSON parse, session tracking, metrics init
 2. **Semantic Preprocessing** — error translation, tool-result clearing, placeholder preservation
@@ -329,7 +393,7 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXY_CLEAR_ENABLED` | `false` (cloud) / `true` (local) | Enable tool-result clearing. **Auto-disabled for cloud backends** (1M+ token context) |
+| `PROXY_CLEAR_ENABLED` | `false` (cloud) / `false` (local) | Enable tool-result clearing. **Recommended `false` for local backends** because rapid-mlx returns `Wasted call` for unchanged re-reads, causing death loops (see warning below). Auto-disabled for cloud backends (1M+ token context) |
 | `PROXY_CLEAR_THRESHOLD` | `30000` (cloud) / `15000` (local) | Character threshold to trigger clearing |
 | `PROXY_TOOL_KEEP` | `10` (cloud) / `2` (local) | Number of recent tool_result pairs to preserve |
 | `PROXY_CONTENT_TOOLS_FALLBACK` | `true` | Enable `<tools>` content-text extraction |
@@ -349,6 +413,63 @@ Environment variables:
 | `PROXY_PRE_TRUNCATE_CHARS` | `400000` | Pre-truncate very large payloads to prevent OOM/timeout |
 | `PROXY_RETRY_AFTER_SECONDS` | `30` | Retry-After header value (seconds) for 503/504 responses |
 | `PROXY_DEDUP_WINDOW` | `2` | Deduplication window (seconds) for detecting duplicate POST requests via body hash |
+| `PROXY_CACHE_ALIGN_ENABLED` | `false` (cloud) / `true` (local) | Enable Cache Aligner: protect first N messages from compression/truncation to stabilize prefix cache |
+| `PROXY_CACHE_ALIGN_HEAD` | `4` | Number of prefix messages to protect (system + skills + first user + first assistant) |
+| `PROXY_COMPRESS_ENABLED` | `false` (cloud) / `true` (local) | Enable Phase 2 semantic compression for long tool_result contents before clearing/truncation |
+| `PROXY_COMPRESS_THRESHOLD` | `4096` | Minimum character length of a tool_result to trigger semantic compression |
+| `PROXY_COMPRESS_MODE` | `semantic` | Compression aggressiveness: `lossless` (audit only), `semantic` (default), or `aggressive` (enables scalar dedupe) |
+| `PROXY_SCRUB_ANSI` | `true` | Remove ANSI color/control codes from tool_result contents before compression |
+| `PROXY_COMPRESS_AUDIT` | `true` | Validate compressed output (JSON parseable, code brackets balanced); fallback to original on failure |
+| `PROXY_DEDUPE_SCALARS` | `false` | Deduplicate repeated long scalar strings within a single tool_result (only active in `aggressive` mode) |
+
+### Semantic compression (Phase 2)
+
+Before clearing or truncating tool_result contents, the proxy can run a
+content-aware compression pass on the **dynamic zone** (messages after
+`PROXY_CACHE_ALIGN_HEAD`). It detects content type and applies a matching
+compressor:
+
+| Type | Heuristic | Compressor behavior |
+|------|-----------|---------------------|
+| `json` | Starts with `[`/`{` and parseable | `_sieve_json`: keep schema, truncate long values, keep first N items, count remainder |
+| `code` | High ratio of identifiers/brackets/keywords | `_compress_code`: remove non-semantic whitespace and comments, keep structure |
+| `log` | Timestamps/levels/duplicate lines | `_compress_log`: collapse repeated lines, preserve error/exception lines |
+| `text` | Fallback | `_compress_text`: paragraph/sentence truncation summary |
+
+All compressed outputs go through the **CompressionAuditor**. If audit fails,
+the original content is used. Metrics are recorded under
+`pipeline.semantic_compress`.
+
+### Resource & observation guardrails (Phase 3)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_TOKEN_RATIO_CHINESE` | `1.5` | Chars-per-token ratio for Chinese-dominated content |
+| `PROXY_TOKEN_RATIO_ENGLISH` | `4.0` | Chars-per-token ratio for English-dominated content |
+| `PROXY_TOKEN_RATIO_CODE` | `3.0` | Chars-per-token ratio for code-dominated content |
+| `PROXY_MEMORY_REJECT_THRESHOLD` | `90` (local) / `95` (cloud) | Reject new requests with 503 when system used_pct exceeds this |
+| `PROXY_DYNAMIC_MAX_TOKENS_ENABLED` | `true` (local) / `false` (cloud) | Adjust `max_tokens` by lifecycle stage and memory pressure |
+| `PROXY_DYNAMIC_MAX_TOKENS_INIT` | `4096` | Ceiling for `init` lifecycle stage |
+| `PROXY_DYNAMIC_MAX_TOKENS_GROWTH` | `4096` | Ceiling for `growth`/`expansion` stages |
+| `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` | `2048` | Ceiling for `saturation`/`oom_danger`/`pre_trunc` stages |
+| `PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO` | `0.8` | Additional multiplier for rapid-mlx backend |
+| `PROXY_DYNAMIC_CONCURRENT_ENABLED` | `true` (local) / `false` (cloud) | Auto-adjust backend concurrency by latency/error rate |
+| `PROXY_DYNAMIC_CONCURRENT_MIN` | `1` | Minimum concurrent requests |
+| `PROXY_DYNAMIC_CONCURRENT_MAX` | `4` (local) / `8` (cloud) | Maximum concurrent requests |
+| `PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS` | `30000` | P95 latency threshold; above this concurrency is reduced |
+| `PROXY_DYNAMIC_CONCURRENT_ERROR_RATE` | `0.2` | Error-rate threshold; above this concurrency is reduced |
+| `PROXY_SNAPSHOT_ENABLED` | `true` | Write before/after JSON snapshots on request failures |
+| `PROXY_SNAPSHOT_MAX_FILES` | `50` | Maximum snapshot files to retain |
+
+**Dynamic concurrency** monitors a sliding window of the last 50 requests.
+When P95 latency exceeds `PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS` or the
+error rate exceeds `PROXY_DYNAMIC_CONCURRENT_ERROR_RATE`, the proxy decreases
+the backend semaphore by 1 (down to MIN). When latency stays below half the
+threshold and there are no errors, it increases by 1 (up to MAX).
+
+**Failure snapshots** are written to `logs/snapshots/<request_id>_before.json`
+and `_after.json` only when a request fails with status >= 500. They include
+the original request body, post-pipeline body, and error details.
 
 ### Truncate smart-preserving Read results (v0.5.2)
 
@@ -598,9 +719,17 @@ bash test/run_tests.sh --trace         # requirement traceability (docs/requirem
 - `_filter_tools` (tool definition filtering)
 - `_translate_tool_result_errors` (error translation patterns)
 
+`test/unit/test_proxy_reload.py` contains `unittest` tests for:
+- `_parse_conf_env` (bash-style KEY=value parsing, quotes, comments, missing files)
+- `_reload_config` Tier 1 scalars (local→cloud and cloud→local switch, defaults, overrides)
+- `_reload_config` Tier 2 Semaphore rebuild (on PROXY_MAX_CONCURRENT change)
+- `_reload_config` Tier 2 MODEL_ALIASES rebuild (picks up new MODEL_NAME)
+- `_reload_config` dependent defaults (LOOP_LEVEL2/3, CHARS_SATURATION fallback)
+
 Run directly:
 ```bash
 python3 test/unit/test_proxy_fallback.py
+python3 test/unit/test_proxy_reload.py
 # or
 python3 -m unittest discover -s test/unit -p 'test_*.py' -v
 ```
@@ -693,25 +822,42 @@ Set `LLAMA_SERVER_BIN` env var or update `tools/bench_mtp.py`'s constant.
 
 ## Known Issues & Limitations
 
-Documented in `BENCHMARK.md` (Chinese), `docs/DEFECT-LIST.md`, and briefly here
-for agent context:
+Documented in `BENCHMARK.md` (Chinese), `docs/DEFECT-LIST.md`, `docs/04-analysis-diagnostics/`,
+and briefly here for agent context:
 
-1. **Rapid-MLX ignores `max_tokens`** (v0.6.30) — requests may generate far more
+1. **vllm-mlx v0.6.71 启动需要 `HF_HUB_OFFLINE=1`** — 后端启动时必连 `huggingface.co`
+   验证模型配置。网络不可用时陷入 `ConnectTimeout` 重试循环，卡死在 `MLX step thread
+   initialized` 且无错误提示。**修复**: `export HF_HUB_OFFLINE=1`（已写入 `configs/mlx_vlm-27b.conf`）。
+
+2. **跨请求前缀缓存不可用（BatchedEngine 限制）** — rapid-mlx v0.6.71 的 BatchedEngine
+   不集成 MemoryAwarePrefixCache，仅有 PagedCache（块级管理）。`cache_fetch` 日志从不出
+   现，所有请求做全量 prefill。旧版引擎（非 BatchedEngine）证实有完整前缀缓存（PID 88059
+   日志显示 99.9% 命中）。**缓解**: 等待上游支持，或评估降级到旧版 rapid-mlx。
+
+3. **Metal 设备死锁** — 多次 `kill -9` 快速重启后端可导致 Metal 初始化挂起（卡在
+   `MLX step thread initialized`），需重启机器恢复。**预防**: 优先使用 `./manage.sh
+   stop-backend` 优雅停止，避免 `kill -9`。
+
+4. **`--gpu-memory-utilization > 0.85` 触发 kernel panic 风险** — 48GB 机器上默认
+   0.90（36.2GB），生产峰值可达 31.7GB（87.6%）。当 KV cache + 激活值超标时风险更高。
+   **推荐**: 设为 0.80（32.2GB），已验证在 20+ 小时运行中稳定。
+
+5. **Rapid-MLX ignores `max_tokens`** (v0.6.30) — requests may generate far more
    tokens than requested. Workaround: `PROXY_MAX_TOKENS_OVERRIDE` enforces a
    hard cap in the proxy.
-2. **llama.cpp poor Qwen3.5-9B performance** — Gated DeltaNet architecture has
+6. **llama.cpp poor Qwen3.5-9B performance** — Gated DeltaNet architecture has
    incomplete Metal support; only ~17 tok/s. This model config has been removed;
    use Rapid-MLX or Qwen3.6-27B-MTP instead.
-3. **KV cache restore errors** — `state_seq_set_data` errors appear in
+7. **KV cache restore errors** — `state_seq_set_data` errors appear in
    `llama-server.log`; non-fatal but indicate compatibility quirks with Qwen3.x.
-4. **Concurrency limits on Apple Silicon** — Metal single-GPU time-slicing is
+8. **Concurrency limits on Apple Silicon** — Metal single-GPU time-slicing is
    inefficient; 2+ concurrent requests cause severe latency spikes on llama-server.
    Rapid-MLX handles multiple concurrent small requests well, but **two concurrent
    large-context (>38K tokens) requests on Rapid-MLX will reliably OOM** on 48GB
    unified memory. The proxy uses `PROXY_MAX_CONCURRENT` via a `threading.Semaphore`
    to control forwarding: `1` for llama-server configs, and **`1` for rapid-mlx-35b**
    (was `4`, reduced after repeated `[METAL] Insufficient Memory` crashes).
-5. **Rapid-MLX OOM on 48GB unified memory** — `allocation_limit` (set via
+9. **Rapid-MLX OOM on 48GB unified memory** — `allocation_limit` (set via
    `--gpu-memory-utilization`) is a **soft target**, not a hard wall. Prefill-phase
    activations + KV cache + prefix cache can overshoot by 20–40% (e.g. limit=28GB,
    actual peaks at 33–39GB). Known crash signature: `[METAL] Command buffer
@@ -720,24 +866,24 @@ for agent context:
    `--gpu-memory-utilization 0.60` (allocation_limit ≈24GB), keep
    `--cache-memory-percent 0.30` with memory-aware cache enabled. The
    `forced cache clear` triggered at 30GB does not prevent the crash.
-6. **Proxy `MODEL_NAME` auto-detection** — `MODEL_NAME` is now automatically
-   set based on `BACKEND_TYPE` (local: `mlx-community/Qwen3.6-35B-A3B-4bit`,
-   cloud: `deepseek-v4-pro`). Manual override via `MODEL_NAME` env var is still
-   supported for edge cases.
-7. **MTP requires source-built llama-server** — Brew version lacks
-   `--spec-type draft-mtp`. Use config `qwen3.6-27b-mtp` with a manually built
-   binary (the `qwen3.6-35b-mtp` config has been removed).
-8. **Cloud API cost risk** — DeepSeek `deepseek-v4-pro` charges per token.
-   A typical agentic coding task with 56K tokens/request × 20 requests costs
-   approximately ¥1–3. Monitor usage via proxy logs (`REQ_SUMMARY` lines).
-9. **Cloud mode observability loss** — When using cloud APIs, the proxy loses
-   visibility into: exact TTFT (network latency overlay), memory pressure,
-   prefix cache effectiveness, and forced cache clears. Only request size,
-   tool-call frequency, and message structure remain observable.
-10. **`deepseek-chat` deprecation** — DeepSeek's `deepseek-chat` and
+10. **Proxy `MODEL_NAME` auto-detection** — `MODEL_NAME` is now automatically
+    set based on `BACKEND_TYPE` (local: `mlx-community/Qwen3.6-35B-A3B-4bit`,
+    cloud: `deepseek-v4-pro`). Manual override via `MODEL_NAME` env var is still
+    supported for edge cases.
+11. **MTP requires source-built llama-server** — Brew version lacks
+    `--spec-type draft-mtp`. Use config `qwen3.6-27b-mtp` with a manually built
+    binary (the `qwen3.6-35b-mtp` config has been removed).
+12. **Cloud API cost risk** — DeepSeek `deepseek-v4-pro` charges per token.
+    A typical agentic coding task with 56K tokens/request × 20 requests costs
+    approximately ¥1–3. Monitor usage via proxy logs (`REQ_SUMMARY` lines).
+13. **Cloud mode observability loss** — When using cloud APIs, the proxy loses
+    visibility into: exact TTFT (network latency overlay), memory pressure,
+    prefix cache effectiveness, and forced cache clears. Only request size,
+    tool-call frequency, and message structure remain observable.
+14. **`deepseek-chat` deprecation** — DeepSeek's `deepseek-chat` and
     `deepseek-reasoner` model names will be deprecated on 2026-07-24. Use
     `deepseek-v4-pro` and `deepseek-v4-flash` instead.
-11. **P0 defects at v0.5.0-baseline** — `docs/DEFECT-LIST.md` tracks 30 defects
+15. **P0 defects at v0.5.0-baseline** — `docs/DEFECT-LIST.md` tracks 30 defects
     including 7 P0 (22% 500 error rate, 37% loop injection rate, re_read_rate
     formula error, tool-filter recent scan failure, Metal OOM, kernel panic risk,
     chat-template fix not toolized). Review this file before attempting fixes.
@@ -768,8 +914,10 @@ for agent context:
 ## Agent Checklist When Editing
 
 - [ ] If you change backend startup flags in `manage.sh`, test `start`, `stop`,
-      `restart`, and `status` for both `llama-server` and `rapid-mlx` backends.
-      Also test `start-cloud` and cloud-mode `status`.
+      `restart`, `reload`, `start-backend`, `stop-backend`, and `status` for both
+      `llama-server` and `rapid-mlx` backends. Also test `start-cloud` and
+      cloud-mode `status`. Verify `switch <name> && reload` hot-switches without
+      restarting the proxy (PID unchanged).
 - [ ] If you modify `anthropic_proxy.py`, run `bash test/run_tests.sh --all`
       (covers unit, integration, e2e, and trace tiers — the e2e tier needs a running
       proxy + backend). Test both local and cloud modes. The pre-commit hook

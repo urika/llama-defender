@@ -1,9 +1,9 @@
 # 代理层上下文窗口替换设计文档
 
-> 状态: Phase 1-2 + P0/P1 已实施  
+> 状态: Phase 1-3 已实施  
 > 作者: Kimi Code CLI / opencode  
-> 日期: 2026-06-05  
-> 版本: v7（P0/P1 实施：Metrics 日志 + 工具过滤 + 关键词索引 + 增量压缩）
+> 日期: 2026-06-18  
+> 版本: v8（新增 Phase 3 资源与观测护栏：动态并发、内存拒绝、动态 max_tokens、失败快照、schema v1）
 
 ---
 
@@ -645,11 +645,16 @@ Kimi 的建议在**推理引擎选择**层面有价值（确认了我们选择 R
 
 ## 11. 相关文档
 
+- `docs/research-context-optimization/06-context-compression-strategy.md` — **上下文压缩管理策略总览**（Phase 1-3 整合版）
+- `docs/research-context-optimization/05-plan.md` — 分阶段落地路线图
+- `docs/research-context-optimization/04-solutions.md` — 代理层可落地的优化方向
+- `docs/04-analysis-diagnostics/dcp-strategy-analysis-20260618.md` — 竞品上下文压缩策略分析
+- `docs/02-architecture-design/proxy-pipeline-reference.md` — 8 层代理管线参考
 - `docs/rapid-mlx-cache-analysis.md` — Prefix cache 命中问题分析（v0.6.30，non-trimmable）
 - `docs/rapid-mlx-cache-analysis-supplement.md` — 补充实验数据
 - `docs/proxy-context-window-design-review.md` — 本文档 review 意见
 - `CLAUDE.md` — 代理层架构说明
-- `AGENTS.md` — 项目编码规范
+- `AGENTS.md` — 环境变量与编码规范
 
 > 注：v0.6.71 已修复 MoE non-trimmable 问题，`rapid-mlx-cache-analysis.md` 中记录的问题已解决。
 
@@ -1129,51 +1134,60 @@ PROXY_CTX_TOKEN_BUDGET=30000
 
 ---
 
-## 20. 完整上下文管理流程（v7）
+## 20. 完整上下文管理流程（v8）
 
 ```
 请求进入 anthropic_proxy.py
   │
-  ├─ 1. 解析 messages, tools
-  ├─ 2. 日期标准化（固定 currentDate）
-  ├─ 3. Error translation（Wasted/FileNotFound → 自然语言）
-  ├─ 4. Tool clearing（语义优先级清除，PROXY_TOOL_KEEP=8）
+  ├─ 1. 解析 messages, tools；初始化 _metrics_ctx
+  ├─ 2. 内存压力检查（Phase 3）
+  │     └─ _should_reject_for_memory() → 503 + Retry-After（超限）
+  ├─ 3. 并发窗口记录 → _record_request_for_concurrency()
+  ├─ 4. 日期标准化（固定 currentDate）
+  ├─ 5. Error translation（Wasted/FileNotFound → 自然语言）
+  ├─ 6. Tool clearing（语义优先级清除，默认关闭）
   │     ├─ 语义评分：Read=3, Agent=3, WebFetch=2, Bash=1, Edit/Write=1
   │     ├─ 动态 KEEP：子代理 auto KEEP=15
   │     └─ Bash dedup（Jaccard >= 0.7 合并）
-  ├─ 5. 循环检测（精确 + 模式匹配）
+  ├─ 7. 循环检测（精确 + 模式匹配）
   │     ├─ 精确：相同工具名+相同参数 >= 3 次
   │     └─ 模式：相同文本+相同工具集合 >= 3 次
-  ├─ 6. Re-read 检测（Read 清除后的文件）
-  ├─ 7. Thinking block 清理
-  ├─ 8. Cleared tool-result 压缩
-  ├─ 9. Context truncation（核心）
+  ├─ 8. Re-read 检测（Read 清除后的文件）
+  ├─ 9. Thinking block 清理
+  ├─ 10. Phase 2 语义压缩（Cache Aligner dynamic zone）
+  │     ├─ _detect_content_type() → json/code/log/text
+  │     ├─ ContentRouter 选择压缩器
+  │     └─ CompressionAuditor 校验，失败回退
+  ├─ 11. Cache Aligner 拆分：prefix zone + dynamic zone
+  ├─ 12. Context truncation（核心）
+  │     ├─ 生命周期阶段：_classify_lifecycle_stage(chars)
   │     ├─ 自适应保留深度：_compute_adaptive_rounds()
-  │     ├─ 分离：HEAD(2) + TAIL(自适应N轮) + MIDDLE
+  │     ├─ 分离：HEAD + TAIL(自适应N轮) + MIDDLE
   │     ├─ MIDDLE 压缩（增量优先）：
   │     │   ├─ 增量压缩：_incremental_compress() 检查 _summary_cache
-  │     │   │   ├─ 缓存命中 → 只压缩新消息 → 合并缓存摘要
-  │     │   │   └─ 缓存未命中 → 全量压缩（下同）
   │     │   ├─ >= 10 msgs → LLM 压缩（30s timeout）
   │     │   ├─ 失败/<10 → 规则压缩
   │     │   └─ 无内容 → 简单折叠
+  │     ├─ Read 结果智能保留（rounds 策略）
   │     ├─ 关键词索引（P1-1）：
-  │     │   ├─ _extract_keywords(dropped) → 文件名/错误/函数名
-  │     │   └─ _inject_keyword_context(keywords, tail) → 子串匹配注入
-  │     └─ 重组：HEAD + 压缩摘要 + TAIL
-  ├─ 10. max_tokens override（16384）
-  ├─ 11. 工具过滤（P0-2）：_filter_tools()
-  │     ├─ TOOL_ALWAYS_KEEP 白名单（12 个核心工具）
+  │     │   ├─ _extract_keywords(dropped)
+  │     │   └─ _inject_keyword_context(keywords, tail)
+  │     └─ 重组：HEAD + 压缩摘要 + 保留 Read + TAIL
+  ├─ 13. 动态 max_tokens（Phase 3）：_compute_dynamic_max_tokens()
+  ├─ 14. 工具过滤（P0-2）：_filter_tools()
+  │     ├─ TOOL_ALWAYS_KEEP 白名单
   │     ├─ 最近 N 轮已使用工具保留
   │     └─ tool_choice 指定工具强制保留
-  ├─ 12. 转发到 rapid-mlx 后端
-  ├─ 13. 输出控制
+  ├─ 15. 转发到后端
+  ├─ 16. 输出控制
   │     ├─ Streaming: FORCE_STOPPED (text + tool_call args)
   │     ├─ Non-streaming: text truncation
   │     └─ _repair_truncated_json() 修复截断 JSON
-  └─ 14. Metrics 记录（P0-1）
-        ├─ _metrics_ctx 各步骤数据收集
-        ├─ _finalize_metrics() 质量标记 + 压缩比
+  ├─ 17. 动态并发调整（Phase 3）：_adjust_concurrency()
+  ├─ 18. 失败快照（Phase 3）：_write_request_snapshot()
+  └─ 19. Metrics 记录（schema v1）
+        ├─ _finalize_metrics()：动态 token 估算 + 固定字段
+        ├─ quality_flags + compression_ratio
         └─ log_metrics() → logs/proxy_metrics.jsonl
 ```
 
@@ -1570,3 +1584,128 @@ PROXY_HISTORY_BM25_B=0.75      # BM25 b 参数
 # 持久化（Phase 3）
 PROXY_HISTORY_INDEX_DIR=data/index  # 索引存储目录
 ```
+
+---
+
+## 23. Phase 3：资源与观测护栏
+
+> 本节补充 2026-06-18 实施的 Phase 3 能力。完整环境变量清单见 `AGENTS.md`「Resource & observation guardrails (Phase 3)」。
+
+### 23.1 设计目标
+
+在 Phase 1（prefix 稳定）和 Phase 2（语义压缩）基础上，增加第三层防御：**资源护栏 + 可观测性**，解决以下问题：
+
+| 问题 | Phase 3 对策 |
+|------|--------------|
+| 后端突发 OOM | 内存压力主动拒绝 |
+| `max_tokens` 被后端忽略导致长输出 OOM | 动态 `max_tokens` 上限 |
+| 固定并发无法适应负载 | 动态并发控制 |
+| 大请求失败后无现场 | 失败快照 |
+| 调参缺乏量化依据 | `/status` 看板 + metrics schema v1 |
+
+### 23.2 生命周期阶段驱动的统一阈值
+
+所有压缩/截断/输出限制力度由 `_classify_lifecycle_stage()` 根据总字符数单调递增决定：
+
+```
+chars →    15K       40K        90K        180K       350K     400K
+           │         │          │           │          │        │
+Stage:   INIT     GROWTH    EXPANSION   SATURATION  OOM_DANGER  PRE_TRUNC
+L2+L4:   跳过    尾40%清除   尾60%+     全dynamic+   全量+     全量+
+                 (无think)  think=5    think=3     think=1   think=1
+L5截断:   关       关       预算触发    rounds=8   rounds=3  rounds=2
+Frozen:   12       12         12          6          0         0
+max_tok: 4096     4096       4096        2048       2048      2048
+```
+
+### 23.3 动态 Token 估算（`_estimate_tokens_dynamic`）
+
+替代单一 `chars / ratio`，按内容语言自动选择 chars-per-token：
+
+| 内容类型 | 默认 ratio | 识别方式 |
+|----------|-----------|----------|
+| Chinese | 1.5 | 中文字符占比 > 30% |
+| English | 4.0 | 英文单词占比高 |
+| Code    | 3.0 | 标识符/括号/关键字密度高 |
+| Mixed   | 2.0 | 其他 |
+
+该估算同时用于：token budget 触发、OOM safety 截断、`/status` 显示、`metrics` 的 `est_input_tokens`。
+
+### 23.4 内存压力主动拒绝（`_should_reject_for_memory`）
+
+- 读取系统内存 `used_pct`。
+- 若 `used_pct > PROXY_MEMORY_REJECT_THRESHOLD`（local 默认 90，cloud 默认 95），在 `do_POST` 入口直接返回：
+  - HTTP 503
+  - `error.type = backend_oom`
+  - `Retry-After: PROXY_RETRY_AFTER_SECONDS`
+  - `"retryable": true`
+- 被拒绝的请求不消耗后端资源，为内存释放争取时间。
+
+### 23.5 动态 `max_tokens`（`_compute_dynamic_max_tokens`）
+
+根据生命周期阶段、后端类型、当前内存压力动态降低 `max_tokens`：
+
+| Stage | local 上限 | cloud 上限 | rapid-mlx 额外系数 |
+|-------|-----------|-----------|-------------------|
+| INIT / GROWTH / EXPANSION | 4096 | 8192 | ×0.8 |
+| SATURATION / OOM_DANGER / PRE_TRUNC | 2048 | 4096 | ×0.8 |
+
+同时记录 `max_tokens_original`、`max_tokens_dynamic`、`used_pct` 到 metrics。
+
+### 23.6 动态并发控制（`_adjust_concurrency`）
+
+维护最近 50 个请求的滑动窗口：
+
+| 信号 | 动作 |
+|------|------|
+| P95 延迟 > 30s 或错误率 > 20% | semaphore 减 1（最低 1） |
+| P95 延迟 < 15s 且错误率为 0 | semaphore 加 1（最高 local=4 / cloud=8） |
+
+local 模式默认最大并发仍受硬件限制，动态调整主要用于从临时高负载快速降级。
+
+### 23.7 请求失败快照（`_write_request_snapshot`）
+
+请求失败（HTTP >= 500 或异常）时，写入：
+
+```
+logs/snapshots/<request_id>_before.json   # 原始请求体
+logs/snapshots/<request_id>_after.json    # 经过 pipeline 后的请求体
+```
+
+最多保留 `PROXY_SNAPSHOT_MAX_FILES` 个文件，旧文件自动清理。
+
+### 23.8 `/status` 与 metrics schema v1
+
+`/status` 新增「Context Optimization」卡片，展示：
+
+| 字段 | 说明 |
+|------|------|
+| `avg_common_prefix_ratio` | 最近 N 请求平均公共前缀比例 |
+| `avg_compression_ratio` | 平均压缩比 |
+| `loop_events` | 循环检测触发次数 |
+| `blocker_events` | blocker 触发次数 |
+| `last_blocker` | 最近 blocker 详情 |
+| `dynamic_concurrent` | 当前动态并发值 |
+
+metrics schema v1 强制固定字段集合，新增 `schema_version: "v1"`、`token_ratio`、`est_input_tokens`、`est_output_tokens`、`memory_rejected`、`used_pct`、`max_tokens_*`、`snapshot_written`、`dynamic_concurrent` 等字段。
+
+### 23.9 与 Phase 1/2 的关系
+
+```
+Phase 1 (稳定层) → Phase 2 (压缩层) → Phase 3 (护栏层)
+     │                   │                   │
+     │ 保护 prefix        │ 减少 token        │ 防止 OOM
+     │ 稳定 cache         │ 保留语义          │ 可观测
+     └───────────────────┴───────────────────┘
+                         ↓
+              完整上下文压缩管理体系
+```
+
+### 23.10 验证结果
+
+| 验证项 | 结果 |
+|--------|------|
+| 单元测试 | 281 个通过 |
+| 集成测试 | 6 套通过（blocker/loop/cache-align/compress/memory-reject/status） |
+| `/status` Context Optimization 卡片 | 字段正常显示 |
+| metrics schema v1 | 所有记录固定字段完整 |

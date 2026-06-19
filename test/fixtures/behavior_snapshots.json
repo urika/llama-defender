@@ -1,0 +1,831 @@
+{
+  "_classify_exception": [
+    {
+      "input": {
+        "note": "Timeout -> 504 retryable",
+        "exc": "TimeoutError",
+        "msg": "timed out"
+      },
+      "expected": {
+        "status": 504,
+        "error_type": "timeout_error",
+        "retryable": true
+      },
+      "note": "Timeout -> 504 retryable"
+    },
+    {
+      "input": {
+        "note": "Connection refused -> 503 retryable",
+        "exc": "ConnectionRefusedError",
+        "msg": "connection refused"
+      },
+      "expected": {
+        "status": 503,
+        "error_type": "backend_unavailable",
+        "retryable": true
+      },
+      "note": "Connection refused -> 503 retryable"
+    },
+    {
+      "input": {
+        "note": "Broken pipe -> 499 not retryable",
+        "exc": "BrokenPipeError",
+        "msg": "broken pipe"
+      },
+      "expected": {
+        "status": 499,
+        "error_type": "client_closed",
+        "retryable": false
+      },
+      "note": "Broken pipe -> 499 not retryable"
+    },
+    {
+      "input": {
+        "note": "ValueError -> 500 not retryable",
+        "exc": "ValueError",
+        "msg": "bad input"
+      },
+      "expected": {
+        "status": 500,
+        "error_type": "internal_error",
+        "retryable": false
+      },
+      "note": "ValueError -> 500 not retryable"
+    },
+    {
+      "input": {
+        "note": "KeyError -> 500 not retryable",
+        "exc": "KeyError",
+        "msg": "missing key"
+      },
+      "expected": {
+        "status": 500,
+        "error_type": "internal_error",
+        "retryable": false
+      },
+      "note": "KeyError -> 500 not retryable"
+    },
+    {
+      "input": {
+        "note": "RuntimeError(OOM) -> 503 retryable",
+        "exc": "RuntimeError",
+        "msg": "out of memory"
+      },
+      "expected": {
+        "status": 503,
+        "error_type": "backend_oom",
+        "retryable": true
+      },
+      "note": "RuntimeError(OOM) -> 503 retryable"
+    },
+    {
+      "input": {
+        "note": "RuntimeError(OOM shorthand) -> 503 retryable",
+        "exc": "RuntimeError",
+        "msg": "OOM"
+      },
+      "expected": {
+        "status": 503,
+        "error_type": "backend_oom",
+        "retryable": true
+      },
+      "note": "RuntimeError(OOM shorthand) -> 503 retryable"
+    },
+    {
+      "input": {
+        "note": "ConnectionError -> 503 retryable",
+        "exc": "ConnectionError",
+        "msg": "failed to connect"
+      },
+      "expected": {
+        "status": 503,
+        "error_type": "backend_unavailable",
+        "retryable": true
+      },
+      "note": "ConnectionError -> 503 retryable"
+    }
+  ],
+  "_repair_truncated_json": [
+    {
+      "input": {
+        "note": "Simple object missing closing brace",
+        "input": "{\"name\": \"read\", \"args\": {\"path\": \"a.py\""
+      },
+      "expected": "{\"name\": \"read\", \"args\": {\"path\": \"a.py\"}}",
+      "note": "Simple object missing closing brace"
+    },
+    {
+      "input": {
+        "note": "String value truncated",
+        "input": "{\"key\": \"value"
+      },
+      "expected": "{\"key\": \"value\"}",
+      "note": "String value truncated"
+    },
+    {
+      "input": {
+        "note": "Array truncated",
+        "input": "{\"a\": [1, 2, 3"
+      },
+      "expected": "{\"a\": [1, 2, 3]}",
+      "note": "Array truncated"
+    },
+    {
+      "input": {
+        "note": "Nested object truncated",
+        "input": "{\"nested\": {\"inner\": \"text\""
+      },
+      "expected": "{\"nested\": {\"inner\": \"text\"}}",
+      "note": "Nested object truncated"
+    },
+    {
+      "input": {
+        "note": "Unicode escape truncated",
+        "input": "{\"unicode\": \"\\u4e2d\\u6587"
+      },
+      "expected": "{\"unicode\": \"\\u4e2d\\u6587\"}",
+      "note": "Unicode escape truncated"
+    },
+    {
+      "input": {
+        "note": "Already complete JSON",
+        "input": "{\"complete\": \"json\"}"
+      },
+      "expected": "{\"complete\": \"json\"}",
+      "note": "Already complete JSON"
+    },
+    {
+      "input": {
+        "note": "Empty input",
+        "input": ""
+      },
+      "expected": "{}",
+      "note": "Empty input"
+    },
+    {
+      "input": {
+        "note": "Null literal",
+        "input": "null"
+      },
+      "expected": "null",
+      "note": "Null literal"
+    },
+    {
+      "input": {
+        "note": "Only opening brace",
+        "input": "{"
+      },
+      "expected": "{}",
+      "note": "Only opening brace"
+    },
+    {
+      "input": {
+        "note": "Missing closing brace for outer and inner",
+        "input": "{\"outer\": {\"inner\": \"deep\""
+      },
+      "expected": "{\"outer\": {\"inner\": \"deep\"}}",
+      "note": "Missing closing brace for outer and inner"
+    }
+  ],
+  "parse_tool_arguments": [
+    {
+      "input": {
+        "note": "Level 1: clean JSON",
+        "input": "{\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}}",
+        "hint": "read"
+      },
+      "expected": {
+        "name": "read",
+        "arguments": {
+          "path": "a.py"
+        }
+      },
+      "note": "Level 1: clean JSON"
+    },
+    {
+      "input": {
+        "note": "Level 1: clean JSON no hint",
+        "input": "{\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}}",
+        "hint": ""
+      },
+      "expected": {
+        "name": "read",
+        "arguments": {
+          "path": "a.py"
+        }
+      },
+      "note": "Level 1: clean JSON no hint"
+    },
+    {
+      "input": {
+        "note": "Level 2: embedded JSON",
+        "input": "text before {\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}} text after",
+        "hint": "read"
+      },
+      "expected": {
+        "name": "read",
+        "arguments": {
+          "path": "a.py"
+        }
+      },
+      "note": "Level 2: embedded JSON"
+    },
+    {
+      "input": {
+        "note": "Level 3: XML tool_call format",
+        "input": "<tool_call>read({\"path\": \"a.py\"})</tool_call>",
+        "hint": "read"
+      },
+      "expected": {
+        "path": "a.py"
+      },
+      "note": "Level 3: XML tool_call format"
+    },
+    {
+      "input": {
+        "note": "Level 4: function tag fallback",
+        "input": "<function=read>{\"path\": \"a.py\"}</function>",
+        "hint": "read"
+      },
+      "expected": {
+        "path": "a.py"
+      },
+      "note": "Level 4: function tag fallback"
+    },
+    {
+      "input": {
+        "note": "Bash tool: command param",
+        "input": "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}",
+        "hint": "bash"
+      },
+      "expected": {
+        "name": "bash",
+        "arguments": {
+          "command": "ls -la"
+        }
+      },
+      "note": "Bash tool: command param"
+    },
+    {
+      "input": {
+        "note": "Write tool: content param",
+        "input": "{\"name\": \"write\", \"arguments\": {\"path\": \"a.py\", \"content\": \"hello\"}}",
+        "hint": "write"
+      },
+      "expected": {
+        "name": "write",
+        "arguments": {
+          "path": "a.py",
+          "content": "hello"
+        }
+      },
+      "note": "Write tool: content param"
+    },
+    {
+      "input": {
+        "note": "Heuristic: tool name hint = read, raw text",
+        "input": "/etc/passwd",
+        "hint": "read"
+      },
+      "expected": {
+        "file_path": "/etc/passwd"
+      },
+      "note": "Heuristic: tool name hint = read, raw text"
+    },
+    {
+      "input": {
+        "note": "Heuristic: tool name hint = bash, shell command",
+        "input": "ls -la",
+        "hint": "bash"
+      },
+      "expected": {
+        "command": "ls -la"
+      },
+      "note": "Heuristic: tool name hint = bash, shell command"
+    },
+    {
+      "input": {
+        "note": "Empty input",
+        "input": "",
+        "hint": "read"
+      },
+      "expected": {},
+      "note": "Empty input"
+    }
+  ],
+  "_extract_content_tool_calls": [
+    {
+      "input": {
+        "note": "Empty input",
+        "input": ""
+      },
+      "expected": {
+        "text": "",
+        "tools": []
+      },
+      "note": "Empty input"
+    },
+    {
+      "input": {
+        "note": "None input",
+        "input": null
+      },
+      "expected": {
+        "text": "",
+        "tools": []
+      },
+      "note": "None input"
+    },
+    {
+      "input": {
+        "note": "No tools block",
+        "input": "plain text no tools"
+      },
+      "expected": {
+        "text": "plain text no tools",
+        "tools": []
+      },
+      "note": "No tools block"
+    },
+    {
+      "input": {
+        "note": "Single tool block",
+        "input": "<tools>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}\n</tools>"
+      },
+      "expected": {
+        "text": "",
+        "tools": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Beijing"
+            }
+          }
+        ]
+      },
+      "note": "Single tool block"
+    },
+    {
+      "input": {
+        "note": "Two adjacent tool blocks",
+        "input": "<tools>\n{\"name\": \"a\", \"arguments\": {\"x\": 1}}\n</tools><tools>\n{\"name\": \"b\", \"arguments\": {\"y\": 2}}\n</tools>"
+      },
+      "expected": {
+        "text": "",
+        "tools": [
+          {
+            "name": "a",
+            "arguments": {
+              "x": 1
+            }
+          },
+          {
+            "name": "b",
+            "arguments": {
+              "y": 2
+            }
+          }
+        ]
+      },
+      "note": "Two adjacent tool blocks"
+    },
+    {
+      "input": {
+        "note": "Mixed prose and tool",
+        "input": "Sure <tools>\n{\"name\": \"x\", \"arguments\": {}}\n</tools> done."
+      },
+      "expected": {
+        "text": "Sure  done.",
+        "tools": [
+          {
+            "name": "x",
+            "arguments": {}
+          }
+        ]
+      },
+      "note": "Mixed prose and tool"
+    },
+    {
+      "input": {
+        "note": "Malformed JSON in tool block",
+        "input": "<tools>\n{this is not json}\n</tools>"
+      },
+      "expected": {
+        "text": "<tools>\n{this is not json}\n</tools>",
+        "tools": []
+      },
+      "note": "Malformed JSON in tool block"
+    },
+    {
+      "input": {
+        "note": "Literal </tools> in JSON args (rfind rescue)",
+        "input": "<tools>\n{\"name\": \"echo\", \"arguments\": {\"msg\": \"watch </tools> here\"}}\n</tools>"
+      },
+      "expected": {
+        "text": "",
+        "tools": [
+          {
+            "name": "echo",
+            "arguments": {
+              "msg": "watch </tools> here"
+            }
+          }
+        ]
+      },
+      "note": "Literal </tools> in JSON args (rfind rescue)"
+    },
+    {
+      "input": {
+        "note": "Arguments as JSON string",
+        "input": "<tools>\n{\"name\": \"x\", \"arguments\": \"{\\\"k\\\": 7}\"}\n</tools>"
+      },
+      "expected": {
+        "text": "",
+        "tools": [
+          {
+            "name": "x",
+            "arguments": {
+              "k": 7
+            }
+          }
+        ]
+      },
+      "note": "Arguments as JSON string"
+    },
+    {
+      "input": {
+        "note": "Array instead of dict (unexpected shape)",
+        "input": "<tools>\n[\"array\", \"not\", \"dict\"]\n</tools>"
+      },
+      "expected": {
+        "text": "<tools>\n[\"array\", \"not\", \"dict\"]\n</tools>",
+        "tools": []
+      },
+      "note": "Array instead of dict (unexpected shape)"
+    },
+    {
+      "input": {
+        "note": "Unterminated tools block",
+        "input": "<tools>\n{\"name\": \"x\", \"arguments\": {}}\n  (no closing tag)"
+      },
+      "expected": {
+        "text": "<tools>\n{\"name\": \"x\", \"arguments\": {}}\n  (no closing tag)",
+        "tools": []
+      },
+      "note": "Unterminated tools block"
+    }
+  ],
+  "_detect_blocker_pattern": [
+    {
+      "input": {
+        "note": "Empty messages",
+        "input": []
+      },
+      "expected": {
+        "triggered": false,
+        "run_length": 0,
+        "threshold": 2
+      },
+      "note": "Empty messages"
+    },
+    {
+      "input": {
+        "note": "Plain user text only",
+        "input": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "expected": {
+        "triggered": false,
+        "run_length": 0,
+        "threshold": 2
+      },
+      "note": "Plain user text only"
+    },
+    {
+      "input": {
+        "note": "Single non-error tool result",
+        "input": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "name": "read",
+                "input": {
+                  "path": "a.py"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "file content here"
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "triggered": false,
+        "run_length": 0,
+        "threshold": 2
+      },
+      "note": "Single non-error tool result"
+    },
+    {
+      "input": {
+        "note": "2 consecutive wasted calls",
+        "input": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "\u8be5\u6587\u4ef6\u81ea\u4e0a\u6b21\u8bfb\u53d6\u540e\u672a\u53d1\u751f\u53d8\u5316"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "content": "\u8be5\u6587\u4ef6\u81ea\u4e0a\u6b21\u8bfb\u53d6\u540e\u672a\u53d1\u751f\u53d8\u5316"
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "triggered": true,
+        "tool_name": "unknown",
+        "error_type": "wasted",
+        "run_length": 2
+      },
+      "note": "2 consecutive wasted calls"
+    }
+  ],
+  "_compute_text_similarity": [
+    {
+      "input": {
+        "note": "Identical text -> 1.0",
+        "text1": "hello world",
+        "text2": "hello world"
+      },
+      "expected": 1.0,
+      "note": "Identical text -> 1.0"
+    },
+    {
+      "input": {
+        "note": "Similar text -> ~0.5",
+        "text1": "hello world",
+        "text2": "goodbye world"
+      },
+      "expected": 0.29411764705882354,
+      "note": "Similar text -> ~0.5"
+    },
+    {
+      "input": {
+        "note": "Completely different -> 0.0",
+        "text1": "abc",
+        "text2": "xyz"
+      },
+      "expected": 0.0,
+      "note": "Completely different -> 0.0"
+    },
+    {
+      "input": {
+        "note": "Both empty -> 0.0",
+        "text1": "",
+        "text2": ""
+      },
+      "expected": 0.0,
+      "note": "Both empty -> 0.0"
+    },
+    {
+      "input": {
+        "note": "Repeated text -> 1.0",
+        "text1": "Same text repeated",
+        "text2": "Same text repeated"
+      },
+      "expected": 1.0,
+      "note": "Repeated text -> 1.0"
+    }
+  ],
+  "convert_anthropic_tool_choice_to_openai": [
+    {
+      "input": {
+        "note": "auto",
+        "input": {
+          "type": "auto"
+        }
+      },
+      "expected": "auto",
+      "note": "auto"
+    },
+    {
+      "input": {
+        "note": "any -> required",
+        "input": {
+          "type": "any"
+        }
+      },
+      "expected": {
+        "type": "function"
+      },
+      "note": "any -> required"
+    },
+    {
+      "input": {
+        "note": "tool/read -> function/read",
+        "input": {
+          "type": "tool",
+          "name": "read"
+        }
+      },
+      "expected": {
+        "type": "function",
+        "function": {
+          "name": "read"
+        }
+      },
+      "note": "tool/read -> function/read"
+    },
+    {
+      "input": {
+        "note": "none",
+        "input": {
+          "type": "none"
+        }
+      },
+      "expected": "none",
+      "note": "none"
+    }
+  ],
+  "convert_anthropic_tools_to_openai": [
+    {
+      "input": {
+        "note": "Empty list",
+        "input": []
+      },
+      "expected": null,
+      "note": "Empty list"
+    },
+    {
+      "input": {
+        "note": "Single tool",
+        "input": [
+          {
+            "name": "read",
+            "description": "Read a file",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "note": "Single tool"
+    },
+    {
+      "input": {
+        "note": "Multiple tools",
+        "input": [
+          {
+            "name": "read",
+            "input_schema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "write",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write",
+            "description": "",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "note": "Multiple tools"
+    }
+  ],
+  "clear_old_tool_results": [
+    {
+      "input": {
+        "note": "Empty messages",
+        "input": [],
+        "tools": null
+      },
+      "expected": [
+        [],
+        {
+          "enabled": true,
+          "skipped": true,
+          "reason": "below_threshold",
+          "chars": 0,
+          "high_prio": 0,
+          "dedup_bash": 0,
+          "dedup_chars_saved": 0,
+          "frozen_head": 12
+        }
+      ],
+      "note": "Empty messages"
+    },
+    {
+      "input": {
+        "note": "No tool results to clear",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": null
+      },
+      "expected": [
+        [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        {
+          "enabled": true,
+          "skipped": true,
+          "reason": "below_threshold",
+          "chars": 2,
+          "high_prio": 0,
+          "dedup_bash": 0,
+          "dedup_chars_saved": 0,
+          "frozen_head": 12
+        }
+      ],
+      "note": "No tool results to clear"
+    }
+  ]
+}

@@ -76,6 +76,40 @@ echo ""
 echo "✅ pre-commit: unit tests passed."
 
 # ------------------------------------------------------------
+# Refactoring regression checks: function signatures + behavior snapshots
+# ------------------------------------------------------------
+echo ""
+echo "pre-commit: checking function signature equivalence..."
+
+bash "$RUNNER" --signature
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  echo ""
+  echo "❌ pre-commit: function signature drift detected." >&2
+  echo "  • If this is an intentional signature change, update the snapshot:" >&2
+  echo "    python3 tools/gen_func_signatures.py" >&2
+  echo "  • Or skip (use sparingly): SKIP_TESTS=1 git commit -m '...'" >&2
+  exit 1
+fi
+
+echo ""
+echo "pre-commit: checking behavior snapshot equivalence..."
+
+bash "$RUNNER" --snapshot
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  echo ""
+  echo "❌ pre-commit: behavior snapshot drift detected." >&2
+  echo "  • If this is an intentional behavior change, update the snapshot:" >&2
+  echo "    python3 tools/gen_behavior_snapshots.py --update" >&2
+  echo "  • Or skip (use sparingly): SKIP_TESTS=1 git commit -m '...'" >&2
+  exit 1
+fi
+
+echo ""
+echo "✅ pre-commit: refactoring regression checks passed."
+
+# ------------------------------------------------------------
 # Optional: Promptfoo regression tests (only if proxy is running)
 # ------------------------------------------------------------
 PROXY_URL="${PROXY_BASE:-http://127.0.0.1:4000}"

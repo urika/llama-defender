@@ -1,0 +1,104 @@
+{
+  "_classify_exception": {
+    "description": "Input is an exception object (e.g., TimeoutError('timed out')). Output is (status, error_type, retryable) tuple.",
+    "cases": [
+      {"note": "Timeout -> 504 retryable", "exc": "TimeoutError", "msg": "timed out"},
+      {"note": "Connection refused -> 503 retryable", "exc": "ConnectionRefusedError", "msg": "connection refused"},
+      {"note": "Broken pipe -> 499 not retryable", "exc": "BrokenPipeError", "msg": "broken pipe"},
+      {"note": "ValueError -> 500 not retryable", "exc": "ValueError", "msg": "bad input"},
+      {"note": "KeyError -> 500 not retryable", "exc": "KeyError", "msg": "missing key"},
+      {"note": "RuntimeError(OOM) -> 503 retryable", "exc": "RuntimeError", "msg": "out of memory"},
+      {"note": "RuntimeError(OOM shorthand) -> 503 retryable", "exc": "RuntimeError", "msg": "OOM"},
+      {"note": "ConnectionError -> 503 retryable", "exc": "ConnectionError", "msg": "failed to connect"}
+    ]
+  },
+  "_repair_truncated_json": {
+    "description": "Input is a truncated JSON string. Output is the repaired JSON string.",
+    "cases": [
+      {"note": "Simple object missing closing brace", "input": "{\"name\": \"read\", \"args\": {\"path\": \"a.py\""},
+      {"note": "String value truncated", "input": "{\"key\": \"value"},
+      {"note": "Array truncated", "input": "{\"a\": [1, 2, 3"},
+      {"note": "Nested object truncated", "input": "{\"nested\": {\"inner\": \"text\""},
+      {"note": "Unicode escape truncated", "input": "{\"unicode\": \"\\u4e2d\\u6587"},
+      {"note": "Already complete JSON", "input": "{\"complete\": \"json\"}"},
+      {"note": "Empty input", "input": ""},
+      {"note": "Null literal", "input": "null"},
+      {"note": "Only opening brace", "input": "{"},
+      {"note": "Missing closing brace for outer and inner", "input": "{\"outer\": {\"inner\": \"deep\""}
+    ]
+  },
+  "parse_tool_arguments": {
+    "description": "Input is (raw_string, tool_name_hint). Output is parsed dict or {}.",
+    "cases": [
+      {"note": "Level 1: clean JSON", "input": "{\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}}", "hint": "read"},
+      {"note": "Level 1: clean JSON no hint", "input": "{\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}}", "hint": ""},
+      {"note": "Level 2: embedded JSON", "input": "text before {\"name\": \"read\", \"arguments\": {\"path\": \"a.py\"}} text after", "hint": "read"},
+      {"note": "Level 3: XML tool_call format", "input": "<tool_call>read({\"path\": \"a.py\"})</tool_call>", "hint": "read"},
+      {"note": "Level 4: function tag fallback", "input": "<function=read>{\"path\": \"a.py\"}</function>", "hint": "read"},
+      {"note": "Bash tool: command param", "input": "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}", "hint": "bash"},
+      {"note": "Write tool: content param", "input": "{\"name\": \"write\", \"arguments\": {\"path\": \"a.py\", \"content\": \"hello\"}}", "hint": "write"},
+      {"note": "Heuristic: tool name hint = read, raw text", "input": "/etc/passwd", "hint": "read"},
+      {"note": "Heuristic: tool name hint = bash, shell command", "input": "ls -la", "hint": "bash"},
+      {"note": "Empty input", "input": "", "hint": "read"}
+    ]
+  },
+  "_extract_content_tool_calls": {
+    "description": "Input is text string. Output is {'text': str, 'tools': [dict]}.",
+    "cases": [
+      {"note": "Empty input", "input": ""},
+      {"note": "None input", "input": null},
+      {"note": "No tools block", "input": "plain text no tools"},
+      {"note": "Single tool block", "input": "<tools>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}\n</tools>"},
+      {"note": "Two adjacent tool blocks", "input": "<tools>\n{\"name\": \"a\", \"arguments\": {\"x\": 1}}\n</tools><tools>\n{\"name\": \"b\", \"arguments\": {\"y\": 2}}\n</tools>"},
+      {"note": "Mixed prose and tool", "input": "Sure <tools>\n{\"name\": \"x\", \"arguments\": {}}\n</tools> done."},
+      {"note": "Malformed JSON in tool block", "input": "<tools>\n{this is not json}\n</tools>"},
+      {"note": "Literal </tools> in JSON args (rfind rescue)", "input": "<tools>\n{\"name\": \"echo\", \"arguments\": {\"msg\": \"watch </tools> here\"}}\n</tools>"},
+      {"note": "Arguments as JSON string", "input": "<tools>\n{\"name\": \"x\", \"arguments\": \"{\\\"k\\\": 7}\"}\n</tools>"},
+      {"note": "Array instead of dict (unexpected shape)", "input": "<tools>\n[\"array\", \"not\", \"dict\"]\n</tools>"},
+      {"note": "Unterminated tools block", "input": "<tools>\n{\"name\": \"x\", \"arguments\": {}}\n  (no closing tag)"}
+    ]
+  },
+  "_detect_blocker_pattern": {
+    "description": "Input is messages list. Output is {'triggered': bool, ...} dict.",
+    "cases": [
+      {"note": "Empty messages", "input": []},
+      {"note": "Plain user text only", "input": [{"role": "user", "content": "hello"}]},
+      {"note": "Single non-error tool result", "input": [{"role": "assistant", "content": [{"type": "tool_use", "name": "read", "input": {"path": "a.py"}}]}, {"role": "user", "content": [{"type": "tool_result", "content": "file content here"}]}]},
+      {"note": "2 consecutive wasted calls", "input": [{"role": "user", "content": [{"type": "tool_result", "content": "该文件自上次读取后未发生变化"}]}, {"role": "user", "content": [{"type": "tool_result", "content": "该文件自上次读取后未发生变化"}]}]}
+    ]
+  },
+  "_compute_text_similarity": {
+    "description": "Input is (text1, text2). Output is float similarity score [0.0, 1.0].",
+    "cases": [
+      {"note": "Identical text -> 1.0", "text1": "hello world", "text2": "hello world"},
+      {"note": "Similar text -> ~0.5", "text1": "hello world", "text2": "goodbye world"},
+      {"note": "Completely different -> 0.0", "text1": "abc", "text2": "xyz"},
+      {"note": "Both empty -> 0.0", "text1": "", "text2": ""},
+      {"note": "Repeated text -> 1.0", "text1": "Same text repeated", "text2": "Same text repeated"}
+    ]
+  },
+  "convert_anthropic_tool_choice_to_openai": {
+    "description": "Input is tool_choice dict. Output is OpenAI-compatible value.",
+    "cases": [
+      {"note": "auto", "input": {"type": "auto"}},
+      {"note": "any -> required", "input": {"type": "any"}},
+      {"note": "tool/read -> function/read", "input": {"type": "tool", "name": "read"}},
+      {"note": "none", "input": {"type": "none"}}
+    ]
+  },
+  "convert_anthropic_tools_to_openai": {
+    "description": "Input is list of tool dicts. Output is OpenAI-compatible list.",
+    "cases": [
+      {"note": "Empty list", "input": []},
+      {"note": "Single tool", "input": [{"name": "read", "description": "Read a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}]},
+      {"note": "Multiple tools", "input": [{"name": "read", "input_schema": {"type": "object"}}, {"name": "write", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}]}
+    ]
+  },
+  "clear_old_tool_results": {
+    "description": "Input is (messages, tools_list). Output is cleaned messages list.",
+    "cases": [
+      {"note": "Empty messages", "input": [], "tools": null},
+      {"note": "No tool results to clear", "input": [{"role": "user", "content": "hi"}], "tools": null}
+    ]
+  }
+}

@@ -1264,7 +1264,7 @@ class TestToolFilter(unittest.TestCase):
         extra tool defs than to break the conversation."""
         # Build a set of 7 tools where recent + always_keep yield < 5.
         # Use only 2 recent and rely on a small whitelist by patching.
-        small_whitelist = {"Read", "Bash"}
+        small_whitelist = ("Read", "Bash")
         tools = self._tools(["Read", "Bash", "Custom1", "Custom2",
                              "Custom3", "Custom4", "Custom5"])
         recent_msgs = [self._asst(["Custom3", "Custom4"])]
@@ -1940,6 +1940,171 @@ class TestOOMSafetyEstimation(unittest.TestCase):
         self.assertEqual(sys_chars, 0)
 
 
+class TestReReadRateHelper(unittest.TestCase):
+    """DEF-003: _compute_re_read_rate must return 0-100%."""
+
+    def test_no_cleared_files(self):
+        self.assertEqual(proxy._compute_re_read_rate(5, 0), 0.0)
+
+    def test_all_re_read(self):
+        self.assertEqual(proxy._compute_re_read_rate(3, 3), 100.0)
+
+    def test_partial_re_read(self):
+        self.assertAlmostEqual(proxy._compute_re_read_rate(2, 8), 25.0)
+
+    def test_capped_at_100(self):
+        self.assertEqual(proxy._compute_re_read_rate(20, 3), 100.0)
+
+
+class TestCommonPrefixRatio(unittest.TestCase):
+    """Phase 1: common prefix ratio metrics."""
+
+    def test_identical_messages(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ]
+        ratio = proxy._compute_common_prefix_ratio(msgs, msgs)
+        self.assertEqual(ratio, 1.0)
+
+    def test_no_common_prefix(self):
+        current = [{"role": "user", "content": "hello"}]
+        previous = [{"role": "user", "content": "world"}]
+        ratio = proxy._compute_common_prefix_ratio(current, previous)
+        self.assertEqual(ratio, 0.0)
+
+    def test_partial_common_prefix(self):
+        current = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "new"},
+        ]
+        previous = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ]
+        ratio = proxy._compute_common_prefix_ratio(current, previous)
+        self.assertGreater(ratio, 0.0)
+        self.assertLess(ratio, 1.0)
+
+    def test_empty_previous(self):
+        current = [{"role": "user", "content": "hello"}]
+        ratio = proxy._compute_common_prefix_ratio(current, [])
+        self.assertEqual(ratio, 0.0)
+
+
+class TestNormalizeSystemMessages(unittest.TestCase):
+    """Phase 1: mid-conversation system messages must be converted to user."""
+
+    def test_first_system_kept(self):
+        msgs = [
+            {"role": "system", "content": "sys1"},
+            {"role": "user", "content": "hello"},
+        ]
+        out = proxy._normalize_system_messages(msgs)
+        self.assertEqual(out[0]["role"], "system")
+        self.assertEqual(out[0]["content"], "sys1")
+
+    def test_mid_system_converted(self):
+        msgs = [
+            {"role": "system", "content": "sys1"},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "mid sys"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        out = proxy._normalize_system_messages(msgs)
+        self.assertEqual(out[0]["role"], "system")
+        self.assertEqual(out[2]["role"], "user")
+        self.assertIn("[System update]", out[2]["content"][0]["text"])
+        self.assertIn("mid sys", out[2]["content"][0]["text"])
+        self.assertEqual(out[3]["role"], "assistant")
+
+    def test_system_list_content(self):
+        msgs = [
+            {"role": "system", "content": [{"type": "text", "text": "sys1"}]},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": [{"type": "text", "text": "mid"}]},
+        ]
+        out = proxy._normalize_system_messages(msgs)
+        self.assertEqual(out[0]["role"], "system")
+        self.assertEqual(out[2]["role"], "user")
+        self.assertIn("mid", out[2]["content"][0]["text"])
+
+
+class TestCacheAligner(unittest.TestCase):
+    """Phase 1: cache aligner protects first N messages."""
+
+    def test_disabled_returns_empty_prefix(self):
+        # Save and restore env-driven setting
+        orig = proxy.PROXY_CACHE_ALIGN_ENABLED
+        proxy.PROXY_CACHE_ALIGN_ENABLED = False
+        try:
+            msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+            prefix, dynamic = proxy._apply_cache_aligner(msgs)
+            self.assertEqual(prefix, [])
+            self.assertEqual(dynamic, msgs)
+        finally:
+            proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+
+    def test_protects_head(self):
+        orig = proxy.PROXY_CACHE_ALIGN_ENABLED
+        orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
+        proxy.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy.PROXY_CACHE_ALIGN_HEAD = 2
+        try:
+            msgs = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "bye"},
+            ]
+            prefix, dynamic = proxy._apply_cache_aligner(msgs)
+            self.assertEqual(len(prefix), 2)
+            self.assertEqual(prefix[0]["role"], "system")
+            self.assertEqual(prefix[1]["role"], "user")
+            self.assertEqual(len(dynamic), 2)
+        finally:
+            proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+
+    def test_head_larger_than_messages(self):
+        orig = proxy.PROXY_CACHE_ALIGN_ENABLED
+        orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
+        proxy.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy.PROXY_CACHE_ALIGN_HEAD = 10
+        try:
+            msgs = [{"role": "system", "content": "sys"}]
+            prefix, dynamic = proxy._apply_cache_aligner(msgs)
+            self.assertEqual(prefix, msgs)
+            self.assertEqual(dynamic, [])
+        finally:
+            proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+
+
+class TestToolFilterStableOrder(unittest.TestCase):
+    """Phase 1: filtered tools keep a stable order across requests."""
+
+    def test_always_keep_order_stable(self):
+        orig_max = proxy.PROXY_TOOL_FILTER_MAX
+        proxy.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
+        try:
+            tools = [
+                {"name": "Write", "description": "w"},
+                {"name": "Read", "description": "r"},
+                {"name": "Bash", "description": "b"},
+                {"name": "Glob", "description": "g"},
+                {"name": "Edit", "description": "e"},
+            ]
+            kept, stats = proxy._filter_tools(tools, [], recent_rounds=5)
+            names = [t["name"] for t in kept]
+            # TOOL_ALWAYS_KEEP defines the order Read, Write, Edit, Bash, Glob, ...
+            self.assertEqual(names, ["Read", "Write", "Edit", "Bash", "Glob"])
+            self.assertTrue(stats.get("filtered"))
+        finally:
+            proxy.PROXY_TOOL_FILTER_MAX = orig_max
+
+
 class TestMaskSensitive(unittest.TestCase):
     def test_masks_authorization(self):
         result = proxy._mask_sensitive({"Authorization": "Bearer sk-abcdef1234567890wxyz"})
@@ -2002,6 +2167,38 @@ class TestConvertToolsToOpenAI(unittest.TestCase):
         ]
         result = proxy.convert_anthropic_tools_to_openai(tools)
         self.assertEqual(len(result), 2)
+
+    def test_web_search_server_side_tool_mapped_to_function(self):
+        """web_search_20250305 (Anthropic server-side tool) must be mapped
+        to a function tool with a query parameter so local/cloud OpenAI
+        backends can execute it. Without this, the tool is converted with
+        empty parameters and the model emits empty tool_calls."""
+        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 1)
+        func = result[0]["function"]
+        self.assertEqual(func["name"], "web_search")
+        self.assertIn("query", func["parameters"]["properties"])
+        self.assertEqual(func["parameters"]["required"], ["query"])
+        # Description must guide the model to extract query from user message
+        self.assertIn("query", func["description"].lower())
+
+    def test_web_search_preserves_custom_name(self):
+        """If the server-side tool has a custom name, preserve it."""
+        tools = [{"type": "web_search_20250305", "name": "search", "max_uses": 8}]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(result[0]["function"]["name"], "search")
+
+    def test_web_search_mixed_with_custom_tools(self):
+        """web_search server-side tool can coexist with custom tools."""
+        tools = [
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+            {"type": "custom", "name": "Read", "input_schema": {}},
+        ]
+        result = proxy.convert_anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["function"]["name"], "web_search")
+        self.assertEqual(result[1]["function"]["name"], "Read")
 
 
 class TestConvertToolChoice(unittest.TestCase):
@@ -2090,7 +2287,9 @@ class TestDedup(unittest.TestCase):
 
 
 class TestFilterToolsSorting(unittest.TestCase):
-    def test_output_is_alphabetically_sorted(self):
+    """Phase 1: filtered tools keep a stable order across requests."""
+
+    def test_output_is_stably_sorted(self):
         tools = [
             {"name": "Zebra", "type": "custom", "input_schema": {}},
             {"name": "Alpha", "type": "custom", "input_schema": {}},
@@ -2101,18 +2300,91 @@ class TestFilterToolsSorting(unittest.TestCase):
         ]
         messages = [{"role": "assistant", "content": [{"type": "tool_use", "name": "Alpha"}]}]
         original_max = proxy.PROXY_TOOL_FILTER_MAX
-        original_keep = proxy.TOOL_ALWAYS_KEEP.copy()
+        original_keep = proxy.TOOL_ALWAYS_KEEP
         proxy.PROXY_TOOL_FILTER_MAX = 5
-        proxy.TOOL_ALWAYS_KEEP.update({"Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"})
+        proxy.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         try:
             kept, stats = proxy._filter_tools(tools, messages, recent_rounds=5)
             self.assertTrue(stats.get("filtered"), f"Expected filtering, got {stats}")
             names = [t["name"] for t in kept]
-            self.assertEqual(names, sorted(names))
+            # Stable order should match TOOL_ALWAYS_KEEP order for all-kept case.
+            self.assertEqual(names, ["Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"])
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = original_max
-            proxy.TOOL_ALWAYS_KEEP.clear()
-            proxy.TOOL_ALWAYS_KEEP.update(original_keep)
+            proxy.TOOL_ALWAYS_KEEP = original_keep
+
+
+class TestSemanticCompression(unittest.TestCase):
+    """Phase 2: TokenSieve-inspired content compression."""
+
+    def test_scrub_ansi(self):
+        text = "\x1b[31merror\x1b[0m: failed"
+        self.assertEqual(proxy._scrub_ansi(text), "error: failed")
+
+    def test_detect_json(self):
+        self.assertEqual(proxy._detect_content_type('{"a": 1}'), "json")
+        self.assertEqual(proxy._detect_content_type('[1, 2, 3]'), "json")
+
+    def test_detect_code(self):
+        code = "def foo():\n    return 1\n"
+        self.assertEqual(proxy._detect_content_type(code), "code")
+
+    def test_detect_log(self):
+        log = "2024-01-01 10:00:00 INFO start\n2024-01-01 10:00:01 WARN slow\n"
+        self.assertEqual(proxy._detect_content_type(log), "log")
+
+    def test_sieve_json_array_truncation(self):
+        data = [{"id": i, "name": "x" * 300} for i in range(20)]
+        result = proxy._sieve_json(data, max_items=5, max_str_len=50, max_depth=4)
+        self.assertEqual(len(result), 6)
+        self.assertIn("more items", result[-1])
+        self.assertIn("truncated", result[0]["name"])
+
+    def test_sieve_json_string_truncation(self):
+        data = {"key": "v" * 500}
+        result = proxy._sieve_json(data, max_str_len=50)
+        self.assertIn("truncated", result["key"])
+
+    def test_compress_code_removes_comments(self):
+        code = "# header\ndef foo():\n    # inline\n    return 1\n\n\n"
+        result = proxy._compress_code(code)
+        self.assertNotIn("#", result)
+        self.assertIn("def foo():", result)
+
+    def test_compress_log_dedupes(self):
+        log = "INFO ok\nINFO ok\nINFO ok\nERROR boom\n"
+        result = proxy._compress_log(log, dedupe=True)
+        self.assertIn("identical lines omitted", result)
+        self.assertIn("ERROR boom", result)
+
+    def test_compress_text_truncates(self):
+        text = "x" * 5000
+        result = proxy._compress_text(text, max_len=1000)
+        self.assertLess(len(result), len(text))
+        self.assertIn("truncated", result)
+
+    def test_dedupe_scalars(self):
+        data = {"a": "long repeated value", "b": "long repeated value"}
+        result = proxy._dedupe_scalars(data, min_len=5)
+        self.assertIn("###", result["b"])
+
+    def test_compress_tool_result_json(self):
+        data = json.dumps({"items": [{"id": i, "text": "t" * 300} for i in range(50)]})
+        result = proxy.compress_tool_result(data, threshold=100, mode="semantic")
+        self.assertEqual(result["content_type"], "json")
+        self.assertLess(result["ratio"], 1.0)
+        self.assertTrue(result["audit_pass"])
+
+    def test_compress_tool_result_short_passthrough(self):
+        result = proxy.compress_tool_result("hello", threshold=100)
+        self.assertEqual(result["strategy"], "none")
+        self.assertEqual(result["ratio"], 1.0)
+
+    def test_audit_json_fails_on_broken(self):
+        self.assertFalse(proxy._audit_compression("", "{not json", "json"))
+
+    def test_audit_code_passes_balanced(self):
+        self.assertTrue(proxy._audit_compression("", "def f(): pass", "code"))
 
 
 class TestConvertAnthropicMessagesToOpenAI(unittest.TestCase):
@@ -3034,6 +3306,228 @@ class TestPhase2ManageShPriority(unittest.TestCase):
 
 
 
+
+
+class TestDynamicTokenEstimation(unittest.TestCase):
+    """Phase 3.1: content-type-aware token estimation."""
+
+    def test_chinese_ratio(self):
+        msgs = [{"role": "user", "content": "这是一个中文句子" * 100}]
+        est = proxy._estimate_tokens_dynamic(msgs)
+        chars = proxy._estimate_message_chars(msgs)
+        self.assertGreater(est, 0)
+        # Chinese ratio (1.5) should yield more tokens than English ratio (4.0)
+        english_est = int(chars / proxy.PROXY_TOKEN_RATIO_ENGLISH)
+        self.assertGreater(est, english_est)
+
+    def test_english_ratio(self):
+        msgs = [{"role": "user", "content": "This is an English sentence. " * 100}]
+        est = proxy._estimate_tokens_dynamic(msgs)
+        chars = proxy._estimate_message_chars(msgs)
+        self.assertGreater(est, 0)
+        chinese_est = int(chars / proxy.PROXY_TOKEN_RATIO_CHINESE)
+        self.assertLess(est, chinese_est)
+
+    def test_code_ratio(self):
+        code = "def foo():\n    return {\"a\": 1, \"b\": 2}\n" * 50
+        msgs = [{"role": "user", "content": code}]
+        est = proxy._estimate_tokens_dynamic(msgs)
+        chars = proxy._estimate_message_chars(msgs)
+        self.assertGreater(est, 0)
+        self.assertLessEqual(est, int(chars / proxy.PROXY_TOKEN_RATIO_CODE) + 1)
+
+    def test_mixed_content(self):
+        msgs = [
+            {"role": "user", "content": "Hello world. " * 50},
+            {"role": "user", "content": "这是一个中文句子" * 50},
+        ]
+        est = proxy._estimate_tokens_dynamic(msgs)
+        self.assertGreater(est, 0)
+
+    def test_ratio_override(self):
+        msgs = [{"role": "user", "content": "x" * 1000}]
+        est = proxy._estimate_tokens_dynamic(msgs, ratio_override=5.0)
+        self.assertEqual(est, int(1000 / 5.0))
+
+    def test_classify_content_for_ratio(self):
+        self.assertEqual(proxy._classify_content_for_ratio("hello world"), "english")
+        self.assertEqual(proxy._classify_content_for_ratio("中文字符" * 50), "chinese")
+        code = "def func():\n    return [1, 2, 3]\n"
+        self.assertEqual(proxy._classify_content_for_ratio(code * 50), "code")
+
+
+class TestMemoryRejection(unittest.TestCase):
+    """Phase 3.3: memory pressure active rejection."""
+
+    def test_reject_when_above_threshold(self):
+        mem = {"used_pct": "95.0"}
+        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
+            rejected, used = proxy._should_reject_for_memory(mem)
+            self.assertTrue(rejected)
+            self.assertEqual(used, 95.0)
+
+    def test_not_reject_when_below_threshold(self):
+        mem = {"used_pct": "70.0"}
+        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
+            rejected, used = proxy._should_reject_for_memory(mem)
+            self.assertFalse(rejected)
+            self.assertEqual(used, 70.0)
+
+    def test_invalid_used_pct_returns_false(self):
+        mem = {"used_pct": "invalid"}
+        rejected, used = proxy._should_reject_for_memory(mem)
+        self.assertFalse(rejected)
+
+
+class TestDynamicMaxTokens(unittest.TestCase):
+    """Phase 3.4: lifecycle-stage-aware max_tokens."""
+
+    def test_init_stage_unchanged(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"):
+                mem = {"available_gb": 20, "total_gb": 48}
+                adjusted, reason = proxy._compute_dynamic_max_tokens(
+                    4096, {"stage": "init"}, mem=mem)
+                self.assertEqual(adjusted, 4096)
+                self.assertIn("stage=init", reason)
+
+    def test_saturation_stage_capped(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+                    mem = {"available_gb": 20, "total_gb": 48}
+                    adjusted, reason = proxy._compute_dynamic_max_tokens(
+                        8192, {"stage": "saturation"}, mem=mem)
+                    self.assertEqual(adjusted, 2048)
+                    self.assertIn("stage=saturation", reason)
+
+    def test_rapid_mlx_discount(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "rapid-mlx/Qwen"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+                    with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8):
+                        mem = {"available_gb": 20, "total_gb": 48}
+                        adjusted, _ = proxy._compute_dynamic_max_tokens(
+                            8192, {"stage": "saturation"}, mem=mem)
+                        self.assertEqual(adjusted, int(2048 * 0.8))
+
+    def test_low_memory_discount(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+                    mem = {"available_gb": 5, "total_gb": 48}
+                    adjusted, reason = proxy._compute_dynamic_max_tokens(
+                        8192, {"stage": "saturation"}, mem=mem)
+                    self.assertLess(adjusted, 2048)
+                    self.assertIn("low_memory", reason)
+
+    def test_disabled_returns_original(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False):
+            adjusted, reason = proxy._compute_dynamic_max_tokens(
+                4096, {"stage": "saturation"})
+            self.assertEqual(adjusted, 4096)
+            self.assertEqual(reason, "dynamic_disabled")
+
+
+class TestRequestSnapshots(unittest.TestCase):
+    """Phase 3.5: failure request snapshots."""
+
+    def setUp(self):
+        self.snapshot_dir = os.path.join(_REPO_ROOT, "logs", "snapshots")
+        if os.path.exists(self.snapshot_dir):
+            for f in os.listdir(self.snapshot_dir):
+                if f.startswith("test_snap_"):
+                    os.remove(os.path.join(self.snapshot_dir, f))
+
+    def tearDown(self):
+        if os.path.exists(self.snapshot_dir):
+            for f in os.listdir(self.snapshot_dir):
+                if f.startswith("test_snap_"):
+                    os.remove(os.path.join(self.snapshot_dir, f))
+
+    def test_snapshot_writes_before_and_after(self):
+        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", True):
+            req_id = "test_snap_1"
+            before = {"messages": [{"role": "user", "content": "hi"}]}
+            written = proxy._write_request_snapshot(req_id, before)
+            self.assertTrue(written)
+            before_path = os.path.join(self.snapshot_dir, f"{req_id}_before.json")
+            self.assertTrue(os.path.exists(before_path))
+
+            err = RuntimeError("boom")
+            proxy._write_request_snapshot(req_id, before, after_body=None, error=err)
+            after_path = os.path.join(self.snapshot_dir, f"{req_id}_after.json")
+            self.assertTrue(os.path.exists(after_path))
+            with open(after_path) as f:
+                data = json.load(f)
+            self.assertEqual(data["error"]["type"], "RuntimeError")
+
+    def test_snapshot_disabled_returns_false(self):
+        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", False):
+            written = proxy._write_request_snapshot("test_snap_2", {"x": 1})
+            self.assertFalse(written)
+
+
+class TestDynamicConcurrency(unittest.TestCase):
+    """Phase 3.2: dynamic concurrency control."""
+
+    def setUp(self):
+        self._orig_latencies = list(proxy._LATENCY_WINDOW)
+        self._orig_errors = list(proxy._ERROR_WINDOW)
+        self._orig_max = proxy.PROXY_MAX_CONCURRENT
+        proxy._LATENCY_WINDOW.clear()
+        proxy._ERROR_WINDOW.clear()
+
+    def tearDown(self):
+        proxy._LATENCY_WINDOW.clear()
+        proxy._LATENCY_WINDOW.extend(self._orig_latencies)
+        proxy._ERROR_WINDOW.clear()
+        proxy._ERROR_WINDOW.extend(self._orig_errors)
+        proxy.PROXY_MAX_CONCURRENT = self._orig_max
+
+    def test_high_latency_triggers_downgrade(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
+            with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MIN", 1):
+                with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MAX", 4):
+                    proxy.PROXY_MAX_CONCURRENT = 4
+                    for _ in range(10):
+                        proxy._record_request_for_concurrency(60000, 200)
+                    result = proxy._adjust_concurrency()
+                    self.assertTrue(result.get("adjusted"))
+                    self.assertLess(proxy.PROXY_MAX_CONCURRENT, 4)
+
+    def test_low_latency_stable_does_not_change(self):
+        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
+            proxy.PROXY_MAX_CONCURRENT = 2
+            # Latency in the stable band: below threshold but above threshold/2
+            for _ in range(5):
+                proxy._record_request_for_concurrency(20000, 200)
+            result = proxy._adjust_concurrency()
+            self.assertFalse(result.get("adjusted"))
+
+
+class TestMetricsSchemaV1(unittest.TestCase):
+    """Phase 3.7: unified metrics schema v1."""
+
+    def test_finalize_metrics_adds_schema_and_fields(self):
+        mc = {
+            "ts": "2026-01-01T00:00:00",
+            "session_id": "s1",
+            "input_msgs": 2,
+            "input_chars": 1000,
+            "input_tools": 1,
+            "output_chars": 200,
+            "duration_ms": 100.0,
+            "status": 200,
+            "pipeline": {},
+        }
+        proxy._finalize_metrics(mc)
+        self.assertEqual(mc.get("schema_version"), "v1")
+        for field in proxy._METRICS_V1_FIELDS:
+            self.assertIn(field, mc, f"missing metrics field: {field}")
+        self.assertIn("token_ratio", mc)
+        self.assertIn("est_input_tokens", mc)
+        self.assertIn("est_output_tokens", mc)
 
 
 if __name__ == "__main__":

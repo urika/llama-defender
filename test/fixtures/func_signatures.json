@@ -1,0 +1,607 @@
+{
+  "BaseHTTPRequestHandler": {
+    "name": "BaseHTTPRequestHandler",
+    "params": [
+      "request",
+      "client_address",
+      "server"
+    ],
+    "defaults": {}
+  },
+  "Handler": {
+    "name": "Handler",
+    "params": [
+      "request",
+      "client_address",
+      "server"
+    ],
+    "defaults": {}
+  },
+  "ThreadingHTTPServer": {
+    "name": "ThreadingHTTPServer",
+    "params": [
+      "server_address",
+      "RequestHandlerClass",
+      "bind_and_activate"
+    ],
+    "defaults": {
+      "bind_and_activate": true
+    }
+  },
+  "_StreamingToolsExtractor": {
+    "name": "_StreamingToolsExtractor",
+    "params": [],
+    "defaults": {}
+  },
+  "_apply_cache_aligner": {
+    "name": "_apply_cache_aligner",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_apply_loop_intervention": {
+    "name": "_apply_loop_intervention",
+    "params": [
+      "raw_messages",
+      "raw_tools",
+      "max_run",
+      "consecutive",
+      "threshold",
+      "level2_threshold",
+      "level3_threshold",
+      "pattern_tool_name",
+      "is_text_loop",
+      "text_loop_run"
+    ],
+    "defaults": {
+      "threshold": 3,
+      "level2_threshold": 6,
+      "level3_threshold": 9,
+      "pattern_tool_name": null,
+      "is_text_loop": false,
+      "text_loop_run": 0
+    }
+  },
+  "_apply_rounds_truncation": {
+    "name": "_apply_rounds_truncation",
+    "params": [
+      "messages",
+      "keep_rounds",
+      "session_id"
+    ],
+    "defaults": {
+      "session_id": null
+    }
+  },
+  "_apply_smart_truncation": {
+    "name": "_apply_smart_truncation",
+    "params": [
+      "messages",
+      "budget_chars",
+      "session_id"
+    ],
+    "defaults": {
+      "budget_chars": null,
+      "session_id": null
+    }
+  },
+  "_build_blocker_message": {
+    "name": "_build_blocker_message",
+    "params": [
+      "tool_name",
+      "error_type",
+      "run_length"
+    ],
+    "defaults": {}
+  },
+  "_build_status_html": {
+    "name": "_build_status_html",
+    "params": [],
+    "defaults": {}
+  },
+  "_build_tool_use_map": {
+    "name": "_build_tool_use_map",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_check_dedup": {
+    "name": "_check_dedup",
+    "params": [
+      "body_str"
+    ],
+    "defaults": {}
+  },
+  "_classify_exception": {
+    "name": "_classify_exception",
+    "params": [
+      "e"
+    ],
+    "defaults": {}
+  },
+  "_classify_lifecycle_stage": {
+    "name": "_classify_lifecycle_stage",
+    "params": [
+      "messages",
+      "session_id"
+    ],
+    "defaults": {
+      "session_id": null
+    }
+  },
+  "_coerce_booleans": {
+    "name": "_coerce_booleans",
+    "params": [
+      "obj"
+    ],
+    "defaults": {}
+  },
+  "_compress_assistant_message": {
+    "name": "_compress_assistant_message",
+    "params": [
+      "msg"
+    ],
+    "defaults": {}
+  },
+  "_compress_content_pass": {
+    "name": "_compress_content_pass",
+    "params": [
+      "messages",
+      "tools_list",
+      "stage_config"
+    ],
+    "defaults": {
+      "tools_list": null,
+      "stage_config": null
+    }
+  },
+  "_compress_middle_with_llm": {
+    "name": "_compress_middle_with_llm",
+    "params": [
+      "messages",
+      "timeout"
+    ],
+    "defaults": {
+      "timeout": 30
+    }
+  },
+  "_compute_adaptive_rounds": {
+    "name": "_compute_adaptive_rounds",
+    "params": [
+      "messages",
+      "base_rounds"
+    ],
+    "defaults": {}
+  },
+  "_compute_common_prefix_ratio": {
+    "name": "_compute_common_prefix_ratio",
+    "params": [
+      "current",
+      "previous"
+    ],
+    "defaults": {}
+  },
+  "_compute_re_read_rate": {
+    "name": "_compute_re_read_rate",
+    "params": [
+      "re_read_files",
+      "cleared_files"
+    ],
+    "defaults": {}
+  },
+  "_compute_text_similarity": {
+    "name": "_compute_text_similarity",
+    "params": [
+      "text1",
+      "text2"
+    ],
+    "defaults": {}
+  },
+  "_detect_blocker_pattern": {
+    "name": "_detect_blocker_pattern",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_detect_text_loop": {
+    "name": "_detect_text_loop",
+    "params": [
+      "tail_assistant",
+      "threshold",
+      "min_chars",
+      "similarity_threshold"
+    ],
+    "defaults": {
+      "threshold": 3,
+      "min_chars": 100,
+      "similarity_threshold": 0.85
+    }
+  },
+  "_empty_traffic_stats": {
+    "name": "_empty_traffic_stats",
+    "params": [],
+    "defaults": {}
+  },
+  "_ensure_jsonl_dir": {
+    "name": "_ensure_jsonl_dir",
+    "params": [],
+    "defaults": {}
+  },
+  "_estimate_message_chars": {
+    "name": "_estimate_message_chars",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_extract_content_tool_calls": {
+    "name": "_extract_content_tool_calls",
+    "params": [
+      "text"
+    ],
+    "defaults": {}
+  },
+  "_extract_keywords": {
+    "name": "_extract_keywords",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_extract_middle_summary_rules": {
+    "name": "_extract_middle_summary_rules",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_extract_xml_params": {
+    "name": "_extract_xml_params",
+    "params": [
+      "raw"
+    ],
+    "defaults": {}
+  },
+  "_extract_xml_tool_name": {
+    "name": "_extract_xml_tool_name",
+    "params": [
+      "raw"
+    ],
+    "defaults": {}
+  },
+  "_filter_tools": {
+    "name": "_filter_tools",
+    "params": [
+      "tools",
+      "messages",
+      "recent_rounds",
+      "tool_choice_name"
+    ],
+    "defaults": {
+      "recent_rounds": 5,
+      "tool_choice_name": null
+    }
+  },
+  "_finalize_metrics": {
+    "name": "_finalize_metrics",
+    "params": [
+      "mc"
+    ],
+    "defaults": {}
+  },
+  "_finalize_parsed_args": {
+    "name": "_finalize_parsed_args",
+    "params": [
+      "parsed"
+    ],
+    "defaults": {}
+  },
+  "_generate_tool_summary": {
+    "name": "_generate_tool_summary",
+    "params": [
+      "tool_name",
+      "meta_info"
+    ],
+    "defaults": {}
+  },
+  "_get_cache_stats": {
+    "name": "_get_cache_stats",
+    "params": [],
+    "defaults": {}
+  },
+  "_get_log_stats": {
+    "name": "_get_log_stats",
+    "params": [],
+    "defaults": {}
+  },
+  "_get_process_info": {
+    "name": "_get_process_info",
+    "params": [
+      "pattern",
+      "name",
+      "fallback_port"
+    ],
+    "defaults": {
+      "fallback_port": null
+    }
+  },
+  "_get_session_trace": {
+    "name": "_get_session_trace",
+    "params": [],
+    "defaults": {}
+  },
+  "_get_system_memory": {
+    "name": "_get_system_memory",
+    "params": [],
+    "defaults": {}
+  },
+  "_get_traffic_stats": {
+    "name": "_get_traffic_stats",
+    "params": [],
+    "defaults": {}
+  },
+  "_has_thinking_content": {
+    "name": "_has_thinking_content",
+    "params": [
+      "msg"
+    ],
+    "defaults": {}
+  },
+  "_incremental_compress": {
+    "name": "_incremental_compress",
+    "params": [
+      "dropped",
+      "session_id"
+    ],
+    "defaults": {}
+  },
+  "_inject_keyword_context": {
+    "name": "_inject_keyword_context",
+    "params": [
+      "keywords",
+      "current_messages",
+      "top_k",
+      "max_chars"
+    ],
+    "defaults": {
+      "top_k": 5,
+      "max_chars": 500
+    }
+  },
+  "_is_tool_result_message": {
+    "name": "_is_tool_result_message",
+    "params": [
+      "msg"
+    ],
+    "defaults": {}
+  },
+  "_is_truncated_json": {
+    "name": "_is_truncated_json",
+    "params": [
+      "raw"
+    ],
+    "defaults": {}
+  },
+  "_mask_sensitive": {
+    "name": "_mask_sensitive",
+    "params": [
+      "headers_dict"
+    ],
+    "defaults": {}
+  },
+  "_mc_put": {
+    "name": "_mc_put",
+    "params": [
+      "step_key",
+      "data"
+    ],
+    "defaults": {}
+  },
+  "_merge_summaries_with_llm": {
+    "name": "_merge_summaries_with_llm",
+    "params": [
+      "old_summary",
+      "new_summary",
+      "timeout"
+    ],
+    "defaults": {
+      "timeout": 15
+    }
+  },
+  "_message_stable_hash": {
+    "name": "_message_stable_hash",
+    "params": [
+      "msg"
+    ],
+    "defaults": {}
+  },
+  "_next_jsonl_token": {
+    "name": "_next_jsonl_token",
+    "params": [],
+    "defaults": {}
+  },
+  "_normalize_system_messages": {
+    "name": "_normalize_system_messages",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_parse_tools_block_body": {
+    "name": "_parse_tools_block_body",
+    "params": [
+      "body"
+    ],
+    "defaults": {}
+  },
+  "_read_log_tail": {
+    "name": "_read_log_tail",
+    "params": [
+      "path",
+      "max_bytes"
+    ],
+    "defaults": {
+      "max_bytes": 200000
+    }
+  },
+  "_repair_truncated_json": {
+    "name": "_repair_truncated_json",
+    "params": [
+      "raw"
+    ],
+    "defaults": {}
+  },
+  "_run": {
+    "name": "_run",
+    "params": [
+      "cmd",
+      "timeout"
+    ],
+    "defaults": {
+      "timeout": 3
+    }
+  },
+  "_strip_thinking_from_msg": {
+    "name": "_strip_thinking_from_msg",
+    "params": [
+      "msg"
+    ],
+    "defaults": {}
+  },
+  "_translate_tool_result_errors": {
+    "name": "_translate_tool_result_errors",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_unescape_double_escaped_json": {
+    "name": "_unescape_double_escaped_json",
+    "params": [
+      "obj"
+    ],
+    "defaults": {}
+  },
+  "clear_old_tool_results": {
+    "name": "clear_old_tool_results",
+    "params": [
+      "messages",
+      "tools_list",
+      "clear_zone_pct"
+    ],
+    "defaults": {
+      "tools_list": null,
+      "clear_zone_pct": null
+    }
+  },
+  "convert_anthropic_messages_to_openai": {
+    "name": "convert_anthropic_messages_to_openai",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "convert_anthropic_tool_choice_to_openai": {
+    "name": "convert_anthropic_tool_choice_to_openai",
+    "params": [
+      "tool_choice"
+    ],
+    "defaults": {}
+  },
+  "convert_anthropic_tools_to_openai": {
+    "name": "convert_anthropic_tools_to_openai",
+    "params": [
+      "tools"
+    ],
+    "defaults": {}
+  },
+  "convert_openai_response_to_anthropic": {
+    "name": "convert_openai_response_to_anthropic",
+    "params": [
+      "openai_resp",
+      "anthropic_model"
+    ],
+    "defaults": {}
+  },
+  "log": {
+    "name": "log",
+    "params": [
+      "msg",
+      "level"
+    ],
+    "defaults": {
+      "level": "INFO"
+    }
+  },
+  "log_metrics": {
+    "name": "log_metrics",
+    "params": [
+      "metrics"
+    ],
+    "defaults": {}
+  },
+  "log_request": {
+    "name": "log_request",
+    "params": [
+      "model",
+      "input_chars",
+      "output_chars",
+      "status",
+      "duration_ms",
+      "start_time"
+    ],
+    "defaults": {
+      "start_time": ""
+    }
+  },
+  "log_structured": {
+    "name": "log_structured",
+    "params": [
+      "event",
+      "kwargs"
+    ],
+    "defaults": {}
+  },
+  "main": {
+    "name": "main",
+    "params": [],
+    "defaults": {}
+  },
+  "parse_tool_arguments": {
+    "name": "parse_tool_arguments",
+    "params": [
+      "raw",
+      "tool_name_hint"
+    ],
+    "defaults": {
+      "tool_name_hint": ""
+    }
+  },
+  "strip_old_thinking_blocks": {
+    "name": "strip_old_thinking_blocks",
+    "params": [
+      "messages",
+      "keep_recent",
+      "frozen_head"
+    ],
+    "defaults": {
+      "keep_recent": 3,
+      "frozen_head": null
+    }
+  },
+  "truncate_messages_if_needed": {
+    "name": "truncate_messages_if_needed",
+    "params": [
+      "messages",
+      "session_id",
+      "keep_rounds"
+    ],
+    "defaults": {
+      "session_id": null,
+      "keep_rounds": null
+    }
+  }
+}

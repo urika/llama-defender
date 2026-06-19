@@ -66,7 +66,7 @@ run_unit() {
 run_integration() {
   print_banner "Integration tests (test/integration/)"
   # Make sure no stale process holds the integration ports.
-  for port in 8089 8090 4001 4002; do
+  for port in 8089 8090 8091 8092 4001 4002 4003 4004; do
     if lsof -ti :"$port" >/dev/null 2>&1; then
       warn "port $port is busy; killing stale holder"
       lsof -ti :"$port" | xargs kill -9 2>/dev/null || true
@@ -74,7 +74,8 @@ run_integration() {
     fi
   done
 
-  local blocker_rc=0 loop_rc=0 blocker_out loop_out
+  local blocker_rc=0 loop_rc=0 cache_rc=0 memory_rc=0 status_rc=0
+  local blocker_out loop_out cache_out memory_out status_out
 
   blocker_out=$(bash "$SCRIPT_DIR/integration/test_blocker_integration.sh" 2>&1)
   blocker_rc=$?
@@ -105,6 +106,70 @@ run_integration() {
       record "integration" "ok" "loop: all ${lp:-?} cases passed"
     else
       record "integration" "fail" "loop: $lf of ${lp:-?} cases failed"
+    fi
+  fi
+
+  cache_out=$(bash "$SCRIPT_DIR/integration/test_cache_align_integration.sh" 2>&1)
+  cache_rc=$?
+  echo "$cache_out" | tail -25
+  if [[ $cache_rc -ne 0 ]]; then
+    record "integration" "fail" "test_cache_align_integration.sh exited $cache_rc"
+  else
+    local cp cf
+    cp=$(echo "$cache_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "passed\." | tail -1 | grep -oE "[0-9]+" | head -1)
+    cf=$(echo "$cache_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "failed," | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${cf:-0}" == "0" ]]; then
+      record "integration" "ok" "cache-align: all ${cp:-?} cases passed"
+    else
+      record "integration" "fail" "cache-align: $cf cases failed"
+    fi
+  fi
+
+  compress_out=$(bash "$SCRIPT_DIR/integration/test_compress_integration.sh" 2>&1)
+  compress_rc=$?
+  echo "$compress_out" | tail -25
+  if [[ $compress_rc -ne 0 ]]; then
+    record "integration" "fail" "test_compress_integration.sh exited $compress_rc"
+  else
+    local comp_p comp_f
+    comp_p=$(echo "$compress_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "passed\." | tail -1 | grep -oE "[0-9]+" | head -1)
+    comp_f=$(echo "$compress_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "failed," | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${comp_f:-0}" == "0" ]]; then
+      record "integration" "ok" "compress: all ${comp_p:-?} cases passed"
+    else
+      record "integration" "fail" "compress: $comp_f cases failed"
+    fi
+  fi
+
+  memory_out=$(bash "$SCRIPT_DIR/integration/test_memory_reject_integration.sh" 2>&1)
+  memory_rc=$?
+  echo "$memory_out" | tail -25
+  if [[ $memory_rc -ne 0 ]]; then
+    record "integration" "fail" "test_memory_reject_integration.sh exited $memory_rc"
+  else
+    local mp mf
+    mp=$(echo "$memory_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "passed\." | tail -1 | grep -oE "[0-9]+" | head -1)
+    mf=$(echo "$memory_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "failed," | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${mf:-0}" == "0" ]]; then
+      record "integration" "ok" "memory-reject: all ${mp:-?} cases passed"
+    else
+      record "integration" "fail" "memory-reject: $mf cases failed"
+    fi
+  fi
+
+  status_out=$(bash "$SCRIPT_DIR/integration/test_status_integration.sh" 2>&1)
+  status_rc=$?
+  echo "$status_out" | tail -25
+  if [[ $status_rc -ne 0 ]]; then
+    record "integration" "fail" "test_status_integration.sh exited $status_rc"
+  else
+    local sp sf
+    sp=$(echo "$status_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "passed\." | tail -1 | grep -oE "[0-9]+" | head -1)
+    sf=$(echo "$status_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "failed," | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${sf:-0}" == "0" ]]; then
+      record "integration" "ok" "status: all ${sp:-?} cases passed"
+    else
+      record "integration" "fail" "status: $sf cases failed"
     fi
   fi
 }
@@ -261,6 +326,38 @@ run_e2e() {
 # ------------------------------------------------------------
 # Tier 4: requirement traceability (--strict exits non-zero on issues)
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Tier: function signature equivalence (refactoring regression)
+# ------------------------------------------------------------
+run_signature() {
+  print_banner "Function signature preservation (tools/gen_func_signatures.py --verify)"
+  local out rc
+  out=$(python3 "$REPO_ROOT/tools/gen_func_signatures.py" --verify 2>&1)
+  rc=$?
+  echo "$out"
+  if [[ $rc -eq 0 ]]; then
+    record "signature" "ok" "all function signatures preserved"
+  else
+    record "signature" "fail" "signature drift detected"
+  fi
+}
+
+# ------------------------------------------------------------
+# Tier: behavior snapshot equivalence (refactoring regression)
+# ------------------------------------------------------------
+run_snapshot() {
+  print_banner "Behavior snapshot equivalence (tools/gen_behavior_snapshots.py --verify)"
+  local out rc
+  out=$(python3 "$REPO_ROOT/tools/gen_behavior_snapshots.py" --verify 2>&1)
+  rc=$?
+  echo "$out"
+  if [[ $rc -eq 0 ]]; then
+    record "snapshot" "ok" "all behavior snapshots match"
+  else
+    record "snapshot" "fail" "behavior drift detected"
+  fi
+}
+
 run_trace() {
   print_banner "Requirement traceability (tools/trace_requirements.py)"
   local out rc
@@ -289,7 +386,10 @@ Tiers:
   --integration   Boots a mock backend, no LLM needed
   --promptfoo     Promptfoo fixed-prompt regression tests (requires proxy)
   --e2e           Requires a running proxy + backend
+  --signature     Check function signature snapshot equivalence
+  --snapshot      Check behavior snapshot equivalence
   --trace         Requirement traceability matrix (docs/requirements.yaml)
+  --refactor      --signature + --snapshot (refactoring regression checks)
   --all           Run all tiers in order
   --fast          Alias for --unit (used by pre-commit hook)
   -h, --help      Show this help
@@ -311,6 +411,9 @@ main() {
     --integration)  run_integration ;;
     --promptfoo)    run_promptfoo ;;
     --e2e)          run_e2e ;;
+    --signature)    run_signature ;;
+    --snapshot)     run_snapshot ;;
+    --refactor)     run_signature; echo ""; run_snapshot ;;
     --trace)        run_trace ;;
     --all)
       run_unit
@@ -330,6 +433,9 @@ main() {
       else
         run_e2e
       fi
+      run_signature
+      echo ""
+      run_snapshot
       echo ""
       run_trace
       ;;

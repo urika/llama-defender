@@ -30,6 +30,13 @@ _load_config() {
         # shellcheck source=/dev/null
         source "$ACTIVE_CONF"
     fi
+    # Always load local secrets (API keys) if present — git-ignored.
+    # This makes LLAMA_API_KEY available at startup so hot-switch to
+    # cloud mode works without restarting manage.sh.
+    if [[ -f "$CONFIG_DIR/secret.local.conf" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_DIR/secret.local.conf"
+    fi
 }
 
 # 加载当前激活配置
@@ -1000,11 +1007,18 @@ cmd_switch() {
     local pid
     if pid=$(_get_pid 2>/dev/null); then
         warn "服务正在运行 (PID: $pid, backend: $(_current_backend))"
-        warn "切换配置后需要重启才能生效"
-        read -p "是否先停止服务再切换? [Y/n] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            cmd_stop || true
+        if [[ -t 0 ]]; then
+            # Interactive: ask whether to stop
+            warn "切换配置后需重启或 reload 生效"
+            read -p "是否先停止服务再切换? [Y/n] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                cmd_stop || true
+            fi
+        else
+            # Non-interactive: just switch the symlink, don't stop
+            info "非交互模式: 仅切换配置软链接，不停止服务"
+            info "切换后请执行 ./manage.sh reload (热重载) 或 restart (重启)"
         fi
     fi
 
@@ -1025,6 +1039,125 @@ cmd_switch() {
     echo "  采样: temp=$LLAMA_TEMP, top-p=$LLAMA_TOP_P"
     echo ""
     echo "运行 ./manage.sh start 启动服务"
+}
+
+# ============================================================
+# 热重载代理配置（SIGHUP，不重启 proxy 进程）
+# ============================================================
+cmd_reload() {
+    local proxy_pid
+    if ! proxy_pid=$(_get_proxy_pid 2>/dev/null); then
+        error "代理未运行，无法热重载"
+        error "请先 ./manage.sh start 启动服务"
+        return 1
+    fi
+
+    # 重新加载配置文件（active.conf 可能已被 switch 更新）
+    _load_config
+
+    info "热重载代理配置 (PID: $proxy_pid)..."
+    info "  配置: $(_current_config_name)"
+    info "  后端: ${LLAMA_BACKEND:-llama-server}"
+
+    # 发送 SIGHUP 信号，触发 proxy 的 _reload_config()
+    if kill -HUP "$proxy_pid" 2>/dev/null; then
+        info "✅ SIGHUP 已发送，代理将在下个请求间隙重载配置"
+        info "  无需重启进程，正在处理的请求不受影响"
+        info ""
+        info "重载内容:"
+        info "  - 后端路由 (LLAMA_BASE_URL, BACKEND_TYPE, MODEL_NAME)"
+        info "  - 并发控制 (PROXY_MAX_CONCURRENT + Semaphore 重建)"
+        info "  - 上下文管理 (clearing/truncation/lifecycle 阈值)"
+        info "  - 工具过滤/循环检测/blocker 等"
+        info ""
+        info "注意: 本地模型的启停需独立操作:"
+        info "  ./manage.sh start-backend   启动本地模型"
+        info "  ./manage.sh stop-backend    停止本地模型(释放 GPU 内存)"
+        info "  云端模式无需本地模型"
+    else
+        error "SIGHUP 发送失败 (PID: $proxy_pid)"
+        return 1
+    fi
+}
+
+# ============================================================
+# 启动本地后端（独立于代理，用于热切换场景）
+# ============================================================
+cmd_start_backend() {
+    local pid
+    if pid=$(_get_pid 2>/dev/null); then
+        warn "本地后端已在运行 (PID: $pid)"
+        return 0
+    fi
+
+    _load_config
+    info "启动本地后端 (独立模式)..."
+    info "  配置: $(_current_config_name)"
+
+    case "$LLAMA_BACKEND" in
+        rapid-mlx|vllm-mlx)
+            _start_rapid_mlx || return 1
+            ;;
+        mlx_vlm|mlx-vlm)
+            _start_mlx_vlm || return 1
+            ;;
+        cloud|deepseek-cloud|openai-cloud)
+            error "当前配置为云端模式 ($LLAMA_BACKEND)，无本地后端可启动"
+            error "请先 ./manage.sh switch <local-config> 切换到本地配置"
+            return 1
+            ;;
+        llama-server|*)
+            _start_llama_server || return 1
+            ;;
+    esac
+
+    info "✅ 本地后端已启动"
+    info "  如需代理也使用此后端，请: ./manage.sh reload"
+}
+
+# ============================================================
+# 停止本地后端（独立于代理，释放 GPU 内存）
+# ============================================================
+cmd_stop_backend() {
+    local backend pid
+    backend=$(_current_backend 2>/dev/null) || true
+
+    if [[ -z "$backend" ]]; then
+        warn "没有本地后端在运行"
+        return 0
+    fi
+
+    pid=$(_get_pid 2>/dev/null) || true
+    if [[ -z "$pid" ]]; then
+        warn "本地后端未在运行"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+
+    info "停止本地后端 $backend (PID: $pid)..."
+
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in {1..15}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            info "✅ 本地后端已停止 (GPU 内存已释放)"
+            rm -f "$PIDFILE"
+            return 0
+        fi
+        sleep 1
+    done
+
+    warn "优雅停止超时，强制终止..."
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        info "✅ 本地后端已强制停止"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+
+    error "无法停止本地后端 (PID: $pid)"
+    return 1
 }
 
 # ============================================================
@@ -1266,13 +1399,16 @@ llama.cpp / Rapid-MLX 服务管理脚本
   stop                 停止后端和代理
   status               查询后端和代理状态
   restart              重启后端和代理
+  reload               热重载代理配置（SIGHUP，不重启进程）
+  start-backend        仅启动本地模型（独立于代理，用于热切换）
+  stop-backend         仅停止本地模型（释放 GPU 内存）
   watchdog             监控后端健康状态，性能衰减时自动重启
   logs [N]             查看最后 N 行后端日志 (默认 50)
   proxy-logs [N]       查看最后 N 行代理日志 (默认 50)
 
 配置命令:
   list                 列出所有可用配置
-  switch <name>        切换到指定配置
+  switch <name>        切换到指定配置（切换后需 reload 或 restart 生效）
   current              显示当前配置详情
 
 维护命令:
@@ -1290,8 +1426,15 @@ llama.cpp / Rapid-MLX 服务管理脚本
   ./manage.sh switch rapid-mlx-35b    # 切换到 Rapid-MLX
   ./manage.sh start                   # 用当前配置启动
   ./manage.sh start-cloud             # 启动云端代理（DeepSeek）
-  ./manage.sh restart                 # 重启（应用新配置）
+  ./manage.sh restart                 重启（应用新配置，停启本地模型）
+  ./manage.sh reload                  # 热重载（SIGHUP，不重启 proxy，~0.5s）
   ./manage.sh status                  # 查看运行状态
+
+热切换示例（本地↔云端，不重启代理）:
+  ./manage.sh switch deepseek-chat && ./manage.sh reload   # 本地→云端
+  ./manage.sh stop-backend                                  # 可选:释放本地模型内存
+  ./manage.sh switch rapid-mlx-35b && ./manage.sh reload   # 云端→本地
+  ./manage.sh start-backend                                 # 启动本地模型
 
 EOF
 }
@@ -1315,6 +1458,15 @@ main() {
             ;;
         restart)
             cmd_restart
+            ;;
+        reload)
+            cmd_reload
+            ;;
+        start-backend)
+            cmd_start_backend
+            ;;
+        stop-backend)
+            cmd_stop_backend
             ;;
         logs)
             cmd_logs "${2:-50}"

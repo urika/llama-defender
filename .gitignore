@@ -11,6 +11,11 @@ logs/
 # Active config symlink (machine-local)
 configs/active.conf
 
+# Local secrets (API keys) — never track
+configs/secret.local.conf
+configs/*.secret
+configs/*.local.conf
+
 # Python cache
 __pycache__/
 *.pyc
@@ -36,3 +41,4 @@ kimi-export-*.md
 configs/*.bak.*
 node_modules/
 package-lock.json
+.aider*

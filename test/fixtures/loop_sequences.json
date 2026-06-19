@@ -1,0 +1,90 @@
+[
+  {
+    "name": "3-round-read-loop",
+    "tools": [{"name": "read", "arguments": {"path": "a.py"}}],
+    "iterations": 3,
+    "expected_level": 1,
+    "expected_intervention": true,
+    "description": "连续 3 次相同 Read 调用，触发 Level 1 干预（提示消息）"
+  },
+  {
+    "name": "6-round-read-loop",
+    "tools": [{"name": "read", "arguments": {"path": "a.py"}}],
+    "iterations": 6,
+    "expected_level": 2,
+    "expected_intervention": true,
+    "description": "连续 6 次相同 Read 调用，触发 Level 2 干预（移除该工具）"
+  },
+  {
+    "name": "9-round-read-loop",
+    "tools": [{"name": "read", "arguments": {"path": "a.py"}}],
+    "iterations": 9,
+    "expected_level": 3,
+    "expected_intervention": true,
+    "description": "连续 9 次相同 Read 调用，触发 Level 3 干预（禁用所有工具）"
+  },
+  {
+    "name": "write-cognitive-loop",
+    "tools": [
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 1"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 2"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 3"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 4"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 5"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "version 6"}}
+    ],
+    "iterations": 6,
+    "expected_level": 3,
+    "expected_intervention": true,
+    "expected_message_contains": "SWITCH",
+    "description": "Write 认知循环：6 次不同参数的 Write，触发 Level 3"
+  },
+  {
+    "name": "single-error-no-loop",
+    "tools": [{"name": "read", "arguments": {"path": "missing.py"}}],
+    "iterations": 1,
+    "expected_level": 0,
+    "expected_intervention": false,
+    "description": "单次错误不触发循环检测"
+  },
+  {
+    "name": "alternating-tools-no-loop",
+    "tools": [
+      {"name": "read", "arguments": {"path": "a.py"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "v1"}},
+      {"name": "read", "arguments": {"path": "a.py"}},
+      {"name": "write", "arguments": {"path": "a.py", "content": "v2"}}
+    ],
+    "iterations": 4,
+    "expected_level": 0,
+    "expected_intervention": false,
+    "description": "交替使用不同工具不应触发循环检测"
+  },
+  {
+    "name": "text-output-loop-3",
+    "tools": [],
+    "iterations": 3,
+    "expected_level": 1,
+    "expected_intervention": true,
+    "is_text_loop": true,
+    "description": "纯文本输出循环 3 次触发 Level 1"
+  },
+  {
+    "name": "text-output-loop-6",
+    "tools": [],
+    "iterations": 6,
+    "expected_level": 2,
+    "expected_intervention": true,
+    "is_text_loop": true,
+    "description": "纯文本输出循环 6 次触发 Level 2"
+  },
+  {
+    "name": "text-output-loop-9",
+    "tools": [],
+    "iterations": 9,
+    "expected_level": 3,
+    "expected_intervention": true,
+    "is_text_loop": true,
+    "description": "纯文本输出循环 9 次触发 Level 3（完全禁用工具）"
+  }
+]

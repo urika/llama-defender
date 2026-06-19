@@ -40,11 +40,11 @@ def analyze_performance(last_n=500):
         return {"error": "no valid metrics"}
 
     ok = sum(1 for r in last if r.get("status") == 200)
-    durs = sorted(r.get("duration_ms", 0) for r in last)
+    durs = sorted(r.get("duration_ms", 0) or 0 for r in last)
     avg_dur = sum(durs) / total
-    avg_in = sum(r.get("input_chars", 0) for r in last) / total
-    avg_out = sum(r.get("output_chars", 0) for r in last) / total
-    avg_msgs = sum(r.get("input_msgs", 0) for r in last) / total
+    avg_in = sum(r.get("input_chars", 0) or 0 for r in last) / total
+    avg_out = sum(r.get("output_chars", 0) or 0 for r in last) / total
+    avg_msgs = sum(r.get("input_msgs", 0) or 0 for r in last) / total
 
     def pct(x):
         i = int(total * x / 100)

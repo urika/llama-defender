@@ -40,10 +40,11 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
-| `proxy-context-window-design.md` | 代理层上下文窗口替换设计文档（v7），Phase 1-2 + P0/P1 已实施，含问题诊断、方案设计、风险矩阵 |
+| `proxy-context-window-design.md` | 代理层上下文窗口替换设计文档（v8），Phase 1-3 已实施，含问题诊断、方案设计、Phase 3 资源护栏、风险矩阵 |
 | `proxy-pipeline-reference.md` | 代理层请求处理管线参考文档，与 `anthropic_proxy.py` (3534 行) 同步，逐层说明 8 层处理逻辑 |
 | `proxy-context-window-design-review.md` | 设计审阅意见（P1-P3 需修正 + S1-S5 建议改进） |
 | `proxy-context-window-design-review-merged.md` | 审阅意见合并记录，8/8 全部采纳 |
+| `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
 
 ---
 
@@ -57,6 +58,7 @@ docs/
 | `ab-experiment-design.md` | A/B 对比实验设计：Context Management 配置对比（模拟本地约束 vs 云端无约束） |
 | `ab-test-task-log-system.md` | A/B 测试任务：为代理添加结构化日志系统（M1 结构化日志 + M2 状态页统计） |
 | `test-strategy.md` | 测试策略与覆盖矩阵，审计发现自动化测试覆盖 7/23 = 30%，列出补齐优先级 |
+| `refactor-test-strategy.md` | 重构测试策略与回归保障方案，覆盖模块拆分等价性校验、Cache Aligner/结构化压缩效果评估、云端模式硬化、84+ 新增测试案例 |
 
 ---
 
@@ -125,4 +127,5 @@ docs/
 | 设计新功能 | `01-requirements-product/` 确认需求边界 → `02-architecture-design/` 参考现有设计模式 |
 | 运行 A/B 测试 | `03-experiments-testing/DEEPSEEK-AB-EXPERIMENT-GUIDE.md` |
 | 补充测试用例 | `03-experiments-testing/test-strategy.md` 查看覆盖缺口 |
+| 重构回归保障 | `03-experiments-testing/refactor-test-strategy.md` 查看等价性校验、效果评估框架和 84+ 新增测试案例 |
 | 优化性能指标 | `06-reference-metrics/` 查看 KPI 定义 → `04-analysis-diagnostics/` 查看历史分析 |

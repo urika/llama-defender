@@ -4,10 +4,12 @@ Anthropic-to-OpenAI proxy for local llama-server.
 Handles Qwen3.6 reasoning_content, streaming, and tool use correctly.
 Includes XML->JSON fallback for Qwen tool calling quirks.
 """
+import collections
 import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import threading
 import urllib.request
@@ -66,6 +68,35 @@ PROXY_FROZEN_HEAD = int(os.environ.get("PROXY_FROZEN_HEAD", "0" if IS_CLOUD else
 # cleared first, protecting the prefix's cache stability.
 # ---------------------------------------------------------------------------
 PROXY_CLEAR_TAIL_FIRST = os.environ.get("PROXY_CLEAR_TAIL_FIRST", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Cache Aligner (Phase 1): protect the first N messages from truncation and
+# reordering to stabilize the prefix KV cache across consecutive requests.
+# - Local: enabled by default, head=4 (system + skills + first user + first assistant)
+# - Cloud: disabled by default (1M context, low marginal cache value)
+# ---------------------------------------------------------------------------
+PROXY_CACHE_ALIGN_ENABLED = os.environ.get("PROXY_CACHE_ALIGN_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_CACHE_ALIGN_HEAD = int(os.environ.get("PROXY_CACHE_ALIGN_HEAD", "4"))
+
+# Per-session last messages for computing common_prefix_ratio.
+# Key: session_id, Value: list of message dicts (after cache aligner / before truncation).
+_SESSION_LAST_MESSAGES = {}
+
+# ---------------------------------------------------------------------------
+# Semantic content compression (Phase 2): TokenSieve-inspired structured
+# compression for tool_result contents. Reduces token pressure while keeping
+# semantics, as an alternative/supplement to aggressive tool-result clearing.
+# ---------------------------------------------------------------------------
+PROXY_COMPRESS_ENABLED = os.environ.get("PROXY_COMPRESS_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_COMPRESS_THRESHOLD = int(os.environ.get("PROXY_COMPRESS_THRESHOLD", "4096"))
+PROXY_COMPRESS_MODE = os.environ.get("PROXY_COMPRESS_MODE", "semantic")  # lossless | semantic | aggressive
+PROXY_SCRUB_ANSI = os.environ.get("PROXY_SCRUB_ANSI", "true").lower() in ("1", "true", "yes")
+PROXY_SIEVE_JSON_MAX_ITEMS = int(os.environ.get("PROXY_SIEVE_JSON_MAX_ITEMS", "10"))
+PROXY_SIEVE_JSON_MAX_STR_LEN = int(os.environ.get("PROXY_SIEVE_JSON_MAX_STR_LEN", "200"))
+PROXY_SIEVE_JSON_MAX_DEPTH = int(os.environ.get("PROXY_SIEVE_JSON_MAX_DEPTH", "4"))
+PROXY_LOG_DEDUPE = os.environ.get("PROXY_LOG_DEDUPE", "true").lower() in ("1", "true", "yes")
+PROXY_DEDUPE_SCALARS = os.environ.get("PROXY_DEDUPE_SCALARS", "false").lower() in ("1", "true", "yes")
+PROXY_COMPRESS_AUDIT = os.environ.get("PROXY_COMPRESS_AUDIT", "true").lower() in ("1", "true", "yes")
 
 CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", "true").lower() in ("1", "true", "yes")
 
@@ -143,6 +174,52 @@ PROXY_OOM_SAFE_TOKENS = int(os.environ.get("PROXY_OOM_SAFE_TOKENS", "60000"))
 PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
+# Phase 3: dynamic token estimation by content type
+# Replaces the single PROXY_CTX_TOKEN_RATIO for more accurate token counts
+# when the prompt is dominated by Chinese, English, or code.
+# ---------------------------------------------------------------------------
+PROXY_TOKEN_RATIO_CHINESE = float(os.environ.get("PROXY_TOKEN_RATIO_CHINESE", "1.5"))
+PROXY_TOKEN_RATIO_ENGLISH = float(os.environ.get("PROXY_TOKEN_RATIO_ENGLISH", "4.0"))
+PROXY_TOKEN_RATIO_CODE = float(os.environ.get("PROXY_TOKEN_RATIO_CODE", "3.0"))
+
+# ---------------------------------------------------------------------------
+# Phase 3: memory pressure active rejection
+# If system used_pct exceeds this threshold, reject new requests with 503.
+# ---------------------------------------------------------------------------
+PROXY_MEMORY_REJECT_THRESHOLD = float(os.environ.get(
+    "PROXY_MEMORY_REJECT_THRESHOLD", "95" if IS_CLOUD else "90"))
+
+# ---------------------------------------------------------------------------
+# Phase 3: dynamic max_tokens based on lifecycle stage and backend type
+# ---------------------------------------------------------------------------
+PROXY_DYNAMIC_MAX_TOKENS_ENABLED = os.environ.get(
+    "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
+PROXY_DYNAMIC_MAX_TOKENS_INIT = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_INIT", "4096"))
+PROXY_DYNAMIC_MAX_TOKENS_GROWTH = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "4096"))
+PROXY_DYNAMIC_MAX_TOKENS_SATURATION = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "2048"))
+PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO = float(os.environ.get(
+    "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "0.8"))
+
+# ---------------------------------------------------------------------------
+# Phase 3: request failure snapshots
+# ---------------------------------------------------------------------------
+PROXY_SNAPSHOT_ENABLED = os.environ.get("PROXY_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes")
+PROXY_SNAPSHOT_MAX_FILES = int(os.environ.get("PROXY_SNAPSHOT_MAX_FILES", "50"))
+
+# ---------------------------------------------------------------------------
+# Phase 3: dynamic concurrency control
+# ---------------------------------------------------------------------------
+PROXY_DYNAMIC_CONCURRENT_ENABLED = os.environ.get(
+    "PROXY_DYNAMIC_CONCURRENT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_DYNAMIC_CONCURRENT_MIN = int(os.environ.get("PROXY_DYNAMIC_CONCURRENT_MIN", "1"))
+PROXY_DYNAMIC_CONCURRENT_MAX = int(os.environ.get(
+    "PROXY_DYNAMIC_CONCURRENT_MAX", "8" if IS_CLOUD else "4"))
+PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS = float(os.environ.get(
+    "PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS", "30000"))
+PROXY_DYNAMIC_CONCURRENT_ERROR_RATE = float(os.environ.get(
+    "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE", "0.2"))
+
+# ---------------------------------------------------------------------------
 # Loop detection: detect consecutive identical tool_use calls
 # ---------------------------------------------------------------------------
 PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
@@ -170,6 +247,21 @@ PROXY_SESSION_CONTINUATION_MIN_REQUESTS = int(os.environ.get(
 
 PROXY_DEDUP_WINDOW = int(os.environ.get("PROXY_DEDUP_WINDOW", "2"))
 _DEDUP_CACHE = {}
+
+# Phase 3: sliding windows for dynamic concurrency control.
+_LATENCY_WINDOW = collections.deque(maxlen=50)
+_ERROR_WINDOW = collections.deque(maxlen=50)
+
+# Phase 3: metrics schema v1 fixed field set.
+# Any metric record logged by log_metrics() is guaranteed to contain these keys.
+_METRICS_V1_FIELDS = {
+    "schema_version", "ts", "session_id", "input_msgs", "input_chars",
+    "input_tools", "output_chars", "duration_ms", "status", "error_type",
+    "error", "pipeline", "quality_flags", "compression_ratio", "token_ratio",
+    "est_input_tokens", "est_output_tokens", "memory_rejected", "used_pct",
+    "max_tokens_original", "max_tokens_dynamic", "snapshot_written",
+    "dynamic_concurrent", "tools",
+}
 
 def _check_dedup(body_str):
     """Hash-based request dedup with TTL.
@@ -301,14 +393,20 @@ _BLOCKER_ERROR_MARKERS = (
 PROXY_TOOL_FILTER_ENABLED = os.environ.get("PROXY_TOOL_FILTER_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
 PROXY_TOOL_FILTER_MAX = int(os.environ.get("PROXY_TOOL_FILTER_MAX", "20"))
 PROXY_TOOL_FILTER_RECENT = int(os.environ.get("PROXY_TOOL_FILTER_RECENT", "5"))
-TOOL_ALWAYS_KEEP = {
+# Phase 1: use a tuple to preserve stable order for prefix cache alignment.
+TOOL_ALWAYS_KEEP = (
     "Read", "Write", "Edit", "Bash", "Glob", "Grep",
     "LS", "Task", "WebFetch", "WebSearch",
     "TodoRead", "TodoWrite",
     "Skill", "Agent", "NotebookEdit",
     "EnterPlanMode", "ExitPlanMode",
     "AskUserQuestion",
-}
+    # MCP search tools — not in Claude Code's built-in set but essential
+    # for real search results (SearXNG, Serper, WeChat).
+    "mcp__searxng__search",
+    "mcp__serper__google_search",
+    "mcp__wechat-search__search_wechat",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +538,7 @@ def _mask_sensitive(headers_dict):
     return masked
 
 
-LOG_SCHEMA_VERSION = "v2"
+LOG_SCHEMA_VERSION = "v1"
 
 
 def log(msg, level="INFO"):
@@ -474,6 +572,267 @@ def log_structured(event, **kwargs):
             f.write(line + "\n")
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# SIGHUP hot-reload: re-read active.conf and update module-level config
+# without restarting the proxy process. manage.sh `reload` command sends
+# SIGHUP after switching the active.conf symlink.
+#
+# Design:
+#   - Tier 1 (simple scalars): updated via setattr from parsed conf
+#   - Tier 2 (derived objects): Semaphore rebuilt if MAX_CONCURRENT changed;
+#     MODEL_ALIASES rebuilt to pick up new MODEL_NAME
+#   - Tier 3 (not reloaded): PORT/HOST (socket bound), log paths, thread-local
+#     session state (_SESSION_REQUEST_COUNT, _DEDUP_CACHE, etc.), constant
+#     tuples (TOOL_ALWAYS_KEEP, _BLOCKER_ERROR_MARKERS)
+#
+# Safety:
+#   - _RELOAD_LOCK serializes reload against concurrent signal delivery
+#   - Semaphore replacement: threads holding the old lock release it
+#     normally; new `with _llama_lock:` lookups hit the new Semaphore.
+#     Brief over-subscription possible during the swap window — acceptable
+#     since reload is triggered at request boundaries, not mid-request.
+# ---------------------------------------------------------------------------
+_RELOAD_LOCK = threading.Lock()
+RELOAD_CONFIG_PATH = os.environ.get(
+    "PROXY_RELOAD_CONFIG",
+    os.path.join(_SCRIPT_DIR, "configs", "active.conf"),
+)
+# Local secrets file (git-ignored) — sourced by manage.sh at startup.
+# _reload_config parses this for LLAMA_API_KEY so hot-switch to cloud
+# mode picks up the real key without restarting the proxy.
+RELOAD_SECRET_PATH = os.environ.get(
+    "PROXY_RELOAD_SECRET",
+    os.path.join(_SCRIPT_DIR, "configs", "secret.local.conf"),
+)
+
+# Tier 1 scalars reloaded from conf. Format:
+#   (env_key, python_attr_name, cast, cloud_default, local_default)
+# cast: "int" | "float" | "bool" | "str"
+# Defaults mirror the module-level os.environ.get defaults (lines 19-368).
+# Variables with None defaults are handled specially in _reload_config.
+_RELOAD_SPEC = [
+    # Clearing
+    ("PROXY_CLEAR_ENABLED", "PROXY_CLEAR_ENABLED", "bool", "false", "true"),
+    ("PROXY_CLEAR_THRESHOLD", "PROXY_CLEAR_THRESHOLD", "int", "30000", "15000"),
+    ("PROXY_TOOL_KEEP", "PROXY_TOOL_KEEP", "int", "10", "2"),
+    ("PROXY_FROZEN_HEAD", "PROXY_FROZEN_HEAD", "int", "0", "12"),
+    ("PROXY_CLEAR_TAIL_FIRST", "PROXY_CLEAR_TAIL_FIRST", "bool", "true", "true"),
+    ("PROXY_REREAD_PREVIEW_CHARS", "PROXY_REREAD_PREVIEW_CHARS", "int", "200", "200"),
+    # Cache aligner
+    ("PROXY_CACHE_ALIGN_ENABLED", "PROXY_CACHE_ALIGN_ENABLED", "bool", "false", "true"),
+    ("PROXY_CACHE_ALIGN_HEAD", "PROXY_CACHE_ALIGN_HEAD", "int", "4", "4"),
+    # Content tools fallback
+    ("PROXY_CONTENT_TOOLS_FALLBACK", "CONTENT_TOOLS_FALLBACK_ENABLED", "bool", "true", "true"),
+    # Context truncation
+    ("PROXY_CTX_LIMIT_ENABLED", "PROXY_CTX_LIMIT_ENABLED", "bool", "false", "true"),
+    ("PROXY_CTX_CHARS_LIMIT", "PROXY_CTX_CHARS_LIMIT", "int", "500000", "180000"),
+    ("PROXY_CTX_KEEP_HEAD", "PROXY_CTX_KEEP_HEAD", "int", "2", "2"),
+    ("PROXY_CTX_KEEP_TAIL", "PROXY_CTX_KEEP_TAIL", "int", "4", "4"),
+    ("PROXY_CTX_TRUNCATE_STRATEGY", "PROXY_CTX_TRUNCATE_STRATEGY", "str", "char", "char"),
+    ("PROXY_CTX_KEEP_ROUNDS", "PROXY_CTX_KEEP_ROUNDS", "int", "10", "10"),
+    ("PROXY_CTX_KEEP_MESSAGES", "PROXY_CTX_KEEP_MESSAGES", "int", "40", "40"),
+    ("PROXY_CTX_TOKEN_BUDGET", "PROXY_CTX_TOKEN_BUDGET", "int", "30000", "30000"),
+    ("PROXY_CTX_TOKEN_RATIO", "PROXY_CTX_TOKEN_RATIO", "float", "2.0", "2.0"),
+    # Lifecycle thresholds
+    ("PROXY_CHARS_GROWTH", "PROXY_CHARS_GROWTH", "int", "80000", "40000"),
+    ("PROXY_CHARS_EXPANSION", "PROXY_CHARS_EXPANSION", "int", "200000", "90000"),
+    ("PROXY_CHARS_OOM_DANGER", "PROXY_CHARS_OOM_DANGER", "int", "1000000", "350000"),
+    # Output control
+    ("PROXY_MAX_TOKENS_OVERRIDE", "PROXY_MAX_TOKENS_OVERRIDE", "int", "0", "0"),
+    ("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "float", "2.0", "2.0"),
+    ("PROXY_BACKEND_TIMEOUT", "PROXY_BACKEND_TIMEOUT", "int", "300", "300"),
+    ("PROXY_OOM_SAFE_TOKENS", "PROXY_OOM_SAFE_TOKENS", "int", "60000", "60000"),
+    ("PROXY_RETRY_AFTER_SECONDS", "PROXY_RETRY_AFTER_SECONDS", "int", "30", "30"),
+    # Loop detection
+    ("PROXY_TEXT_LOOP_ENABLED", "PROXY_TEXT_LOOP_ENABLED", "bool", "true", "true"),
+    ("PROXY_TEXT_LOOP_THRESHOLD", "PROXY_TEXT_LOOP_THRESHOLD", "int", "3", "3"),
+    ("PROXY_TEXT_LOOP_MIN_CHARS", "PROXY_TEXT_LOOP_MIN_CHARS", "int", "100", "100"),
+    ("PROXY_TEXT_LOOP_SIMILARITY", "PROXY_TEXT_LOOP_SIMILARITY", "float", "0.85", "0.85"),
+    # Session continuation
+    ("PROXY_SESSION_CONTINUATION_ENABLED", "PROXY_SESSION_CONTINUATION_ENABLED", "bool", "true", "true"),
+    ("PROXY_SESSION_CONTINUATION_MIN_REQUESTS", "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", "int", "2", "2"),
+    # Dedup
+    ("PROXY_DEDUP_WINDOW", "PROXY_DEDUP_WINDOW", "int", "2", "2"),
+    # Blocker
+    ("PROXY_BLOCKER_ENABLED", "PROXY_BLOCKER_ENABLED", "bool", "false", "true"),
+    ("PROXY_BLOCKER_THRESHOLD", "PROXY_BLOCKER_THRESHOLD", "int", "2", "2"),
+    # Tool filter
+    ("PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_ENABLED", "bool", "false", "true"),
+    ("PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_MAX", "int", "20", "20"),
+    ("PROXY_TOOL_FILTER_RECENT", "PROXY_TOOL_FILTER_RECENT", "int", "5", "5"),
+    # History index
+    ("PROXY_HISTORY_INDEX", "PROXY_HISTORY_INDEX", "str", "rule", "rule"),
+    ("PROXY_HISTORY_TOP_K", "PROXY_HISTORY_TOP_K", "int", "5", "5"),
+    ("PROXY_HISTORY_MAX_CHARS", "PROXY_HISTORY_MAX_CHARS", "int", "500", "500"),
+    # Metrics
+    ("PROXY_METRICS_ENABLED", "PROXY_METRICS_ENABLED", "bool", "true", "true"),
+]
+
+
+def _parse_conf_env(path):
+    """Parse a bash-style KEY="value" config file into a dict.
+
+    Handles double/single quotes, comments (#), and blank lines.
+    Strips inline comments (space + #) after quoted values.
+    Does NOT evaluate shell expansions — active.conf files are simple
+    KEY=value assignments with no command substitution.
+    """
+    result = {}
+    if not path or not os.path.isfile(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # Strip inline comment after the value: only when the value
+                # is quoted (so # inside quotes is preserved) and a space-#
+                # sequence follows the closing quote.
+                if len(val) >= 2 and val[0] in ('"', "'"):
+                    quote = val[0]
+                    # Find the matching closing quote
+                    end = val.find(quote, 1)
+                    if end != -1:
+                        trailing = val[end + 1:].strip()
+                        if trailing.startswith("#"):
+                            val = val[:end + 1]
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                if key:
+                    result[key] = val
+    except OSError:
+        pass
+    return result
+
+
+def _cast_config_value(value, cast):
+    if cast == "int":
+        return int(value)
+    if cast == "float":
+        return float(value)
+    if cast == "bool":
+        return str(value).lower() in ("1", "true", "yes")
+    return value
+
+
+def _reload_config(signum=None, frame=None):
+    """SIGHUP handler: re-read active.conf and update module-level config.
+
+    Triggered by `manage.sh reload` after switching the active.conf symlink.
+    Updates Tier 1 scalars via setattr, rebuilds Semaphore (Tier 2) if
+    PROXY_MAX_CONCURRENT changed, and rebuilds MODEL_ALIASES to pick up
+    the new MODEL_NAME. PORT/HOST and session state are left untouched.
+    """
+    with _RELOAD_LOCK:
+        mod = sys.modules[__name__]
+        env = _parse_conf_env(RELOAD_CONFIG_PATH)
+        # Merge secrets (LLAMA_API_KEY) from secret.local.conf
+        secret_env = _parse_conf_env(RELOAD_SECRET_PATH)
+        if secret_env:
+            env.update({k: v for k, v in secret_env.items() if k not in env})
+        if not env:
+            log("[RELOAD] no config parsed from %s — keeping current values"
+                % RELOAD_CONFIG_PATH, level="WARN")
+            return
+
+        # --- Backend routing (special: drives IS_CLOUD defaults) ---
+        # Local configs may not set LLAMA_BASE_URL — reconstruct from
+        # LLAMA_HOST + LLAMA_PORT (mirrors manage.sh _start_proxy logic).
+        if "LLAMA_BASE_URL" in env:
+            base = env["LLAMA_BASE_URL"]
+        else:
+            host = env.get("LLAMA_HOST", "127.0.0.1")
+            port = env.get("LLAMA_PORT", "8081")
+            base = "http://%s:%s/v1" % (host, port)
+        setattr(mod, "LLAMA_BASE", base)
+        setattr(mod, "LLAMA_API_KEY",
+                env.get("LLAMA_API_KEY", getattr(mod, "LLAMA_API_KEY")))
+
+        bt = env.get("BACKEND_TYPE", "")
+        if not bt:
+            low = base.lower()
+            if "deepseek" in low or "openai" in low or "api." in low:
+                bt = "cloud"
+            else:
+                bt = "local"
+        setattr(mod, "BACKEND_TYPE", bt)
+        is_cloud = bt == "cloud"
+        setattr(mod, "IS_CLOUD", is_cloud)
+
+        # MODEL_NAME: conf may use MODEL_NAME or LLAMA_MODEL (manage.sh
+        # passes MODEL_NAME=${MODEL_NAME:-$LLAMA_MODEL} to the proxy).
+        model = env.get("MODEL_NAME") or env.get("LLAMA_MODEL",
+                                                  getattr(mod, "MODEL_NAME"))
+        setattr(mod, "MODEL_NAME", model)
+
+        # --- Concurrency + Semaphore rebuild (Tier 2) ---
+        new_max = int(env.get("PROXY_MAX_CONCURRENT", "4" if is_cloud else "1"))
+        old_max = getattr(mod, "PROXY_MAX_CONCURRENT")
+        setattr(mod, "PROXY_MAX_CONCURRENT", new_max)
+        if new_max != old_max:
+            setattr(mod, "_llama_lock", threading.Semaphore(new_max))
+            log("[RELOAD] Semaphore rebuilt: %d -> %d" % (old_max, new_max))
+
+        # --- MODEL_ALIASES rebuild (Tier 2) ---
+        setattr(mod, "MODEL_ALIASES", [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-5-haiku-20241022",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-7",
+            "default",
+            model,
+        ])
+
+        # --- Tier 1 scalars ---
+        for env_key, py_name, cast, cloud_def, local_def in _RELOAD_SPEC:
+            default = cloud_def if is_cloud else local_def
+            raw = env.get(env_key, default)
+            setattr(mod, py_name, _cast_config_value(raw, cast))
+
+        # --- Dependent defaults (special handling) ---
+        # PROXY_LOOP_LEVEL2/3 default to LOOP_THRESHOLD * 2 / * 3
+        loop_thr = int(env.get("PROXY_LOOP_THRESHOLD",
+                               getattr(mod, "PROXY_LOOP_THRESHOLD")))
+        setattr(mod, "PROXY_LOOP_THRESHOLD", loop_thr)
+        setattr(mod, "PROXY_LOOP_LEVEL2",
+                int(env.get("PROXY_LOOP_LEVEL2", str(loop_thr * 2))))
+        setattr(mod, "PROXY_LOOP_LEVEL3",
+                int(env.get("PROXY_LOOP_LEVEL3", str(loop_thr * 3))))
+
+        # PROXY_CHARS_SATURATION: falls back to PROXY_CTX_CHARS_LIMIT
+        sat = (env.get("PROXY_CHARS_SATURATION")
+               or env.get("PROXY_CTX_CHARS_LIMIT",
+                          "500000" if is_cloud else "180000"))
+        setattr(mod, "PROXY_CHARS_SATURATION", int(sat))
+
+        # PROXY_OOM_SAFE_CHARS: falls back to PROXY_PRE_TRUNCATE_CHARS
+        oom = (env.get("PROXY_OOM_SAFE_CHARS")
+               or env.get("PROXY_PRE_TRUNCATE_CHARS", "200000"))
+        setattr(mod, "PROXY_OOM_SAFE_CHARS", int(oom))
+        setattr(mod, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
+
+        log("[RELOAD] OK: backend=%s base=%s model=%s concurrent=%d "
+            "clear=%s ctx_limit=%s frozen=%d truncate=%s"
+            % (bt, base[:60], model, new_max,
+               getattr(mod, "PROXY_CLEAR_ENABLED"),
+               getattr(mod, "PROXY_CTX_LIMIT_ENABLED"),
+               getattr(mod, "PROXY_FROZEN_HEAD"),
+               getattr(mod, "PROXY_CTX_TRUNCATE_STRATEGY")))
+
+
+# Register SIGHUP handler (must be in main thread; module-level code runs
+# in main thread at import time).
+signal.signal(signal.SIGHUP, _reload_config)
 
 
 # ---------------------------------------------------------------------------
@@ -884,12 +1243,48 @@ class _StreamingToolsExtractor:
 
 
 def convert_anthropic_tools_to_openai(tools):
-    """Convert Anthropic tool format to OpenAI tool format."""
+    """Convert Anthropic tool format to OpenAI tool format.
+
+    Handles three tool types:
+    - Anthropic custom tools (type="custom") → OpenAI function tools
+    - Simple tools (name only, no type) → OpenAI function tools
+    - Anthropic server-side web_search_20250305 → mapped to a function tool
+      with a `query` parameter so local/cloud OpenAI-compatible backends can
+      execute it. The model extracts the query from the user message and
+      emits a tool_call; proxy returns it as a tool_use block to Claude Code.
+      See AGENTS.md "Server-side web_search mapping" for details.
+    """
     if not tools:
         return None
     openai_tools = []
     for tool in tools:
-        if tool.get("type") == "custom":
+        tool_type = tool.get("type", "")
+        # Server-side web_search tool → function with query parameter
+        if tool_type == "web_search_20250305":
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", "web_search"),
+                    "description": (
+                        "Search the web for up-to-date information. "
+                        "Extract the search query from the user's message "
+                        "(the text after 'Perform a web search for the query: ') "
+                        "and pass it as the `query` parameter. Returns search "
+                        "results with titles, URLs, and snippets."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "description": "The search query string",
+                                "type": "string",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                }
+            })
+        elif tool_type == "custom":
             # Anthropic custom tool
             openai_tools.append({
                 "type": "function",
@@ -955,6 +1350,445 @@ def _estimate_message_chars(messages):
         else:
             total += len(str(content))
     return total
+
+
+def _extract_text_from_messages(messages):
+    """Concatenate all text content from messages for content-type analysis."""
+    parts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    parts.append(str(block.get("content", "")))
+                elif block.get("type") == "tool_use":
+                    parts.append(json.dumps(block.get("input", {}), ensure_ascii=False))
+        else:
+            parts.append(str(content))
+    return "\n".join(parts)
+
+
+def _classify_content_for_ratio(text):
+    """Return dominant content type for dynamic token ratio selection.
+
+    Heuristics:
+      - cjk: ratio of CJK characters > 0.4
+      - code: high density of code tokens (brackets, semicolons, keywords)
+      - english: fallback
+    """
+    if not text:
+        return "english"
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    total = len(text)
+    if total == 0:
+        return "english"
+    if cjk / total > 0.4:
+        return "chinese"
+    code_tokens = len(re.findall(r"[{}\[\];()=]", text))
+    keywords = len(re.findall(
+        r"\b(def|class|function|const|let|var|import|from|return|if|else|for|while|try|except|async|await)\b",
+        text, re.IGNORECASE))
+    if total > 200 and (code_tokens / total > 0.08 or keywords >= 5):
+        return "code"
+    return "english"
+
+
+def _estimate_tokens_dynamic(messages, ratio_override=None):
+    """Estimate token count using content-type-aware ratios.
+
+    Falls back to PROXY_CTX_TOKEN_RATIO when ratio_override is provided or
+    content classification is inconclusive.
+    """
+    if ratio_override:
+        return int(_estimate_message_chars(messages) / max(ratio_override, 0.1))
+    text = _extract_text_from_messages(messages)
+    content_type = _classify_content_for_ratio(text)
+    ratio_map = {
+        "chinese": PROXY_TOKEN_RATIO_CHINESE,
+        "english": PROXY_TOKEN_RATIO_ENGLISH,
+        "code": PROXY_TOKEN_RATIO_CODE,
+    }
+    ratio = ratio_map.get(content_type, PROXY_CTX_TOKEN_RATIO)
+    # For mixed content, weight by detected type but blend with the default ratio
+    # to avoid over-correction on short or ambiguous inputs.
+    if len(text) < 500:
+        ratio = (ratio + PROXY_CTX_TOKEN_RATIO) / 2.0
+    return int(_estimate_message_chars(messages) / max(ratio, 0.1))
+
+
+def _compute_re_read_rate(re_read_files, cleared_files):
+    """Compute re-read rate as a percentage capped at 100.
+
+    DEF-003: rate must be re_read_files / cleared_files, not raw call count.
+    Returns 0.0 when there are no cleared files.
+    """
+    if not cleared_files:
+        return 0.0
+    return min(float(re_read_files) / float(cleared_files) * 100.0, 100.0)
+
+
+def _message_stable_hash(msg):
+    """Return a stable hash for a message dict used in prefix comparison."""
+    try:
+        return hashlib.sha256(json.dumps(msg, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return hashlib.sha256(str(msg).encode("utf-8")).hexdigest()
+
+
+def _compute_common_prefix_ratio(current, previous):
+    """Compute the ratio of chars in the common prefix of two message lists.
+
+    Walks from the first message until messages differ, then returns
+    common_chars / total_chars. Used to quantify prefix cache stability.
+    """
+    if not current or not previous:
+        return 0.0
+    common_chars = 0
+    min_len = min(len(current), len(previous))
+    for i in range(min_len):
+        if _message_stable_hash(current[i]) != _message_stable_hash(previous[i]):
+            break
+        common_chars += _estimate_message_chars([current[i]])
+    total_chars = _estimate_message_chars(current)
+    if total_chars <= 0:
+        return 0.0
+    return round(common_chars / total_chars, 4)
+
+
+def _normalize_system_messages(messages):
+    """Convert mid-conversation system messages to user messages.
+
+    Qwen chat templates require the system message to be at the beginning.
+    Claude Code's mid-conversation-system beta inserts system messages later,
+    which breaks rapid-mlx/Qwen. We keep the first system message (if any) and
+    convert subsequent ones to user messages prefixed with [System update].
+    """
+    if not messages:
+        return messages
+    result = []
+    seen_system = False
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            if not seen_system:
+                result.append(msg)
+                seen_system = True
+            else:
+                content = msg.get("content", "")
+                text = content
+                if isinstance(content, list):
+                    text = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+                new_msg = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"[System update]: {text}"}]
+                }
+                result.append(new_msg)
+        else:
+            result.append(msg)
+    return result
+
+
+def _apply_cache_aligner(messages):
+    """Cache Aligner MVP: protect the first N messages from truncation.
+
+    Returns (prefix_messages, dynamic_messages). The caller should run
+    truncation only on dynamic_messages, then reassemble prefix + dynamic.
+    """
+    if not PROXY_CACHE_ALIGN_ENABLED:
+        return [], messages
+    head = min(PROXY_CACHE_ALIGN_HEAD, len(messages))
+    prefix = messages[:head]
+    dynamic = messages[head:]
+    return prefix, dynamic
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: TokenSieve-inspired content compression for tool_result payloads.
+# ---------------------------------------------------------------------------
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _scrub_ansi(text):
+    """Remove ANSI color/control escape sequences from terminal output."""
+    if not isinstance(text, str):
+        text = str(text)
+    return _ANSI_ESCAPE_RE.sub('', text)
+
+
+def _detect_content_type(text, mime_hint=None):
+    """Detect whether a tool_result payload is json, code, log, or plain text."""
+    if mime_hint:
+        hint = mime_hint.lower()
+        if "json" in hint:
+            return "json"
+        if any(k in hint for k in ("html", "xml", "markdown")):
+            return "text"
+        if any(k in hint for k in ("python", "javascript", "typescript", "rust", "go", "c++", "c", "java")):
+            return "code"
+    if not isinstance(text, str):
+        return "text"
+    stripped = text.strip()
+    if (stripped.startswith("{") and stripped.endswith("}")) or \
+       (stripped.startswith("[") and stripped.endswith("]")):
+        try:
+            json.loads(stripped)
+            return "json"
+        except Exception:
+            pass
+    # Log heuristic: lines starting with timestamps or level keywords.
+    lines = stripped.splitlines()
+    if len(lines) >= 2:
+        log_markers = 0
+        for line in lines[:10]:
+            if re.search(r"^\d{4}[-/]\d{2}[-/]\d{2}|^\d{2}:\d{2}:\d{2}|\b(ERROR|WARN|INFO|DEBUG|FATAL)\b", line):
+                log_markers += 1
+        if log_markers >= 1:
+            return "log"
+    # Code heuristic: significant syntax markers or indentation pattern.
+    code_markers = sum(1 for kw in ("def ", "class ", "import ", "function ", "const ", "let ", "var ", "#include", "return ")
+                       if kw in text)
+    indented_lines = sum(1 for line in lines if line.startswith(("    ", "\t")))
+    if code_markers >= 1 or (len(lines) >= 3 and indented_lines >= 1):
+        return "code"
+    return "text"
+
+
+def _sieve_json(obj, max_items=None, max_str_len=None, max_depth=None,
+                seen_strings=None, enable_dedupe=False, _depth=0):
+    """Summarize JSON while preserving structure.
+
+    - Arrays keep first max_items entries plus a count note.
+    - Strings longer than max_str_len are truncated.
+    - Nesting deeper than max_depth is stringified.
+    - Optional scalar dedupe (first-seen-wins) for long repeated strings.
+    """
+    if max_items is None:
+        max_items = PROXY_SIEVE_JSON_MAX_ITEMS
+    if max_str_len is None:
+        max_str_len = PROXY_SIEVE_JSON_MAX_STR_LEN
+    if max_depth is None:
+        max_depth = PROXY_SIEVE_JSON_MAX_DEPTH
+    if seen_strings is None:
+        seen_strings = {}
+
+    if _depth > max_depth:
+        return str(obj)[:max_str_len]
+
+    if isinstance(obj, str):
+        if enable_dedupe and len(obj) > 20:
+            if obj in seen_strings:
+                return f"###(repeated: {seen_strings[obj]})"
+            seen_strings[obj] = len(seen_strings) + 1
+        if len(obj) > max_str_len:
+            return obj[:max_str_len] + f"...[truncated {len(obj) - max_str_len} chars]"
+        return obj
+
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, float)):
+        return obj
+    if obj is None:
+        return None
+
+    if isinstance(obj, list):
+        if len(obj) > max_items:
+            summarized = [_sieve_json(item, max_items, max_str_len, max_depth,
+                                      seen_strings, enable_dedupe, _depth + 1)
+                          for item in obj[:max_items]]
+            return summarized + [f"...({len(obj) - max_items} more items)"]
+        return [_sieve_json(item, max_items, max_str_len, max_depth,
+                            seen_strings, enable_dedupe, _depth + 1)
+                for item in obj]
+
+    if isinstance(obj, dict):
+        return {
+            k: _sieve_json(v, max_items, max_str_len, max_depth,
+                           seen_strings, enable_dedupe, _depth + 1)
+            for k, v in obj.items()
+        }
+
+    return str(obj)[:max_str_len]
+
+
+def _compress_code(text):
+    """Remove comments and collapse excessive blank lines while keeping code."""
+    if not isinstance(text, str):
+        text = str(text)
+    lines = text.splitlines()
+    result = []
+    prev_blank = False
+    for line in lines:
+        stripped = line.strip()
+        # Drop full-line comments (common languages)
+        if stripped.startswith(("#", "//", "/*", "*", "--", ";")):
+            continue
+        # Drop trailing comments
+        for marker in ("//", "#", "--"):
+            idx = line.find(marker)
+            if idx >= 0:
+                line = line[:idx]
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        result.append(line.rstrip())
+        prev_blank = is_blank
+    return "\n".join(result).strip()
+
+
+def _compress_log(text, dedupe=True):
+    """Deduplicate adjacent log lines and strip common timestamps.
+    Keep lines containing error/exception/warning keywords."""
+    if not isinstance(text, str):
+        text = str(text)
+    lines = text.splitlines()
+    out = []
+    last_line = None
+    dup_count = 0
+    for line in lines:
+        # Strip common timestamp prefixes
+        cleaned = re.sub(r"^\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?\s*", "", line)
+        cleaned = re.sub(r"^\d{2}:\d{2}:\d{2}\s*", "", cleaned)
+        if dedupe and cleaned == last_line:
+            dup_count += 1
+            continue
+        if dup_count > 0:
+            out.append(f"...({dup_count} identical lines omitted)")
+            dup_count = 0
+        last_line = cleaned
+        # Prioritize error lines by keeping them verbatim; compress benign lines
+        if re.search(r"\b(ERROR|Exception|Traceback|FATAL|CRITICAL)\b", cleaned, re.IGNORECASE):
+            out.append(line)  # keep original with timestamp for errors
+        else:
+            out.append(cleaned)
+    if dup_count > 0:
+        out.append(f"...({dup_count} identical lines omitted)")
+    return "\n".join(out).strip()
+
+
+def _compress_text(text, max_len=2000):
+    """Truncate very long plain text while keeping first/last context."""
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= max_len:
+        return text
+    head = text[:max_len // 2]
+    tail = text[-max_len // 2:]
+    return f"{head}\n\n...[truncated {len(text) - max_len} chars]\n\n{tail}"
+
+
+def _dedupe_scalars(obj, min_len=20, seen=None):
+    """First-seen-wins scalar deduplication for JSON/string values."""
+    if seen is None:
+        seen = {}
+    if isinstance(obj, str):
+        if len(obj) >= min_len:
+            if obj in seen:
+                return f"###(repeated: {seen[obj]})"
+            seen[obj] = len(seen) + 1
+        return obj
+    if isinstance(obj, list):
+        return [_dedupe_scalars(item, min_len, seen) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _dedupe_scalars(v, min_len, seen) for k, v in obj.items()}
+    return obj
+
+
+def _audit_compression(original, compressed, content_type):
+    """Validate that compression did not destroy syntax/semantics."""
+    if not PROXY_COMPRESS_AUDIT:
+        return True
+    if content_type == "json":
+        try:
+            json.loads(compressed)
+            return True
+        except Exception:
+            return False
+    if content_type == "code":
+        # Simple balance check: brackets and quotes should still be roughly paired.
+        open_br = compressed.count("(") + compressed.count("[") + compressed.count("{")
+        close_br = compressed.count(")") + compressed.count("]") + compressed.count("}")
+        return abs(open_br - close_br) <= 2
+    # text/log: always pass the audit
+    return True
+
+
+def compress_tool_result(content, mime_hint=None, threshold=None, mode=None):
+    """Compress a single tool_result content payload.
+
+    Returns a dict:
+        {
+            "original": str,
+            "compressed": str,
+            "content_type": str,
+            "strategy": str,
+            "audit_pass": bool,
+            "ratio": float,
+        }
+    """
+    if threshold is None:
+        threshold = PROXY_COMPRESS_THRESHOLD
+    if mode is None:
+        mode = PROXY_COMPRESS_MODE
+
+    original = content if isinstance(content, str) else str(content)
+
+    if mode == "lossless" or len(original) < threshold:
+        return {
+            "original": original,
+            "compressed": original,
+            "content_type": "short",
+            "strategy": "none",
+            "audit_pass": True,
+            "ratio": 1.0,
+        }
+
+    # Stage 1: scrub ANSI
+    scrubbed = _scrub_ansi(original) if PROXY_SCRUB_ANSI else original
+
+    # Stage 2: detect content type
+    content_type = _detect_content_type(scrubbed, mime_hint=mime_hint)
+
+    # Stage 3: route to compressor
+    if content_type == "json":
+        try:
+            parsed = json.loads(scrubbed)
+            enable_dedupe = PROXY_DEDUPE_SCALARS and mode == "aggressive"
+            compressed_obj = _sieve_json(parsed, enable_dedupe=enable_dedupe)
+            if PROXY_DEDUPE_SCALARS and mode == "aggressive":
+                compressed_obj = _dedupe_scalars(compressed_obj)
+            compressed = json.dumps(compressed_obj, ensure_ascii=False, separators=(',', ':'))
+            strategy = "json_sieve"
+        except Exception:
+            compressed = scrubbed
+            strategy = "json_passthrough"
+    elif content_type == "code":
+        compressed = _compress_code(scrubbed)
+        strategy = "code_compress"
+    elif content_type == "log":
+        compressed = _compress_log(scrubbed, dedupe=PROXY_LOG_DEDUPE)
+        strategy = "log_compress"
+    else:
+        compressed = _compress_text(scrubbed)
+        strategy = "text_truncate"
+
+    # Stage 4: audit
+    audit_pass = _audit_compression(scrubbed, compressed, content_type)
+    if not audit_pass:
+        compressed = scrubbed
+        strategy = "audit_fallback"
+
+    ratio = len(compressed) / len(original) if original else 1.0
+    return {
+        "original": original,
+        "compressed": compressed,
+        "content_type": content_type,
+        "strategy": strategy,
+        "audit_pass": audit_pass,
+        "ratio": round(ratio, 4),
+    }
 
 
 def _generate_tool_summary(tool_name, meta_info):
@@ -1079,6 +1913,47 @@ def _classify_lifecycle_stage(messages, session_id=None):
         }
 
 
+def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
+    """Compute a context-aware max_tokens ceiling.
+
+    - Heavy lifecycle stages get a lower ceiling.
+    - rapid-mlx backend gets an additional discount (known to ignore max_tokens).
+    - Low available memory lowers the ceiling one more notch.
+    Returns (adjusted_max_tokens, reason_string).
+    """
+    if not PROXY_DYNAMIC_MAX_TOKENS_ENABLED:
+        return max_tokens_orig, "dynamic_disabled"
+
+    stage = stage_config.get("stage", "init")
+    if stage == "init":
+        cap = PROXY_DYNAMIC_MAX_TOKENS_INIT
+    elif stage in ("growth", "expansion"):
+        cap = PROXY_DYNAMIC_MAX_TOKENS_GROWTH
+    else:  # saturation, oom_danger, pre_trunc
+        cap = PROXY_DYNAMIC_MAX_TOKENS_SATURATION
+
+    adjusted = min(max_tokens_orig, cap)
+    reasons = [f"stage={stage}"]
+
+    if not IS_CLOUD and "rapid-mlx" in (MODEL_NAME or ""):
+        adjusted = int(adjusted * PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO)
+        reasons.append("rapid-mlx_discount")
+
+    try:
+        if mem is None:
+            mem = _get_system_memory()
+        available_gb = float(mem.get("available_gb", 48))
+        total_gb = float(mem.get("total_gb", 48))
+        if total_gb > 0 and available_gb / total_gb < 0.20:
+            adjusted = int(adjusted * 0.7)
+            reasons.append("low_memory")
+    except Exception:
+        pass
+
+    adjusted = max(1, adjusted)
+    return adjusted, ",".join(reasons)
+
+
 def _compress_content_pass(messages, tools_list=None, stage_config=None):
     """
     Single-pass content compression: combines L2 tool-result clearing and
@@ -1123,6 +1998,50 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                         if msg_idx not in thinking_indices:
                             thinking_indices.append(msg_idx)
                         break
+
+    # ---- Phase 1b: semantic compression of tool_result contents (Phase 2) ----
+    compress_stats_list = []
+    if PROXY_COMPRESS_ENABLED:
+        for msg_idx, block_idx in all_tool_result_indices:
+            if frozen_head > 0 and msg_idx < frozen_head:
+                continue
+            block = messages[msg_idx]["content"][block_idx]
+            content = block.get("content", "")
+            if not content:
+                continue
+            # Guess mime hint from tool name when possible.
+            mime_hint = None
+            tool_use_id = block.get("tool_use_id", "")
+            for m_idx in range(msg_idx - 1, -1, -1):
+                m = messages[m_idx]
+                if m.get("role") == "assistant":
+                    c = m.get("content", "")
+                    if isinstance(c, list):
+                        for b in c:
+                            if b.get("type") == "tool_use" and b.get("id") == tool_use_id:
+                                tool_name = b.get("name", "")
+                                if tool_name == "Read":
+                                    inp = b.get("input", {})
+                                    if isinstance(inp, dict):
+                                        fp = inp.get("file_path", inp.get("path", ""))
+                                        if fp:
+                                            mime_hint = fp.lower().split(".")[-1] if "." in fp else None
+                                break
+                    break
+
+            result = compress_tool_result(content, mime_hint=mime_hint)
+            if result["ratio"] < 1.0:
+                block["content"] = result["compressed"]
+                compress_stats_list.append({
+                    "msg_idx": msg_idx,
+                    "block_idx": block_idx,
+                    "content_type": result["content_type"],
+                    "strategy": result["strategy"],
+                    "ratio": result["ratio"],
+                    "audit_pass": result["audit_pass"],
+                    "original_len": len(result["original"]),
+                    "compressed_len": len(result["compressed"]),
+                })
 
     # ---- Phase 2a: tool-result clearing logic ----
     clear_stats = {"enabled": False, "skipped": True, "reason": "disabled"}
@@ -1287,7 +2206,26 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
             think_stats = {"enabled": True, "skipped": True, "reason": "few_dynamic_thinking",
                            "count": len(dynamic_thinking)}
 
-    return messages, {"clear": clear_stats, "think": think_stats}
+    # Aggregate compression stats
+    aggregated_compress_stats = {"enabled": False, "compressed_count": 0, "saved_chars": 0}
+    if compress_stats_list:
+        original_total = sum(s["original_len"] for s in compress_stats_list)
+        compressed_total = sum(s["compressed_len"] for s in compress_stats_list)
+        strategies = {}
+        for s in compress_stats_list:
+            strategies[s["strategy"]] = strategies.get(s["strategy"], 0) + 1
+        aggregated_compress_stats = {
+            "enabled": True,
+            "compressed_count": len(compress_stats_list),
+            "original_chars": original_total,
+            "compressed_chars": compressed_total,
+            "saved_chars": original_total - compressed_total,
+            "ratio": round(compressed_total / original_total, 4) if original_total else 1.0,
+            "strategies": strategies,
+            "audit_failures": sum(1 for s in compress_stats_list if not s["audit_pass"]),
+        }
+
+    return messages, {"clear": clear_stats, "think": think_stats, "compress": aggregated_compress_stats}
 
 
 def clear_old_tool_results(messages, tools_list=None, clear_zone_pct=None):
@@ -2323,13 +3261,13 @@ def convert_anthropic_messages_to_openai(messages):
                     del openai_msg["content"]
                 openai_messages.append(openai_msg)
             elif role == "user" and tool_results:
-                # Add text message first if there's text
-                if text_parts:
-                    openai_messages.append({
-                        "role": "user",
-                        "content": "\n".join(text_parts),
-                    })
-                # Then add tool results
+                # Tool results MUST come immediately after the assistant
+                # tool_calls that triggered them. OpenAI/DeepSeek strictly
+                # validate that every tool_calls message is followed by tool
+                # messages (one per tool_call_id) before any other role.
+                # Inserting a user text message here would break that pairing
+                # ("insufficient tool messages following tool_calls").
+                # So: emit tool results first, then any trailing text.
                 for tr in tool_results:
                     tr_content = tr["content"]
                     if tr_content is None:
@@ -2338,6 +3276,11 @@ def convert_anthropic_messages_to_openai(messages):
                         "role": "tool",
                         "tool_call_id": tr["tool_call_id"],
                         "content": str(tr_content),
+                    })
+                if text_parts:
+                    openai_messages.append({
+                        "role": "user",
+                        "content": "\n".join(text_parts),
                     })
             else:
                 openai_messages.append({
@@ -2497,6 +3440,64 @@ def _get_system_memory():
     return data
 
 
+def _should_reject_for_memory(mem=None):
+    """Return (rejected: bool, used_pct: float) based on memory pressure threshold."""
+    try:
+        if mem is None:
+            mem = _get_system_memory()
+        used_pct = float(mem.get("used_pct", 0))
+        return used_pct > PROXY_MEMORY_REJECT_THRESHOLD, used_pct
+    except Exception:
+        return False, 0.0
+
+
+def _cleanup_snapshots(snapshot_dir, max_files):
+    """Keep only the most recent max_files snapshot pairs."""
+    try:
+        files = [
+            (f, os.path.getmtime(os.path.join(snapshot_dir, f)))
+            for f in os.listdir(snapshot_dir)
+            if f.endswith(".json")
+        ]
+        files.sort(key=lambda x: x[1], reverse=True)
+        for old_file, _ in files[max_files:]:
+            try:
+                os.remove(os.path.join(snapshot_dir, old_file))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _write_request_snapshot(request_id, before_body, after_body=None, error=None):
+    """Write before/after request snapshots for debugging failures.
+
+    Returns True if a snapshot was written.
+    """
+    if not PROXY_SNAPSHOT_ENABLED:
+        return False
+    try:
+        snapshot_dir = os.path.join(_SCRIPT_DIR, "logs", "snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        before_path = os.path.join(snapshot_dir, f"{request_id}_before.json")
+        with open(before_path, "w", encoding="utf-8") as f:
+            json.dump({"request_id": request_id, "body": before_body}, f,
+                      ensure_ascii=False, indent=2)
+        if after_body is not None or error is not None:
+            after_path = os.path.join(snapshot_dir, f"{request_id}_after.json")
+            payload = {"request_id": request_id}
+            if after_body is not None:
+                payload["body_after_pipeline"] = after_body
+            if error is not None:
+                payload["error"] = {"type": type(error).__name__, "message": str(error)[:500]}
+            with open(after_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        _cleanup_snapshots(snapshot_dir, PROXY_SNAPSHOT_MAX_FILES)
+        return True
+    except Exception:
+        return False
+
+
 def _read_log_tail(path, max_bytes=200000):
     if not os.path.exists(path):
         return ""
@@ -2508,6 +3509,59 @@ def _read_log_tail(path, max_bytes=200000):
             return f.read()
     except OSError:
         return ""
+
+
+def _record_request_for_concurrency(duration_ms, status):
+    """Append a sample to the latency/error sliding windows."""
+    try:
+        _LATENCY_WINDOW.append(float(duration_ms))
+        _ERROR_WINDOW.append(0 if int(status) == 200 else 1)
+    except Exception:
+        pass
+
+
+def _percentile(values, p):
+    """Return the p-th percentile of a list of numbers (0 <= p <= 1)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return float(s[f])
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _adjust_concurrency():
+    """Dynamically adjust backend semaphore size based on recent latency/error window.
+
+    Returns a dict describing the decision (or None if disabled).
+    """
+    global _llama_lock, PROXY_MAX_CONCURRENT
+    if not PROXY_DYNAMIC_CONCURRENT_ENABLED:
+        return None
+    try:
+        latencies = list(_LATENCY_WINDOW)
+        errors = list(_ERROR_WINDOW)
+        if len(latencies) < 5:
+            return None
+        p95 = _percentile(latencies, 0.95)
+        error_rate = sum(errors) / len(errors) if errors else 0.0
+        current = PROXY_MAX_CONCURRENT
+        new_max = current
+        if p95 > PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS or error_rate > PROXY_DYNAMIC_CONCURRENT_ERROR_RATE:
+            new_max = max(PROXY_DYNAMIC_CONCURRENT_MIN, current - 1)
+        elif p95 < PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS / 2 and error_rate == 0.0:
+            new_max = min(PROXY_DYNAMIC_CONCURRENT_MAX, current + 1)
+        if new_max != current:
+            PROXY_MAX_CONCURRENT = new_max
+            _llama_lock = threading.Semaphore(new_max)
+            log(f"[DYNAMIC_CONCURRENT] adjusted {current} -> {new_max} (p95={p95:.0f}ms, error_rate={error_rate:.2f})")
+            return {"adjusted": True, "previous": current, "current": new_max, "p95": p95, "error_rate": error_rate}
+        return {"adjusted": False, "current": current, "p95": p95, "error_rate": error_rate}
+    except Exception:
+        return None
 
 
 def _get_log_stats():
@@ -2742,6 +3796,88 @@ def _empty_traffic_stats():
     }
 
 
+def _get_context_optimization_stats():
+    """Aggregate recent proxy_metrics.jsonl for context optimization dashboard.
+
+    Returns dict with avg common_prefix_ratio, avg compression_ratio,
+    loop/blocker counts, and the most recent blocker event.
+    """
+    try:
+        with open(_METRICS_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return _empty_context_optimization_stats()
+
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts_str = rec.get("ts", "")
+            if ts_str:
+                try:
+                    rec["_ts"] = datetime.fromisoformat(ts_str)
+                    records.append(rec)
+                except ValueError:
+                    pass
+        except json.JSONDecodeError:
+            continue
+
+    if not records:
+        return _empty_context_optimization_stats()
+
+    now = datetime.now()
+    recent = [r for r in records if (now - r["_ts"]).total_seconds() <= 600]
+    if not recent:
+        recent = records[-50:]
+
+    ratios = [r.get("pipeline", {}).get("common_prefix_ratio", {}).get("ratio", 0) for r in recent]
+    ratios = [r for r in ratios if isinstance(r, (int, float))]
+    compressions = [r.get("compression_ratio", 1.0) for r in recent]
+    compressions = [c for c in compressions if isinstance(c, (int, float))]
+
+    loop_count = 0
+    blocker_count = 0
+    recent_blocker = None
+    for r in recent:
+        pipeline = r.get("pipeline", {})
+        if pipeline.get("loop_detect", {}).get("max_run", 0) >= PROXY_LOOP_THRESHOLD:
+            loop_count += 1
+        blocker = pipeline.get("blocker_detect", {})
+        if blocker.get("triggered"):
+            blocker_count += 1
+            recent_blocker = {
+                "ts": r.get("ts", ""),
+                "tool": blocker.get("tool_name", "?"),
+                "error": blocker.get("error_type", "?"),
+                "run": blocker.get("run_length", 0),
+            }
+
+    return {
+        "avg_common_prefix_ratio": round(sum(ratios) / len(ratios), 3) if ratios else 0.0,
+        "avg_compression_ratio": round(sum(compressions) / len(compressions), 3) if compressions else 1.0,
+        "loop_triggered_10m": loop_count,
+        "blocker_triggered_10m": blocker_count,
+        "recent_blocker": recent_blocker,
+        "max_concurrent": PROXY_MAX_CONCURRENT,
+        "dynamic_concurrent_enabled": PROXY_DYNAMIC_CONCURRENT_ENABLED,
+    }
+
+
+def _empty_context_optimization_stats():
+    return {
+        "avg_common_prefix_ratio": 0.0,
+        "avg_compression_ratio": 1.0,
+        "loop_triggered_10m": 0,
+        "blocker_triggered_10m": 0,
+        "recent_blocker": None,
+        "max_concurrent": PROXY_MAX_CONCURRENT,
+        "dynamic_concurrent_enabled": PROXY_DYNAMIC_CONCURRENT_ENABLED,
+    }
+
+
 def _get_session_trace():
     """Parse /tmp/anthropic_request_body.json and build an HTML snippet showing
     the semantic message timeline (roles, tool calls, text previews, errors).
@@ -2890,6 +4026,7 @@ def _build_status_html():
     traffic = _get_traffic_stats()
     session_trace, tools_detail, errors_detail = _get_session_trace()
     cache_stats = _get_cache_stats()
+    ctx_opt = _get_context_optimization_stats()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     backend_color = "#2ecc71" if backend_info.get("running") else "#e74c3c"
@@ -2898,8 +4035,10 @@ def _build_status_html():
         rate = cache_stats["hit"] / cache_stats["total"] * 100
         cache_rate_color = "#2ecc71" if rate >= 50 else "#f39c12" if rate >= 20 else "#e74c3c"
     proxy_color = "#2ecc71" if proxy_info.get("running") else "#e74c3c"
-    mem_warn = float(mem.get("used_pct", 0)) > 75
-    mem_color = "#e74c3c" if mem_warn else "#2ecc71"
+    mem_used_pct = float(mem.get("used_pct", 0))
+    mem_warn = mem_used_pct > PROXY_MEMORY_REJECT_THRESHOLD
+    mem_alert = mem_used_pct > 75
+    mem_color = "#e74c3c" if mem_warn or mem_alert else "#2ecc71"
 
     # --- Traffic Stats card ---
     s1h = traffic.get("stats_1h", {})
@@ -2916,6 +4055,24 @@ def _build_status_html():
     <div class="row"><span class="label">Success Rate</span><span class="value" style="color:{"#2ecc71" if s1h.get("success_rate", 100) >= 95 else "#f39c12" if s1h.get("success_rate", 100) >= 80 else "#e74c3c"}">{s1h.get("success_rate", 100):.1f}%</span></div>
     <div class="row"><span class="label">Est. QPS (10m)</span><span class="value">{qps:.3f}</span></div>
     <div class="row"><span class="label">Last Record</span><span class="value">{traffic.get("last_record_time", "—")}</span></div>
+  </div>"""
+
+    # --- Context Optimization card (Phase 3) ---
+    recent_blocker_html = ""
+    rb = ctx_opt.get("recent_blocker")
+    if rb:
+        recent_blocker_html = (
+            f'<div class="row"><span class="label">Recent Blocker</span>'
+            f'<span class="value" style="color:#f39c12">{rb.get("tool", "?")} / {rb.get("error", "?")} (run={rb.get("run", 0)})</span></div>'
+        )
+    ctx_opt_card = f"""<div class="card">
+    <h2>🧠 Context Optimization</h2>
+    <div class="row"><span class="label">Avg Prefix Ratio</span><span class="value">{ctx_opt.get("avg_common_prefix_ratio", 0):.1%}</span></div>
+    <div class="row"><span class="label">Avg Compression</span><span class="value">{ctx_opt.get("avg_compression_ratio", 1.0):.2f}x</span></div>
+    <div class="row"><span class="label">Loop Triggered (10m)</span><span class="value">{ctx_opt.get("loop_triggered_10m", 0)}</span></div>
+    <div class="row"><span class="label">Blocker Triggered (10m)</span><span class="value">{ctx_opt.get("blocker_triggered_10m", 0)}</span></div>
+    {recent_blocker_html}
+    <div class="row"><span class="label">Max Concurrent</span><span class="value">{ctx_opt.get("max_concurrent", PROXY_MAX_CONCURRENT)}{" (dynamic)" if ctx_opt.get("dynamic_concurrent_enabled") else ""}</span></div>
   </div>"""
 
     # --- Alerts card ---
@@ -3053,9 +4210,12 @@ def _build_status_html():
     <div class="row"><span class="label">Prefix Cache</span><span class="value" style="color:{cache_rate_color}" title="统计范围: {cache_stats['since']} (跨session累计请查看 /status 页面历史)">{cache_stats["hit"]}/{cache_stats["total"]} ({cache_stats["rate_str"]})</span></div>
     <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={PROXY_MAX_CONCURRENT}</span></div>
     <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
+    {'<div class="row"><span class="label">Memory Alert</span><span class="value" style="color:#e74c3c">⚠️ Used ' + str(mem_used_pct) + '% (reject threshold ' + str(PROXY_MEMORY_REJECT_THRESHOLD) + '%)</span></div>' if mem_warn else ''}
   </div>
 
   {traffic_card}
+
+  {ctx_opt_card}
 
   <div class="card" style="grid-column: 1 / -1;">
     <h2>🚨 Alerts (last 10m)</h2>
@@ -3147,12 +4307,44 @@ def _finalize_metrics(mc):
     if blocker.get("triggered"):
         quality_flags.append("blocker_injected")
     mc["quality_flags"] = quality_flags
-    input_est = mc.get("input_chars", 0) / max(PROXY_CTX_TOKEN_RATIO, 0.1)
+
+    # Phase 3: dynamic token estimation
+    input_chars = mc.get("input_chars", 0)
+    token_ratio = PROXY_CTX_TOKEN_RATIO
+    try:
+        # Reconstruct a minimal message list for ratio detection. The original
+        # body is no longer available here, so we fall back to classifying the
+        # input_chars text as a single English block for ratio selection.
+        content_type = _classify_content_for_ratio("x" * min(input_chars, 1000))
+        ratio_map = {
+            "chinese": PROXY_TOKEN_RATIO_CHINESE,
+            "english": PROXY_TOKEN_RATIO_ENGLISH,
+            "code": PROXY_TOKEN_RATIO_CODE,
+        }
+        token_ratio = ratio_map.get(content_type, PROXY_CTX_TOKEN_RATIO)
+    except Exception:
+        token_ratio = PROXY_CTX_TOKEN_RATIO
+    input_est = int(input_chars / max(token_ratio, 0.1))
     est_after = trunc.get("est_tokens_after", input_est) if trunc.get("triggered") else input_est
     if input_est > 0:
         mc["compression_ratio"] = round(est_after / input_est, 2)
     else:
         mc["compression_ratio"] = 1.0
+    mc["token_ratio"] = round(token_ratio, 2)
+    mc["est_input_tokens"] = input_est
+    output_chars = mc.get("output_chars", 0)
+    mc["est_output_tokens"] = int(output_chars / max(token_ratio, 0.1))
+
+    # Phase 3: schema v1 — guarantee a fixed set of keys
+    mc["schema_version"] = "v1"
+    for field in _METRICS_V1_FIELDS:
+        mc.setdefault(field, None)
+    mc["dynamic_concurrent"] = {
+        "enabled": PROXY_DYNAMIC_CONCURRENT_ENABLED,
+        "current": PROXY_MAX_CONCURRENT,
+        "min": PROXY_DYNAMIC_CONCURRENT_MIN,
+        "max": PROXY_DYNAMIC_CONCURRENT_MAX,
+    }
 
 
 def _mc_put(step_key, data):
@@ -3178,28 +4370,40 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
             if assistant_count >= recent_rounds:
                 break
 
-    keep_set = TOOL_ALWAYS_KEEP | recent_tools
+    always_keep_set = set(TOOL_ALWAYS_KEEP)
+    keep_set = always_keep_set | recent_tools
     if tool_choice_name:
         keep_set.add(tool_choice_name)
 
+    # Phase 1: sort kept tools by a stable order (always-keep first, then recent,
+    # then alphabetical) so the prefix token sequence is identical across requests
+    # when the same tools are available.
+    def _tool_sort_key(t):
+        name = t.get("name", "")
+        if name in always_keep_set:
+            # preserve the order defined in TOOL_ALWAYS_KEEP
+            return (0, TOOL_ALWAYS_KEEP.index(name))
+        if name in recent_tools:
+            return (1, name)
+        return (2, name)
+
     kept = sorted(
         [t for t in tools if isinstance(t, dict) and t.get("name", "") in keep_set],
-        key=lambda t: t.get("name", "")
+        key=_tool_sort_key
     )
 
     if len(kept) < 5:
         return tools, {"filtered": False, "reason": "too_few_after_filter"}
 
+    kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
     if len(kept) < PROXY_TOOL_FILTER_MAX:
-        kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
         remaining = sorted(
             [t for t in tools if isinstance(t, dict) and t.get("name", "") not in kept_names],
             key=lambda t: t.get("name", "")
         )
         kept.extend(remaining[:PROXY_TOOL_FILTER_MAX - len(kept)])
-        kept.sort(key=lambda t: t.get("name", ""))
-
-    kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
+        kept.sort(key=_tool_sort_key)
+        kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
 
     all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     filtered_out = sorted(all_names - kept_names)
@@ -3208,8 +4412,8 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
         "filtered": True,
         "original": len(tools),
         "kept": len(kept),
-        "always_keep": len(TOOL_ALWAYS_KEEP & kept_names),
-        "recent_only": len(recent_tools - TOOL_ALWAYS_KEEP),
+        "always_keep": len(always_keep_set & kept_names),
+        "recent_only": len(recent_tools - always_keep_set),
         "recent_tools": sorted(recent_tools),
         "scanned_assistant": assistant_count,
         "filtered_out": filtered_out,
@@ -3523,6 +4727,30 @@ class Handler(BaseHTTPRequestHandler):
             log(f"  Body: {json.dumps(parsed, ensure_ascii=False)[:1500]}")
 
             if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
+                # Phase 3: memory pressure active rejection
+                mem_rejected, used_pct = _should_reject_for_memory()
+                if mem_rejected:
+                    log(f"  -> Memory pressure rejection: used_pct={used_pct:.1f}% > threshold={PROXY_MEMORY_REJECT_THRESHOLD:.1f}%")
+                    if PROXY_METRICS_ENABLED:
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["memory_rejected"] = True
+                            mc["used_pct"] = used_pct
+                            _finalize_metrics(mc)
+                            log_metrics(mc)
+                    self._respond_json(
+                        {
+                            "error": {
+                                "type": "backend_oom",
+                                "message": f"System memory pressure is high (used {used_pct:.1f}%). Retry after {PROXY_RETRY_AFTER_SECONDS}s.",
+                                "retryable": True,
+                            }
+                        },
+                        503,
+                        extra_headers={"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)},
+                    )
+                    return
+
                 # Log request summary with timestamp for status page tracking
                 msgs = parsed.get("messages", [])
                 total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
@@ -3560,8 +4788,14 @@ class Handler(BaseHTTPRequestHandler):
                 import time as _time
                 _t0 = _time.monotonic()
                 _req_start_time = datetime.now().isoformat()
+                if not getattr(self, "_request_id", None):
+                    self._request_id = f"req_{os.urandom(8).hex()}"
+                _req_id = self._request_id
                 self._last_jsonl_token = _next_jsonl_token()
                 _jsonl_output_map[self._last_jsonl_token] = 0
+                # Phase 3: request failure snapshot — save original body before processing
+                _write_request_snapshot(_req_id, parsed)
+                _snapshot_written = False
                 try:
                     self._handle_messages(parsed)
                     _dur = (_time.monotonic() - _t0) * 1000
@@ -3574,6 +4808,7 @@ class Handler(BaseHTTPRequestHandler):
                         duration_ms=_dur,
                         start_time=_req_start_time,
                     )
+                    _record_request_for_concurrency(_dur, 200)
                     if PROXY_METRICS_ENABLED:
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
@@ -3586,6 +4821,7 @@ class Handler(BaseHTTPRequestHandler):
                     _dur = (_time.monotonic() - _t0) * 1000
                     log(f"  -> Error: {e}")
                     _jsonl_output_map.pop(self._last_jsonl_token, None)
+                    status_code, _, _ = _classify_exception(e)
                     log_request(
                         model=parsed.get("model", "unknown"),
                         input_chars=total_chars,
@@ -3594,17 +4830,20 @@ class Handler(BaseHTTPRequestHandler):
                         duration_ms=_dur,
                         start_time=_req_start_time,
                     )
+                    _record_request_for_concurrency(_dur, status_code)
                     if PROXY_METRICS_ENABLED:
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
                             mc["output_chars"] = 0
                             mc["duration_ms"] = round(_dur, 1)
-                            status_code, _, _ = _classify_exception(e)
                             mc["status"] = status_code
                             mc["error_type"] = type(e).__name__
                             mc["error"] = str(e)[:200]
                             _finalize_metrics(mc)
                             log_metrics(mc)
+                    # Phase 3: failure snapshot — record pipeline state and error
+                    if status_code >= 500:
+                        _snapshot_written = _write_request_snapshot(_req_id, parsed, after_body=None, error=e)
                     # DEF-001 fix: classify error and return proper JSON response.
                     # Uses _classify_exception to pick 503/504/499/500 + Retry-After
                     # header for retryable errors (OOM, timeout, connection refused).
@@ -3620,7 +4859,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "error": {
                                         "type": error_type,
                                         "message": f"Proxy error: {type(e).__name__}: {str(e)[:500]}",
-                                        "request_id": getattr(self, '_request_id', 'unknown'),
+                                        "request_id": _req_id,
                                         "retryable": retryable,
                                     }
                                 },
@@ -3630,6 +4869,16 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception as respond_err:
                             log(f"  -> CRITICAL: failed to send error response: {respond_err}")
                     # No raise — let the connection close cleanly
+                finally:
+                    # Phase 3: dynamic concurrency adjustment after every request
+                    try:
+                        _adjust_concurrency()
+                    except Exception:
+                        pass
+                    if PROXY_METRICS_ENABLED:
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["snapshot_written"] = _snapshot_written
             elif self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
                 # OpenAI-compatible chat completions endpoint for Open WebUI
                 # Forward directly to backend
@@ -3695,6 +4944,7 @@ class Handler(BaseHTTPRequestHandler):
                 mc["input_msgs"] = len(body.get("messages", []))
                 mc["input_chars"] = total_chars
                 mc["input_tools"] = len(tools_list or [])
+                mc["tools"] = tools_list or []
 
         log(f"  -> Handling model={model}, stream={is_stream}")
 
@@ -3718,8 +4968,22 @@ class Handler(BaseHTTPRequestHandler):
         if PROXY_METRICS_ENABLED:
             _mc_put("lifecycle_stage", stage_config)
 
-        # max_tokens override
-        if PROXY_MAX_TOKENS_OVERRIDE > 0 and max_tokens_orig > PROXY_MAX_TOKENS_OVERRIDE:
+        # Phase 3: dynamic max_tokens based on lifecycle stage and memory pressure
+        _current_mem = _get_system_memory()
+        dynamic_max, dynamic_reason = _compute_dynamic_max_tokens(
+            max_tokens_orig, stage_config, mem=_current_mem)
+        if dynamic_max != max_tokens_orig:
+            body["max_tokens"] = dynamic_max
+            log(f"  -> max_tokens dynamic: {max_tokens_orig} -> {dynamic_max} ({dynamic_reason})")
+        if PROXY_METRICS_ENABLED:
+            mc = getattr(_metrics_ctx, 'mc', None)
+            if mc:
+                mc["max_tokens_original"] = max_tokens_orig
+                mc["max_tokens_dynamic"] = dynamic_max
+                mc["used_pct"] = float(_current_mem.get("used_pct", 0))
+
+        # max_tokens override (hard cap from env, takes final precedence)
+        if PROXY_MAX_TOKENS_OVERRIDE > 0 and body.get("max_tokens", max_tokens_orig) > PROXY_MAX_TOKENS_OVERRIDE:
             body["max_tokens"] = PROXY_MAX_TOKENS_OVERRIDE
             log(f"  -> max_tokens override: {max_tokens_orig} -> {PROXY_MAX_TOKENS_OVERRIDE}")
 
@@ -3748,13 +5012,39 @@ class Handler(BaseHTTPRequestHandler):
             ))
         _mc_put("blocker_detect", blocker_info)
 
+        # Phase 1: normalize mid-conversation system messages for Qwen compatibility.
+        raw_messages = _normalize_system_messages(raw_messages)
+
+        # Phase 1: Cache Aligner — protect the first N messages from compression
+        # and truncation so the prefix token sequence stays stable across requests.
+        cache_prefix, cache_dynamic = _apply_cache_aligner(raw_messages)
+        if cache_prefix:
+            log(f"  -> Cache aligner: protecting first {len(cache_prefix)} messages from compression/truncation")
+
         # Single-pass content compression (L2 tool clearing + L4 thinking strip)
-        raw_messages, compress_stats = _compress_content_pass(
-            raw_messages, tools_list=tools_list, stage_config=stage_config,
-        )
+        # applied only to the dynamic zone; prefix is protected.
+        compress_stats = {"clear": {"enabled": False}, "think": {"enabled": False}}
+        if cache_dynamic:
+            dynamic_stage_config = dict(stage_config)
+            dynamic_stage_config["frozen_head"] = 0  # prefix already protected
+            cache_dynamic, compress_stats = _compress_content_pass(
+                cache_dynamic, tools_list=tools_list, stage_config=dynamic_stage_config,
+            )
+        raw_messages = cache_prefix + cache_dynamic
         clear_stats = compress_stats.get("clear", {})
         think_stats = compress_stats.get("think", {})
+        semantic_compress_stats = compress_stats.get("compress", {"enabled": False})
         cleared_files = clear_stats.get("cleared_files", [])
+
+        # Log and metrics for semantic compression (Phase 2)
+        if semantic_compress_stats.get("enabled"):
+            log(f"  -> Semantic compression: {semantic_compress_stats['compressed_count']} tool_results compressed, "
+                f"{semantic_compress_stats['saved_chars']:,} chars saved "
+                f"(ratio={semantic_compress_stats['ratio']:.2%}, strategies={semantic_compress_stats.get('strategies', {})})")
+            if PROXY_METRICS_ENABLED:
+                _mc_put("semantic_compress", semantic_compress_stats)
+        elif PROXY_COMPRESS_ENABLED:
+            log(f"  -> Semantic compression: active (threshold={PROXY_COMPRESS_THRESHOLD}, mode={PROXY_COMPRESS_MODE})")
 
         # Log and metrics for tool clearing
         if PROXY_METRICS_ENABLED:
@@ -3909,7 +5199,7 @@ class Handler(BaseHTTPRequestHandler):
                                     re_read_count += 1
                                     re_read_targets.add(fp)
             if re_read_count > 0:
-                rate = min(len(re_read_targets) / len(cleared_files) * 100, 100.0)
+                rate = _compute_re_read_rate(len(re_read_targets), len(cleared_files))
                 re_read_info = {"count": re_read_count, "cleared_files": len(cleared_files), "re_read_files": len(re_read_targets), "rate_pct": round(rate, 1)}
                 log(f"  -> Re-read detected: {re_read_count} Read calls targeting {len(re_read_targets)}/{len(cleared_files)} cleared files "
                     f"(rate={rate:.1f}%)")
@@ -4043,21 +5333,41 @@ class Handler(BaseHTTPRequestHandler):
             _iteration = 0
             while True:
                 est_chars = _estimate_message_chars(raw_messages) + static_chars
-                if est_chars <= PROXY_CHARS_OOM_DANGER or len(raw_messages) <= 4:
+                est_tokens = _estimate_tokens_dynamic(raw_messages) + int(static_chars / max(PROXY_CTX_TOKEN_RATIO, 0.1))
+                if (est_chars <= PROXY_CHARS_OOM_DANGER and est_tokens <= PROXY_OOM_SAFE_TOKENS) or len(raw_messages) <= 4:
                     break
                 _iteration += 1
                 keep = max(PROXY_CTX_KEEP_HEAD + PROXY_CTX_KEEP_TAIL, 4)
                 if len(raw_messages) > keep:
                     dropped = len(raw_messages) - keep
                     raw_messages[:] = raw_messages[:PROXY_CTX_KEEP_HEAD] + raw_messages[-(keep - PROXY_CTX_KEEP_HEAD):]
-                    log(f"  -> OOM safety (iter {_iteration}): est_chars={est_chars}, "
+                    log(f"  -> OOM safety (iter {_iteration}): est_chars={est_chars}, est_tokens={est_tokens}, "
                         f"dropped {dropped} msgs, kept {len(raw_messages)}")
                 else:
                     break
             if _iteration > 0:
                 _mc_put("oom_safety", {"triggered": True, "chars": est_chars,
+                                       "est_tokens": est_tokens,
                                        "limit_chars": PROXY_CHARS_OOM_DANGER,
+                                       "limit_tokens": PROXY_OOM_SAFE_TOKENS,
                                        "iterations": _iteration, "final_msgs": len(raw_messages)})
+
+        # Phase 1: compute common prefix ratio against previous request in session.
+        # This quantifies prefix KV cache stability. High ratio = stable prefix = better cache hits.
+        previous_messages = _SESSION_LAST_MESSAGES.get(session_id) if session_id else None
+        common_prefix_ratio = _compute_common_prefix_ratio(raw_messages, previous_messages or [])
+        if PROXY_METRICS_ENABLED:
+            _mc_put("common_prefix_ratio", {
+                "ratio": common_prefix_ratio,
+                "current_msgs": len(raw_messages),
+                "previous_msgs": len(previous_messages) if previous_messages else 0,
+            })
+        log(f"  -> Common prefix ratio: {common_prefix_ratio:.2%} (current={len(raw_messages)} msgs, previous={len(previous_messages) if previous_messages else 0} msgs)")
+        if session_id:
+            # Bound memory for the session message cache.
+            if len(_SESSION_LAST_MESSAGES) > 1000:
+                _SESSION_LAST_MESSAGES.pop(next(iter(_SESSION_LAST_MESSAGES)), None)
+            _SESSION_LAST_MESSAGES[session_id] = [dict(m) for m in raw_messages]
 
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)
@@ -4492,7 +5802,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         total = len(records)
         if total == 0:
-            self._respond_json({"schema": LOG_SCHEMA_VERSION, "total": 0})
+            self._respond_json({"schema": "v1", "total": 0})
             return
         status_counts = {}
         quality_flag_counts = {}
@@ -4500,6 +5810,9 @@ class Handler(BaseHTTPRequestHandler):
         loop_triggered = 0
         blocker_triggered = 0
         truncation_triggered = 0
+        memory_rejected = 0
+        snapshot_written = 0
+        dynamic_concurrent_events = 0
         for r in records:
             s = r.get("status", "unknown")
             status_counts[s] = status_counts.get(s, 0) + 1
@@ -4512,17 +5825,27 @@ class Handler(BaseHTTPRequestHandler):
                 blocker_triggered += 1
             if pipeline.get("truncate", {}).get("triggered"):
                 truncation_triggered += 1
-            for t in r.get("tools", []):
+            for t in r.get("tools") or []:
                 tool_usage[t] = tool_usage.get(t, 0) + 1
+            if r.get("memory_rejected"):
+                memory_rejected += 1
+            if r.get("snapshot_written"):
+                snapshot_written += 1
+            dc = r.get("dynamic_concurrent", {})
+            if isinstance(dc, dict) and dc.get("adjusted"):
+                dynamic_concurrent_events += 1
         top_tools = sorted(tool_usage.items(), key=lambda x: -x[1])[:10]
         self._respond_json({
-            "schema": LOG_SCHEMA_VERSION,
+            "schema": "v1",
             "total": total,
             "status": status_counts,
             "quality_flags": quality_flag_counts,
             "loop_triggered": loop_triggered,
             "blocker_triggered": blocker_triggered,
             "truncation_triggered": truncation_triggered,
+            "memory_rejected": memory_rejected,
+            "snapshot_written": snapshot_written,
+            "dynamic_concurrent_events": dynamic_concurrent_events,
             "top_tools": [{"name": n, "count": c} for n, c in top_tools],
             "last_n": last_n,
         })
@@ -4549,6 +5872,11 @@ def main():
         _trunc_info += f", limit={PROXY_CTX_CHARS_LIMIT}"
     log(f"Context limit: {'enabled (' + _trunc_info + ')' if PROXY_CTX_LIMIT_ENABLED else 'disabled (' + BACKEND_TYPE + ' backend)'}")
     log(f"Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
+    log(f"Dynamic token ratio: chinese={PROXY_TOKEN_RATIO_CHINESE}, english={PROXY_TOKEN_RATIO_ENGLISH}, code={PROXY_TOKEN_RATIO_CODE}")
+    log(f"Memory reject threshold: {PROXY_MEMORY_REJECT_THRESHOLD}%")
+    log(f"Dynamic max_tokens: {'enabled' if PROXY_DYNAMIC_MAX_TOKENS_ENABLED else 'disabled'}")
+    log(f"Dynamic concurrency: {'enabled' if PROXY_DYNAMIC_CONCURRENT_ENABLED else 'disabled'} (min={PROXY_DYNAMIC_CONCURRENT_MIN}, max={PROXY_DYNAMIC_CONCURRENT_MAX})")
+    log(f"Failure snapshots: {'enabled' if PROXY_SNAPSHOT_ENABLED else 'disabled'}")
     if IS_CLOUD:
         log(f"Cloud API mode — no local backend required")
     ThreadingHTTPServer((host, port), Handler).serve_forever()

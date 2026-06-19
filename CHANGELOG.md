@@ -4,6 +4,146 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [Unreleased] - 2026-06-19
+
+### 配置优化：27B 模型 + rapid-mlx v0.6.71 后端加固
+
+本次更新基于 27B 模型（Qwen3.6-27B-OptiQ-4bit）在生产环境运行 20+ 小时的实测数据，对后端和代理配置进行系统性优化。
+
+### Changed
+
+- **Tool Clearing 关闭** (`PROXY_CLEAR_ENABLED=false`): 明确关闭，消除 re-read 死循环风险。
+  之前被显式设为 `true`，覆盖了安全默认值 `false`。
+  见 AGENTS.md ⚠️ WARNING。
+
+- **GPU 内存上限** (`--gpu-memory-utilization 0.80`): Metal allocation_limit 从 90%（36.2GB）
+  降至 80%（32.2GB）。之前无此参数使用默认 90%，峰值达 31.7GB（87.6%）逼近 kernel panic 阈值。
+  降低后预留 ~3.5GB 安全余量。
+
+- **EXTRA_ARGS 精简**: 移除冗余 `--continuous-batching`（BatchedEngine 已是 v0.6.71 默认引擎）。
+
+### Added
+
+- **`HF_HUB_OFFLINE=1` 写入配置**: vllm-mlx v0.6.71 启动时必连 huggingface.co 验证模型配置，
+  网络不可用时陷入 ConnectTimeout 重试循环导致死锁。
+  已通过 `export HF_HUB_OFFLINE=1` 写入 `configs/mlx_vlm-27b.conf`（manage.sh `_load_config()` 自动 source）。
+
+### Known Issues (Updated)
+
+- **跨请求前缀缓存不可用**: rapid-mlx v0.6.71 的 BatchedEngine 不集成 MemoryAwarePrefixCache。
+  当前只有 PagedCache（块级管理），每次请求全量 prefill。等待上游支持。
+  参考分析: `docs/04-analysis-diagnostics/rapid-mlx-cache-analysis-supplement.md`
+
+- **Metal 设备死锁**: 多次 `kill -9` 快速重启后端可导致 Metal 设备初始化挂起（卡在
+  `MLX step thread initialized`），需机器重启恢复。
+
+- **旧引擎缓存确认可用**: rapid-mlx 旧版引擎（非 BatchedEngine）的 MemoryAwarePrefixCache
+  实测支持跨请求前缀缓存（PID 92244, 98-99% 命中率）。
+  PID 88059 的 `cache_fetch` HIT 日志为最直接的证据。
+
+---
+
+## [Unreleased] - 2026-06-18
+
+### Phase 1: 基线与快速收益
+
+本次更新聚焦上下文优化研究的第一阶段落地，全部改动围绕 **metrics 基线、Cache Aligner MVP、可观测性修复** 展开。
+
+### Added
+
+- **Cache Aligner MVP**: `PROXY_CACHE_ALIGN_ENABLED` + `PROXY_CACHE_ALIGN_HEAD` 保护前 N 条消息不被压缩/截断，提升 prefix cache 稳定性。
+- **`common_prefix_ratio` 指标**: 每条请求记录与上一请求的公共前缀比例，用于量化 prefix cache 稳定性。
+- **`_compute_re_read_rate` 辅助函数**: 统一 re-read 率计算，确保结果在 0–100% 之间。
+- **`_normalize_system_messages`**: 自动将对话中间的 system 消息转换为 user 消息，避免 Qwen chat template 报错。
+- **`_apply_cache_aligner` / `_compute_common_prefix_ratio` / `_message_stable_hash`**: 新增标准库实现的辅助函数。
+
+### Changed
+
+- **`_filter_tools` 排序稳定性**: `TOOL_ALWAYS_KEEP` 改为有序 tuple，过滤后工具按固定白名单顺序排列，减少不同请求间的 token 序列差异。
+- **`_compress_content_pass` 调用方式**: 仅对 Cache Aligner 划分出的 dynamic zone 执行压缩，prefix zone 被完全保护。
+- **请求处理流程**: 在 `_handle_messages` 中集成 system 消息规范化、cache aligner 拆分、common_prefix_ratio 计算与 session 消息缓存。
+
+### Fixed
+
+- **DEF-003**: `re_read_rate` 计算收敛到 `_compute_re_read_rate` 辅助函数，避免未来再次出现公式错误。
+- **Qwen template 兼容性**: 中 conversation system 消息不再导致 `System message must be at the beginning` 错误。
+
+### Tests
+
+- 新增 15 个单元测试覆盖 re_read_rate、common_prefix_ratio、system 消息规范化、cache aligner、工具过滤稳定顺序。
+- 新增 `test/integration/test_cache_align_integration.sh`：启动 mock backend + proxy，验证两请求间 `common_prefix_ratio > 0` 且首条消息保持 system 角色。
+- 更新 `test/run_tests.sh` 将 cache-align 集成测试纳入 `--integration` 流程。
+
+### Phase 2: 语义压缩与防御增强
+
+本次更新聚焦上下文优化的第二阶段：用语义保留压缩替代粗暴 clearing，同时增强防御与可观测性。
+
+### Added
+
+- **语义压缩管线（Semantic Compression Pipeline）**：在 `_compress_content_pass` 中新增 Phase 1b 压缩层，仅对 Cache Aligner 划分出的 dynamic zone 中长度超过阈值的 `tool_result` 执行压缩。
+- **JSON 结构化摘要（`_sieve_json`）**：借鉴 TokenSieve 的 `sieve` 思路，对 JSON 数组/对象保留 schema、截断长 value、保留前 N 项并计数剩余项，失败时回退原内容。
+- **代码压缩器（`_compress_code`）**：删除不影响语法的空白与注释，保留代码结构。
+- **日志压缩器（`_compress_log`）**：借鉴 TokenSieve 的 `log_compressor` 思路，聚合重复日志行并保留错误/异常行。
+- **文本压缩器（`_compress_text`）**：对长文本进行段落/句子截断摘要。
+- **ANSI Scrubber（`_scrub_ansi`）**：借鉴 TokenSieve 的 `scrubber` 思路，去除 Bash 输出中的 ANSI 颜色码与不可见控制字符。
+- **内容类型路由（`_detect_content_type`）**：根据语法启发式将 tool_result 分类为 `json` / `code` / `log` / `text`，并选择对应压缩策略。
+- **压缩审计器（`_audit_compression`）**：JSON 压缩后执行 `json.loads` 校验，代码压缩后校验括号平衡，失败时回退原内容，避免破坏语义。
+- **标量去重器（`_dedupe_scalars`）**：默认关闭，仅在 `aggressive` 模式下启用，对首次出现后的相同长字符串进行去重。
+- **语义压缩 Metrics**：`pipeline.semantic_compress` 字段记录 `compressed_count`、`saved_chars`、`ratio`、`strategies`、`audit_failures`。
+- **新的环境变量**：`PROXY_COMPRESS_ENABLED`、`PROXY_COMPRESS_THRESHOLD`、`PROXY_COMPRESS_MODE`、`PROXY_SCRUB_ANSI`、`PROXY_DEDUPE_SCALARS`、`PROXY_COMPRESS_AUDIT`。
+
+### Changed
+
+- **`_compress_content_pass` 调用方式**：先执行 Phase 1b 语义压缩，再执行原有 clearing/截断逻辑，压缩后的内容仍然会被 audit 校验。
+- **`_handle_messages` 流程**：在重组 prefix + dynamic zones 后，记录 `semantic_compress` 指标。
+
+### Tests
+
+- 新增 `TestSemanticCompression` 单元测试类，14 个用例覆盖 scrubber、content router、JSON/code/log/text 压缩、auditor、deduper。
+- 新增 `test/integration/test_compress_integration.sh`：启动 mock backend + proxy，发送含大 JSON tool_result 的请求，验证转发内容显著变短且 metrics 中 `semantic_compress.ratio < 1.0`。
+- 更新 `test/run_tests.sh` 将 compress 集成测试纳入 `--integration` 流程。
+
+### Docs
+
+- 更新 `AGENTS.md` 补充 `PROXY_COMPRESS_*` 环境变量说明。
+- 更新 `docs/research-context-optimization/05-plan.md` 标记第二阶段任务完成状态。
+
+### Phase 3: 资源与观测护栏
+
+本次更新聚焦上下文优化的第三阶段：降低本地后端 OOM 风险、提升并发资源利用率、增强可观测性与排障能力。
+
+### Added
+
+- **动态 token 预估模型（`_estimate_tokens_dynamic`）**：按中文、英文、代码选择不同的 chars-per-token ratio（`PROXY_TOKEN_RATIO_*`），替代单一静态 ratio。
+- **内存压力主动拒绝（`_should_reject_for_memory`）**：当 `used_pct > PROXY_MEMORY_REJECT_THRESHOLD` 时，在请求入口处返回 503 + Retry-After，避免后端 OOM。
+- **动态输出 token 限制（`_compute_dynamic_max_tokens`）**：根据 lifecycle stage、后端类型、可用内存动态降低 `max_tokens`。
+- **动态并发控制（`_adjust_concurrency`）**：基于最近请求的 P95 延迟与错误率自动调整 `_llama_lock` 大小，高负载降级、低负载升级。
+- **请求失败快照（`_write_request_snapshot`）**：请求失败时保存 `logs/snapshots/<req_id>_{before,after}.json`，便于排障。
+- **`/status` 增强**：新增「Context Optimization」卡片，展示平均 `common_prefix_ratio`、`compression_ratio`、loop/blocker 触发次数、最近 blocker 详情与当前并发状态。
+- **统一 metrics schema v1**：所有 metrics 记录固定字段集合，新增 `schema_version: v1`、`token_ratio`、`est_input_tokens`、`est_output_tokens`、`memory_rejected`、`used_pct`、`max_tokens_*`、`snapshot_written`、`dynamic_concurrent` 等字段。
+
+### Changed
+
+- **`_finalize_metrics`**：使用动态 token ratio 估算输入/输出 token，补充 schema v1 固定字段。
+- **`_handle_messages`**：在 `max_tokens` 处理流程中接入动态限制，并记录 `max_tokens_original`/`max_tokens_dynamic`/`used_pct`。
+- **`do_POST`**：接入内存压力检查、失败快照、并发窗口记录与动态调整。
+- **OOM 安全检查**：OOM safety 迭代截断同时考虑字符数与动态 token 估算。
+- **`/metrics` 端点**：返回 schema v1，新增 `memory_rejected`、`snapshot_written`、`dynamic_concurrent_events` 聚合。
+
+### Tests
+
+- 新增 `TestDynamicTokenEstimation`、`TestMemoryRejection`、`TestDynamicMaxTokens`、`TestRequestSnapshots`、`TestDynamicConcurrency`、`TestMetricsSchemaV1` 等单元测试类，新增 22 个用例。
+- 新增 `test/integration/test_memory_reject_integration.sh`：monkey-patch `_get_system_memory` 模拟 95% 内存压力，验证 `/v1/messages` 返回 503 + Retry-After + backend_oom。
+- 新增 `test/integration/test_status_integration.sh`：验证 `/status` 页面 Context Optimization 卡片字段存在，且 `/metrics` 返回 schema v1。
+- 更新 `test/run_tests.sh` 纳入 memory-reject 与 status 集成测试。
+
+### Docs
+
+- 更新 `AGENTS.md` 补充 Phase 3 环境变量说明。
+- 更新 `docs/research-context-optimization/05-plan.md` 标记第三阶段任务完成状态。
+
+---
+
 ## [0.5.0-baseline] - 2026-06-06
 
 ### Status: Pre-OSS-migration baseline
