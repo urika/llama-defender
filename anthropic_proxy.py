@@ -16,6 +16,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
+import proxy_config
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LLAMA_BASE = os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8081/v1")
@@ -81,7 +83,12 @@ PROXY_CACHE_ALIGN_HEAD = int(os.environ.get("PROXY_CACHE_ALIGN_HEAD", "4"))
 # Per-session last messages for computing common_prefix_ratio.
 # Key: session_id, Value: list of message dicts (after cache aligner / before truncation).
 _SESSION_LAST_MESSAGES = {}
+_LOOP_SESSION_STATE = {}
 
+# Shared state for session tracking, dedup, and dynamic concurrency.
+# Read-modify-write sequences on these dicts must acquire proxy_config._state_lock.
+_SESSION_REQUEST_COUNT = {}
+_DEDUP_CACHE = {}
 # ---------------------------------------------------------------------------
 # Semantic content compression (Phase 2): TokenSieve-inspired structured
 # compression for tool_result contents. Reduces token pressure while keeping
@@ -165,6 +172,13 @@ PROXY_OOM_SAFE_CHARS = int(os.environ.get(
 # Legacy alias for any external consumers (status page, metrics, tests).
 PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS
 
+# P0: Hard limit on request body size to prevent Metal OOM from oversized payloads.
+# If Content-Length exceeds this threshold, return 413 Payload Too Large immediately,
+# before any pipeline processing. This catches runaway requests (e.g. 359KB tool+dialog)
+# that would crash the backend regardless of OOM_SAFE_CHARS pre-truncation.
+# Default: 500KB — safe for 48GB machines with 27B-class models.
+PROXY_MAX_REQUEST_BYTES = int(os.environ.get("PROXY_MAX_REQUEST_BYTES", str(500 * 1024)))
+
 # DEF-005: estimated prompt token limit to prevent Metal OOM.
 # After all pipeline steps, if estimated tokens exceed this, force aggressive FIFO.
 # Set to 0 to disable. Default 60000 (~120K chars at ratio 2.0) for 48GB Apple Silicon.
@@ -239,7 +253,10 @@ _LOOP_SESSION_STATE = {}
 # requests AND the current payload is in saturation/expansion territory,
 # _classify_lifecycle_stage returns an aggressive config (frozen_head=2,
 # truncate_rounds=max(3, base//2)) to prevent OOM in long agent sessions.
+# Thread safety: read-modify-write on this dict must acquire
+# proxy_config._state_lock (see _classify_lifecycle_stage).
 _SESSION_REQUEST_COUNT = {}
+
 PROXY_SESSION_CONTINUATION_ENABLED = os.environ.get(
     "PROXY_SESSION_CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes")
 PROXY_SESSION_CONTINUATION_MIN_REQUESTS = int(os.environ.get(
@@ -268,12 +285,13 @@ def _check_dedup(body_str):
     Uses MD5 instead of Python hash() for cross-process stability and collision resistance."""
     h = hashlib.md5(body_str.encode("utf-8")).hexdigest()
     now = datetime.now().timestamp()
-    for k in list(_DEDUP_CACHE):
-        if now - _DEDUP_CACHE[k] > PROXY_DEDUP_WINDOW:
-            del _DEDUP_CACHE[k]
-    if h in _DEDUP_CACHE:
-        return True
-    _DEDUP_CACHE[h] = now
+    with _state_lock:
+        for k in list(_DEDUP_CACHE):
+            if now - _DEDUP_CACHE[k] > PROXY_DEDUP_WINDOW:
+                del _DEDUP_CACHE[k]
+        if h in _DEDUP_CACHE:
+            return True
+        _DEDUP_CACHE[h] = now
     return False
 
 
@@ -451,7 +469,8 @@ PROXY_METRICS_ENABLED = os.environ.get("PROXY_METRICS_ENABLED", "true").lower() 
 PROXY_METRICS_DIR = os.environ.get("PROXY_METRICS_DIR", "logs")
 _METRICS_PATH = os.path.join(_SCRIPT_DIR, PROXY_METRICS_DIR, "proxy_metrics.jsonl")
 _metrics_lock = threading.Lock()
-
+# Shared state lock — defined in proxy_config to avoid circular imports.
+_state_lock = proxy_config._state_lock
 
 def _next_jsonl_token():
     """Generate a unique request token for correlating request log entries."""
@@ -645,6 +664,8 @@ _RELOAD_SPEC = [
     ("PROXY_BACKEND_TIMEOUT", "PROXY_BACKEND_TIMEOUT", "int", "300", "300"),
     ("PROXY_OOM_SAFE_TOKENS", "PROXY_OOM_SAFE_TOKENS", "int", "60000", "60000"),
     ("PROXY_RETRY_AFTER_SECONDS", "PROXY_RETRY_AFTER_SECONDS", "int", "30", "30"),
+    # P0: 请求体大小硬上限（bytes，默认 500KB）
+    ("PROXY_MAX_REQUEST_BYTES", "PROXY_MAX_REQUEST_BYTES", "int", str(500 * 1024), str(500 * 1024)),
     # Loop detection
     ("PROXY_TEXT_LOOP_ENABLED", "PROXY_TEXT_LOOP_ENABLED", "bool", "true", "true"),
     ("PROXY_TEXT_LOOP_THRESHOLD", "PROXY_TEXT_LOOP_THRESHOLD", "int", "3", "3"),
@@ -1842,9 +1863,10 @@ def _classify_lifecycle_stage(messages, session_id=None):
     is_continuation = False
     request_count = 0
     if PROXY_SESSION_CONTINUATION_ENABLED and session_id:
-        request_count = _SESSION_REQUEST_COUNT.get(session_id, 0)
-        is_continuation = request_count >= PROXY_SESSION_CONTINUATION_MIN_REQUESTS
-        _SESSION_REQUEST_COUNT[session_id] = request_count + 1
+        with _state_lock:
+            request_count = _SESSION_REQUEST_COUNT.get(session_id, 0)
+            is_continuation = request_count >= PROXY_SESSION_CONTINUATION_MIN_REQUESTS
+            _SESSION_REQUEST_COUNT[session_id] = request_count + 1
 
     # Aggressive branch: continuation + above-EXPANSION payload. Return a
     # saturation-grade config regardless of the raw stage mapping. This
@@ -4698,6 +4720,21 @@ class Handler(BaseHTTPRequestHandler):
             }
         try:
             content_len = int(self.headers.get("Content-Length", 0))
+
+            # P0: 请求体大小硬上限 — 在读取 body 前检查，防止超大请求穿透到后端
+            if content_len > PROXY_MAX_REQUEST_BYTES:
+                log(f"  -> Request body too large: {content_len} bytes > {PROXY_MAX_REQUEST_BYTES} limit, rejecting")
+                self._respond_json(
+                    {"error": {
+                        "type": "payload_too_large",
+                        "message": f"Request body ({content_len} bytes) exceeds maximum allowed size ({PROXY_MAX_REQUEST_BYTES} bytes)",
+                        "max_bytes": PROXY_MAX_REQUEST_BYTES,
+                        "received_bytes": content_len,
+                    }},
+                    413,
+                )
+                return
+
             body = self.rfile.read(content_len).decode("utf-8")
             log(f"POST {self.path}")
             log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
@@ -5364,10 +5401,11 @@ class Handler(BaseHTTPRequestHandler):
             })
         log(f"  -> Common prefix ratio: {common_prefix_ratio:.2%} (current={len(raw_messages)} msgs, previous={len(previous_messages) if previous_messages else 0} msgs)")
         if session_id:
-            # Bound memory for the session message cache.
-            if len(_SESSION_LAST_MESSAGES) > 1000:
-                _SESSION_LAST_MESSAGES.pop(next(iter(_SESSION_LAST_MESSAGES)), None)
-            _SESSION_LAST_MESSAGES[session_id] = [dict(m) for m in raw_messages]
+            with _state_lock:
+                # Bound memory for the session message cache.
+                if len(_SESSION_LAST_MESSAGES) > 1000:
+                    _SESSION_LAST_MESSAGES.pop(next(iter(_SESSION_LAST_MESSAGES)), None)
+                _SESSION_LAST_MESSAGES[session_id] = [dict(m) for m in raw_messages]
 
         # Convert messages
         messages = convert_anthropic_messages_to_openai(raw_messages)

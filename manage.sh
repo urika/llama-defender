@@ -1319,6 +1319,13 @@ cmd_watchdog() {
     local restart_count=0
     local restart_window=$(date +%s)
 
+    # 支持 daemon 模式: ./manage.sh watchdog --daemon
+    if [[ "$1" == "--daemon" ]]; then
+        info "Watchdog 后台运行 (PID: $$)"
+        # 重定向日志到文件
+        exec >> "$SCRIPT_DIR/logs/watchdog.log" 2>&1
+    fi
+
     info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
     info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
 
@@ -1501,3 +1508,31 @@ main() {
 }
 
 main "$@"
+
+# ============================================================
+# Metal 内存实时监控
+# ============================================================
+cmd_monitor() {
+    local interval="${1:-5}"
+    info "Metal 内存监控 (每 ${interval}s 刷新, Ctrl+C 退出)"
+    info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
+    info ""
+    printf "  %-12s %-12s %-12s %-8s %-8s\n" "TIME" "ACTIVE" "PEAK" "RUNNING" "MEM%"
+    while true; do
+        local line
+        line=$(grep "Metal memory" "$SCRIPT_DIR/logs/llama-server.log" 2>/dev/null | tail -1)
+        if [[ -n "$line" ]]; then
+            local active peak running
+            active=$(echo "$line" | grep -oE 'active=[0-9.]+GB' | cut -d= -f2)
+            peak=$(echo "$line" | grep -oE 'peak=[0-9.]+GB' | cut -d= -f2)
+            running=$(echo "$line" | grep -oE 'running=[0-9]+' | cut -d= -f2)
+            # 计算内存占比（假定 36.2GB 上限）
+            local pct
+            pct=$(echo "$active" | awk '{printf "%.0f", $1/36.2*100}' 2>/dev/null || echo "?")
+            printf "  %-12s %-12s %-12s %-8s %-8s\n" "$(date +%H:%M:%S)" "${active}GB" "${peak}GB" "${running}" "${pct}%"
+        else
+            printf "  %-12s %-12s\n" "$(date +%H:%M:%S)" "(无数据)"
+        fi
+        sleep "$interval"
+    done
+}
