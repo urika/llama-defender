@@ -6,7 +6,45 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased] - 2026-06-21
 
-### 安全加固 + 长上下文支持 + 配置一致性修复
+### 模型评估、缓存清理与测试覆盖提升
+
+基于 deepseek-v4-flash 基线完成 5 个本地模型的系统性评估，清理低效模型与缓存，补充重构后模块的单元测试。
+
+### Added
+
+- **本地模型评估报告**: 完成 `gemma4-26b`、`mlx_vlm-27b`、`qwen2.5-coder-14b`、`qwen3-8b`、`rapid-mlx-35b-opt` 与 `deepseek-v4-flash` 基线的质量/性能/长上下文对比。
+  - `rapid-mlx-35b-opt`: 质量 12/14，TTFT 0.29s，生成 70.7 tok/s，长上下文可达 100K tokens，定位为长上下文专用本地模型。
+  - `qwen3-8b`: 质量 13/14（持平基线），TTFT 0.36s，生成 57.7 tok/s，定位为日常任务首选本地模型。
+  - `gemma4-26b`: 质量 12/14，生成 ~69 tok/s，长上下文实用上限约 40K tokens。
+  - `mlx_vlm-27b` / `qwen2.5-coder-14b`: 评估后不建议使用（前者极慢且长上下文 OOM，后者速度/质量均不占优）。
+
+- **单元测试补充**: 新增 4 个测试文件，扩展 `test_proxy_state.py`。
+  - `test/unit/test_message_converter.py` (18 tests): Anthropic↔OpenAI 工具/tool_choice 转换、文本提取、动态 token 估算。
+  - `test/unit/test_content_compressor.py` (28 tests): JSON/code/log/text 语义压缩、审计回退、lossless/semantic/aggressive 模式。
+  - `test/unit/test_tool_parser.py` (21 tests): 布尔强制转换、双重转义 JSON 还原、XML/启发式 fallback、`<tools>` 内容提取。
+  - `test/unit/test_proxy_logging.py` (7 tests): 敏感头脱敏、JSONL 记录、结构化日志、目录权限。
+  - `test/unit/test_proxy_state.py`: 新增 `_default`、`_parse_conf_env` 边界用例、`value_with_equals`、空文件/缺失文件、`_cast_config_value`。
+  - 单元测试总数从 462 提升至 **548**，全部通过。
+
+### Removed
+
+- **删除配置**: `configs/mlx_vlm-27b.conf`、`configs/qwen2.5-coder-14b.conf`。
+- **清理模型缓存**: 删除 HuggingFace Hub 与 prefix cache 中的以下模型：
+  - `mlx-community/Qwen3.6-27B-OptiQ-4bit`
+  - `mlx-community/Qwen2.5-Coder-14B-Instruct-4bit`
+  - `mlx-community/Qwen3.5-27B-4bit`
+  - `mlx-community/Qwen3.5-9B-4bit`
+  - `mlx-community/Qwen3.5-9B-MLX-4bit`
+  - 释放 HF Hub 缓存约 26GB（230GB → 204GB）。
+
+### Fixed
+
+- **`proxy_logging.py` 导入错误**: 修复 `AttributeError: module 'proxy_logging' has no attribute 'log'`（移除空的 `_log` 占位符，保留真实 `log` 实现）。
+- **文档同步**:
+  - `test/README.md`: 更新单元测试文件列表与测试数（462 → 548）。
+  - `AGENTS.md`: 移除对 `configs/mlx_vlm-27b.conf` 的引用，更新单元测试说明。
+
+---
 
 本次更新解决 code review 发现的 P0/P1 问题：请求体大小硬限制、长上下文超时统一、Qwen3.6 系列配置一致性、以及 repetition-penalty 副作用缓解。
 

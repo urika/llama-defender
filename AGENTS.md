@@ -277,7 +277,7 @@ Rapid-MLX specific variables:
 >
 > **Recommendation**: Set `--gpu-memory-utilization 0.80` (32.2GB) for 27B
 > models on 48GB machines. This provides ~4GB safety margin while maintaining
-> full performance. Verfied in `configs/mlx_vlm-27b.conf`.
+> full performance. Verified in previous `mlx_vlm-27b` testing.
 
 > ⚠️ **WARNING: `--kv-cache-turboquant` breaks prefix cache persistence**
 > The `--kv-cache-turboquant` CLI flag (used in `RAPID_MLX_EXTRA_ARGS`) enables
@@ -324,7 +324,7 @@ Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 > indefinitely — **no error message, just a deadlock**.
 > 
 > **Fix**: Add `export HF_HUB_OFFLINE=1` to the config file (see
-> `configs/mlx_vlm-27b.conf`). The config is bash-sourcable, so `manage.sh`
+> `configs/qwen3-8b.conf` or `configs/rapid-mlx-35b-opt.conf`). The config is bash-sourcable, so `manage.sh`
 > will export it automatically via `_load_config()`.
 > 
 > This only affects the `vllm-mlx` binary. `llama-server` and `rapid-mlx`
@@ -816,10 +816,42 @@ bash test/run_tests.sh --trace         # requirement traceability (docs/requirem
 - `_reload_config` Tier 2 MODEL_ALIASES rebuild (picks up new MODEL_NAME)
 - `_reload_config` dependent defaults (LOOP_LEVEL2/3, CHARS_SATURATION fallback)
 
+`test/unit/test_message_converter.py` contains `unittest` tests for:
+- `convert_anthropic_tools_to_openai` (custom/simple/web_search tool mapping)
+- `convert_anthropic_tool_choice_to_openai` (auto/any/none/tool conversions)
+- `_extract_text_from_messages` (text/tool_result/tool_use concatenation)
+- `_estimate_tokens_dynamic` (English/Chinese/code ratio detection, ratio override)
+
+`test/unit/test_content_compressor.py` contains `unittest` tests for:
+- `_detect_content_type` (JSON/code/log/text + MIME hints)
+- `_sieve_json` (string truncation, array item limit, depth overflow, scalar dedupe)
+- `_compress_code` (comment removal, blank-line collapse)
+- `_compress_log` (timestamp stripping, adjacent-line dedupe)
+- `_compress_text` (short/long truncation)
+- `_audit_compression` (JSON parseability, code bracket balance)
+- `compress_tool_result` (lossless/semantic/aggressive modes, audit fallback)
+
+`test/unit/test_tool_parser.py` contains `unittest` tests for:
+- `_coerce_booleans` (nested string→bool coercion)
+- `_unescape_double_escaped_json` (string-wrapped JSON arrays/objects)
+- `parse_tool_arguments` (JSON repair, embedded JSON, XML fallback, heuristic fallback)
+- `_parse_tools_block_body` and `_extract_content_tool_calls` (`<tools>` content-text extraction)
+
+`test/unit/test_proxy_logging.py` contains `unittest` tests for:
+- `_mask_sensitive` (Authorization/X-Api-Key masking)
+- `_ensure_jsonl_dir` (directory creation with 0o700 permissions)
+- `log_request` (JSONL record format)
+- `log_structured` (schema/session_id/event fields)
+- `_next_jsonl_token` (counter increment)
+
 Run directly:
 ```bash
 python3 test/unit/test_proxy_fallback.py
 python3 test/unit/test_proxy_reload.py
+python3 test/unit/test_message_converter.py
+python3 test/unit/test_content_compressor.py
+python3 test/unit/test_tool_parser.py
+python3 test/unit/test_proxy_logging.py
 # or
 python3 -m unittest discover -s test/unit -p 'test_*.py' -v
 ```
@@ -917,7 +949,8 @@ and briefly here for agent context:
 
 1. **vllm-mlx v0.6.71 启动需要 `HF_HUB_OFFLINE=1`** — 后端启动时必连 `huggingface.co`
    验证模型配置。网络不可用时陷入 `ConnectTimeout` 重试循环，卡死在 `MLX step thread
-   initialized` 且无错误提示。**修复**: `export HF_HUB_OFFLINE=1`（已写入 `configs/mlx_vlm-27b.conf`）。
+   initialized` 且无错误提示。**修复**: `export HF_HUB_OFFLINE=1`（已写入 `configs/qwen3-8b.conf`、
+   `configs/rapid-mlx-35b-opt.conf` 等 vllm-mlx 配置）。
 
 2. **跨请求前缀缓存不可用（BatchedEngine 限制）** — rapid-mlx v0.6.71 的 BatchedEngine
    不集成 MemoryAwarePrefixCache，仅有 PagedCache（块级管理）。`cache_fetch` 日志从不出

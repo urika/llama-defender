@@ -9,7 +9,7 @@ are run manually before merging feature branches.
 ```
 test/
 ├── run_tests.sh                    # unified runner: --unit / --integration / --e2e / --all
-├── unit/                           # pure logic, no I/O, <1s (10 files, 462 tests)
+├── unit/                           # pure logic, no I/O, <1s (13 files, 548 tests)
 │   ├── test_proxy_fallback.py      # content tools fallback, blocker, truncation, compression
 │   ├── test_proxy_reload.py        # SIGHUP hot-reload regression
 │   ├── test_proxy_state.py         # config invariants, __all__ coverage, RELOAD_SPEC consistency
@@ -19,7 +19,11 @@ test/
 │   ├── test_payload_limit.py       # P0: 413 payload rejection
 │   ├── test_text_loop.py           # text output loop detection
 │   ├── test_tool_parser_edge.py    # XML↔JSON tool argument parsing edge cases
-│   └── test_utils.py               # percentile, stable hash, cast_config, jsonl logging
+│   ├── test_utils.py               # percentile, stable hash, cast_config, jsonl logging
+│   ├── test_message_converter.py   # Anthropic↔OpenAI tool/tool_choice conversion, token estimation
+│   ├── test_content_compressor.py  # semantic compression (json/code/log/text) + audit fallback
+│   ├── test_tool_parser.py         # tool argument parsing, <tools> content extraction
+│   └── test_proxy_logging.py       # sensitive header masking, JSONL/structured logging
 ├── integration/                    # boots a mock backend, no real LLM, ~60s (7 suites)
 │   ├── test_blocker_integration.sh
 │   ├── test_loop_integration.sh
@@ -42,7 +46,7 @@ test/
 The unified runner picks a tier by flag:
 
 ```bash
-bash test/run_tests.sh --unit          # pure logic — 462 tests in <1s
+bash test/run_tests.sh --unit          # pure logic — 548 tests in <1s
 bash test/run_tests.sh --integration   # mock backend — 7 suites ~60s
 bash test/run_tests.sh --e2e           # needs running proxy + backend
 bash test/run_tests.sh --all           # unit + integration + e2e + trace

@@ -89,6 +89,19 @@ class TestProxyStateConfigInvariants(unittest.TestCase):
         self.assertGreaterEqual(proxy_state.PROXY_FROZEN_HEAD, 0)
 
 
+class TestDefaultResolution(unittest.TestCase):
+    """Tests for _default() fallback chain."""
+
+    def test_returns_hardcoded_local_default(self):
+        # When resolve_default returns None, fall back to BackendStrategy.
+        result = proxy_state._default("PROXY_MAX_CONCURRENT", "4", "1")
+        self.assertIn(result, ("1", "4"))
+
+    def test_returns_string(self):
+        result = proxy_state._default("PROXY_TOOL_KEEP", "10", "2")
+        self.assertIsInstance(result, str)
+
+
 class TestParseConfEnv(unittest.TestCase):
     """Tests for _parse_conf_env in proxy_state."""
 
@@ -124,6 +137,63 @@ class TestParseConfEnv(unittest.TestCase):
             result = proxy_state._parse_conf_env(f.name)
         os.unlink(f.name)
         self.assertEqual(result["KEY"], "value with spaces")
+
+    def test_value_with_equals(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write('EXTRA="--foo=bar --baz=qux"\n')
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result["EXTRA"], "--foo=bar --baz=qux")
+
+    def test_empty_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write("")
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result, {})
+
+    def test_missing_file(self):
+        result = proxy_state._parse_conf_env("/nonexistent/path.conf")
+        self.assertEqual(result, {})
+
+    def test_line_without_equals_ignored(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write("not a key value pair\nKEY=val\n")
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result, {"KEY": "val"})
+
+    def test_whitespace_value(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write('KEY="   "\n')
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result["KEY"], "   ")
+
+
+class TestCastConfigValue(unittest.TestCase):
+    """Tests for _cast_config_value."""
+
+    def test_cast_int(self):
+        self.assertEqual(proxy_state._cast_config_value("42", "int"), 42)
+
+    def test_cast_float(self):
+        self.assertEqual(proxy_state._cast_config_value("3.14", "float"), 3.14)
+
+    def test_cast_bool_true(self):
+        for v in ("true", "True", "1", "yes"):
+            self.assertTrue(proxy_state._cast_config_value(v, "bool"))
+
+    def test_cast_bool_false(self):
+        for v in ("false", "False", "0", "no", ""):
+            self.assertFalse(proxy_state._cast_config_value(v, "bool"))
+
+    def test_cast_unknown_returns_value(self):
+        self.assertEqual(proxy_state._cast_config_value("abc", "str"), "abc")
 
 
 class TestProxyConfigImportsFromProxyState(unittest.TestCase):
