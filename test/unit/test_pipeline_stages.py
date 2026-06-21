@@ -93,6 +93,14 @@ class TestRequestParser(unittest.TestCase):
         self.assertEqual(ctx.max_tokens_orig, 4096)
         self.assertFalse(ctx.is_stream)
 
+    def test_output_metrics(self):
+        ctx = RequestParser().process(PipelineContext(body=self.body))
+        metrics = RequestParser().output_metrics(ctx)
+        self.assertEqual(metrics["msg_count"], 2)
+        self.assertEqual(metrics["tool_count"], 2)
+        self.assertGreater(metrics["input_chars"], 0)
+        self.assertEqual(metrics["is_stream"], 1)
+
 
 # ===========================================================================
 # LifecycleClassifier — stage 1
@@ -823,6 +831,18 @@ class TestBackendDispatcher(unittest.TestCase):
     def test_requires_constructor_args(self):
         stage = BackendDispatcher(llama_lock=None, handler=None)
         self.assertEqual(stage.name, "backend_dispatcher")
+
+    def test_backend_status_initialized_none(self):
+        stage = BackendDispatcher(llama_lock=None, handler=None)
+        self.assertIsNone(stage._backend_status)
+
+    def test_output_metrics_structure(self):
+        stage = BackendDispatcher(llama_lock=None, handler=None)
+        ctx = PipelineContext(openai_body={"model": "test"}, is_stream=True)
+        metrics = stage.output_metrics(ctx)
+        self.assertIn("backend_status", metrics)
+        self.assertIn("stream", metrics)
+        self.assertEqual(metrics["stream"], 1)
 
 
 # ===========================================================================

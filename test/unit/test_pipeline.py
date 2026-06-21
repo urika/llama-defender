@@ -245,6 +245,32 @@ class TestInstrumentedPipeline(unittest.TestCase):
             pipeline.run(ctx)
         self.assertIn("BOOM", str(cm.exception))
 
+    def test_pipeline_summary_emitted(self):
+        """Pipeline-level aggregate metrics should be written after run."""
+        captured = {}
+
+        def capture_mc_put(key, data):
+            captured[key] = data
+
+        self.mock_admin.return_value._mc_put = capture_mc_put
+
+        pipeline = InstrumentedPipeline([
+            FakeStage("a"),
+            SkippableStage(),
+            FakeStage("b"),
+        ])
+        ctx = PipelineContext(model="skip", messages=["x"])
+        pipeline.run(ctx)
+
+        summary = captured.get("pipeline_summary")
+        self.assertIsNotNone(summary, "pipeline_summary should be emitted")
+        self.assertEqual(summary["total_stages"], 3)
+        self.assertEqual(summary["executed"], 2)     # SkippableStage skipped
+        self.assertEqual(summary["skipped"], 1)
+        self.assertGreaterEqual(summary["pipeline_total_ms"], 0)
+        self.assertIsNotNone(summary["slowest_stage"])
+        self.assertGreaterEqual(summary["slowest_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

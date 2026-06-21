@@ -192,16 +192,38 @@ class InstrumentedPipeline(Pipeline):
 
     def run(self, ctx: PipelineContext) -> PipelineContext:
         admin = _import_admin_server()
+        executed = 0
+        skipped = 0
+        total_ms = 0.0
+        slowest_name = None
+        slowest_ms = 0.0
+
         for stage in self.stages:
             if isinstance(stage, ConditionalStage) and not stage.should_run(ctx):
+                skipped += 1
                 continue
+            executed += 1
             t0 = time.monotonic()
             ctx = stage.process(ctx)
             elapsed = (time.monotonic() - t0) * 1000
+            total_ms += elapsed
+            if elapsed > slowest_ms:
+                slowest_ms = elapsed
+                slowest_name = stage.name
             data = stage.output_metrics(ctx)
             if data is not None:
                 admin._mc_put(stage.name, data)
             log(f"  -> [{stage.name}] completed in {elapsed:.1f}ms")
+
+        # Pipeline-level aggregate: one summary per request
+        admin._mc_put("pipeline_summary", {
+            "total_stages": len(self.stages),
+            "executed": executed,
+            "skipped": skipped,
+            "pipeline_total_ms": round(total_ms, 1),
+            "slowest_stage": slowest_name,
+            "slowest_ms": round(slowest_ms, 1),
+        })
         return ctx
 
 
@@ -265,6 +287,14 @@ class RequestParser(PipelineStage):
         ctx.messages = body.get("messages", [])
 
         return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return {
+            "msg_count": len(ctx.messages),
+            "tool_count": len(ctx.tools_list or []),
+            "input_chars": ctx.total_chars,
+            "is_stream": 1 if ctx.is_stream else 0,
+        }
 
 
 # ============================================================================
@@ -1359,6 +1389,7 @@ class BackendDispatcher(PipelineStage):
     def __init__(self, llama_lock=None, handler=None):
         self._llama_lock = llama_lock
         self._handler = handler
+        self._backend_status = None
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         log(f"  -> Forwarding to {_ps.LLAMA_BASE}/chat/completions")
@@ -1375,6 +1406,7 @@ class BackendDispatcher(PipelineStage):
                     method="POST",
                 )
                 resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
+                self._backend_status = resp.status
                 log(f"  <- backend status: {resp.status}")
 
                 if ctx.is_stream:
@@ -1383,7 +1415,14 @@ class BackendDispatcher(PipelineStage):
                     self._handler._handle_non_streaming_response(resp, ctx.body)
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8")
+            self._backend_status = e.code
             log(f"  <- backend error: {e.code} - {err[:500]}")
             self._handler._respond_json({"error": {"message": err}}, e.code)
 
         return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return {
+            "backend_status": self._backend_status,
+            "stream": 1 if ctx.is_stream else 0,
+        }

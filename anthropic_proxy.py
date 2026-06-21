@@ -653,10 +653,9 @@ class Handler(BaseHTTPRequestHandler):
         """Pipeline-based message processing — 22 stages."""
         # Emergency rollback: set PROXY_PIPELINE_DISABLED=1 to use the old path
         # (requires reverting to a prior commit that still has the legacy code).
-        ctx = RequestParser().process(
-            PipelineContext(body=body, request_id=getattr(self, '_request_id', ''))
-        )
+        ctx = PipelineContext(body=body, request_id=getattr(self, '_request_id', ''))
         InstrumentedPipeline([
+            RequestParser(),              # 0
             LifecycleClassifier(),        # 1
             DynamicMaxTokens(),           # 2
             ErrorTranslator(),            # 3
