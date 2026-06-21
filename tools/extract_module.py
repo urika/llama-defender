@@ -119,28 +119,42 @@ def gen_module(name, result):
     stdlib_imports = detect_stdlib_imports(code_text)
     lines.extend(stdlib_imports)
     lines.append('import proxy_state as _ps')
+    # Add cross-module imports for external dependencies
+    cross_module_imports = {
+        '_estimate_message_chars': 'from message_converter import _estimate_message_chars',
+        '_classify_content_for_ratio': 'from message_converter import _classify_content_for_ratio',
+    }
+    for ext_name, import_line in cross_module_imports.items():
+        if ext_name in result.get('external', set()):
+            lines.append(import_line)
     # Add delegates for external functions (only for actual functions in proxy)
     import keyword
     proxy_funcs = set(parse_funcs('anthropic_proxy.py').keys()) | {'log'}
     real_external = {e for e in result['external']
-                     if e in proxy_funcs and e not in ('_estimate_message_chars',)}
+                     if e in proxy_funcs and e not in ('_estimate_message_chars', '_classify_content_for_ratio')}
     if real_external:
         lines.append('# External function delegates — set by anthropic_proxy after import')
         for ext in sorted(real_external):
             lines.append(f'{ext} = None  # delegate')
     if result['log_refs']:
-        lines += ['','def _log(msg, level="INFO"):','    pass']
+        lines += ['', 'def _log(msg, level="INFO"):', '    pass']
     lines.append('')
+    ps_refs = sorted(result['ps_refs'], key=len, reverse=True)
     for cl in result['code']:
         line = cl.rstrip('\n')
-        for ref in sorted(result['ps_refs'], key=len, reverse=True):
-            if ref in line and f'_ps.{ref}' not in line and not line.lstrip().startswith('#'):
-                line = line.replace(ref, f'_ps.{ref}')
+        # Replace bare proxy_state references with _ps. prefix using regex
+        # to avoid double-prefix and partial-match issues.
+        for ref in ps_refs:
+            pattern = re.compile(r'(?<![\w.])' + re.escape(ref) + r'(?![\w.])')
+            if pattern.search(line):
+                line = pattern.sub(f'_ps.{ref}', line)
+        # Sanity: strip any _ps._ps. double prefixes introduced by edge cases
+        line = line.replace('_ps._ps.', '_ps.')
         if result['log_refs'] and 'log(' in line and 'def _log' not in line and not line.lstrip().startswith('#'):
             line = line.replace('log(', '_log(')
         lines.append(line)
-    lines += ['',f'__all__ = ['] + [f'    "{n}",' for n in result['ranges']] + [']']
-    return '\n'.join(lines)+'\n'
+    lines += ['', f'__all__ = ['] + [f'    "{n}",' for n in result['ranges']] + [']']
+    return '\n'.join(lines) + '\n'
 
 
 def fix_tests(vars_list):
@@ -218,7 +232,41 @@ def apply_extraction(result, name, proxy_path='anthropic_proxy.py'):
         first_s = ranges_list[0][0]
         cur.insert(first_s - 1, f'import {name}\n')
     with open(proxy_path,'w') as f: f.writelines(cur)
-    print(f'{name}.py: {len(mc.splitlines())}l, proxy: {len(cur)}l')
+    # Cleanup: remove module-level assignments that shadow proxy_state exports.
+    # After extraction, functions that referenced these names now use _ps. prefix
+    # in the extracted module. Keeping local copies causes thread-local divergence
+    # (e.g. _metrics_ctx) and wasted init code.
+    _SHADOW_PATTERNS = [
+        r'^_log_ctx\s*=\s*threading\.local\(\)\n?',
+        r'^_metrics_ctx\s*=\s*threading\.local\(\)\n?',
+        r'^_metrics_lock\s*=\s*threading\.Lock\(\)\n?',
+        r'^_state_lock\s*=.*\n?',
+        r'^_METRICS_PATH\s*=.*\n?',
+        r'^PROXY_METRICS_ENABLED\s*=.*\n?',
+        r'^PROXY_METRICS_DIR\s*=.*\n?',
+        r'^MODEL_ALIASES\s*=.*\n?',
+    ]
+    with open(proxy_path) as f: cur = f.readlines()
+    cleaned = []
+    shadow_count = 0
+    for line in cur:
+        if any(re.match(p, line) for p in _SHADOW_PATTERNS):
+            # Skip the MODEL_ALIASES block (multi-line)
+            if line.strip().startswith('MODEL_ALIASES'):
+                shadow_count += 1
+                continue
+            shadow_count += 1
+        elif shadow_count > 0 and line.strip().startswith(('"', "'", '#')):
+            # Skip continuation of MODEL_ALIASES list
+            shadow_count += 1
+            continue
+        else:
+            cleaned.append(line)
+            shadow_count = 0
+    if len(cleaned) < len(cur):
+        print(f'  Removed {len(cur) - len(cleaned)} shadowing lines (proxy_state owns these)')
+    with open(proxy_path, 'w') as f: f.writelines(cleaned)
+    print(f'{name}.py: {len(mc.splitlines())}l, proxy: {len(cleaned)}l')
 
 
 if __name__ == '__main__':
