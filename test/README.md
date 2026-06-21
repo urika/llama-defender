@@ -81,3 +81,19 @@ Test logs are written to `logs/`:
 - `logs/unit_test.log`      — verbose unittest output
 - `logs/itest/`             — blocker-integration raw logs (`proxy.log`, `mock.log`, `mock_capture.jsonl`, `proxy_metrics.jsonl`)
 - `logs/e2e_test.log`       — combined e2e sub-suite output
+
+## 性能基准测试
+
+```bash
+# 完整性能测试（TTFT / tok/s / 并发 / 长上下文）
+python3 tools/bench_perf.py
+
+# 快速模式（仅核心场景）
+python3 tools/bench_perf.py --quick
+
+# 仅测试长上下文（1K → 5K → ... → 200K）
+python3 tools/bench_perf.py --long-ctx-only
+
+# 模型质量评测（14 项代码/数学/指令/格式/常识）
+python3 tools/bench_quality.py
+```

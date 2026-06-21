@@ -51,8 +51,10 @@ Startup polls `http://host:port/v1/models` for up to 60 s to confirm readiness, 
 Additional commands (see `./manage.sh help`):
 
 ```bash
-./manage.sh watchdog              # Monitor backend health, auto-restart on degradation
-./manage.sh fix-template <dir>    # Repair Qwen chat_template (DEF-007: prevents system message crashes)
+./manage.sh watchdog [--daemon]       # Monitor backend health, auto-restart on degradation
+                                      # --daemon: background process, logs to logs/watchdog.log
+./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
+./manage.sh fix-template <dir>        # Repair Qwen chat_template (DEF-007: prevents system message crashes)
 ```
 
 ## Available configurations
