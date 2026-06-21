@@ -44,6 +44,36 @@ signal.signal(signal.SIGHUP, _reload_config)
 import loop_detection
 from loop_detection import *
 
+# ---------------------------------------------------------------------------
+# Pipeline abstraction: refactored _handle_messages processing stages.
+# ---------------------------------------------------------------------------
+from pipeline import (
+    PipelineContext,
+    InstrumentedPipeline,
+    RequestParser,
+    LifecycleClassifier,
+    DynamicMaxTokens,
+    ErrorTranslator,
+    BlockerDetector,
+    SystemNormalizer,
+    CacheAligner,
+    ContentCompressor,
+    ToolLoopDetector,
+    TextLoopDetector,
+    SessionLoopState,
+    LoopIntervention,
+    RereadDetector,
+    DateNormalizer,
+    ContextTruncator,
+    HighDropRatioNotice,
+    MessageHashDebug,
+    OOMSafetyFIFO,
+    PrefixRatioComputer,
+    ToolPairingRepair,
+    FormatConverter,
+    BackendDispatcher,
+)
+
 
 
 
@@ -619,7 +649,50 @@ class Handler(BaseHTTPRequestHandler):
             if PROXY_METRICS_ENABLED:
                 _metrics_ctx.mc = None
 
+    # -----------------------------------------------------------------------
+    # Pipeline-based message processing (refactored from inline ~536 lines).
+    # See docs/pipeline-abstraction-plan.md for the full design.
+    # -----------------------------------------------------------------------
+    def _handle_messages_pipeline(self, body):
+        """Pipeline-based message processing — 22 stages, ~30 lines."""
+        ctx = RequestParser().process(
+            PipelineContext(body=body, request_id=getattr(self, '_request_id', ''))
+        )
+        pipeline = InstrumentedPipeline([
+            LifecycleClassifier(),        # 1
+            DynamicMaxTokens(),           # 2
+            ErrorTranslator(),            # 3
+            BlockerDetector(),            # 4
+            SystemNormalizer(),           # 5
+            CacheAligner(),               # 6
+            ContentCompressor(),          # 7
+            ToolLoopDetector(),           # 8
+            TextLoopDetector(),           # 9
+            SessionLoopState(),           # 10
+            LoopIntervention(),           # 11
+            RereadDetector(),             # 12
+            DateNormalizer(),             # 13
+            ContextTruncator(),           # 14
+            HighDropRatioNotice(),        # 15
+            MessageHashDebug(),           # 16
+            OOMSafetyFIFO(),              # 17
+            PrefixRatioComputer(),        # 18
+            ToolPairingRepair(),          # 19
+            FormatConverter(),            # 20
+            BackendDispatcher(            # 21
+                llama_lock=_llama_lock,
+                handler=self,
+            ),
+        ])
+        pipeline.run(ctx)
+        # BackendDispatcher already wrote the HTTP response to self.wfile.
+
     def _handle_messages(self, body):
+        # Dual-mode: when PROXY_PIPELINE_ENABLED is set, use the pipeline path.
+        if os.environ.get("PROXY_PIPELINE_ENABLED", "").lower() in ("1", "true"):
+            return self._handle_messages_pipeline(body)
+
+        # --- Legacy path (preserved until pipeline is fully validated) ---
         is_stream = body.get("stream", False)
         model = body.get("model", "unknown")
         _req_start_time = datetime.now().isoformat()
