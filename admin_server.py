@@ -1,6 +1,6 @@
 """Auto-extracted admin_server module."""
 import json
-import os, subprocess, time, threading
+import os, re, subprocess, time, threading
 from datetime import datetime
 import proxy_state as _ps
 from backend_strategy import BackendStrategy
@@ -189,7 +189,7 @@ def _get_log_stats():
     OOM/CacheClear have no timestamp (backend logs don't include wall-clock time).
     For cloud backends, OOM/cache-clear metrics are not available."""
     backend_tail = _read_log_tail(_ps._LOG_PATH, 200000) if not _strategy.oom_safety_enabled else ""
-    proxy_log_path = os.environ.get("PROXY_ps._LOG_PATH", "/tmp/anthropic_proxy.log")
+    proxy_log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
     proxy_tail = _read_log_tail(proxy_log_path, 100000)
 
     # --- Extract request events from proxy logs ([HH:MM:SS] [REQ_SUMMARY] chars=X tools=Y) ---
@@ -702,10 +702,10 @@ def _build_status_html():
     if _strategy.oom_safety_enabled:
         backend_card = f"""<div class="card">
     <h2>Backend</h2>
-    <div class="row"><span class="label">Type</span><span class="value">Cloud API ({BACKEND_TYPE})</span></div>
-    <div class="row"><span class="label">Endpoint</span><span class="value">{LLAMA_BASE}</span></div>
-    <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
-    <div class="row"><span class="label">API Key</span><span class="value">{LLAMA_API_KEY[:8]}****</span></div>
+    <div class="row"><span class="label">Type</span><span class="value">Cloud API ({_ps.BACKEND_TYPE})</span></div>
+    <div class="row"><span class="label">Endpoint</span><span class="value">{_ps.LLAMA_BASE}</span></div>
+    <div class="row"><span class="label">Model</span><span class="value">{_ps.MODEL_NAME}</span></div>
+    <div class="row"><span class="label">API Key</span><span class="value">{_ps.LLAMA_API_KEY[:8]}****</span></div>
   </div>"""
     else:
         backend_card = f"""<div class="card">
@@ -799,7 +799,7 @@ def _build_status_html():
     <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
     <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
     <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
-    <div class="row"><span class="label">Backend</span><span class="value">{LLAMA_BASE}</span></div>
+    <div class="row"><span class="label">Backend</span><span class="value">{_ps.LLAMA_BASE}</span></div>
   </div>
 
   <div class="card">
