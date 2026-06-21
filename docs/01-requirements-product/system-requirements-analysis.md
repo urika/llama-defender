@@ -11,8 +11,8 @@
 用户 ──→ Claude Code (Anthropic SDK) ──→ anthropic_proxy.py:4000 ──→ rapid-mlx:8081 ──→ Qwen3.6-35B-A3B
                                               │
                                          代理层优化:
-                                         8层处理管线, 3534行代码
-                                         25+ 配置参数
+                                         8层处理管线, 3模块 (5529+518+659 行)
+                                         60+ 配置参数 (proxy_state.py 单一事实源)
 ```
 
 **实测性能基线** (93消息 agentic coding 会话):

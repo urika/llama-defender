@@ -1,9 +1,89 @@
 # 代理层上下文窗口替换设计文档
 
-> 状态: Phase 1-3 已实施  
+> 状态: Phase 1-3 已实施 + Phase 0 模块拆分完成  
 > 作者: Kimi Code CLI / opencode  
-> 日期: 2026-06-18  
-> 版本: v8（新增 Phase 3 资源与观测护栏：动态并发、内存拒绝、动态 max_tokens、失败快照、schema v1）
+> 日期: 2026-06-21  
+> 版本: v9（Phase 0 模块拆分：proxy_state.py 作为配置/共享状态单一事实源，dual-setattr reload）
+
+---
+
+## 0. 模块架构 (Phase 0 重构)
+
+本设计文档描述的上下文管理逻辑全部实现在 `anthropic_proxy.py` 中，但配置常量、共享状态和热重载基础设施已提取到独立模块，确保单一事实源和可维护性。
+
+### 0.1 模块依赖关系
+
+```
+proxy_state.py (518 行)              # 单一事实源，无外部依赖
+  ├── 所有 PROXY_*/LLAMA_* 配置常量（本文档涉及的所有阈值）
+  ├── 共享可变状态 (_SESSION_REQUEST_COUNT, _DEDUP_CACHE, _LATENCY_WINDOW, ...)
+  ├── Thread-local 上下文 (_log_ctx, _metrics_ctx)
+  ├── _RELOAD_SPEC (热重载标量列表)
+  ├── _parse_conf_env() / _cast_config_value()  (配置解析辅助)
+  └── __all__ 白名单 (from proxy_state import *)
+        ▲
+        │ from proxy_state import *
+        │ import proxy_state  (用于 _reload_config 的 dual-setattr)
+        │
+anthropic_proxy.py (5529 行)         # 8 层管线 + Handler
+  ├── _reload_config()               # SIGHUP dual-setattr (proxy_state + self)
+  ├── 上下文管理函数:
+  │     _classify_lifecycle_stage()  → 阶段判定 (§0.2)
+  │     _compress_content_pass()     → L2 内容压缩
+  │     truncate_messages_if_needed()→ L5 截断入口
+  │     _apply_rounds_truncation()   → Rounds 策略
+  │     _compress_middle_with_llm()  → LLM 压缩
+  │     _incremental_compress()      → 增量缓存
+  │     clear_old_tool_results()     → 语义清除 (legacy)
+  │     strip_old_thinking_blocks()  → Thinking 剥离
+  ├── 8 层管线其余函数
+  ├── class Handler(BaseHTTPRequestHandler)
+  └── main()
+        ▲
+        │ from proxy_state import (_state_lock, _SESSION_*, ...)
+        │
+proxy_config.py (659 行)             # CONFIG_REGISTRY
+  ├── 配置元数据 + 校验
+  └── validate() / get_config_summary()
+```
+
+### 0.2 配置热重载 (SIGHUP dual-setattr)
+
+`_reload_config()` 在收到 SIGHUP 信号时触发（`./manage.sh reload`），同时更新两个模块的属性：
+
+```python
+# anthropic_proxy.py:35
+def _reload_config(signum=None, frame=None):
+    with _RELOAD_LOCK:
+        self_mod = sys.modules[__name__]
+        env = _parse_conf_env(RELOAD_CONFIG_PATH)
+        # ... parse env ...
+        for env_key, py_name, cast, cloud_def, local_def in _RELOAD_SPEC:
+            val = _cast_config_value(env.get(env_key, default), cast)
+            setattr(proxy_state, py_name, val)   # ← 更新 proxy_state
+            setattr(self_mod, py_name, val)       # ← 更新 anthropic_proxy
+```
+
+**为什么需要 dual-setattr**:
+- `proxy_config.py` 等 sub-module 通过 `proxy_state.PROXY_*` 读取配置 → 需要更新 `proxy_state`
+- `anthropic_proxy.py` 内的 local function 引用 module-level name（通过 `from proxy_state import *` 导入）→ 需要更新 `anthropic_proxy` 自身
+
+**测试守护**: `test/unit/test_proxy_reload.py` 的 `TestProxyStateSync` 类验证每次 reload 后 `proxy_state.PROXY_*` 与 `anthropic_proxy.PROXY_*` 保持一致。
+
+### 0.3 生命周期阶段阈值 (本文档核心)
+
+所有阈值定义在 `proxy_state.py`，可通过环境变量或 `configs/active.conf` 覆盖：
+
+| 阶段 | 环境变量 | local 默认 | cloud 默认 | 触发动作 |
+|------|----------|-----------|-----------|---------|
+| INIT | `PROXY_CLEAR_THRESHOLD` | 15000 | 30000 | 无压缩 |
+| GROWTH | `PROXY_CHARS_GROWTH` | 40000 | 80000 | tail-40% 清除 |
+| EXPANSION | `PROXY_CHARS_EXPANSION` | 90000 | 200000 | tail-60% 清除 + think strip |
+| SATURATION | `PROXY_CHARS_SATURATION` | 180000 | 500000 | full-dynamic clear + merge + trunc |
+| OOM_DANGER | `PROXY_CHARS_OOM_DANGER` | 350000 | 1000000 | no frozen + hard truncation |
+| PRE_TRUNC | `PROXY_OOM_SAFE_CHARS` | 200000 | 200000 | keep_rounds=2 强制截断 |
+
+> 注：阈值严格单调递增。`_classify_lifecycle_stage()` (anthropic_proxy.py:1427) 根据当前消息总字符数判定阶段，返回 stage_config 驱动 L2-L5 的压缩/截断强度。
 
 ---
 

@@ -497,6 +497,39 @@ CONFIG_REGISTRY = {
         "doc": "Maximum snapshot files to retain.",
     },
 
+    # ---- Re-read prevention ----
+    "PROXY_REREAD_PREVIEW_CHARS": {
+        "defaults": {"all": "200"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Number of chars to preserve as preview when clearing Read tool_results.",
+    },
+
+    # ---- Session continuation ----
+    "PROXY_SESSION_CONTINUATION_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Enable aggressive lifecycle classification for long-running agent sessions.",
+    },
+    "PROXY_SESSION_CONTINUATION_MIN_REQUESTS": {
+        "defaults": {"all": "2"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Min prior requests before session is classified as continuation.",
+    },
+
+    # ---- Dedup ----
+    "PROXY_DEDUP_WINDOW": {
+        "defaults": {"all": "2"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Deduplication window in seconds for detecting duplicate POST requests.",
+    },
+
+    # ---- Log dedup (compression) ----
+    "PROXY_LOG_DEDUPE": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Collapse repeated log lines during log-type compression.",
+    },
+
     # ---- Logging ----
     "PROXY_LOG_PATH": {
         "defaults": {"all": "/tmp/anthropic_proxy.log"},

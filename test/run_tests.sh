@@ -172,6 +172,22 @@ run_integration() {
       record "integration" "fail" "status: $sf cases failed"
     fi
   fi
+
+  longctx_out=$(bash "$SCRIPT_DIR/integration/test_long_context_integration.sh" 2>&1)
+  longctx_rc=$?
+  echo "$longctx_out" | tail -20
+  if [[ $longctx_rc -ne 0 ]]; then
+    record "integration" "fail" "test_long_context_integration.sh exited $longctx_rc"
+  else
+    local lp lf
+    lp=$(echo "$longctx_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    lf=$(echo "$longctx_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${lf:-0}" == "0" ]]; then
+      record "integration" "ok" "long-context: all ${lp:-?} cases passed"
+    else
+      record "integration" "fail" "long-context: $lf of ${lp:-?} cases failed"
+    fi
+  fi
 }
 
 # ------------------------------------------------------------

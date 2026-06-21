@@ -1,12 +1,57 @@
 # 代理层请求处理管线参考文档
 
-> 状态: 与 anthropic_proxy.py 同步
-> 日期: 2026-06-08
-> 版本: v3（统一 char 阈值 + 生命周期阶段 + L2/L4 合并为 _compress_content_pass + 移除 cleared merge）
+> 状态: 与 anthropic_proxy.py + proxy_state.py + proxy_config.py 同步
+> 日期: 2026-06-21
+> 版本: v4（Phase 0 模块拆分：proxy_state.py 作为配置/共享状态单一事实源，dual-setattr reload）
+> 代码: anthropic_proxy.py (5529 行) + proxy_state.py (518 行) + proxy_config.py (659 行)
 
 ---
 
 ## 0. 全局视图
+
+### 0.1 模块架构 (Phase 0 重构)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    模块依赖关系                              │
+│                                                              │
+│  proxy_state.py (518 行)                                     │
+│    ├── 所有 PROXY_*/LLAMA_* 配置常量 (单一事实源)             │
+│    ├── 共享可变状态 (_SESSION_*, _DEDUP_CACHE, _LATENCY_*)   │
+│    ├── Thread-local 上下文 (_log_ctx, _metrics_ctx)          │
+│    ├── _RELOAD_SPEC + _parse_conf_env + _cast_config_value   │
+│    └── 无外部依赖 (仅 stdlib)                                 │
+│           ▲                                                   │
+│           │ from proxy_state import *                         │
+│           │ import proxy_state  (用于 _reload_config setattr) │
+│  ─────────┼────────────────────────────────────────────────  │
+│           │                                                   │
+│  anthropic_proxy.py (5529 行)                                │
+│    ├── from proxy_state import *  (继承所有配置常量)          │
+│    ├── import proxy_state         (用于 dual-setattr reload)  │
+│    ├── import proxy_config        (CONFIG_REGISTRY 校验)      │
+│    ├── _reload_config()           (SIGHUP dual-setattr)      │
+│    ├── 8 层管线处理函数                                       │
+│    ├── class Handler(BaseHTTPRequestHandler)                 │
+│    └── main()                                                │
+│           ▲                                                   │
+│           │ from proxy_state import (_state_lock, ...)        │
+│  ─────────┼────────────────────────────────────────────────  │
+│           │                                                   │
+│  proxy_config.py (659 行)                                    │
+│    ├── CONFIG_REGISTRY (配置元数据 + 校验)                    │
+│    ├── validate() / get_config_summary()                     │
+│    └── from proxy_state import (_state_lock, _SESSION_*, ...)│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**设计原则**:
+- **单一事实源**: 所有配置常量定义在 `proxy_state.py`，其他模块通过 `from proxy_state import *` 继承
+- **dual-setattr reload**: `_reload_config()` 同时更新 `proxy_state` 模块和 `anthropic_proxy` 模块的属性，确保从 `proxy_state.PROXY_*` 读取的 sub-module 和引用 module-level name 的 local function 都看到更新
+- **无循环依赖**: `proxy_state` 无外部依赖，`proxy_config` 只依赖 `proxy_state`，`anthropic_proxy` 依赖两者
+
+### 0.2 请求处理管线
 
 ```
 Claude Code (Anthropic SDK)
@@ -19,6 +64,7 @@ Claude Code (Anthropic SDK)
 │  ┌──────────────────────────────────────────────────┐   │
 │  │ Layer 1: 请求入口 (Handler)                       │   │
 │  │   - 路由、JSON解析、会话跟踪、Metrics初始化        │   │
+│  │   - 请求体大小硬限制 (413 Payload Too Large)      │   │
 │  └────────────────────┬─────────────────────────────┘   │
 │                       │                                  │
 │  ┌────────────────────▼─────────────────────────────┐   │
@@ -62,7 +108,7 @@ Claude Code (Anthropic SDK)
 │  │   统一 char 阈值，单调递增:                       │   │
 │  │   INIT(15K) → GROWTH(40K) → EXPANSION(90K)     │   │
 │  │   → SATURATION(180K) → OOM_DANGER(350K)         │   │
-│  │   → PRE_TRUNC(400K)                              │   │
+│  │   → PRE_TRUNC(200K)                              │   │
 │  └─────────────────────────────────────────────────┘   │
 │                                                          │
 └─────────────────────────────────────────────────────────┘
@@ -79,7 +125,7 @@ Claude Code (Anthropic SDK)
 
 **职责**: 接收 HTTP 请求，解析 JSON，管理会话和日志上下文。
 
-**入口**: `Handler.do_POST()` (line 3017)
+**入口**: `Handler.do_POST()` (line 4309)
 
 ### 1.1 路由
 
@@ -88,6 +134,7 @@ Claude Code (Anthropic SDK)
 | `/v1/models` | GET | 返回模型别名列表 |
 | `/v1/messages` | POST | 核心请求处理 |
 | `/status` | GET | 返回 HTML 状态页 |
+| `/metrics` | GET | 返回 JSONL metrics 查询 |
 | 其他 | - | 404 |
 
 ### 1.2 请求处理流程
@@ -101,7 +148,8 @@ do_POST()
   ├─ 请求去重检查 _check_dedup(body) → 429 (重复请求, DEF-205)
   ├─ 写入 /tmp/anthropic_request_body.json (调试)
   │
-  ├─ [DEF-001] Pre-truncation: total_chars > 400K 时强制 keep_rounds=2
+  ├─ [P0] 请求体大小检查: Content-Length > PROXY_MAX_REQUEST_BYTES → 413
+  ├─ [DEF-001] Pre-truncation: total_chars > PROXY_OOM_SAFE_CHARS 时强制 keep_rounds=2
   │
   └─ 调用 _handle_messages(body)          ← 核心管线 (2-8层)
        ├─ 成功: log_request() + log_metrics()
@@ -118,9 +166,14 @@ do_POST()
 ### 1.4 并发控制
 
 ```python
+# proxy_state.py (单一事实源)
 _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 # local: 默认 1 (防止 Metal OOM)
 # cloud: 默认 4 (云端天然支持并发)
+
+# _reload_config 重建 Semaphore 时 dual-setattr:
+#   setattr(proxy_state, "_llama_lock", new_sem)
+#   setattr(self_mod, "_llama_lock", new_sem)
 ```
 
 ### 1.5 配置参数
@@ -191,7 +244,7 @@ if total_chars > 400K:
 
 ### 2.5 工具内容清除 (Tool-Result Clearing)
 
-**核心函数**: `clear_old_tool_results()` (line 756)
+**核心函数**: `clear_old_tool_results()` (line 1850)
 
 **目的**: 用轻量占位文本替换旧 tool_result 的完整内容，释放 token 空间。
 
@@ -277,7 +330,7 @@ tool_result #8: Bash("ls") → score = 1(base) = 1
 
 **职责**: 检测模型陷入重复行为模式的场景，并施加递进式干预。
 
-**入口**: `_handle_messages()` 中段 (line 3267-3385)
+**入口**: `_handle_messages()` 中段 (line 4557-5095)
 
 ### 3.1 循环检测 (Loop Detection)
 
@@ -351,7 +404,7 @@ def _compute_text_similarity(text1, text2):
 
 ### 3.3 阻塞检测 (Blocker Detection)
 
-**核心函数**: `_detect_blocker_pattern()` (line 1229)
+**核心函数**: `_detect_blocker_pattern()` (line 2464)
 
 **检测逻辑**: 扫描尾部 tool_result，查找连续 N 次相同错误类型的失败。
 
@@ -415,7 +468,7 @@ After:  "Today's date is DATE_PLACEHOLDER."
 
 ### 4.2 Thinking Block 清除
 
-**核心函数**: `strip_old_thinking_blocks()` (line 1715)
+**核心函数**: `strip_old_thinking_blocks()` (line 2770)
 
 **原理**: Qwen 模型在 assistant 消息中产生 `thinking`/`reasoning_content` blocks，占据大量 token 但对后续推理无价值。
 
@@ -434,7 +487,7 @@ After:  "Today's date is DATE_PLACEHOLDER."
 
 **职责**: 当消息总量超过预算时，主动截断旧消息并生成压缩摘要。
 
-**核心函数**: `truncate_messages_if_needed()` (line 1227)
+**核心函数**: `truncate_messages_if_needed()` (line 2281)
 
 ### 5.1 三种策略
 
@@ -491,7 +544,7 @@ Round 策略由 lifecycle stage 的 `truncate_rounds` 字段驱动。当 `_class
 
 ### 5.3 增量压缩 (Incremental Compress)
 
-**核心函数**: `_incremental_compress()` (line 1172)
+**核心函数**: `_incremental_compress()` (line 2102)
 
 **原理**: 避免每次全量重压缩。维护会话级摘要缓存 `_summary_cache`。
 
@@ -514,7 +567,7 @@ Session 第 5 次请求:
 
 ### 5.4 LLM 压缩
 
-**核心函数**: `_compress_middle_with_llm()` (line 1057)
+**核心函数**: `_compress_middle_with_llm()` (line 1985)
 
 **调用方式**: `POST /chat/completions` 到本地后端 (同模型)
 
@@ -555,11 +608,11 @@ Session 第 5 次请求:
 
 **职责**: 将 Anthropic 格式转换为 OpenAI 格式，优化工具定义，发送到后端。
 
-**入口**: `_handle_messages()` 后段 (line 3528-3584)
+**入口**: `_handle_messages()` 后段 (line 5095-5408)
 
 ### 6.1 工具定义过滤 (Tool Filter)
 
-**核心函数**: `_filter_tools()` (line 2591)
+**核心函数**: `_filter_tools()` (line 3975)
 
 **原理**: 44 个工具定义 ≈ 8K-12K tokens 固定开销。大部分 agentic coding 场景只用 3-8 个工具。
 
@@ -584,7 +637,7 @@ Session 第 5 次请求:
 
 ### 6.2 格式转换
 
-**消息转换**: `convert_anthropic_messages_to_openai()` (line 1715)
+**消息转换**: `convert_anthropic_messages_to_openai()` (line 2834)
 
 | Anthropic | OpenAI |
 |-----------|--------|
@@ -592,14 +645,14 @@ Session 第 5 次请求:
 | `assistant` with `[text, tool_use]` | `assistant` (text + tool_calls) |
 | `system` field (body-level) | `system` role message (前置) |
 
-**工具转换**: `convert_anthropic_tools_to_openai()` (line 571)
+**工具转换**: `convert_anthropic_tools_to_openai()` (line 863)
 
 ```
 Anthropic: {"name": "Read", "description": "...", "input_schema": {...}}
 OpenAI:    {"type": "function", "function": {"name": "Read", "description": "...", "parameters": {...}}}
 ```
 
-**工具选择转换**: `convert_anthropic_tool_choice_to_openai()` (line 600)
+**工具选择转换**: `convert_anthropic_tool_choice_to_openai()` (line 928)
 
 ### 6.3 转发
 
@@ -629,7 +682,7 @@ urllib.request.urlopen(
 
 ### 7.1 流式响应 (Streaming)
 
-**函数**: `Handler._handle_streaming_response()` (line 3600+)
+**函数**: `Handler._handle_streaming_response()` (line 5152)
 
 **SSE 事件序列**:
 ```
@@ -650,7 +703,7 @@ event: message_stop       → 消息结束
 
 ### 7.2 非流式响应 (Non-Streaming)
 
-**函数**: `Handler._handle_non_streaming_response()` (line 3598)
+**函数**: `Handler._handle_non_streaming_response()` (line 5095)
 
 **处理**: 一次性读取完整响应 → `convert_openai_response_to_anthropic()` → 返回 JSON。
 
@@ -671,7 +724,7 @@ max_tokens (请求值)
 
 ### 7.4 JSON 修复
 
-**函数**: `_repair_truncated_json()` (line 282)
+**函数**: `_repair_truncated_json()` (line 492)
 
 **场景**: FORCE_STOPPED 截断了 tool_call 的 arguments JSON（如 `"file_path": "/src/boar`）。
 
@@ -679,7 +732,7 @@ max_tokens (请求值)
 
 ### 7.5 XML→JSON 回退
 
-**函数**: `parse_tool_arguments()` (line 336)
+**函数**: `parse_tool_arguments()` (line 614)
 
 **场景**: Qwen 模型偶尔以 XML 格式输出 tool_call 参数，而非标准 JSON。
 
@@ -765,61 +818,74 @@ max_tokens (请求值)
 
 ## 9. 辅助函数索引
 
+> 行号基于 `anthropic_proxy.py` (5529 行，2026-06-21)。配置常量和共享状态定义在 `proxy_state.py` (518 行)。
+
 ### 格式转换 (Layer 6)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `convert_anthropic_messages_to_openai()` | 1683 | Anthropic 消息 → OpenAI 消息 |
-| `convert_anthropic_tools_to_openai()` | 540 | Anthropic 工具 → OpenAI 工具 |
-| `convert_anthropic_tool_choice_to_openai()` | 569 | Anthropic tool_choice → OpenAI |
-| `convert_openai_response_to_anthropic()` | 1758 | OpenAI 响应 → Anthropic 响应 |
-| `parse_tool_arguments()` | 336 | JSON/XML/混合 → dict |
-| `_extract_content_tool_calls()` | 415 | `<tools>` 文本提取 |
-| `_StreamingToolsExtractor` | 463 | 流式 `<tools>` 状态机 |
-| `_repair_truncated_json()` | 282 | 截断 JSON 修复 |
+| `convert_anthropic_messages_to_openai()` | 2834 | Anthropic 消息 → OpenAI 消息 |
+| `convert_anthropic_tools_to_openai()` | 863 | Anthropic 工具 → OpenAI 工具 |
+| `convert_anthropic_tool_choice_to_openai()` | 928 | Anthropic tool_choice → OpenAI |
+| `convert_openai_response_to_anthropic()` | 2918 | OpenAI 响应 → Anthropic 响应 |
+| `parse_tool_arguments()` | 614 | JSON/XML/混合 → dict |
+| `_extract_content_tool_calls()` | 709 | `<tools>` 文本提取 |
+| `_StreamingToolsExtractor` | 757 | 流式 `<tools>` 状态机 |
+| `_repair_truncated_json()` | 492 | 截断 JSON 修复 |
 
 ### 上下文管理 (Layer 2-5)
 
-| 函数 | 用途 |
-|------|------|
-| `_classify_lifecycle_stage()` | 统一 char 阈值阶段判定 → 返回 stage_config |
-| `_compress_content_pass()` | 合并 L2+L4 thinking 单次内容压缩 |
-| `clear_old_tool_results()` | 语义优先级工具内容清除（legacy） |
-| `_generate_tool_summary()` | 确定性清除摘要 (Cache 友好) |
-| `_estimate_message_chars()` | 字符级 token 估算 |
-| `truncate_messages_if_needed()` | 统一截断入口 (char-budget + keep_rounds) |
-| `_apply_rounds_truncation()` | Rounds 策略实现 |
-| `_extract_middle_summary_rules()` | 规则压缩摘要 |
-| `_compress_middle_with_llm()` | LLM 压缩摘要 |
-| `_merge_summaries_with_llm()` | LLM 合并两个摘要 |
-| `_incremental_compress()` | 增量压缩 (缓存) |
-| `_extract_keywords()` | 关键词提取 (TF-IDF MVP) |
-| `_inject_keyword_context()` | 关键词匹配注入 |
-| `strip_old_thinking_blocks()` | Thinking block 清除（legacy） |
+| 函数 | 行号 | 用途 |
+|------|------|------|
+| `_classify_lifecycle_stage()` | 1427 | 统一 char 阈值阶段判定 → 返回 stage_config |
+| `_compress_content_pass()` | 1576 | 合并 L2+L4 thinking 单次内容压缩 |
+| `clear_old_tool_results()` | 1850 | 语义优先级工具内容清除（legacy） |
+| `_generate_tool_summary()` | 1412 | 确定性清除摘要 (Cache 友好) |
+| `_estimate_message_chars()` | 955 | 字符级 token 估算 |
+| `truncate_messages_if_needed()` | 2281 | 统一截断入口 (char-budget + keep_rounds) |
+| `_apply_rounds_truncation()` | 2584 | Rounds 策略实现 |
+| `_extract_middle_summary_rules()` | 1918 | 规则压缩摘要 |
+| `_compress_middle_with_llm()` | 1985 | LLM 压缩摘要 |
+| `_merge_summaries_with_llm()` | 2068 | LLM 合并两个摘要 |
+| `_incremental_compress()` | 2102 | 增量压缩 (缓存) |
+| `_extract_keywords()` | 4042 | 关键词提取 (TF-IDF MVP) |
+| `_inject_keyword_context()` | 4083 | 关键词匹配注入 |
+| `strip_old_thinking_blocks()` | 2770 | Thinking block 清除（legacy） |
 
 ### 检测与干预 (Layer 3)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `_detect_blocker_pattern()` | 1354 | 连续错误检测 |
-| `_build_blocker_message()` | 1437 | 阻塞干预消息生成 |
+| `_detect_blocker_pattern()` | 2464 | 连续错误检测 |
+| `_build_blocker_message()` | 2547 | 阻塞干预消息生成 |
+| `_detect_text_loop()` | 190 | 文本输出循环检测 (bigram Jaccard) |
+| `_compute_text_similarity()` | 173 | 文本相似度计算 |
 
 ### 工具过滤 (Layer 6)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `_filter_tools()` | 2732 | 动态工具定义过滤 |
+| `_filter_tools()` | 3975 | 动态工具定义过滤 |
 
 ### 可观测性 (Layer 8)
 
 | 函数 | 行号 | 用途 |
 |------|------|------|
-| `log()` | 309 | 文本日志输出 |
-| `log_request()` | 236 | JSONL 请求日志 |
-| `log_metrics()` | 279 | JSONL Metrics 日志 |
-| `_finalize_metrics()` | 2696 | 质量标记生成 |
-| `_mc_put()` | 2726 | Metrics 数据安全追加 |
-| `_build_status_html()` | 2453 | 状态页面 HTML |
+| `log()` | 423 | 文本日志输出 |
+| `log_request()` | 361 | JSONL 请求日志 |
+| `log_metrics()` | 393 | JSONL Metrics 日志 |
+| `_finalize_metrics()` | 3907 | 质量标记生成 |
+| `_mc_put()` | 3969 | Metrics 数据安全追加 |
+| `_build_status_html()` | 3640 | 状态页面 HTML |
+
+### 配置与热重载 (proxy_state.py)
+
+| 函数/常量 | 行号 | 用途 |
+|-----------|------|------|
+| `_RELOAD_SPEC` | 322 | Tier 1 热重载标量列表 |
+| `_parse_conf_env()` | 386 | bash-style conf 文件解析 |
+| `_cast_config_value()` | 423 | 配置值类型转换 |
+| `_reload_config()` | 35 (anthropic_proxy.py) | SIGHUP dual-setattr 热重载 |
 
 ---
 

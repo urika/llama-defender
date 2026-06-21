@@ -612,6 +612,13 @@
       "frame": null
     }
   },
+  "_reorder_tool_results": {
+    "name": "_reorder_tool_results",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
   "_repair_truncated_json": {
     "name": "_repair_truncated_json",
     "params": [

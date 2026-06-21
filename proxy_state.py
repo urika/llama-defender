@@ -33,21 +33,34 @@ IS_CLOUD = BACKEND_TYPE == "cloud"
 # ---------------------------------------------------------------------------
 # Concurrency control: backend-aware request serialization
 # ---------------------------------------------------------------------------
-PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", "4" if IS_CLOUD else "1"))
+
+# Config default resolution: reads canonical defaults from proxy_config
+def _default(env_key, cloud_val, local_val):
+    """Return the canonical default for env_key, falling back to hardcoded."""
+    try:
+        from proxy_config import resolve_default
+        resolved = resolve_default(env_key, IS_CLOUD)
+        if resolved is not None:
+            return str(resolved)
+    except (ImportError, Exception):
+        pass
+    return str(cloud_val if IS_CLOUD else local_val)
+
+PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", _default("PROXY_MAX_CONCURRENT", "4", "1")))
 _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
-MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-v4-pro" if IS_CLOUD else "mlx-community/Qwen3.6-35B-A3B-4bit")
+MODEL_NAME = os.environ.get("MODEL_NAME", _default("MODEL_NAME", "deepseek-v4-pro", "mlx-community/Qwen3.6-35B-A3B-4bit"))
 
 # ---------------------------------------------------------------------------
 # Tool-result clearing: proxy-side context management
 # ---------------------------------------------------------------------------
-PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", "30000" if IS_CLOUD else "15000"))
-PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", "10" if IS_CLOUD else "2"))
+PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", _default("PROXY_CLEAR_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
+PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", _default("PROXY_CLEAR_THRESHOLD", "30000", "15000")))
+PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", _default("PROXY_TOOL_KEEP", "10", "2")))
 
 # ---------------------------------------------------------------------------
 # Frozen Zone
 # ---------------------------------------------------------------------------
-PROXY_FROZEN_HEAD = int(os.environ.get("PROXY_FROZEN_HEAD", "0" if IS_CLOUD else "12"))
+PROXY_FROZEN_HEAD = int(os.environ.get("PROXY_FROZEN_HEAD", _default("PROXY_FROZEN_HEAD", "0", "12")))
 
 # ---------------------------------------------------------------------------
 # Tail-first clearing
@@ -57,7 +70,7 @@ PROXY_CLEAR_TAIL_FIRST = os.environ.get("PROXY_CLEAR_TAIL_FIRST", "true").lower(
 # ---------------------------------------------------------------------------
 # Cache Aligner (Phase 1)
 # ---------------------------------------------------------------------------
-PROXY_CACHE_ALIGN_ENABLED = os.environ.get("PROXY_CACHE_ALIGN_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_CACHE_ALIGN_ENABLED = os.environ.get("PROXY_CACHE_ALIGN_ENABLED", _default("PROXY_CACHE_ALIGN_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
 PROXY_CACHE_ALIGN_HEAD = int(os.environ.get("PROXY_CACHE_ALIGN_HEAD", "4"))
 
 # Per-session last messages for computing common_prefix_ratio.
@@ -71,7 +84,7 @@ _SESSION_REQUEST_COUNT = {}
 # ---------------------------------------------------------------------------
 # Semantic content compression (Phase 2)
 # ---------------------------------------------------------------------------
-PROXY_COMPRESS_ENABLED = os.environ.get("PROXY_COMPRESS_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+PROXY_COMPRESS_ENABLED = os.environ.get("PROXY_COMPRESS_ENABLED", _default("PROXY_COMPRESS_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
 PROXY_COMPRESS_THRESHOLD = int(os.environ.get("PROXY_COMPRESS_THRESHOLD", "4096"))
 PROXY_COMPRESS_MODE = os.environ.get("PROXY_COMPRESS_MODE", "semantic")
 PROXY_SCRUB_ANSI = os.environ.get("PROXY_SCRUB_ANSI", "true").lower() in ("1", "true", "yes")
@@ -87,8 +100,8 @@ CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", 
 # ---------------------------------------------------------------------------
 # Context-limit truncation
 # ---------------------------------------------------------------------------
-PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000"))
+PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", _default("PROXY_CTX_LIMIT_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
+PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", _default("PROXY_CTX_CHARS_LIMIT", "500000", "180000")))
 PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))
 PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))
 PROXY_CTX_TRUNCATE_STRATEGY = os.environ.get("PROXY_CTX_TRUNCATE_STRATEGY", "char")
@@ -106,7 +119,7 @@ PROXY_CHARS_EXPANSION = int(os.environ.get(
     "PROXY_CHARS_EXPANSION", "200000" if IS_CLOUD else "90000"))
 PROXY_CHARS_SATURATION = int(os.environ.get(
     "PROXY_CHARS_SATURATION",
-    os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000")))
+    os.environ.get("PROXY_CTX_CHARS_LIMIT", _default("PROXY_CTX_CHARS_LIMIT", "500000", "180000"))))
 PROXY_CHARS_OOM_DANGER = int(os.environ.get(
     "PROXY_CHARS_OOM_DANGER", "1000000" if IS_CLOUD else "350000"))
 
@@ -117,10 +130,14 @@ PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0")
 PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
 PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "600"))
 
-# DEF-001: hard ceiling for total payload size
+# DEF-001: hard ceiling for total payload size.
+# Cloud backends (DeepSeek/OpenAI) support 1M+ tokens, so pre_truncate is
+# effectively disabled (10M chars threshold). Local backends cap at 200K
+# to prevent Metal OOM.
+_default_oom = "10000000" if IS_CLOUD else "200000"
 PROXY_OOM_SAFE_CHARS = int(os.environ.get(
     "PROXY_OOM_SAFE_CHARS",
-    os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "200000"),
+    os.environ.get("PROXY_PRE_TRUNCATE_CHARS", _default_oom),
 ))
 PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS  # Legacy alias
 
@@ -332,6 +349,17 @@ _RELOAD_SPEC = [
     ("PROXY_CACHE_ALIGN_HEAD", "PROXY_CACHE_ALIGN_HEAD", "int", "4", "4"),
     # Content tools fallback
     ("PROXY_CONTENT_TOOLS_FALLBACK", "CONTENT_TOOLS_FALLBACK_ENABLED", "bool", "true", "true"),
+    # Semantic compression (Phase 2)
+    ("PROXY_COMPRESS_ENABLED", "PROXY_COMPRESS_ENABLED", "bool", "false", "true"),
+    ("PROXY_COMPRESS_THRESHOLD", "PROXY_COMPRESS_THRESHOLD", "int", "4096", "4096"),
+    ("PROXY_COMPRESS_MODE", "PROXY_COMPRESS_MODE", "str", "semantic", "semantic"),
+    ("PROXY_SCRUB_ANSI", "PROXY_SCRUB_ANSI", "bool", "true", "true"),
+    ("PROXY_SIEVE_JSON_MAX_ITEMS", "PROXY_SIEVE_JSON_MAX_ITEMS", "int", "10", "10"),
+    ("PROXY_SIEVE_JSON_MAX_STR_LEN", "PROXY_SIEVE_JSON_MAX_STR_LEN", "int", "200", "200"),
+    ("PROXY_SIEVE_JSON_MAX_DEPTH", "PROXY_SIEVE_JSON_MAX_DEPTH", "int", "4", "4"),
+    ("PROXY_DEDUPE_SCALARS", "PROXY_DEDUPE_SCALARS", "bool", "false", "false"),
+    ("PROXY_LOG_DEDUPE", "PROXY_LOG_DEDUPE", "bool", "true", "true"),
+    ("PROXY_COMPRESS_AUDIT", "PROXY_COMPRESS_AUDIT", "bool", "true", "true"),
     # Context truncation
     ("PROXY_CTX_LIMIT_ENABLED", "PROXY_CTX_LIMIT_ENABLED", "bool", "false", "true"),
     ("PROXY_CTX_CHARS_LIMIT", "PROXY_CTX_CHARS_LIMIT", "int", "500000", "180000"),

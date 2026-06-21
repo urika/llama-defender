@@ -130,7 +130,8 @@ def _reload_config(signum=None, frame=None):
         setattr(self_mod, "PROXY_CHARS_SATURATION", int(sat))
 
         oom = (env.get("PROXY_OOM_SAFE_CHARS")
-               or env.get("PROXY_PRE_TRUNCATE_CHARS", "200000"))
+               or env.get("PROXY_PRE_TRUNCATE_CHARS",
+                          "10000000" if is_cloud else "200000"))
         setattr(proxy_state, "PROXY_OOM_SAFE_CHARS", int(oom))
         setattr(self_mod, "PROXY_OOM_SAFE_CHARS", int(oom))
         setattr(proxy_state, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
@@ -1772,6 +1773,98 @@ def _fix_tool_pairings(messages):
         log(f"  -> Tool pairing fix: removed {removed_results} orphaned tool_results, "
             f"{removed_uses} orphaned tool_uses")
 
+    result = _reorder_tool_results(result)
+
+    return result
+
+
+def _reorder_tool_results(messages):
+    """Ensure tool_result messages immediately follow their tool_use.
+
+    OpenAI/DeepSeek strictly require that every tool_calls message is followed
+    by tool role messages (one per tool_call_id) before any other role.
+    Anthropic format allows text user messages between tool_use and tool_result.
+
+    Only reorders when needed: if tool_result already immediately follows
+    its tool_use, no change is made.
+    """
+    tool_result_msg_idx = {}
+    for i, m in enumerate(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                tid = b.get("tool_use_id", "")
+                if tid:
+                    tool_result_msg_idx[tid] = i
+
+    tool_use_to_assistant_idx = {}
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                tid = b.get("id", "")
+                if tid:
+                    tool_use_to_assistant_idx[tid] = i
+
+    needs_reorder = False
+    for tid, result_idx in tool_result_msg_idx.items():
+        assistant_idx = tool_use_to_assistant_idx.get(tid)
+        if assistant_idx is not None and result_idx != assistant_idx + 1:
+            needs_reorder = True
+            break
+
+    if not needs_reorder:
+        return messages
+
+    log(f"  -> Tool pairing fix: reordering {len(tool_result_msg_idx)} tool_results for adjacency")
+
+    # Build set of all tool_use_ids so we can defer tool_results that appear
+    # before their assistant message (they'll be emitted inline later).
+    all_tool_use_ids = set()
+    for m in messages:
+        if m.get("role") == "assistant":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        all_tool_use_ids.add(b.get("id", ""))
+
+    seen_assistant_tool_uses = set()
+    emitted_indices = set()
+    result = []
+    for i, m in enumerate(messages):
+        if i in emitted_indices:
+            continue
+        role = m.get("role", "")
+        content = m.get("content", "")
+
+        if role == "user" and isinstance(content, list):
+            tids_in_msg = [b.get("tool_use_id", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if tids_in_msg:
+                deferred = all(tid not in seen_assistant_tool_uses for tid in tids_in_msg if tid)
+                if deferred:
+                    continue
+        result.append(m)
+        if role == "assistant" and isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tid = b.get("id", "")
+                    seen_assistant_tool_uses.add(tid)
+                    result_idx = tool_result_msg_idx.get(tid)
+                    if result_idx is not None and result_idx != i + 1:
+                        tr_msg = messages[result_idx]
+                        result.append(tr_msg)
+                        emitted_indices.add(result_idx)
+
     return result
 
 
@@ -1923,8 +2016,7 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
 # Thinking/reasoning block stripping: remove old assistant thinking content
 # to reduce context size. Operates defensively since current clients rarely
 # send explicit thinking blocks (reasoning is usually inline text).
-# ---------------------------------------------------------------------------
-from message_converter import *
+# (conversion helpers moved to message_converter.py)
 
 import subprocess
 import time

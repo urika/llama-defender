@@ -198,5 +198,85 @@ class TestProxyStateAll(unittest.TestCase):
         self.assertIn("_cast_config_value", proxy_state.__all__)
 
 
+class TestReloadSpecDefaultsConsistency(unittest.TestCase):
+    """Verify _RELOAD_SPEC defaults match CONFIG_REGISTRY canonical defaults.
+
+    This prevents drift between the two sources of truth. If someone updates
+    CONFIG_REGISTRY but forgets _RELOAD_SPEC (or vice versa), this test fails.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.registry = proxy_config.CONFIG_REGISTRY
+
+    def _resolve_registry_default(self, env_key, mode):
+        """Get the canonical default string from CONFIG_REGISTRY for a mode."""
+        entry = self.registry.get(env_key)
+        if not entry:
+            return None
+        defaults = entry.get("defaults", {})
+        return defaults.get(mode, defaults.get("all"))
+
+    def _cast_to_canonical_str(self, value, cast):
+        """Normalize a value to its string representation for comparison."""
+        if cast == "bool":
+            return "true" if proxy_state._cast_config_value(value, cast) else "false"
+        if cast == "int":
+            return str(int(value))
+        if cast == "float":
+            return str(float(value))
+        return str(value)
+
+    def test_reload_spec_matches_config_registry_cloud(self):
+        """Each RELOAD_SPEC cloud_default must match CONFIG_REGISTRY cloud default."""
+        mismatches = []
+        for env_key, py_name, cast, cloud_def, local_def in proxy_state._RELOAD_SPEC:
+            registry_default = self._resolve_registry_default(env_key, "cloud")
+            if registry_default is None:
+                mismatches.append(f"{env_key}: missing from CONFIG_REGISTRY")
+                continue
+            spec_val = self._cast_to_canonical_str(cloud_def, cast)
+            reg_val = self._cast_to_canonical_str(registry_default, cast)
+            if spec_val != reg_val:
+                mismatches.append(
+                    f"{env_key}: RELOAD_SPEC={spec_val} vs CONFIG_REGISTRY={reg_val}"
+                )
+        if mismatches:
+            self.fail("Cloud defaults drift detected:\n  " + "\n  ".join(mismatches))
+
+    def test_reload_spec_matches_config_registry_local(self):
+        """Each RELOAD_SPEC local_default must match CONFIG_REGISTRY local default."""
+        mismatches = []
+        for env_key, py_name, cast, cloud_def, local_def in proxy_state._RELOAD_SPEC:
+            registry_default = self._resolve_registry_default(env_key, "local")
+            if registry_default is None:
+                mismatches.append(f"{env_key}: missing from CONFIG_REGISTRY")
+                continue
+            spec_val = self._cast_to_canonical_str(local_def, cast)
+            reg_val = self._cast_to_canonical_str(registry_default, cast)
+            if spec_val != reg_val:
+                mismatches.append(
+                    f"{env_key}: RELOAD_SPEC={spec_val} vs CONFIG_REGISTRY={reg_val}"
+                )
+        if mismatches:
+            self.fail("Local defaults drift detected:\n  " + "\n  ".join(mismatches))
+
+    def test_reload_spec_py_names_exist_in_module(self):
+        """Every py_name in RELOAD_SPEC must be an attribute of proxy_state."""
+        missing = []
+        for env_key, py_name, _cast, _cd, _ld in proxy_state._RELOAD_SPEC:
+            if not hasattr(proxy_state, py_name):
+                missing.append(f"{env_key} → {py_name}: not found on proxy_state")
+        if missing:
+            self.fail("RELOAD_SPEC refers to missing module attributes:\n  " +
+                      "\n  ".join(missing))
+
+    def test_reload_spec_covers_compression_vars(self):
+        """Compression-related vars must be in RELOAD_SPEC for hot-reload support."""
+        names = {entry[1] for entry in proxy_state._RELOAD_SPEC}
+        self.assertIn("PROXY_COMPRESS_ENABLED", names)
+        self.assertIn("PROXY_COMPRESS_AUDIT", names)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -203,5 +203,5 @@ Set `LLAMA_SERVER_BIN` env var or update `tools/bench_mtp.py`'s `LLAMA_SERVER_BI
 ## Code style
 
 - `manage.sh`: `set -euo pipefail`. Private helpers prefixed `_`, public commands prefixed `cmd_`. User-facing strings and comments are in **Chinese**.
-- `anthropic_proxy.py`: **standard library only** — no third-party deps. Top-level constants, helpers as module-level functions, one `Handler` class. Logs to stdout *and* `/tmp/anthropic_proxy.log`.
+- `anthropic_proxy.py` + `proxy_state.py` + `proxy_config.py`: **standard library only** — no third-party deps. `proxy_state.py` is the single source of truth for config constants and shared state (imported via `from proxy_state import *`). `anthropic_proxy.py` contains the 8-layer pipeline, helpers as module-level functions, and one `Handler` class. `proxy_config.py` contains CONFIG_REGISTRY metadata + validation. Logs to stdout *and* `/tmp/anthropic_proxy.log`.
 - Config files: bash-sourcable `KEY="value"` syntax, Chinese section headers, self-contained (no includes), include the `CONFIG_NAME`/`CONFIG_DESC`/`CONFIG_MEMORY` metadata.

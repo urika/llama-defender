@@ -40,10 +40,12 @@ Anthropic format (including streaming SSE events).
 
 | Component | Technology |
 |-----------|------------|
-| Service manager | Bash 4+ (`manage.sh`) |
-| API proxy | Python 3 (stdlib only: `http.server`, `urllib.request`, `json`, `re`) |
+| Service manager | Bash 4+ (`manage.sh`, 1539 lines) |
+| API proxy core | Python 3 (stdlib only) — `anthropic_proxy.py` (5529 lines, 8-layer pipeline) |
+| Config & shared state | `proxy_state.py` (518 lines, single source of truth) — imported by proxy + config |
+| Config registry | `proxy_config.py` (659 lines, CONFIG_REGISTRY metadata + validation) |
 | Backend option 1 (local) | `llama-server` binary from upstream llama.cpp (GGUF) |
-| Backend option 2 (local) | `rapid-mlx` binary (MLX framework, Apple-optimized) |
+| Backend option 2 (local) | `rapid-mlx` / `vllm-mlx` binary (MLX framework, Apple-optimized) |
 | Backend option 3 (cloud) | DeepSeek API (`deepseek-v4-pro`) or OpenAI API |
 | OS target | macOS with Metal (Apple Silicon) |
 
@@ -56,15 +58,23 @@ etc.). The project is a collection of runnable scripts and configuration files.
 
 ```
 .
-├── manage.sh                  # Main service manager (bash)
-├── anthropic_proxy.py         # Anthropic→OpenAI proxy (python3, ~3,600 lines)
+├── manage.sh                  # Main service manager (bash, 1539 lines)
+├── anthropic_proxy.py         # Anthropic→OpenAI proxy + 8-layer pipeline (python3, 5529 lines)
+├── proxy_state.py             # Single source of truth: config constants, shared state, reload helpers (518 lines)
+├── proxy_config.py            # CONFIG_REGISTRY: config metadata, validation, drift detection (659 lines)
 ├── configs/
 │   ├── active.conf            # Symlink to the currently active config
 │   ├── deepseek-chat.conf     # Cloud proxy → DeepSeek API (no local backend)
-│   ├── qwen3.6-27b-mtp.conf   # llama-server + Qwen3.6-27B-MTP (GGUF)
-│   ├── rapid-mlx-35b.conf     # rapid-mlx + Qwen3.6-35B-A3B (MLX)
-│   └── rapid-mlx-9b.conf      # rapid-mlx + Qwen3.6-9B (lightweight)
-├── tools/
+│   ├── rapid-mlx-35b-opt.conf # rapid-mlx + Qwen3.6-35B-A3B (MLX, optimized)
+│   ├── mlx_vlm-27b.conf       # vllm-mlx + Qwen3.6-27B-OptiQ (PagedCache, 4-bit KV)
+│   ├── qwen2.5-coder-14b.conf # vllm-mlx + Qwen2.5-Coder-14B
+│   ├── qwen3-8b.conf          # vllm-mlx + Qwen3-8B (lightweight, test)
+│   ├── gemma4-26b.conf        # vllm-mlx + Gemma-4-26B (data processing)
+│   ├── secret.local.conf      # Git-ignored secrets (LLAMA_API_KEY for cloud)
+│   └── archived/              # Deprecated configs (qwen3.5-27b, rapid-mlx-9b, etc.)
+├── tools/                     # Benchmarks, monitors, analysis scripts (29 files)
+│   ├── bench_perf.py          # Performance benchmark (TTFT / tok/s / concurrency / long-ctx)
+│   ├── bench_quality.py       # Model quality evaluation (14 code/math/instruction/format cases)
 │   ├── bench_mtp.py           # MTP model performance benchmark
 │   ├── bench_rapidmlx.py      # Rapid-MLX throughput benchmark
 │   ├── bench_agent.py         # Agentic end-to-end benchmark
@@ -72,8 +82,8 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   ├── cache_analyzer.py      # Prefix-cache hit-rate analyzer
 │   ├── context_stress_test.py # Long-context stress test
 │   ├── stress_test.py         # Load stress test
-│   ├── analyze_claude_semantics.py  # Semantic behavior analysis
-│   ├── analyze_experiment.py  # A/B experiment result analyzer
+│   ├── gen_func_signatures.py # Function signature snapshot (refactoring regression)
+│   ├── gen_behavior_snapshots.py # Behavior snapshot (refactoring regression)
 │   ├── trace_requirements.py  # Requirement traceability checker
 │   ├── logview.sh             # Unified log viewer
 │   ├── sysmon.sh              # System monitoring (memory, CPU, disk)
@@ -82,10 +92,11 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   └── run_experiment.sh      # A/B experiment runner
 ├── test/                      # Automated tests (see test/README.md)
 │   ├── run_tests.sh           # Unified tier-based runner
-│   ├── unit/                  # Pure logic, no I/O (<1s)
-│   ├── integration/           # Mock backend, no LLM (~5s)
+│   ├── unit/                  # Pure logic, no I/O (<1s, 7 files, 399 tests)
+│   ├── integration/           # Mock backend, no LLM (~5s, 6 suites, 37 tests)
 │   ├── e2e/                   # Requires running proxy + backend
-│   └── fixtures/              # Shared test fixtures
+│   ├── promptfoo/             # Promptfoo fixed-prompt regression (5 core tests)
+│   └── fixtures/              # Shared test fixtures (signatures, snapshots)
 ├── docs/                      # Project documentation (24+ files)
 │   ├── 01-requirements-product/
 │   ├── 02-architecture-design/
@@ -280,7 +291,42 @@ Config files also contain metadata fields (`CONFIG_NAME`, `CONFIG_DESC`,
 
 ---
 
-## Proxy (`anthropic_proxy.py`)
+## Proxy (`anthropic_proxy.py` + `proxy_state.py` + `proxy_config.py`)
+
+### Module architecture (Phase 0 refactor)
+
+The proxy is split into three modules with strict dependency ordering (no cycles):
+
+```
+proxy_state.py (518 lines)          # Single source of truth
+  ├── All PROXY_*/LLAMA_* config constants
+  ├── Shared mutable state (_SESSION_*, _DEDUP_CACHE, _LATENCY_WINDOW, ...)
+  ├── Thread-local contexts (_log_ctx, _metrics_ctx)
+  ├── _RELOAD_SPEC + _parse_conf_env + _cast_config_value
+  └── __all__ whitelist for `from proxy_state import *`
+        ▲
+        │ from proxy_state import *
+        │ import proxy_state  (for _reload_config setattr)
+        │
+anthropic_proxy.py (5529 lines)     # 8-layer pipeline + Handler
+  ├── _reload_config()              # SIGHUP dual-setattr (proxy_state + self)
+  ├── 8-layer request pipeline
+  ├── class Handler(BaseHTTPRequestHandler)
+  └── main()
+        ▲
+        │ from proxy_state import (_state_lock, _SESSION_*, ...)
+        │
+proxy_config.py (659 lines)         # CONFIG_REGISTRY
+  ├── Config metadata + validation
+  └── validate() / get_config_summary()
+```
+
+**`_reload_config()` dual-setattr**: When SIGHUP fires, the handler updates
+both `proxy_state.PROXY_*` and `anthropic_proxy.PROXY_*` via `setattr`. This
+ensures sub-modules reading `proxy_state.PROXY_*` at call time and local
+functions referencing module-level names (imported via `from proxy_state
+import *`) both see the new values. Test guard: `test/unit/test_proxy_reload.py`
+`TestProxyStateSync` class verifies sync after every reload.
 
 ### Startup
 
@@ -294,10 +340,10 @@ The proxy listens on `HOST:PORT` (default `127.0.0.1:4000`) and forwards to
 `LLAMA_BASE_URL` (default `http://127.0.0.1:8081/v1`).
 
 On startup, the proxy registers a SIGHUP handler (`_reload_config`) that
-re-reads `configs/active.conf` and updates all module-level config via
-`setattr` — see "Hot-reload (SIGHUP) vs restart" above. This enables
-`./manage.sh reload` to switch backends (local↔cloud) in ~0.5s without
-restarting the proxy process.
+re-reads `configs/active.conf` and updates config in both `proxy_state` and
+`anthropic_proxy` modules via dual-setattr — see "Hot-reload (SIGHUP) vs
+restart" above. This enables `./manage.sh reload` to switch backends
+(local↔cloud) in ~0.5s without restarting the proxy process.
 
 ### Dual-mode design (local vs cloud)
 
@@ -664,10 +710,12 @@ at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.
 - Color-coded output: `info`, `warn`, `error` helper functions.
 - Comments and user-facing output are in **Chinese**.
 
-### Python (`anthropic_proxy.py`, `tools/*.py`)
+### Python (`anthropic_proxy.py`, `proxy_state.py`, `proxy_config.py`, `tools/*.py`)
 
 - Standard library **only** — do not add third-party dependencies.
-- Top-level constants (`LLAMA_BASE`, `MODEL_NAME`, `MODEL_ALIASES`).
+- `proxy_state.py` is the single source of truth for all config constants (`PROXY_*`, `LLAMA_*`), shared mutable state (`_SESSION_*`, `_DEDUP_CACHE`), thread-locals, and reload helpers (`_RELOAD_SPEC`, `_parse_conf_env`). Other modules import via `from proxy_state import *`.
+- `anthropic_proxy.py` contains the 8-layer pipeline, format converters, loop/blocker detection, and `Handler` class. Config is imported from `proxy_state`; `_reload_config()` uses dual-setattr to update both `proxy_state` and `anthropic_proxy` modules on SIGHUP.
+- `proxy_config.py` contains `CONFIG_REGISTRY` (config metadata, validation, drift detection).
 - Helper functions at module level, no classes except `Handler`.
 - `log()` writes to stdout and `/tmp/anthropic_proxy.log` (or `PROXY_LOG_PATH`).
 - Keep the proxy stateless; all request state lives in `Handler` instances.

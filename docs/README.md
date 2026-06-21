@@ -40,8 +40,9 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
-| `proxy-context-window-design.md` | 代理层上下文窗口替换设计文档（v8），Phase 1-3 已实施，含问题诊断、方案设计、Phase 3 资源护栏、风险矩阵 |
-| `proxy-pipeline-reference.md` | 代理层请求处理管线参考文档，与 `anthropic_proxy.py` (3534 行) 同步，逐层说明 8 层处理逻辑 |
+| `proxy-context-window-design.md` | 代理层上下文窗口替换设计文档（v9），Phase 1-3 已实施 + Phase 0 模块拆分，含问题诊断、方案设计、资源护栏、风险矩阵 |
+| `proxy-pipeline-reference.md` | 代理层请求处理管线参考文档，与 `anthropic_proxy.py` (5529 行) + `proxy_state.py` (518 行) + `proxy_config.py` (659 行) 同步，逐层说明 8 层处理逻辑、Phase 0 模块架构、dual-setattr 热重载 |
+| `use-cases.md` | 目标场景使用案例（7 个场景 A-G）：日常编码、本地↔云端热切换、多模型分工、长上下文分析、模型选型评测、并发压测、故障恢复 |
 | `proxy-context-window-design-review.md` | 设计审阅意见（P1-P3 需修正 + S1-S5 建议改进） |
 | `proxy-context-window-design-review-merged.md` | 审阅意见合并记录，8/8 全部采纳 |
 | `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
@@ -122,7 +123,8 @@ docs/
 
 | 场景 | 推荐路径 |
 |------|----------|
-| 新成员 onboarding | `01-requirements-product/PRD-anthropic-proxy.md` → `02-architecture-design/proxy-pipeline-reference.md` |
+| 新成员 onboarding | `01-requirements-product/PRD-anthropic-proxy.md` → `02-architecture-design/proxy-pipeline-reference.md` → `02-architecture-design/use-cases.md` |
+| 了解使用场景 | `02-architecture-design/use-cases.md`（7 个场景：日常编码 / 云端切换 / 多模型分工 / 长上下文 / 评测 / 压测 / 故障恢复） |
 | 排查线上问题 | `05-operations-changelog/` 查看近期变更 → `04-analysis-diagnostics/` 查找同类问题 |
 | 设计新功能 | `01-requirements-product/` 确认需求边界 → `02-architecture-design/` 参考现有设计模式 |
 | 运行 A/B 测试 | `03-experiments-testing/DEEPSEEK-AB-EXPERIMENT-GUIDE.md` |
