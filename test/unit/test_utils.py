@@ -15,6 +15,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
+import proxy_state
 
 
 class TestPercentile(unittest.TestCase):
@@ -142,13 +143,13 @@ class TestEnsureJsonlDir(unittest.TestCase):
     def test_creates_missing_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_dir = os.path.join(tmpdir, "nonexistent", "logs")
-            old_log_dir = proxy._LOG_DIR
+            old_log_dir = proxy_state._LOG_DIR
             try:
-                proxy._LOG_DIR = log_dir
+                proxy_state._LOG_DIR = log_dir
                 proxy._ensure_jsonl_dir()
                 self.assertTrue(os.path.isdir(log_dir))
             finally:
-                proxy._LOG_DIR = old_log_dir
+                proxy_state._LOG_DIR = old_log_dir
 
 
 class TestMaskSensitive(unittest.TestCase):

@@ -251,45 +251,14 @@ _metrics_lock = threading.Lock()
 # Shared state lock — defined in proxy_config to avoid circular imports.
 _state_lock = proxy_config._state_lock
 
-def _next_jsonl_token():
-    """Generate a unique request token for correlating request log entries."""
-    global _jsonl_counter
-    _jsonl_counter += 1
-    return f"req_{_jsonl_counter}_{os.urandom(4).hex()}"
+import proxy_logging
+from proxy_logging import *
 
 
-def _ensure_jsonl_dir():
-    """Create logs/ directory if it doesn't exist."""
-    try:
-        os.makedirs(_LOG_DIR, exist_ok=True)
-        os.chmod(_LOG_DIR, 0o700)
-    except OSError:
-        pass
+from proxy_logging import *
 
 
-def log_request(model: str, input_chars: int, output_chars: int,
-                status: int, duration_ms: float, start_time: str = ""):
-    """Append one JSON Lines record to proxy_requests.jsonl (thread-safe)."""
-    _ensure_jsonl_dir()
-    now_iso = datetime.now().isoformat()
-    record = {
-        "start_time": start_time or now_iso,
-        "end_time": now_iso,
-        "method": "POST",
-        "path": "/v1/messages",
-        "model": model,
-        "input_chars": input_chars,
-        "output_chars": output_chars,
-        "status": status,
-        "duration_ms": round(duration_ms, 1),
-    }
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    try:
-        with _jsonl_lock:
-            with open(_JSONL_PATH, "a") as f:
-                f.write(line)
-    except OSError:
-        pass
+from proxy_logging import *
 
 
 MODEL_ALIASES = [
@@ -310,67 +279,19 @@ _log_ctx = threading.local()
 _metrics_ctx = threading.local()
 
 
-def log_metrics(metrics: dict):
-    _ensure_jsonl_dir()
-    line = json.dumps(metrics, ensure_ascii=False) + "\n"
-    try:
-        with _metrics_lock:
-            with open(_METRICS_PATH, "a") as f:
-                f.write(line)
-    except OSError:
-        pass
+from proxy_logging import *
 
 
-def _mask_sensitive(headers_dict):
-    if not isinstance(headers_dict, dict):
-        return headers_dict
-    masked = {}
-    for k, v in headers_dict.items():
-        kl = k.lower()
-        if kl in ("authorization", "x-api-key") and isinstance(v, str):
-            if len(v) > 12:
-                masked[k] = v[:8] + "****" + v[-4:]
-            else:
-                masked[k] = v[:4] + "****"
-        else:
-            masked[k] = v
-    return masked
+from proxy_logging import *
 
 
 LOG_SCHEMA_VERSION = "v1"
 
 
-def log(msg, level="INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    sess = getattr(_log_ctx, 'session_id', None)
-    if sess:
-        line = f"[{ts}] [{level}] [sess={sess}] {msg}"
-    else:
-        line = f"[{ts}] [{level}] {msg}"
-    print(line)
-    log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
-    try:
-        with open(log_path, "a") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
+from proxy_logging import *
 
 
-def log_structured(event, **kwargs):
-    ts = datetime.now().strftime("%H:%M:%S")
-    sess = getattr(_log_ctx, 'session_id', None)
-    entry = {"schema": LOG_SCHEMA_VERSION, "ts": ts, "event": event}
-    if sess:
-        entry["session_id"] = sess
-    entry.update(kwargs)
-    line = json.dumps(entry, ensure_ascii=False)
-    print(line)
-    log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
-    try:
-        with open(log_path, "a") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
+from proxy_logging import *
 
 
 # ---------------------------------------------------------------------------
@@ -2934,6 +2855,8 @@ lifecycle._get_system_memory = _get_system_memory
 
 
 admin_server._log = log
+
+proxy_logging._log = log
 def main():
     port = int(os.environ.get("PORT", "4000"))
     host = os.environ.get("HOST", "127.0.0.1")
