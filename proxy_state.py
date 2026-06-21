@@ -467,7 +467,7 @@ def _cast_config_value(value, cast):
 # ---------------------------------------------------------------------------
 __all__ = [
     # Backend
-    "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD", "_strategy",
+    "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD", "_strategy", "_SCRIPT_DIR",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
     # Tool-result clearing

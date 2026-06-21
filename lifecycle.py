@@ -80,7 +80,7 @@ def _classify_lifecycle_stage(messages, session_id=None):
       }
     """
     total_chars = _estimate_message_chars(messages)
-    # oom safety via strategy
+    cloud = not _strategy.oom_safety_enabled
 
     # Phase 1: detect session continuation. The increment happens here so the
     # counter advances exactly once per request, atomically w.r.t. the

@@ -3522,6 +3522,7 @@ class TestDynamicConcurrency(unittest.TestCase):
         self._orig_latencies = list(proxy._LATENCY_WINDOW)
         self._orig_errors = list(proxy._ERROR_WINDOW)
         self._orig_max = proxy.PROXY_MAX_CONCURRENT
+        proxy_state.PROXY_DYNAMIC_CONCURRENT_ENABLED = True
         proxy._LATENCY_WINDOW.clear()
         proxy._ERROR_WINDOW.clear()
 
@@ -3548,7 +3549,7 @@ class TestDynamicConcurrency(unittest.TestCase):
                         proxy._record_request_for_concurrency(60000, 200)
                     result = proxy._adjust_concurrency()
                     self.assertTrue(result.get("adjusted"))
-                    self.assertLess(proxy.PROXY_MAX_CONCURRENT, 4)
+                    self.assertLess(proxy_state.PROXY_MAX_CONCURRENT, 4)
 
     def test_low_latency_stable_does_not_change(self):
         with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):

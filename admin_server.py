@@ -1,4 +1,5 @@
 """Auto-extracted admin_server module."""
+import json
 import os, subprocess, time, threading
 from datetime import datetime
 import proxy_state as _ps
@@ -101,7 +102,7 @@ def _write_request_snapshot(request_id, before_body, after_body=None, error=None
     if not _ps.PROXY_SNAPSHOT_ENABLED:
         return False
     try:
-        snapshot_dir = os.path.join(_SCRIPT_DIR, "logs", "snapshots")
+        snapshot_dir = os.path.join(_ps._SCRIPT_DIR, "logs", "snapshots")
         os.makedirs(snapshot_dir, exist_ok=True)
         before_path = os.path.join(snapshot_dir, f"{request_id}_before.json")
         with open(before_path, "w", encoding="utf-8") as f:
@@ -187,8 +188,8 @@ def _get_log_stats():
     Requests get accurate timestamps from proxy logs [REQ_SUMMARY].
     OOM/CacheClear have no timestamp (backend logs don't include wall-clock time).
     For cloud backends, OOM/cache-clear metrics are not available."""
-    backend_tail = _read_log_tail(_LOG_PATH, 200000) if not _strategy.oom_safety_enabled else ""
-    proxy_log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
+    backend_tail = _read_log_tail(_ps._LOG_PATH, 200000) if not _strategy.oom_safety_enabled else ""
+    proxy_log_path = os.environ.get("PROXY_ps._LOG_PATH", "/tmp/anthropic_proxy.log")
     proxy_tail = _read_log_tail(proxy_log_path, 100000)
 
     # --- Extract request events from proxy logs ([HH:MM:SS] [REQ_SUMMARY] chars=X tools=Y) ---
@@ -243,7 +244,7 @@ def _get_cache_stats():
     if _strategy.oom_safety_enabled:
         return {"hit": 0, "miss": 0, "total": 0, "rate_str": "N/A", "since": "N/A (cloud)"}
     try:
-        with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        with open(_ps._LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
     except (OSError, IOError):
         return {"hit": 0, "miss": 0, "total": 0, "rate_str": "N/A", "since": "log unavailable"}
