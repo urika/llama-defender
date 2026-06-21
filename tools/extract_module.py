@@ -57,7 +57,7 @@ def find_refs(code_lines):
     cleaned = re.sub(r'"[^"]*"', '""', code)
     cleaned = re.sub(r"'[^']*'", "''", cleaned)
     cleaned = re.sub(r'#.*$', '', cleaned, flags=re.MULTILINE)
-    identifiers = set(re.findall(r'\b([A-Z][A-Z0-9_]*|[a-z_][a-z0-9_]*)\b', cleaned))
+    identifiers = set(re.findall(r'\b([A-Z][A-Z0-9_]*|[a-z_][_a-zA-Z0-9]*)\b', cleaned))
     return identifiers - KEYWORDS - STDLIB_NAMES
 
 
@@ -91,11 +91,11 @@ def analyze(target_funcs, proxy_path='anthropic_proxy.py'):
 
 def gen_module(name, result):
     lines = [f'"""Auto-extracted {name} module."""','import proxy_state as _ps']
-    # Add delegates for external functions (filter keywords and builtins)
+    # Add delegates for external functions (only for actual functions in proxy)
     import keyword
+    proxy_funcs = set(parse_funcs('anthropic_proxy.py').keys()) | {'log'}
     real_external = {e for e in result['external']
-                     if not keyword.iskeyword(e) and e not in STDLIB_NAMES
-                     and e not in ('_estimate_message_chars',)}  # handled via import
+                     if e in proxy_funcs and e not in ('_estimate_message_chars',)}
     if real_external:
         lines.append('# External function delegates — set by anthropic_proxy after import')
         for ext in sorted(real_external):
@@ -106,7 +106,7 @@ def gen_module(name, result):
     for cl in result['code']:
         line = cl.rstrip('\n')
         for ref in sorted(result['ps_refs'], key=len, reverse=True):
-            if ref in line and '_ps.' not in line and not line.lstrip().startswith('#'):
+            if ref in line and f'_ps.{ref}' not in line and not line.lstrip().startswith('#'):
                 line = line.replace(ref, f'_ps.{ref}')
         if result['log_refs'] and 'log(' in line and 'def _log' not in line and not line.lstrip().startswith('#'):
             line = line.replace('log(', '_log(')
@@ -116,6 +116,8 @@ def gen_module(name, result):
 
 
 def fix_tests(vars_list):
+    """Add proxy_state patches alongside existing proxy patches (dual strategy)."""
+    import re
     for tf in ['test/unit/test_proxy_fallback.py','test/unit/test_proxy_reload.py',
                'test/unit/test_text_loop.py','test/unit/test_payload_limit.py']:
         path = os.path.join(REPO_ROOT, tf)
@@ -123,17 +125,74 @@ def fix_tests(vars_list):
         with open(path) as f: c = f.read()
         changed = False
         for v in vars_list:
-            # Pattern 1: patch.object(proxy, "VAR" → patch.object(proxy_state, "VAR"
-            old = f'patch.object(proxy, "{v}"'
-            nu = f'patch.object(proxy_state, "{v}"'
-            if old in c: c = c.replace(old, nu); changed = True
-            # Pattern 2: proxy.VAR → proxy_state.VAR (direct attribute access)
-            old2 = f'proxy.{v}'
-            nu2 = f'proxy_state.{v}'
-            if old2 in c: c = c.replace(old2, nu2); changed = True
+            # Pattern 1: 'with patch.object(proxy, "VAR", val):' → dual context
+            p1 = re.compile(rf'(\s*)with patch\.object\(proxy, "{v}", ([^)]+)\):')
+            c2 = p1.sub(rf'\1with patch.object(proxy, "{v}", \2), patch.object(proxy_state, "{v}", \2):', c)
+            if c2 != c: c = c2; changed = True
+            # Pattern 2: list-based patches: patch.object(proxy, "VAR", val) → also add proxy_state
+            p2 = re.compile(rf'patch\.object\(proxy, "{v}", ([^)]+)\)')
+            # For each match, add a proxy_state equivalent right after
+            def add_dual(m):
+                return f'{m.group(0)}, patch.object(proxy_state, "{v}", {m.group(1)})'
+            c3 = p2.sub(add_dual, c)
+            if c3 != c: c = c3; changed = True
+            # Pattern 3: direct assignment proxy.VAR = val → also proxy_state.VAR = val
+            p3 = re.compile(rf'^(\s*)(proxy)\.({v})\s*=\s*(.+)$', re.MULTILINE)
+            c4 = p3.sub(rf'\1\2.\3 = \4\n\1proxy_state.\3 = \4', c)
+            if c4 != c: c = c4; changed = True
         if changed:
             with open(path,'w') as f: f.write(c)
             print(f"Updated {tf}")
+
+
+def apply_extraction(result, name, proxy_path='anthropic_proxy.py'):
+    """Generate module file and modify anthropic_proxy.py."""
+    mc = gen_module(name, result)
+    if '_estimate_message_chars' in result.get('external', set()):
+        mc = mc.replace('import proxy_state as _ps',
+                        'import proxy_state as _ps\nfrom message_converter import _estimate_message_chars')
+    with open(f'{name}.py','w') as f: f.write(mc)
+    with open(proxy_path) as f: cur = f.readlines()
+    ss = [x[0] for x in result['ranges'].values()]
+    ee = [x[1] for x in result['ranges'].values()]
+    mn, mx = min(ss), max(ee)
+    # Wire delegate at end before main()
+    delegate_lines = []
+    if result.get('log_refs'): delegate_lines.append(f'{name}._log = log')
+    proxy_funcs = set(parse_funcs('anthropic_proxy.py').keys()) | {'log'}
+    for ext in sorted(result.get('external',set())):
+        if ext in proxy_funcs and ext not in ('_estimate_message_chars',):
+            delegate_lines.append(f'{name}.{ext} = {ext}')
+    if delegate_lines:
+        for i, line in enumerate(cur):
+            if 'def main():' in line:
+                for dl in reversed(delegate_lines): cur.insert(i, dl + '\n')
+                if delegate_lines: cur.insert(i, '\n')
+                break
+    # Check if segments are contiguous
+    ranges_list = sorted(result['ranges'].values(), key=lambda x: x[0])
+    contiguous = True
+    for i in range(len(ranges_list) - 1):
+        if ranges_list[i + 1][0] > ranges_list[i][1] + 2:
+            contiguous = False
+            break
+
+    pre_lines = [f'import {name}\n', f'from {name} import *\n']
+    if name == 'lifecycle':
+        pre_lines += ['import content_compressor\n', 'from content_compressor import *\n']
+    pre_lines.append('\n')
+
+    if contiguous:
+        cur = cur[:mn-1] + pre_lines + cur[mx:]
+    else:
+        # Non-contiguous: remove each segment individually (highest first)
+        for s, e in reversed(ranges_list):
+            cur = cur[:s-1] + [f'from {name} import *\n'] + cur[e:]
+        # Add the 'import' line at the first segment
+        first_s = ranges_list[0][0]
+        cur.insert(first_s - 1, f'import {name}\n')
+    with open(proxy_path,'w') as f: f.writelines(cur)
+    print(f'{name}.py: {len(mc.splitlines())}l, proxy: {len(cur)}l')
 
 
 if __name__ == '__main__':

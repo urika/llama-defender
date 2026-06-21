@@ -335,7 +335,7 @@ class TestBlockerDetection(unittest.TestCase):
         return {"role": "user", "content": text}
 
     def test_disabled_short_circuits(self):
-        with patch.object(proxy, "PROXY_BLOCKER_ENABLED", False):
+        with patch.object(proxy, "PROXY_BLOCKER_ENABLED", False), patch.object(proxy_state, "PROXY_BLOCKER_ENABLED", False), patch.object(proxy_state, "PROXY_BLOCKER_ENABLED", False):
             msgs = [
                 self._assistant_tool_use("Read"),
                 self._user_tool_result("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，然后使用正确的文件路径。]"),
@@ -347,7 +347,7 @@ class TestBlockerDetection(unittest.TestCase):
         self.assertEqual(r.get("reason"), "disabled")
 
     def test_below_threshold(self):
-        with patch.object(proxy, "PROXY_BLOCKER_THRESHOLD", 3):
+        with patch.object(proxy, "PROXY_BLOCKER_THRESHOLD", 3), patch.object(proxy_state, "PROXY_BLOCKER_THRESHOLD", 3), patch.object(proxy_state, "PROXY_BLOCKER_THRESHOLD", 3):
             msgs = [
                 self._assistant_tool_use("Read"),
                 self._user_tool_result("[System: 文件不存在]"),
@@ -608,11 +608,11 @@ class TestToolClearing(unittest.TestCase):
         # length stays at the production default (200 chars).
         self._patches = [
             patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
-            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0),
+            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 0),
             patch.object(proxy, "PROXY_TOOL_KEEP", 2),
             patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
             # Frozen Zone disabled for backward-compatible tests
-            patch.object(proxy, "PROXY_FROZEN_HEAD", 0),
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0),
         ]
         for p in self._patches:
             p.start()
@@ -2039,6 +2039,7 @@ class TestCacheAligner(unittest.TestCase):
         # Save and restore env-driven setting
         orig = proxy.PROXY_CACHE_ALIGN_ENABLED
         proxy.PROXY_CACHE_ALIGN_ENABLED = False
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = False
         try:
             msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
             prefix, dynamic = proxy._apply_cache_aligner(msgs)
@@ -2046,12 +2047,15 @@ class TestCacheAligner(unittest.TestCase):
             self.assertEqual(dynamic, msgs)
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
 
     def test_protects_head(self):
         orig = proxy.PROXY_CACHE_ALIGN_ENABLED
         orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
         proxy.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
         proxy.PROXY_CACHE_ALIGN_HEAD = 2
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 2
         try:
             msgs = [
                 {"role": "system", "content": "sys"},
@@ -2066,13 +2070,17 @@ class TestCacheAligner(unittest.TestCase):
             self.assertEqual(len(dynamic), 2)
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
 
     def test_head_larger_than_messages(self):
         orig = proxy.PROXY_CACHE_ALIGN_ENABLED
         orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
         proxy.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
         proxy.PROXY_CACHE_ALIGN_HEAD = 10
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 10
         try:
             msgs = [{"role": "system", "content": "sys"}]
             prefix, dynamic = proxy._apply_cache_aligner(msgs)
@@ -2080,7 +2088,9 @@ class TestCacheAligner(unittest.TestCase):
             self.assertEqual(dynamic, [])
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
 
 
 class TestToolFilterStableOrder(unittest.TestCase):
@@ -2524,9 +2534,9 @@ class TestFrozenZoneToolClearing(unittest.TestCase):
     def setUp(self):
         self._patches = [
             patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
-            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0),
+            patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 0),
             patch.object(proxy, "PROXY_TOOL_KEEP", 2),
-            patch.object(proxy, "PROXY_FROZEN_HEAD", 12),
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 12), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 12),
             patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
         ]
         for p in self._patches:
@@ -2632,7 +2642,7 @@ class TestFrozenZoneToolClearing(unittest.TestCase):
 
     def test_frozen_zero_clears_all(self):
         """When PROXY_FROZEN_HEAD=0, all tool_results are eligible."""
-        with patch.object(proxy, "PROXY_FROZEN_HEAD", 0):
+        with patch.object(proxy, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0):
             msgs = self._msgs_with_frozen(n_frozen_reads=2, n_dynamic_reads=4)
             result, stats = proxy.clear_old_tool_results(msgs)
             self.assertEqual(stats["frozen_used"], 0)
@@ -2649,7 +2659,7 @@ class TestFrozenZoneThinkingStrip(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(proxy, "PROXY_FROZEN_HEAD", 12),
+            patch.object(proxy, "PROXY_FROZEN_HEAD", 12), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 12),
         ]
         for p in self._patches:
             p.start()
@@ -2743,7 +2753,7 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_init_stage(self):
         """Below PROXY_CLEAR_THRESHOLD → stage=init, no compression."""
-        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000):
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
             msgs = self._msgs_chars(10000)
             stage = proxy._classify_lifecycle_stage(msgs)
             self.assertEqual(stage["stage"], "init")
@@ -2753,8 +2763,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_growth_stage(self):
         """PROXY_CLEAR_THRESHOLD ≤ chars < PROXY_CHARS_GROWTH → growth."""
-        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000):
-            with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000):
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
+            with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
                 msgs = self._msgs_chars(25000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "growth")
@@ -2764,8 +2774,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_expansion_stage(self):
         """PROXY_CHARS_GROWTH ≤ chars < PROXY_CHARS_EXPANSION → expansion."""
-        with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000):
-            with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000):
+        with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
+            with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
                 msgs = self._msgs_chars(60000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "expansion")
@@ -2775,8 +2785,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_saturation_stage(self):
         """PROXY_CHARS_EXPANSION ≤ chars < PROXY_CHARS_SATURATION."""
-        with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000):
-            with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000):
+        with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
+            with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
                 msgs = self._msgs_chars(120000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "saturation")
@@ -2784,8 +2794,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_oom_danger_stage(self):
         """PROXY_CHARS_SATURATION ≤ chars < PROXY_CHARS_OOM_DANGER."""
-        with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000):
-            with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000):
+        with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
+            with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
                 msgs = self._msgs_chars(250000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "oom_danger")
@@ -2795,7 +2805,7 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_pre_trunc_stage(self):
         """chars ≥ PROXY_CHARS_OOM_DANGER → pre_trunc."""
-        with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000):
+        with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
             msgs = self._msgs_chars(500000)
             stage = proxy._classify_lifecycle_stage(msgs)
             self.assertEqual(stage["stage"], "pre_trunc")
@@ -2841,9 +2851,9 @@ class TestPhase1RoundsBudgetIterate(unittest.TestCase):
     def setUp(self):
         self._patches = [
             patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
-            patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10),
+            patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10), patch.object(proxy_state, "PROXY_CTX_KEEP_ROUNDS", 10),
             # Tight budget so iteration is forced.
-            patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000),
+            patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 30_000),
         ]
         for p in self._patches:
             p.start()
@@ -2915,10 +2925,10 @@ class TestPhase1SessionContinuation(unittest.TestCase):
         # Clear any state from other tests.
         proxy._SESSION_REQUEST_COUNT.clear()
         self._patches = [
-            patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", True),
-            patch.object(proxy, "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", 2),
-            patch.object(proxy, "PROXY_CHARS_EXPANSION", 90_000),
-            patch.object(proxy, "PROXY_CHARS_SATURATION", 180_000),
+            patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", True), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", True),
+            patch.object(proxy, "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", 2), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", 2),
+            patch.object(proxy, "PROXY_CHARS_EXPANSION", 90_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90_000),
+            patch.object(proxy, "PROXY_CHARS_SATURATION", 180_000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180_000),
         ]
         for p in self._patches:
             p.start()
@@ -2980,7 +2990,7 @@ class TestPhase1SessionContinuation(unittest.TestCase):
         """When PROXY_SESSION_CONTINUATION_ENABLED is false, the counter
         is not consulted regardless of count, and the function does not
         increment it."""
-        with patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", False):
+        with patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", False), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", False), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", False):
             # Pre-seed the counter to verify it is not advanced.
             proxy._SESSION_REQUEST_COUNT["sess_disabled"] = 100
             before = proxy._SESSION_REQUEST_COUNT["sess_disabled"]
@@ -3015,8 +3025,8 @@ class TestPhase1RoundsStrategyBudgetLoop(unittest.TestCase):
         proxy._SESSION_REQUEST_COUNT.clear()
         self._patches = [
             patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
-            patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10),
-            patch.object(proxy, "PROXY_CHARS_EXPANSION", 40_000),
+            patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10), patch.object(proxy_state, "PROXY_CTX_KEEP_ROUNDS", 10),
+            patch.object(proxy, "PROXY_CHARS_EXPANSION", 40_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 40_000),
         ]
         for p in self._patches:
             p.start()
@@ -3057,7 +3067,7 @@ class TestPhase2SmartStrategy(unittest.TestCase):
         self._patches = [
             patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "smart"),
             patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True),
-            patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000),
+            patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 30_000),
         ]
         for p in self._patches:
             p.start()
@@ -3384,8 +3394,8 @@ class TestDynamicMaxTokens(unittest.TestCase):
     """Phase 3.4: lifecycle-stage-aware max_tokens."""
 
     def test_init_stage_unchanged(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
                 mem = {"available_gb": 20, "total_gb": 48}
                 adjusted, reason = proxy._compute_dynamic_max_tokens(
                     4096, {"stage": "init"}, mem=mem)
@@ -3393,9 +3403,9 @@ class TestDynamicMaxTokens(unittest.TestCase):
                 self.assertIn("stage=init", reason)
 
     def test_saturation_stage_capped(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
                     mem = {"available_gb": 20, "total_gb": 48}
                     adjusted, reason = proxy._compute_dynamic_max_tokens(
                         8192, {"stage": "saturation"}, mem=mem)
@@ -3403,19 +3413,19 @@ class TestDynamicMaxTokens(unittest.TestCase):
                     self.assertIn("stage=saturation", reason)
 
     def test_rapid_mlx_discount(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "rapid-mlx/Qwen"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
-                    with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "rapid-mlx/Qwen"), patch.object(proxy_state, "MODEL_NAME", "rapid-mlx/Qwen"), patch.object(proxy_state, "MODEL_NAME", "rapid-mlx/Qwen"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+                    with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8):
                         mem = {"available_gb": 20, "total_gb": 48}
                         adjusted, _ = proxy._compute_dynamic_max_tokens(
                             8192, {"stage": "saturation"}, mem=mem)
                         self.assertEqual(adjusted, int(2048 * 0.8))
 
     def test_low_memory_discount(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
                     mem = {"available_gb": 5, "total_gb": 48}
                     adjusted, reason = proxy._compute_dynamic_max_tokens(
                         8192, {"stage": "saturation"}, mem=mem)
@@ -3423,7 +3433,7 @@ class TestDynamicMaxTokens(unittest.TestCase):
                     self.assertIn("low_memory", reason)
 
     def test_disabled_returns_original(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False):
             adjusted, reason = proxy._compute_dynamic_max_tokens(
                 4096, {"stage": "saturation"})
             self.assertEqual(adjusted, 4096)

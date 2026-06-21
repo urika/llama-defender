@@ -12,6 +12,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
+import proxy_state
 
 
 def _make_msg(text):
@@ -110,11 +111,13 @@ class TestTextLoopEdgeCases(unittest.TestCase):
         old = proxy.PROXY_TEXT_LOOP_ENABLED
         try:
             proxy.PROXY_TEXT_LOOP_ENABLED = False
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = False
             run, is_loop = proxy._detect_text_loop(msgs, threshold=3)
             self.assertFalse(is_loop)
             self.assertEqual(run, 0)
         finally:
             proxy.PROXY_TEXT_LOOP_ENABLED = old
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = old
 
 
 class TestComputeTextSimilarity(unittest.TestCase):
