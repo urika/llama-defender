@@ -525,9 +525,9 @@ class TestFifoPlaceholderStability(unittest.TestCase):
     def setUp(self):
         # Force fifo strategy for these tests regardless of the process env.
         self._patches = [
-            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"),
-            patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True),
-            patch.object(proxy, "PROXY_CTX_KEEP_MESSAGES", 40),
+            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"), patch.object(proxy_state, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"),
+            patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True), patch.object(proxy_state, "PROXY_CTX_LIMIT_ENABLED", True),
+            patch.object(proxy, "PROXY_CTX_KEEP_MESSAGES", 40), patch.object(proxy_state, "PROXY_CTX_KEEP_MESSAGES", 40),
             patch.object(proxy, "PROXY_CTX_KEEP_HEAD", 2),
         ]
         for p in self._patches:
@@ -607,7 +607,7 @@ class TestToolClearing(unittest.TestCase):
         # every test case actually triggers the clear pass. Read preview
         # length stays at the production default (200 chars).
         self._patches = [
-            patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
+            patch.object(proxy, "PROXY_CLEAR_ENABLED", True), patch.object(proxy_state, "PROXY_CLEAR_ENABLED", True),
             patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 0),
             patch.object(proxy, "PROXY_TOOL_KEEP", 2),
             patch.object(proxy, "PROXY_REREAD_PREVIEW_CHARS", 200),
@@ -739,7 +739,7 @@ class TestToolClearing(unittest.TestCase):
     def test_disabled_returns_immediately(self):
         """R2.2: when PROXY_CLEAR_ENABLED is False, the function is a
         no-op — no clearing, no scoring, stats.enabled=False."""
-        with patch.object(proxy, "PROXY_CLEAR_ENABLED", False):
+        with patch.object(proxy, "PROXY_CLEAR_ENABLED", False), patch.object(proxy_state, "PROXY_CLEAR_ENABLED", False), patch.object(proxy_state, "PROXY_CLEAR_ENABLED", False):
             msgs = self._msgs_with(n_reads=4)
             original = [m for m in msgs]  # shallow copy
             msgs, stats = proxy.clear_old_tool_results(msgs)
@@ -999,8 +999,8 @@ class TestIncrementalCompress(unittest.TestCase):
         for p in self._patches:
             p.stop()
         # Wipe session cache so cross-test state doesn't leak.
-        with proxy._summary_cache_lock:
-            proxy._summary_cache.clear()
+        with proxy_state._summary_cache_lock:
+            proxy_state._summary_cache.clear()
 
     def _err_msg(self, text):
         """A user message with a tool_result block that contains 'error'
@@ -1016,8 +1016,8 @@ class TestIncrementalCompress(unittest.TestCase):
     def test_first_call_no_cache_uses_rules_path(self):
         """R1.3: first compression on a fresh session uses the rule-based
         path (not the LLM) because dropped has <10 messages."""
-        with proxy._summary_cache_lock:
-            proxy._summary_cache.pop("sess_A", None)
+        with proxy_state._summary_cache_lock:
+            proxy_state._summary_cache.pop("sess_A", None)
         dropped = [self._err_msg(f"boom_{i}") for i in range(3)]
         result, was_incremental = proxy._incremental_compress(dropped, "sess_A")
         self.assertIsNotNone(result)
@@ -1047,33 +1047,33 @@ class TestIncrementalCompress(unittest.TestCase):
         """R1.3: when _SUMMARY_CACHE_MAX_SESSIONS is reached, the oldest
         session is evicted to make room. New sessions start fresh."""
         # Save the real limit and override for this test.
-        real_max = proxy._SUMMARY_CACHE_MAX_SESSIONS
-        with patch.object(proxy, "_SUMMARY_CACHE_MAX_SESSIONS", 2):
+        real_max = proxy_state._SUMMARY_CACHE_MAX_SESSIONS
+        with patch.object(proxy_state, "_SUMMARY_CACHE_MAX_SESSIONS", 2):
             # Fill the cache: sess_1 (oldest), sess_2.
             proxy._incremental_compress([self._err_msg("a")], "sess_1")
             proxy._incremental_compress([self._err_msg("b")], "sess_2")
-            with proxy._summary_cache_lock:
-                self.assertIn("sess_1", proxy._summary_cache)
-                self.assertIn("sess_2", proxy._summary_cache)
+            with proxy_state._summary_cache_lock:
+                self.assertIn("sess_1", proxy_state._summary_cache)
+                self.assertIn("sess_2", proxy_state._summary_cache)
             # Add sess_3 → sess_1 (oldest) should be evicted.
             proxy._incremental_compress([self._err_msg("c")], "sess_3")
-            with proxy._summary_cache_lock:
-                self.assertNotIn("sess_1", proxy._summary_cache)
-                self.assertIn("sess_2", proxy._summary_cache)
-                self.assertIn("sess_3", proxy._summary_cache)
+            with proxy_state._summary_cache_lock:
+                self.assertNotIn("sess_1", proxy_state._summary_cache)
+                self.assertIn("sess_2", proxy_state._summary_cache)
+                self.assertIn("sess_3", proxy_state._summary_cache)
         # Restore so teardown's `cache.clear()` is consistent.
         proxy._SUMMARY_CACHE_MAX_SESSIONS = real_max
 
     def test_empty_dropped_returns_none(self):
         """R1.3: when dropped is empty, the function returns (None, None)
         — there's nothing to summarise. The cache must NOT be populated."""
-        with proxy._summary_cache_lock:
-            proxy._summary_cache.pop("sess_E", None)
+        with proxy_state._summary_cache_lock:
+            proxy_state._summary_cache.pop("sess_E", None)
         result, was_incremental = proxy._incremental_compress([], "sess_E")
         self.assertIsNone(result)
         self.assertIsNone(was_incremental)
-        with proxy._summary_cache_lock:
-            self.assertNotIn("sess_E", proxy._summary_cache)
+        with proxy_state._summary_cache_lock:
+            self.assertNotIn("sess_E", proxy_state._summary_cache)
 
 
 # =============================================================================
@@ -2568,7 +2568,7 @@ class TestFrozenZoneToolClearing(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(proxy, "PROXY_CLEAR_ENABLED", True),
+            patch.object(proxy, "PROXY_CLEAR_ENABLED", True), patch.object(proxy_state, "PROXY_CLEAR_ENABLED", True),
             patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 0), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 0),
             patch.object(proxy, "PROXY_TOOL_KEEP", 2),
             patch.object(proxy, "PROXY_FROZEN_HEAD", 12), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 12),
@@ -2885,7 +2885,7 @@ class TestPhase1RoundsBudgetIterate(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
+            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"), patch.object(proxy_state, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
             patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10), patch.object(proxy_state, "PROXY_CTX_KEEP_ROUNDS", 10),
             # Tight budget so iteration is forced.
             patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 30_000),
@@ -3059,7 +3059,7 @@ class TestPhase1RoundsStrategyBudgetLoop(unittest.TestCase):
     def setUp(self):
         proxy._SESSION_REQUEST_COUNT.clear()
         self._patches = [
-            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
+            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"), patch.object(proxy_state, "PROXY_CTX_TRUNCATE_STRATEGY", "rounds"),
             patch.object(proxy, "PROXY_CTX_KEEP_ROUNDS", 10), patch.object(proxy_state, "PROXY_CTX_KEEP_ROUNDS", 10),
             patch.object(proxy, "PROXY_CHARS_EXPANSION", 40_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 40_000),
         ]
@@ -3100,8 +3100,8 @@ class TestPhase2SmartStrategy(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "smart"),
-            patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True),
+            patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "smart"), patch.object(proxy_state, "PROXY_CTX_TRUNCATE_STRATEGY", "smart"),
+            patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True), patch.object(proxy_state, "PROXY_CTX_LIMIT_ENABLED", True),
             patch.object(proxy, "PROXY_CHARS_EXPANSION", 30_000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 30_000),
         ]
         for p in self._patches:

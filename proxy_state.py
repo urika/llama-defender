@@ -283,12 +283,26 @@ TOOL_SEMANTIC_PRIORITY = {
     "Read": 3, "Agent": 3, "WebFetch": 2, "WebSearch": 2,
     "Bash": 1, "Edit": 1, "Write": 1,
 }
+# LLM compression cache (used by truncation module)
+_summary_cache = {}
+_summary_cache_lock = threading.Lock()
+_SUMMARY_CACHE_MAX_SESSIONS = 10
+_SUMMARY_CACHE_MAX_CHARS = 3000
+
 TOOL_RESULT_HIGH_VALUE_PATTERNS = [
     (re.compile(r'(function |class |def |import |from |\{\s*"[a-z]|\#include)', re.IGNORECASE), 3),
     (re.compile(r'(total \d+|drwx|\.py$|\.js$|\.ts$)', re.IGNORECASE), 1),
     (re.compile(r'(error|traceback|exception)', re.IGNORECASE), 2),
     (re.compile(r'Wasted call', re.IGNORECASE), 0),
 ]
+
+# ---------------------------------------------------------------------------
+# Incremental summary cache (used by truncation.py)
+# ---------------------------------------------------------------------------
+_summary_cache = {}
+_summary_cache_lock = threading.Lock()
+_SUMMARY_CACHE_MAX_SESSIONS = 10
+_SUMMARY_CACHE_MAX_CHARS = 3000
 
 # ---------------------------------------------------------------------------
 # Structured request logging
@@ -529,10 +543,13 @@ __all__ = [
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority
     "TOOL_SEMANTIC_PRIORITY", "TOOL_RESULT_HIGH_VALUE_PATTERNS",
+    "_summary_cache", "_summary_cache_lock", "_SUMMARY_CACHE_MAX_SESSIONS", "_SUMMARY_CACHE_MAX_CHARS",
     # Logging
     "_LOG_DIR", "_LOG_PATH", "_JSONL_PATH", "_jsonl_lock", "_jsonl_output_map", "_jsonl_counter",
     "PROXY_METRICS_ENABLED", "PROXY_METRICS_DIR", "_METRICS_PATH", "_metrics_lock",
     "_state_lock", "MODEL_ALIASES", "_log_ctx", "_metrics_ctx",
+    # Summary cache
+    "_summary_cache", "_summary_cache_lock", "_SUMMARY_CACHE_MAX_SESSIONS", "_SUMMARY_CACHE_MAX_CHARS",
     # Reload
     "_RELOAD_LOCK", "RELOAD_CONFIG_PATH", "RELOAD_SECRET_PATH", "_RELOAD_SPEC",
     # Config helpers
