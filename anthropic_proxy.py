@@ -16,269 +16,137 @@ import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
+from proxy_state import *
 import proxy_config
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-LLAMA_BASE = os.environ.get("LLAMA_BASE_URL", "http://127.0.0.1:8081/v1")
-LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "sk-1234")
-# Backend type: "local" (llama-server/rapid-mlx) or "cloud" (DeepSeek/OpenAI)
-BACKEND_TYPE = os.environ.get("BACKEND_TYPE", "")
-if not BACKEND_TYPE:
-    # Auto-detect from URL
-    if "deepseek" in LLAMA_BASE.lower() or "openai" in LLAMA_BASE.lower() or "api." in LLAMA_BASE.lower():
-        BACKEND_TYPE = "cloud"
-    else:
-        BACKEND_TYPE = "local"
-IS_CLOUD = BACKEND_TYPE == "cloud"
+LOG_SCHEMA_VERSION = "v1"
+
 
 # ---------------------------------------------------------------------------
-# Concurrency control: backend-aware request serialization
-# llama-server on Metal single-GPU suffers from time-slicing with -np > 1,
-# so it defaults to 1 (serialized). rapid-mlx handles 2-4 concurrent requests
-# well, so its config sets this higher.
-# Cloud APIs handle concurrency natively, so we allow more.
+# SIGHUP hot-reload: re-read active.conf and update config in proxy_state + self.
+# Dual setattr (proxy_state + self_mod) ensures both sub-modules (which read
+# proxy_state.PROXY_* at call time) and local functions (which reference
+# module-level names imported via `from proxy_state import *`) see updates.
 # ---------------------------------------------------------------------------
-PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", "4" if IS_CLOUD else "1"))
-_llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
-# TODO(roadmap-U6): Multi-model collaboration — small model for compression, large for main inference
-MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-v4-pro" if IS_CLOUD else "mlx-community/Qwen3.6-35B-A3B-4bit")
 
-# ---------------------------------------------------------------------------
-# Tool-result clearing: proxy-side context management
-# Defaults are tied to BACKEND_TYPE:
-#   - Cloud APIs (DeepSeek/OpenAI): disabled by default (1M+ token context)
-#   - Local backends (llama-server/rapid-mlx): enabled by default (limited VRAM)
-# Override via env vars: PROXY_CLEAR_ENABLED, PROXY_CLEAR_THRESHOLD, PROXY_TOOL_KEEP
-# ---------------------------------------------------------------------------
-PROXY_CLEAR_ENABLED = os.environ.get("PROXY_CLEAR_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_CLEAR_THRESHOLD = int(os.environ.get("PROXY_CLEAR_THRESHOLD", "30000" if IS_CLOUD else "15000"))  # chars, not tokens
-PROXY_TOOL_KEEP = int(os.environ.get("PROXY_TOOL_KEEP", "10" if IS_CLOUD else "2"))  # keep last N tool_use/tool_result pairs
+def _reload_config(signum=None, frame=None):
+    """SIGHUP handler: re-read active.conf and update proxy_state + self module."""
+    with _RELOAD_LOCK:
+        self_mod = sys.modules[__name__]
+        env = _parse_conf_env(RELOAD_CONFIG_PATH)
+        secret_env = _parse_conf_env(RELOAD_SECRET_PATH)
+        if secret_env:
+            env.update({k: v for k, v in secret_env.items() if k not in env})
+        if not env:
+            log("[RELOAD] no config parsed from %s — keeping current values"
+                % RELOAD_CONFIG_PATH, level="WARN")
+            return
 
-# ---------------------------------------------------------------------------
-# Frozen Zone: protect the first N messages from L2/L4 modification to
-# preserve prefix KV cache stability across consecutive requests.
-# - Local: 12 messages (~5-8K tokens of stable prefix)
-# - Cloud: 0 (disabled, 1M+ context means low marginal cache value)
-# Override via env vars:
-# ---------------------------------------------------------------------------
-PROXY_FROZEN_HEAD = int(os.environ.get("PROXY_FROZEN_HEAD", "0" if IS_CLOUD else "12"))
+        # --- Backend routing ---
+        if "LLAMA_BASE_URL" in env:
+            base = env["LLAMA_BASE_URL"]
+        else:
+            host = env.get("LLAMA_HOST", "127.0.0.1")
+            port = env.get("LLAMA_PORT", "8081")
+            base = "http://%s:%s/v1" % (host, port)
+        setattr(proxy_state, "LLAMA_BASE", base)
+        setattr(self_mod, "LLAMA_BASE", base)
+        api_key = env.get("LLAMA_API_KEY", getattr(self_mod, "LLAMA_API_KEY"))
+        setattr(proxy_state, "LLAMA_API_KEY", api_key)
+        setattr(self_mod, "LLAMA_API_KEY", api_key)
 
-# ---------------------------------------------------------------------------
-# Tail-first clearing: when enabled, L2 clear_old_tool_results() operates
-# from tail to head in the dynamic zone. The newest tool_results get
-# cleared first, protecting the prefix's cache stability.
-# ---------------------------------------------------------------------------
-PROXY_CLEAR_TAIL_FIRST = os.environ.get("PROXY_CLEAR_TAIL_FIRST", "true").lower() in ("1", "true", "yes")
+        bt = env.get("BACKEND_TYPE", "")
+        if not bt:
+            low = base.lower()
+            if "deepseek" in low or "openai" in low or "api." in low:
+                bt = "cloud"
+            else:
+                bt = "local"
+        setattr(proxy_state, "BACKEND_TYPE", bt)
+        setattr(self_mod, "BACKEND_TYPE", bt)
+        is_cloud = bt == "cloud"
+        setattr(proxy_state, "IS_CLOUD", is_cloud)
+        setattr(self_mod, "IS_CLOUD", is_cloud)
 
-# ---------------------------------------------------------------------------
-# Cache Aligner (Phase 1): protect the first N messages from truncation and
-# reordering to stabilize the prefix KV cache across consecutive requests.
-# - Local: enabled by default, head=4 (system + skills + first user + first assistant)
-# - Cloud: disabled by default (1M context, low marginal cache value)
-# ---------------------------------------------------------------------------
-PROXY_CACHE_ALIGN_ENABLED = os.environ.get("PROXY_CACHE_ALIGN_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_CACHE_ALIGN_HEAD = int(os.environ.get("PROXY_CACHE_ALIGN_HEAD", "4"))
+        # MODEL_NAME
+        model = env.get("MODEL_NAME") or env.get("LLAMA_MODEL",
+                                                  getattr(self_mod, "MODEL_NAME"))
+        setattr(proxy_state, "MODEL_NAME", model)
+        setattr(self_mod, "MODEL_NAME", model)
 
-# Per-session last messages for computing common_prefix_ratio.
-# Key: session_id, Value: list of message dicts (after cache aligner / before truncation).
-_SESSION_LAST_MESSAGES = {}
-_LOOP_SESSION_STATE = {}
+        # --- Concurrency + Semaphore rebuild ---
+        new_max = int(env.get("PROXY_MAX_CONCURRENT", "4" if is_cloud else "1"))
+        old_max = getattr(self_mod, "PROXY_MAX_CONCURRENT")
+        setattr(proxy_state, "PROXY_MAX_CONCURRENT", new_max)
+        setattr(self_mod, "PROXY_MAX_CONCURRENT", new_max)
+        if new_max != old_max:
+            setattr(proxy_state, "_llama_lock", threading.Semaphore(new_max))
+            setattr(self_mod, "_llama_lock", threading.Semaphore(new_max))
+            log("[RELOAD] Semaphore rebuilt: %d -> %d" % (old_max, new_max))
 
-# Shared state for session tracking, dedup, and dynamic concurrency.
-# Read-modify-write sequences on these dicts must acquire proxy_config._state_lock.
-_SESSION_REQUEST_COUNT = {}
-_DEDUP_CACHE = {}
-# ---------------------------------------------------------------------------
-# Semantic content compression (Phase 2): TokenSieve-inspired structured
-# compression for tool_result contents. Reduces token pressure while keeping
-# semantics, as an alternative/supplement to aggressive tool-result clearing.
-# ---------------------------------------------------------------------------
-PROXY_COMPRESS_ENABLED = os.environ.get("PROXY_COMPRESS_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_COMPRESS_THRESHOLD = int(os.environ.get("PROXY_COMPRESS_THRESHOLD", "4096"))
-PROXY_COMPRESS_MODE = os.environ.get("PROXY_COMPRESS_MODE", "semantic")  # lossless | semantic | aggressive
-PROXY_SCRUB_ANSI = os.environ.get("PROXY_SCRUB_ANSI", "true").lower() in ("1", "true", "yes")
-PROXY_SIEVE_JSON_MAX_ITEMS = int(os.environ.get("PROXY_SIEVE_JSON_MAX_ITEMS", "10"))
-PROXY_SIEVE_JSON_MAX_STR_LEN = int(os.environ.get("PROXY_SIEVE_JSON_MAX_STR_LEN", "200"))
-PROXY_SIEVE_JSON_MAX_DEPTH = int(os.environ.get("PROXY_SIEVE_JSON_MAX_DEPTH", "4"))
-PROXY_LOG_DEDUPE = os.environ.get("PROXY_LOG_DEDUPE", "true").lower() in ("1", "true", "yes")
-PROXY_DEDUPE_SCALARS = os.environ.get("PROXY_DEDUPE_SCALARS", "false").lower() in ("1", "true", "yes")
-PROXY_COMPRESS_AUDIT = os.environ.get("PROXY_COMPRESS_AUDIT", "true").lower() in ("1", "true", "yes")
+        # --- MODEL_ALIASES rebuild ---
+        aliases = [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-5-haiku-20241022",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-opus-4-7",
+            "default",
+            model,
+        ]
+        setattr(proxy_state, "MODEL_ALIASES", aliases)
+        setattr(self_mod, "MODEL_ALIASES", aliases)
 
-CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", "true").lower() in ("1", "true", "yes")
+        # --- Tier 1 scalars ---
+        for env_key, py_name, cast, cloud_def, local_def in _RELOAD_SPEC:
+            default = cloud_def if is_cloud else local_def
+            raw = env.get(env_key, default)
+            val = _cast_config_value(raw, cast)
+            setattr(proxy_state, py_name, val)
+            setattr(self_mod, py_name, val)
 
-# ---------------------------------------------------------------------------
-# Context-limit truncation: proxy-side message dropping when total context
-# exceeds backend capacity. Complements tool-result clearing by dropping
-# entire old messages (not just tool payloads).
-# Defaults tied to BACKEND_TYPE (disabled for cloud, enabled for local).
-# ---------------------------------------------------------------------------
-PROXY_CTX_LIMIT_ENABLED = os.environ.get("PROXY_CTX_LIMIT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_CTX_CHARS_LIMIT = int(os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000"))  # chars heuristic
-PROXY_CTX_KEEP_HEAD = int(os.environ.get("PROXY_CTX_KEEP_HEAD", "2"))  # keep first N messages (system context + skills)
-PROXY_CTX_KEEP_TAIL = int(os.environ.get("PROXY_CTX_KEEP_TAIL", "4"))  # keep last N messages
-PROXY_CTX_TRUNCATE_STRATEGY = os.environ.get("PROXY_CTX_TRUNCATE_STRATEGY", "char")
-PROXY_CTX_KEEP_ROUNDS = int(os.environ.get("PROXY_CTX_KEEP_ROUNDS", "10"))
-PROXY_CTX_KEEP_MESSAGES = int(os.environ.get("PROXY_CTX_KEEP_MESSAGES", "40"))  # fifo strategy: total messages to keep
-PROXY_CTX_TOKEN_BUDGET = int(os.environ.get("PROXY_CTX_TOKEN_BUDGET", "30000"))
-PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
+        # --- Dependent defaults ---
+        loop_thr = int(env.get("PROXY_LOOP_THRESHOLD",
+                               getattr(self_mod, "PROXY_LOOP_THRESHOLD")))
+        setattr(proxy_state, "PROXY_LOOP_THRESHOLD", loop_thr)
+        setattr(self_mod, "PROXY_LOOP_THRESHOLD", loop_thr)
+        setattr(proxy_state, "PROXY_LOOP_LEVEL2",
+                int(env.get("PROXY_LOOP_LEVEL2", str(loop_thr * 2))))
+        setattr(self_mod, "PROXY_LOOP_LEVEL2",
+                int(env.get("PROXY_LOOP_LEVEL2", str(loop_thr * 2))))
+        setattr(proxy_state, "PROXY_LOOP_LEVEL3",
+                int(env.get("PROXY_LOOP_LEVEL3", str(loop_thr * 3))))
+        setattr(self_mod, "PROXY_LOOP_LEVEL3",
+                int(env.get("PROXY_LOOP_LEVEL3", str(loop_thr * 3))))
 
-# ---------------------------------------------------------------------------
-# Unified char-based lifecycle stage thresholds.
-# All size thresholds use _estimate_message_chars() as the single metric.
-# Stages are strictly monotonic by char count — lighter compression at
-# lower thresholds, heavier at higher thresholds.
-#
-#   INIT       < PROXY_CLEAR_THRESHOLD           (15K)  — no compression
-#   GROWTH     < PROXY_CHARS_GROWTH              (40K)  — tail-40% clearing
-#   EXPANSION  < PROXY_CHARS_EXPANSION           (90K)  — tail-60% clearing + think strip
-#   SATURATION < PROXY_CHARS_SATURATION          (180K) — full-dynamic clear + merge + trunc
-#   OOM_DANGER < PROXY_CHARS_OOM_DANGER          (350K) — no frozen + hard truncation
-#   PRE_TRUNC  ≥ PROXY_OOM_SAFE_CHARS            (200K) — keep_rounds=2
-#
-# Deprecated aliases (auto-fallback if new var not set):
-#   PROXY_CTX_CHARS_LIMIT → PROXY_CHARS_SATURATION
-# ---------------------------------------------------------------------------
-PROXY_CHARS_GROWTH = int(os.environ.get(
-    "PROXY_CHARS_GROWTH", "80000" if IS_CLOUD else "40000"))
-PROXY_CHARS_EXPANSION = int(os.environ.get(
-    "PROXY_CHARS_EXPANSION", "200000" if IS_CLOUD else "90000"))
-PROXY_CHARS_SATURATION = int(os.environ.get(
-    "PROXY_CHARS_SATURATION",
-    os.environ.get("PROXY_CTX_CHARS_LIMIT", "500000" if IS_CLOUD else "180000")))
-PROXY_CHARS_OOM_DANGER = int(os.environ.get(
-    "PROXY_CHARS_OOM_DANGER", "1000000" if IS_CLOUD else "350000"))
+        sat = (env.get("PROXY_CHARS_SATURATION")
+               or env.get("PROXY_CTX_CHARS_LIMIT",
+                          "500000" if is_cloud else "180000"))
+        setattr(proxy_state, "PROXY_CHARS_SATURATION", int(sat))
+        setattr(self_mod, "PROXY_CHARS_SATURATION", int(sat))
 
-# ---------------------------------------------------------------------------
-# Output token control: prevent rapid-mlx from generating unbounded output
-# Known Issue #1: rapid-mlx ignores max_tokens
-# ---------------------------------------------------------------------------
-PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0"))
-PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
-PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "300"))
+        oom = (env.get("PROXY_OOM_SAFE_CHARS")
+               or env.get("PROXY_PRE_TRUNCATE_CHARS", "200000"))
+        setattr(proxy_state, "PROXY_OOM_SAFE_CHARS", int(oom))
+        setattr(self_mod, "PROXY_OOM_SAFE_CHARS", int(oom))
+        setattr(proxy_state, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
+        setattr(self_mod, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
 
-# DEF-001: hard ceiling for total payload size to prevent rapid-mlx OOM/timeout.
-# When a request exceeds this char count, the proxy force-truncates to
-# keep_rounds=2 BEFORE any other processing. Default lowered 400K → 200K
-# (Phase 1 of proxy-truncation-agent-scenario.md) because multi-round agent
-# sessions can compose 80K history + 80K new content = 160K; the old 400K
-# ceiling left no headroom for the actual LLM call after pipeline overhead.
-# Tune via PROXY_OOM_SAFE_CHARS env var; set very high (e.g. 10000000) to
-# disable. PROXY_PRE_TRUNCATE_CHARS is the legacy name, kept for compat.
-PROXY_OOM_SAFE_CHARS = int(os.environ.get(
-    "PROXY_OOM_SAFE_CHARS",
-    os.environ.get("PROXY_PRE_TRUNCATE_CHARS", "200000"),
-))
-# Legacy alias for any external consumers (status page, metrics, tests).
-PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS
+        log("[RELOAD] OK: backend=%s base=%s model=%s concurrent=%d "
+            "clear=%s ctx_limit=%s frozen=%d truncate=%s"
+            % (bt, base[:60], model, new_max,
+               getattr(self_mod, "PROXY_CLEAR_ENABLED"),
+               getattr(self_mod, "PROXY_CTX_LIMIT_ENABLED"),
+               getattr(self_mod, "PROXY_FROZEN_HEAD"),
+               getattr(self_mod, "PROXY_CTX_TRUNCATE_STRATEGY")))
 
-# P0: Hard limit on request body size to prevent Metal OOM from oversized payloads.
-# If Content-Length exceeds this threshold, return 413 Payload Too Large immediately,
-# before any pipeline processing. This catches runaway requests (e.g. 359KB tool+dialog)
-# that would crash the backend regardless of OOM_SAFE_CHARS pre-truncation.
-# Default: 500KB — safe for 48GB machines with 27B-class models.
-PROXY_MAX_REQUEST_BYTES = int(os.environ.get("PROXY_MAX_REQUEST_BYTES", str(500 * 1024)))
 
-# DEF-005: estimated prompt token limit to prevent Metal OOM.
-# After all pipeline steps, if estimated tokens exceed this, force aggressive FIFO.
-# Set to 0 to disable. Default 60000 (~120K chars at ratio 2.0) for 48GB Apple Silicon.
-PROXY_OOM_SAFE_TOKENS = int(os.environ.get("PROXY_OOM_SAFE_TOKENS", "60000"))
+# Register SIGHUP handler (must be in main thread at import time).
+signal.signal(signal.SIGHUP, _reload_config)
 
-# DEF-001 retry: seconds to ask clients to wait before retrying on 503/504.
-PROXY_RETRY_AFTER_SECONDS = int(os.environ.get("PROXY_RETRY_AFTER_SECONDS", "30"))
-
-# ---------------------------------------------------------------------------
-# Phase 3: dynamic token estimation by content type
-# Replaces the single PROXY_CTX_TOKEN_RATIO for more accurate token counts
-# when the prompt is dominated by Chinese, English, or code.
-# ---------------------------------------------------------------------------
-PROXY_TOKEN_RATIO_CHINESE = float(os.environ.get("PROXY_TOKEN_RATIO_CHINESE", "1.5"))
-PROXY_TOKEN_RATIO_ENGLISH = float(os.environ.get("PROXY_TOKEN_RATIO_ENGLISH", "4.0"))
-PROXY_TOKEN_RATIO_CODE = float(os.environ.get("PROXY_TOKEN_RATIO_CODE", "3.0"))
-
-# ---------------------------------------------------------------------------
-# Phase 3: memory pressure active rejection
-# If system used_pct exceeds this threshold, reject new requests with 503.
-# ---------------------------------------------------------------------------
-PROXY_MEMORY_REJECT_THRESHOLD = float(os.environ.get(
-    "PROXY_MEMORY_REJECT_THRESHOLD", "95" if IS_CLOUD else "90"))
-
-# ---------------------------------------------------------------------------
-# Phase 3: dynamic max_tokens based on lifecycle stage and backend type
-# ---------------------------------------------------------------------------
-PROXY_DYNAMIC_MAX_TOKENS_ENABLED = os.environ.get(
-    "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
-PROXY_DYNAMIC_MAX_TOKENS_INIT = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_INIT", "4096"))
-PROXY_DYNAMIC_MAX_TOKENS_GROWTH = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "4096"))
-PROXY_DYNAMIC_MAX_TOKENS_SATURATION = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "2048"))
-PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO = float(os.environ.get(
-    "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "0.8"))
-
-# ---------------------------------------------------------------------------
-# Phase 3: request failure snapshots
-# ---------------------------------------------------------------------------
-PROXY_SNAPSHOT_ENABLED = os.environ.get("PROXY_SNAPSHOT_ENABLED", "true").lower() in ("1", "true", "yes")
-PROXY_SNAPSHOT_MAX_FILES = int(os.environ.get("PROXY_SNAPSHOT_MAX_FILES", "50"))
-
-# ---------------------------------------------------------------------------
-# Phase 3: dynamic concurrency control
-# ---------------------------------------------------------------------------
-PROXY_DYNAMIC_CONCURRENT_ENABLED = os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
-PROXY_DYNAMIC_CONCURRENT_MIN = int(os.environ.get("PROXY_DYNAMIC_CONCURRENT_MIN", "1"))
-PROXY_DYNAMIC_CONCURRENT_MAX = int(os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_MAX", "8" if IS_CLOUD else "4"))
-PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS = float(os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS", "30000"))
-PROXY_DYNAMIC_CONCURRENT_ERROR_RATE = float(os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE", "0.2"))
-
-# ---------------------------------------------------------------------------
-# Loop detection: detect consecutive identical tool_use calls
-# ---------------------------------------------------------------------------
-PROXY_LOOP_THRESHOLD = int(os.environ.get("PROXY_LOOP_THRESHOLD", "3"))
-PROXY_LOOP_LEVEL2 = int(os.environ.get("PROXY_LOOP_LEVEL2", str(PROXY_LOOP_THRESHOLD * 2)))
-PROXY_LOOP_LEVEL3 = int(os.environ.get("PROXY_LOOP_LEVEL3", str(PROXY_LOOP_THRESHOLD * 3)))
-
-# Text output loop detection: detect repeated similar text in assistant messages
-PROXY_TEXT_LOOP_ENABLED = os.environ.get("PROXY_TEXT_LOOP_ENABLED", "true").lower() in ("true", "1", "yes")
-PROXY_TEXT_LOOP_THRESHOLD = int(os.environ.get("PROXY_TEXT_LOOP_THRESHOLD", "3"))
-PROXY_TEXT_LOOP_MIN_CHARS = int(os.environ.get("PROXY_TEXT_LOOP_MIN_CHARS", "100"))
-PROXY_TEXT_LOOP_SIMILARITY = float(os.environ.get("PROXY_TEXT_LOOP_SIMILARITY", "0.85"))
-
-_LOOP_SESSION_STATE = {}
-
-# Phase 1 (改进3): session request counter for continuation detection.
-# When a session has ≥ PROXY_SESSION_CONTINUATION_MIN_REQUESTS prior
-# requests AND the current payload is in saturation/expansion territory,
-# _classify_lifecycle_stage returns an aggressive config (frozen_head=2,
-# truncate_rounds=max(3, base//2)) to prevent OOM in long agent sessions.
-# Thread safety: read-modify-write on this dict must acquire
-# proxy_config._state_lock (see _classify_lifecycle_stage).
-_SESSION_REQUEST_COUNT = {}
-
-PROXY_SESSION_CONTINUATION_ENABLED = os.environ.get(
-    "PROXY_SESSION_CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes")
-PROXY_SESSION_CONTINUATION_MIN_REQUESTS = int(os.environ.get(
-    "PROXY_SESSION_CONTINUATION_MIN_REQUESTS", "2"))
-
-PROXY_DEDUP_WINDOW = int(os.environ.get("PROXY_DEDUP_WINDOW", "2"))
-_DEDUP_CACHE = {}
-
-# Phase 3: sliding windows for dynamic concurrency control.
-_LATENCY_WINDOW = collections.deque(maxlen=50)
-_ERROR_WINDOW = collections.deque(maxlen=50)
-
-# Phase 3: metrics schema v1 fixed field set.
-# Any metric record logged by log_metrics() is guaranteed to contain these keys.
-_METRICS_V1_FIELDS = {
-    "schema_version", "ts", "session_id", "input_msgs", "input_chars",
-    "input_tools", "output_chars", "duration_ms", "status", "error_type",
-    "error", "pipeline", "quality_flags", "compression_ratio", "token_ratio",
-    "est_input_tokens", "est_output_tokens", "memory_rejected", "used_pct",
-    "max_tokens_original", "max_tokens_dynamic", "snapshot_written",
-    "dynamic_concurrent", "tools",
-}
 
 def _check_dedup(body_str):
     """Hash-based request dedup with TTL.

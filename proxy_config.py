@@ -211,7 +211,7 @@ CONFIG_REGISTRY = {
         "doc": "Multiplier applied to max_tokens for output safety margin.",
     },
     "PROXY_BACKEND_TIMEOUT": {
-        "defaults": {"all": "300"},
+        "defaults": {"all": "600"},
         "type": "int", "scope": "reloadable",
         "doc": "Backend request timeout in seconds. Increase for long-context (100K+ prefill ~5 min).",
     },
@@ -506,18 +506,20 @@ CONFIG_REGISTRY = {
 }
 
 # ---------------------------------------------------------------------------
-# Thread lock and shared state: used by anthropic_proxy.py for thread-safe
-# module-level dict access. Defined here to avoid circular imports —
-# proxy_config has no dependencies.
+# Thread lock and shared state: imported from proxy_state (single source of
+# truth for all module-level config constants and mutable shared state).
+# Previously defined here to avoid circular imports — now resolved by
+# extracting state into its own dependency-free module.
 # ---------------------------------------------------------------------------
 
-_state_lock = threading.Lock()
-
-_SESSION_REQUEST_COUNT = {}
-_SESSION_LAST_MESSAGES = {}
-_DEDUP_CACHE = {}
-_LATENCY_WINDOW = collections.deque(maxlen=50)
-_ERROR_WINDOW = collections.deque(maxlen=50)
+from proxy_state import (
+    _state_lock,
+    _SESSION_REQUEST_COUNT,
+    _SESSION_LAST_MESSAGES,
+    _DEDUP_CACHE,
+    _LATENCY_WINDOW,
+    _ERROR_WINDOW,
+)
 
 __all__ = [
     "CONFIG_REGISTRY",
