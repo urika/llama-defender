@@ -244,12 +244,9 @@ _jsonl_counter = 0
 # Structured metrics logging: JSON Lines to logs/proxy_metrics.jsonl
 # Per-request pipeline stats for observability and tuning.
 # ---------------------------------------------------------------------------
-PROXY_METRICS_ENABLED = os.environ.get("PROXY_METRICS_ENABLED", "true").lower() in ("1", "true", "yes")
-PROXY_METRICS_DIR = os.environ.get("PROXY_METRICS_DIR", "logs")
-_METRICS_PATH = os.path.join(_SCRIPT_DIR, PROXY_METRICS_DIR, "proxy_metrics.jsonl")
-_metrics_lock = threading.Lock()
-# Shared state lock — defined in proxy_config to avoid circular imports.
-_state_lock = proxy_config._state_lock
+# All PROXY_METRICS_ENABLED, PROXY_METRICS_DIR, _METRICS_PATH, _metrics_lock,
+# MODEL_ALIASES, _log_ctx, _metrics_ctx, and _state_lock are defined in
+# proxy_state (single source of truth) and imported via from proxy_state import *.
 
 import proxy_logging
 from proxy_logging import *
@@ -261,22 +258,6 @@ from proxy_logging import *
 from proxy_logging import *
 
 
-MODEL_ALIASES = [
-    "claude-3-5-sonnet-20241022",
-    "claude-3-opus-20240229",
-    "claude-3-5-haiku-20241022",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-    "claude-opus-4-7",
-    "default",
-    MODEL_NAME,
-]
-
-# Thread-local context for per-request logging (session_id prefix)
-_log_ctx = threading.local()
-
-# Thread-local context for per-request metrics collection
-_metrics_ctx = threading.local()
 
 
 from proxy_logging import *
