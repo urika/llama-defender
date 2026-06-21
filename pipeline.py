@@ -891,7 +891,7 @@ class DateNormalizer(PipelineStage):
                     if block.get("type") == "text":
                         text = block.get("text", "")
                         new_text = re.sub(
-                            r"Today's date is \d{4}/\d{2}/\d{2}\\.",
+                            r"Today's date is \d{4}/\d{2}/\d{2}\.",
                             "Today's date is DATE_PLACEHOLDER.",
                             text,
                         )
@@ -900,7 +900,7 @@ class DateNormalizer(PipelineStage):
                             log(f"  -> Standardized date in msg0 block")
             else:
                 new_content = re.sub(
-                    r"Today's date is \d{4}/\d{2}/\d{2}\\.",
+                    r"Today's date is \d{4}/\d{2}/\d{2}\.",
                     "Today's date is DATE_PLACEHOLDER.",
                     str(content),
                 )
