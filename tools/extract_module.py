@@ -52,6 +52,29 @@ def _find_end(source, start):
     return i + 1 if i > start else start
 
 
+# Map of stdlib symbol patterns to required import
+_STDLIB_IMPORT_MAP = {
+    r'\bjson\.': 'import json',
+    r'\bos\.path\.|\bos\.makedirs|\bos\.chmod|\bos\.environ|\bos\.listdir|\bos\.remove|\bos\.urandom': 'import os',
+    r'\bre\.findall|\bre\.sub|\bre\.search|\bre\.compile|\bre\.match|\bre\.finditer': 'import re',
+    r'\bsubprocess\.': 'import subprocess',
+    r'\bdatetime\.': 'from datetime import datetime',
+    r'\btime\.': 'import time',
+    r'\bhashlib\.': 'import hashlib',
+    r'\bthreading\.(?!Semaphore)': 'import threading',
+    r'\bcollections\.': 'import collections',
+}
+
+
+def detect_stdlib_imports(code_text):
+    """Detect which stdlib modules are used and return import lines."""
+    imports = []
+    for pattern, import_line in _STDLIB_IMPORT_MAP.items():
+        if re.search(pattern, code_text):
+            imports.append(import_line)
+    return imports
+
+
 def find_refs(code_lines):
     code = '\n'.join(code_lines)
     cleaned = re.sub(r'"[^"]*"', '""', code)
@@ -90,7 +113,12 @@ def analyze(target_funcs, proxy_path='anthropic_proxy.py'):
 
 
 def gen_module(name, result):
-    lines = [f'"""Auto-extracted {name} module."""','import proxy_state as _ps']
+    lines = [f'"""Auto-extracted {name} module."""']
+    # Auto-detect stdlib imports
+    code_text = '\n'.join(result['code'])
+    stdlib_imports = detect_stdlib_imports(code_text)
+    lines.extend(stdlib_imports)
+    lines.append('import proxy_state as _ps')
     # Add delegates for external functions (only for actual functions in proxy)
     import keyword
     proxy_funcs = set(parse_funcs('anthropic_proxy.py').keys()) | {'log'}
@@ -142,9 +170,13 @@ def fix_tests(vars_list):
 def apply_extraction(result, name, proxy_path='anthropic_proxy.py'):
     """Generate module file and modify anthropic_proxy.py."""
     mc = gen_module(name, result)
+    # Add special imports for known cross-module dependencies
     if '_estimate_message_chars' in result.get('external', set()):
         mc = mc.replace('import proxy_state as _ps',
                         'import proxy_state as _ps\nfrom message_converter import _estimate_message_chars')
+    if '_classify_content_for_ratio' in result.get('external', set()):
+        mc = mc.replace('import proxy_state as _ps',
+                        'import proxy_state as _ps\nfrom message_converter import _classify_content_for_ratio')
     with open(f'{name}.py','w') as f: f.write(mc)
     with open(proxy_path) as f: cur = f.readlines()
     ss = [x[0] for x in result['ranges'].values()]
