@@ -2,6 +2,8 @@
 import os, subprocess, time, threading
 from datetime import datetime
 import proxy_state as _ps
+from backend_strategy import BackendStrategy
+_strategy = BackendStrategy.create(_ps.IS_CLOUD)
 from message_converter import _classify_content_for_ratio
 
 def _log(msg, level="INFO"):
@@ -185,7 +187,7 @@ def _get_log_stats():
     Requests get accurate timestamps from proxy logs [REQ_SUMMARY].
     OOM/CacheClear have no timestamp (backend logs don't include wall-clock time).
     For cloud backends, OOM/cache-clear metrics are not available."""
-    backend_tail = _read_log_tail(_LOG_PATH, 200000) if not _ps.IS_CLOUD else ""
+    backend_tail = _read_log_tail(_LOG_PATH, 200000) if not _strategy.oom_safety_enabled else ""
     proxy_log_path = os.environ.get("PROXY_LOG_PATH", "/tmp/anthropic_proxy.log")
     proxy_tail = _read_log_tail(proxy_log_path, 100000)
 
@@ -199,7 +201,7 @@ def _get_log_stats():
     # --- Build recent events list ---
     events = []
     req_idx = 0
-    if not _ps.IS_CLOUD:
+    if not _strategy.oom_safety_enabled:
         for line in backend_tail.splitlines()[-40:]:
             if "Insufficient Memory" in line:
                 events.append(("—", "🔴 OOM", line.split(":")[-1].strip()[-80:]))
@@ -214,7 +216,7 @@ def _get_log_stats():
     events = events[-12:]
 
     # --- Detailed lists for modal popup ---
-    if _ps.IS_CLOUD:
+    if _strategy.oom_safety_enabled:
         oom_details = []
         clear_details = []
     else:
@@ -238,7 +240,7 @@ def _get_cache_stats():
     """Parse backend log for prefix cache HIT/MISS since current startup.
     Returns {"hit": N, "miss": N, "total": N, "rate_str": "X.X%", "since": "description"}.
     Cloud backends return zeros."""
-    if _ps.IS_CLOUD:
+    if _strategy.oom_safety_enabled:
         return {"hit": 0, "miss": 0, "total": 0, "rate_str": "N/A", "since": "N/A (cloud)"}
     try:
         with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
@@ -696,7 +698,7 @@ def _build_status_html():
         alerts_html = '<div class="evt" style="color:#2ecc71;">✅ No anomalies detected (last 10m)</div>'
 
     # Cloud-backend status card (no PID/memory/uptime)
-    if _ps.IS_CLOUD:
+    if _strategy.oom_safety_enabled:
         backend_card = f"""<div class="card">
     <h2>Backend</h2>
     <div class="row"><span class="label">Type</span><span class="value">Cloud API ({BACKEND_TYPE})</span></div>
@@ -718,7 +720,7 @@ def _build_status_html():
     # Conditional log-stat rows (avoid backslashes inside f-strings)
     oom_row = ""
     cache_row = ""
-    if not _ps.IS_CLOUD:
+    if not _strategy.oom_safety_enabled:
         oom_row = '<div class="row"><span class="label">OOM Crashes</span><span class="value oom clickable" onclick="showModal(' + "'oom', '🔴 OOM Crashes Detail')" + f'">{log["ooms"]}</span></div>'
         cache_row = '<div class="row"><span class="label">Forced Cache Clear</span><span class="value clear clickable" onclick="showModal(' + "'clear', '🟡 Forced Cache Clear Detail')" + f'">{log["clears"]}</span></div>'
 

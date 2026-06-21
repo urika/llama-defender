@@ -1,5 +1,7 @@
 """Auto-extracted lifecycle module."""
 import proxy_state as _ps
+from backend_strategy import BackendStrategy
+_strategy = BackendStrategy.create(_ps.IS_CLOUD)
 from message_converter import _estimate_message_chars
 # External function delegates — set by anthropic_proxy after import
 _get_system_memory = None  # delegate
@@ -78,7 +80,7 @@ def _classify_lifecycle_stage(messages, session_id=None):
       }
     """
     total_chars = _estimate_message_chars(messages)
-    cloud = _ps.IS_CLOUD
+    # oom safety via strategy
 
     # Phase 1: detect session continuation. The increment happens here so the
     # counter advances exactly once per request, atomically w.r.t. the
@@ -179,7 +181,7 @@ def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
     adjusted = min(max_tokens_orig, cap)
     reasons = [f"stage={stage}"]
 
-    if not _ps.IS_CLOUD and "rapid-mlx" in (_ps.MODEL_NAME or ""):
+    if _strategy.oom_safety_enabled and "rapid-mlx" in (_ps.MODEL_NAME or ""):
         adjusted = int(adjusted * _ps.PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO)
         reasons.append("rapid-mlx_discount")
 
