@@ -30,13 +30,17 @@ if not BACKEND_TYPE:
         BACKEND_TYPE = "local"
 IS_CLOUD = BACKEND_TYPE == "cloud"
 
+from backend_strategy import BackendStrategy
+_strategy = BackendStrategy.create(IS_CLOUD)
+
 # ---------------------------------------------------------------------------
 # Concurrency control: backend-aware request serialization
 # ---------------------------------------------------------------------------
 
 # Config default resolution: reads canonical defaults from proxy_config
 def _default(env_key, cloud_val, local_val):
-    """Return the canonical default for env_key, falling back to hardcoded."""
+    """Return the canonical default for env_key, falling back to hardcoded.
+    Uses backend_strategy for IS_CLOUD-dependent defaults."""
     try:
         from proxy_config import resolve_default
         resolved = resolve_default(env_key, IS_CLOUD)
@@ -44,7 +48,7 @@ def _default(env_key, cloud_val, local_val):
             return str(resolved)
     except (ImportError, Exception):
         pass
-    return str(cloud_val if IS_CLOUD else local_val)
+    return str(_strategy.get_default(env_key, local_val if not IS_CLOUD else cloud_val))
 
 PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", _default("PROXY_MAX_CONCURRENT", "4", "1")))
 _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
@@ -134,7 +138,7 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "600"))
 # Cloud backends (DeepSeek/OpenAI) support 1M+ tokens, so pre_truncate is
 # effectively disabled (10M chars threshold). Local backends cap at 200K
 # to prevent Metal OOM.
-_default_oom = "10000000" if IS_CLOUD else "200000"
+_default_oom = _strategy.get_default("PROXY_OOM_SAFE_CHARS", "200000")
 PROXY_OOM_SAFE_CHARS = int(os.environ.get(
     "PROXY_OOM_SAFE_CHARS",
     os.environ.get("PROXY_PRE_TRUNCATE_CHARS", _default_oom),
@@ -463,7 +467,7 @@ def _cast_config_value(value, cast):
 # ---------------------------------------------------------------------------
 __all__ = [
     # Backend
-    "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD",
+    "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD", "_strategy",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
     # Tool-result clearing

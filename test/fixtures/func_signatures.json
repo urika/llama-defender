@@ -672,6 +672,11 @@
       "_depth": 0
     }
   },
+  "_strategy": {
+    "name": "LocalStrategy",
+    "params": [],
+    "defaults": {}
+  },
   "_strip_thinking_from_msg": {
     "name": "_strip_thinking_from_msg",
     "params": [
