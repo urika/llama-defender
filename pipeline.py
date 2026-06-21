@@ -212,7 +212,14 @@ class InstrumentedPipeline(Pipeline):
                 slowest_name = stage.name
             data = stage.output_metrics(ctx)
             if data is not None:
-                admin._mc_put(stage.name, data)
+                # Multi-key mode: if all values are dicts, write each key
+                # separately (supports stages like ContentCompressor that
+                # produce semantic_compress + tool_clear + think_strip).
+                if all(isinstance(v, dict) for v in data.values()):
+                    for sub_key, sub_data in data.items():
+                        admin._mc_put(sub_key, sub_data)
+                else:
+                    admin._mc_put(stage.name, data)
             log(f"  -> [{stage.name}] completed in {elapsed:.1f}ms")
 
         # Pipeline-level aggregate: one summary per request
