@@ -1182,7 +1182,7 @@ class TestToolFilter(unittest.TestCase):
 
     def setUp(self):
         self._patches = [
-            patch.object(proxy, "PROXY_TOOL_FILTER_MAX", 5),
+            patch.object(proxy, "PROXY_TOOL_FILTER_MAX", 5), patch.object(proxy_state, "PROXY_TOOL_FILTER_MAX", 5),
         ]
         for p in self._patches:
             p.start()
@@ -1269,7 +1269,7 @@ class TestToolFilter(unittest.TestCase):
         tools = self._tools(["Read", "Bash", "Custom1", "Custom2",
                              "Custom3", "Custom4", "Custom5"])
         recent_msgs = [self._asst(["Custom3", "Custom4"])]
-        with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist):
+        with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist), patch.object(proxy_state, "TOOL_ALWAYS_KEEP", small_whitelist):
             result, stats = proxy._filter_tools(tools, recent_msgs)
         # Too_few_after_filter: kept would be {Read, Bash, Custom3, Custom4} = 4 < 5.
         self.assertFalse(stats["filtered"])
@@ -2099,6 +2099,8 @@ class TestToolFilterStableOrder(unittest.TestCase):
     def test_always_keep_order_stable(self):
         orig_max = proxy.PROXY_TOOL_FILTER_MAX
         proxy.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
+        proxy_state.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
+        proxy_state.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
         try:
             tools = [
                 {"name": "Write", "description": "w"},
@@ -2114,6 +2116,8 @@ class TestToolFilterStableOrder(unittest.TestCase):
             self.assertTrue(stats.get("filtered"))
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = orig_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = orig_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = orig_max
 
 
 class TestMaskSensitive(unittest.TestCase):
@@ -2313,7 +2317,10 @@ class TestFilterToolsSorting(unittest.TestCase):
         original_max = proxy.PROXY_TOOL_FILTER_MAX
         original_keep = proxy.TOOL_ALWAYS_KEEP
         proxy.PROXY_TOOL_FILTER_MAX = 5
+        proxy_state.PROXY_TOOL_FILTER_MAX = 5
+        proxy_state.PROXY_TOOL_FILTER_MAX = 5
         proxy.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
+        proxy_state.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         try:
             kept, stats = proxy._filter_tools(tools, messages, recent_rounds=5)
             self.assertTrue(stats.get("filtered"), f"Expected filtering, got {stats}")
@@ -2322,7 +2329,10 @@ class TestFilterToolsSorting(unittest.TestCase):
             self.assertEqual(names, ["Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"])
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = original_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = original_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = original_max
             proxy.TOOL_ALWAYS_KEEP = original_keep
+            proxy_state.TOOL_ALWAYS_KEEP = original_keep
 
 
 class TestSemanticCompression(unittest.TestCase):
