@@ -20,6 +20,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
+import proxy_state
 
 
 class TestExtractContentToolCalls(unittest.TestCase):
@@ -91,7 +92,7 @@ class TestExtractContentToolCalls(unittest.TestCase):
 
     def test_env_var_disabled(self):
         text = '<tools>\n{"name": "x", "arguments": {}}\n</tools>'
-        with patch.object(proxy, "CONTENT_TOOLS_FALLBACK_ENABLED", False):
+        with patch.object(proxy_state, "CONTENT_TOOLS_FALLBACK_ENABLED", False):
             r = proxy._extract_content_tool_calls(text)
         self.assertEqual(r["tools"], [])
         self.assertEqual(r["text"], text)
@@ -206,7 +207,7 @@ class TestStreamingStateMachine(unittest.TestCase):
             self.assertLess(len(ext.pending_text), len(proxy.TOOLS_TRIGGER))
 
     def test_disabled_passthrough(self):
-        with patch.object(proxy, "CONTENT_TOOLS_FALLBACK_ENABLED", False):
+        with patch.object(proxy_state, "CONTENT_TOOLS_FALLBACK_ENABLED", False):
             ext = proxy._StreamingToolsExtractor()
             ev = self._drain(ext, [
                 '<tools>\n{"name":"x","arguments":{}}\n</tools>',
