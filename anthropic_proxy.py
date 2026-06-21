@@ -32,121 +32,12 @@ LOG_SCHEMA_VERSION = "v1"
 # module-level names imported via `from proxy_state import *`) see updates.
 # ---------------------------------------------------------------------------
 
+import reload_config
+
 def _reload_config(signum=None, frame=None):
-    """SIGHUP handler: re-read active.conf and update proxy_state + self module."""
-    with _RELOAD_LOCK:
-        self_mod = sys.modules[__name__]
-        env = _parse_conf_env(RELOAD_CONFIG_PATH)
-        secret_env = _parse_conf_env(RELOAD_SECRET_PATH)
-        if secret_env:
-            env.update({k: v for k, v in secret_env.items() if k not in env})
-        if not env:
-            log("[RELOAD] no config parsed from %s — keeping current values"
-                % RELOAD_CONFIG_PATH, level="WARN")
-            return
+    reload_config.reload_config(signum, frame, target_module=sys.modules[__name__])
 
-        # --- Backend routing ---
-        if "LLAMA_BASE_URL" in env:
-            base = env["LLAMA_BASE_URL"]
-        else:
-            host = env.get("LLAMA_HOST", "127.0.0.1")
-            port = env.get("LLAMA_PORT", "8081")
-            base = "http://%s:%s/v1" % (host, port)
-        setattr(proxy_state, "LLAMA_BASE", base)
-        setattr(self_mod, "LLAMA_BASE", base)
-        api_key = env.get("LLAMA_API_KEY", getattr(self_mod, "LLAMA_API_KEY"))
-        setattr(proxy_state, "LLAMA_API_KEY", api_key)
-        setattr(self_mod, "LLAMA_API_KEY", api_key)
-
-        bt = env.get("BACKEND_TYPE", "")
-        if not bt:
-            low = base.lower()
-            if "deepseek" in low or "openai" in low or "api." in low:
-                bt = "cloud"
-            else:
-                bt = "local"
-        setattr(proxy_state, "BACKEND_TYPE", bt)
-        setattr(self_mod, "BACKEND_TYPE", bt)
-        is_cloud = bt == "cloud"
-        setattr(proxy_state, "IS_CLOUD", is_cloud)
-        setattr(self_mod, "IS_CLOUD", is_cloud)
-
-        # MODEL_NAME
-        model = env.get("MODEL_NAME") or env.get("LLAMA_MODEL",
-                                                  getattr(self_mod, "MODEL_NAME"))
-        setattr(proxy_state, "MODEL_NAME", model)
-        setattr(self_mod, "MODEL_NAME", model)
-
-        # --- Concurrency + Semaphore rebuild ---
-        new_max = int(env.get("PROXY_MAX_CONCURRENT", "4" if is_cloud else "1"))
-        old_max = getattr(self_mod, "PROXY_MAX_CONCURRENT")
-        setattr(proxy_state, "PROXY_MAX_CONCURRENT", new_max)
-        setattr(self_mod, "PROXY_MAX_CONCURRENT", new_max)
-        if new_max != old_max:
-            setattr(proxy_state, "_llama_lock", threading.Semaphore(new_max))
-            setattr(self_mod, "_llama_lock", threading.Semaphore(new_max))
-            log("[RELOAD] Semaphore rebuilt: %d -> %d" % (old_max, new_max))
-
-        # --- MODEL_ALIASES rebuild ---
-        aliases = [
-            "claude-3-5-sonnet-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-5-haiku-20241022",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-            "claude-opus-4-7",
-            "default",
-            model,
-        ]
-        setattr(proxy_state, "MODEL_ALIASES", aliases)
-        setattr(self_mod, "MODEL_ALIASES", aliases)
-
-        # --- Tier 1 scalars ---
-        for env_key, py_name, cast, cloud_def, local_def in _RELOAD_SPEC:
-            default = cloud_def if is_cloud else local_def
-            raw = env.get(env_key, default)
-            val = _cast_config_value(raw, cast)
-            setattr(proxy_state, py_name, val)
-            setattr(self_mod, py_name, val)
-
-        # --- Dependent defaults ---
-        loop_thr = int(env.get("PROXY_LOOP_THRESHOLD",
-                               getattr(self_mod, "PROXY_LOOP_THRESHOLD")))
-        setattr(proxy_state, "PROXY_LOOP_THRESHOLD", loop_thr)
-        setattr(self_mod, "PROXY_LOOP_THRESHOLD", loop_thr)
-        setattr(proxy_state, "PROXY_LOOP_LEVEL2",
-                int(env.get("PROXY_LOOP_LEVEL2", str(loop_thr * 2))))
-        setattr(self_mod, "PROXY_LOOP_LEVEL2",
-                int(env.get("PROXY_LOOP_LEVEL2", str(loop_thr * 2))))
-        setattr(proxy_state, "PROXY_LOOP_LEVEL3",
-                int(env.get("PROXY_LOOP_LEVEL3", str(loop_thr * 3))))
-        setattr(self_mod, "PROXY_LOOP_LEVEL3",
-                int(env.get("PROXY_LOOP_LEVEL3", str(loop_thr * 3))))
-
-        sat = (env.get("PROXY_CHARS_SATURATION")
-               or env.get("PROXY_CTX_CHARS_LIMIT",
-                          "500000" if is_cloud else "180000"))
-        setattr(proxy_state, "PROXY_CHARS_SATURATION", int(sat))
-        setattr(self_mod, "PROXY_CHARS_SATURATION", int(sat))
-
-        oom = (env.get("PROXY_OOM_SAFE_CHARS")
-               or env.get("PROXY_PRE_TRUNCATE_CHARS",
-                          "10000000" if is_cloud else "200000"))
-        setattr(proxy_state, "PROXY_OOM_SAFE_CHARS", int(oom))
-        setattr(self_mod, "PROXY_OOM_SAFE_CHARS", int(oom))
-        setattr(proxy_state, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
-        setattr(self_mod, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
-
-        log("[RELOAD] OK: backend=%s base=%s model=%s concurrent=%d "
-            "clear=%s ctx_limit=%s frozen=%d truncate=%s"
-            % (bt, base[:60], model, new_max,
-               getattr(self_mod, "PROXY_CLEAR_ENABLED"),
-               getattr(self_mod, "PROXY_CTX_LIMIT_ENABLED"),
-               getattr(self_mod, "PROXY_FROZEN_HEAD"),
-               getattr(self_mod, "PROXY_CTX_TRUNCATE_STRATEGY")))
-
-
-# Register SIGHUP handler (must be in main thread at import time).
+# Register SIGHUP handler
 signal.signal(signal.SIGHUP, _reload_config)
 
 
