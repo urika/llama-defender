@@ -41,16 +41,25 @@ Anthropic format (including streaming SSE events).
 | Component | Technology |
 |-----------|------------|
 | Service manager | Bash 4+ (`manage.sh`, 1539 lines) |
-| API proxy core | Python 3 (stdlib only) — `anthropic_proxy.py` (5529 lines, 8-layer pipeline) |
-| Config & shared state | `proxy_state.py` (518 lines, single source of truth) — imported by proxy + config |
+| API proxy core | Python 3 (stdlib only) — `anthropic_proxy.py` (1726 lines, 8-layer pipeline) |
+| Config & shared state | `proxy_state.py` (557 lines, single source of truth) — imported by all modules |
 | Config registry | `proxy_config.py` (659 lines, CONFIG_REGISTRY metadata + validation) |
+| Backend strategy | `backend_strategy.py` (134 lines) — LocalStrategy / CloudStrategy pattern |
+| Lifecycle engine | `lifecycle.py` (209 lines) — stage classification, dynamic max_tokens |
+| Observability | `admin_server.py` (990 lines) — /status page, metrics, system monitoring |
+| Truncation | `truncation.py` (1224 lines) — rounds/fifo/smart/char context truncation |
+| Format conversion | `message_converter.py` — Anthropic↔OpenAI message/tool conversion |
+| Tool filtering | `tool_filter.py` — dynamic tool definition filtering + keyword index |
+| Loop detection | `loop_detection.py` — 3-level loop detection + blocker injection |
+| Content compression | `content_compressor.py` — JSON/code/log/text semantic compression |
+| Tool parsing | `tool_parser.py` — XML↔JSON tool arguments + streaming extractor |
+| Logging | `proxy_logging.py` — request JSONL logging + log rotation |
 | Backend option 1 (local) | `llama-server` binary from upstream llama.cpp (GGUF) |
 | Backend option 2 (local) | `rapid-mlx` / `vllm-mlx` binary (MLX framework, Apple-optimized) |
 | Backend option 3 (cloud) | DeepSeek API (`deepseek-v4-pro`) or OpenAI API |
 | OS target | macOS with Metal (Apple Silicon) |
 
-**No build tools** (no `pyproject.toml`, `package.json`, `Cargo.toml`, `Makefile`,
-etc.). The project is a collection of runnable scripts and configuration files.
+**No build tools**. The project is a collection of runnable scripts and configuration files.
 
 ---
 
@@ -59,22 +68,32 @@ etc.). The project is a collection of runnable scripts and configuration files.
 ```
 .
 ├── manage.sh                  # Main service manager (bash, 1539 lines)
-├── anthropic_proxy.py         # Anthropic→OpenAI proxy + 8-layer pipeline (python3, 5529 lines)
-├── proxy_state.py             # Single source of truth: config constants, shared state, reload helpers (518 lines)
-├── proxy_config.py            # CONFIG_REGISTRY: config metadata, validation, drift detection (659 lines)
+├── anthropic_proxy.py         # Request pipeline core (1726 lines)
+├── proxy_state.py             # Single source of truth: config + shared state + helpers (557 lines)
+├── proxy_config.py            # CONFIG_REGISTRY: config metadata, validation, diff (659 lines)
+├── backend_strategy.py        # Strategy pattern: LocalStrategy / CloudStrategy defaults (134 lines)
+├── lifecycle.py               # Stage classification, continuation detection, dynamic max_tokens (209 lines)
+├── admin_server.py            # /status page, system monitoring, metrics finalization (990 lines)
+├── truncation.py              # Context truncation: rounds / fifo / smart / char (1224 lines)
+├── message_converter.py       # Anthropic↔OpenAI format conversion
+├── tool_filter.py             # Dynamic tool definition filtering + keyword index
+├── loop_detection.py          # 3-level loop detection + blocker intervention
+├── content_compressor.py      # JSON / code / log / text semantic compression
+├── tool_parser.py             # XML↔JSON tool arguments + streaming content-text extractor
+├── proxy_logging.py           # Structured request/log JSONL logging
 ├── configs/
 │   ├── active.conf            # Symlink to the currently active config
 │   ├── deepseek-chat.conf     # Cloud proxy → DeepSeek API (no local backend)
 │   ├── rapid-mlx-35b-opt.conf # rapid-mlx + Qwen3.6-35B-A3B (MLX, optimized)
-│   ├── mlx_vlm-27b.conf       # vllm-mlx + Qwen3.6-27B-OptiQ (PagedCache, 4-bit KV)
-│   ├── qwen2.5-coder-14b.conf # vllm-mlx + Qwen2.5-Coder-14B
-│   ├── qwen3-8b.conf          # vllm-mlx + Qwen3-8B (lightweight, test)
 │   ├── gemma4-26b.conf        # vllm-mlx + Gemma-4-26B (data processing)
+│   ├── qwen3-8b.conf          # vllm-mlx + Qwen3-8B (lightweight, test)
 │   ├── secret.local.conf      # Git-ignored secrets (LLAMA_API_KEY for cloud)
-│   └── archived/              # Deprecated configs (qwen3.5-27b, rapid-mlx-9b, etc.)
-├── tools/                     # Benchmarks, monitors, analysis scripts (29 files)
+│   └── archived/              # Deprecated configs (qwen3.5-27b, rapid-mlx-35b, rapid-mlx-9b, etc.)
+├── tools/                     # Benchmarks, monitors, analysis scripts (30+ files)
 │   ├── bench_perf.py          # Performance benchmark (TTFT / tok/s / concurrency / long-ctx)
 │   ├── bench_quality.py       # Model quality evaluation (14 code/math/instruction/format cases)
+│   ├── bench_baseline.py      # Baseline consistency benchmark
+│   ├── bench_compare.py       # Cross-benchmark comparison reporter
 │   ├── bench_mtp.py           # MTP model performance benchmark
 │   ├── bench_rapidmlx.py      # Rapid-MLX throughput benchmark
 │   ├── bench_agent.py         # Agentic end-to-end benchmark
@@ -82,9 +101,13 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   ├── cache_analyzer.py      # Prefix-cache hit-rate analyzer
 │   ├── context_stress_test.py # Long-context stress test
 │   ├── stress_test.py         # Load stress test
+│   ├── stress_concurrency.py  # Concurrency stress test
+│   ├── stress_multi_agent.py  # Multi-agent session stress test
 │   ├── gen_func_signatures.py # Function signature snapshot (refactoring regression)
 │   ├── gen_behavior_snapshots.py # Behavior snapshot (refactoring regression)
 │   ├── trace_requirements.py  # Requirement traceability checker
+│   ├── extract_module.py      # Semi-auto module extraction tool
+│   ├── monitor.py             # Real-time proxy performance monitor
 │   ├── logview.sh             # Unified log viewer
 │   ├── sysmon.sh              # System monitoring (memory, CPU, disk)
 │   ├── modelmon.sh            # Model service monitoring
@@ -92,8 +115,25 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   └── run_experiment.sh      # A/B experiment runner
 ├── test/                      # Automated tests (see test/README.md)
 │   ├── run_tests.sh           # Unified tier-based runner
-│   ├── unit/                  # Pure logic, no I/O (<1s, 7 files, 399 tests)
-│   ├── integration/           # Mock backend, no LLM (~5s, 6 suites, 37 tests)
+│   ├── unit/                  # Pure logic, no I/O (<1s, 10 files, 462 tests)
+│   │   ├── test_proxy_fallback.py
+│   │   ├── test_proxy_reload.py
+│   │   ├── test_proxy_state.py
+│   │   ├── test_backend_strategy.py
+│   │   ├── test_lifecycle.py
+│   │   ├── test_admin_server.py
+│   │   ├── test_payload_limit.py
+│   │   ├── test_text_loop.py
+│   │   ├── test_tool_parser_edge.py
+│   │   └── test_utils.py
+│   ├── integration/           # Mock backend, no LLM (~60s, 7 suites)
+│   │   ├── test_blocker_integration.sh
+│   │   ├── test_loop_integration.sh
+│   │   ├── test_cache_align_integration.sh
+│   │   ├── test_compress_integration.sh
+│   │   ├── test_memory_reject_integration.sh
+│   │   ├── test_status_integration.sh
+│   │   └── test_long_context_integration.sh
 │   ├── e2e/                   # Requires running proxy + backend
 │   ├── promptfoo/             # Promptfoo fixed-prompt regression (5 core tests)
 │   └── fixtures/              # Shared test fixtures (signatures, snapshots)
@@ -104,9 +144,10 @@ etc.). The project is a collection of runnable scripts and configuration files.
 │   ├── 04-analysis-diagnostics/
 │   ├── 05-operations-changelog/
 │   ├── 06-reference-metrics/
-│   ├── DEFECT-LIST.md         # 30 defects (7 P0 + 8 P1 + 10 P2 + 5 P3)
+│   ├── DEFECT-LIST.md         # Defect tracking
 │   ├── OSS-REPLACEMENT-EVALUATION.md
 │   ├── PM-ANALYSIS-FUTURE-ROADMAP.md
+│   ├── architecture-review-2026-06-21.md  # Phase 0-3 architecture review
 │   └── README.md              # Documentation navigation
 ├── assets/
 │   └── chat-templates/        # Fixed Qwen Jinja templates

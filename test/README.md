@@ -8,18 +8,33 @@ are run manually before merging feature branches.
 
 ```
 test/
-├── run_tests.sh                # unified runner with --unit / --integration / --e2e / --all
-├── unit/                       # pure logic, no network, <1s
-│   └── test_proxy_fallback.py
-├── integration/                # boots a mock backend, no real LLM, ~5s
+├── run_tests.sh                    # unified runner: --unit / --integration / --e2e / --all
+├── unit/                           # pure logic, no I/O, <1s (10 files, 462 tests)
+│   ├── test_proxy_fallback.py      # content tools fallback, blocker, truncation, compression
+│   ├── test_proxy_reload.py        # SIGHUP hot-reload regression
+│   ├── test_proxy_state.py         # config invariants, __all__ coverage, RELOAD_SPEC consistency
+│   ├── test_backend_strategy.py    # LocalStrategy / CloudStrategy defaults + flags (22 tests)
+│   ├── test_lifecycle.py           # stage classification, dynamic max_tokens (20 tests)
+│   ├── test_admin_server.py        # /status rendering, percentile, metrics finalization (17 tests)
+│   ├── test_payload_limit.py       # P0: 413 payload rejection
+│   ├── test_text_loop.py           # text output loop detection
+│   ├── test_tool_parser_edge.py    # XML↔JSON tool argument parsing edge cases
+│   └── test_utils.py               # percentile, stable hash, cast_config, jsonl logging
+├── integration/                    # boots a mock backend, no real LLM, ~60s (7 suites)
 │   ├── test_blocker_integration.sh
 │   ├── test_loop_integration.sh
-│   └── mock_backend.py         # shared OpenAI-compatible mock fixture
-├── e2e/                        # requires a running proxy + backend, ~30-60s
+│   ├── test_cache_align_integration.sh
+│   ├── test_compress_integration.sh
+│   ├── test_memory_reject_integration.sh
+│   ├── test_status_integration.sh
+│   ├── test_long_context_integration.sh
+│   └── mock_backend.py             # shared OpenAI-compatible mock fixture
+├── e2e/                            # requires running proxy + backend, ~30-60s
 │   ├── test_proxy_integration.py
 │   └── e2e_tools_fallback.sh
-├── fixtures/                   # (reserved for future shared fixtures)
-└── README.md                   # this file
+├── promptfoo/                      # Promptfoo fixed-prompt regression (5 core tests)
+├── fixtures/                       # function signatures, behavior snapshots
+└── README.md                       # this file
 ```
 
 ## Running
@@ -27,41 +42,19 @@ test/
 The unified runner picks a tier by flag:
 
 ```bash
-bash test/run_tests.sh --unit          # pure logic — runs in <1s, no I/O
-bash test/run_tests.sh --integration   # boots mock backend on :8089 + proxy on :4001
-bash test/run_tests.sh --e2e           # hits the live proxy on :4000 + backend on :8081
-bash test/run_tests.sh --all           # unit + integration + e2e (in that order)
-bash test/run_tests.sh --fast          # alias for --unit (used by pre-commit)
-```
-
-Override URLs for the e2e tier when running against cloud mode or a non-default port:
-
-```bash
-PROXY_BASE=http://127.0.0.1:4000 BACKEND_URL=http://127.0.0.1:8081 \
-  bash test/run_tests.sh --e2e
+bash test/run_tests.sh --unit          # pure logic — 462 tests in <1s
+bash test/run_tests.sh --integration   # mock backend — 7 suites ~60s
+bash test/run_tests.sh --e2e           # needs running proxy + backend
+bash test/run_tests.sh --all           # unit + integration + e2e + trace
+bash test/run_tests.sh --fast          # alias for --unit (pre-commit uses this)
+bash test/run_tests.sh --trace         # requirement traceability (docs/requirements.yaml)
 ```
 
 ## Pre-commit gate
 
-`.githooks/pre-commit` is wired up automatically — it runs the **unit** tier on every
-`git commit`. If the unit tests fail, the commit is rejected.
-
-To install on a fresh clone (the file is committed; `core.hooksPath` is per-machine):
-
-```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit test/run_tests.sh
-```
-
-Skip mechanisms (use sparingly — both are recorded in commit history by the user's choice):
-
-| Mechanism                       | Scope                  | Recommended? |
-|---------------------------------|------------------------|--------------|
-| `SKIP_TESTS=1 git commit -m …`  | skips this hook only   | emergency    |
-| `git commit --no-verify`        | skips **all** git hooks| emergency    |
-
-The hook is also bypassed automatically during `git rebase` and `git merge` (when
-`MERGE_HEAD` exists) so rebasing past commits doesn't re-run the entire test history.
+The `.githooks/pre-commit` hook runs `--unit` before every `git commit`.
+Install with `git config core.hooksPath .githooks` on a fresh clone.
+Skip with `SKIP_TESTS=1 git commit …` or `git commit --no-verify`.
 
 ## Adding a new test
 
@@ -79,24 +72,5 @@ update `run_tests.sh` to include it in the right tier.
 Test logs are written to `logs/`:
 
 - `logs/unit_test.log`      — verbose unittest output
-- `logs/itest/`             — blocker-integration raw logs (`proxy.log`, `mock.log`, `mock_capture.jsonl`, `proxy_metrics.jsonl`)
+- `logs/itest/`             — integration test logs (mock, proxy, metrics)
 - `logs/e2e_test.log`       — combined e2e sub-suite output
-
-## 性能基准测试
-
-```bash
-# 完整性能测试（TTFT / tok/s / 并发 / 长上下文）
-python3 tools/bench_perf.py
-
-# 快速模式（仅核心场景）
-python3 tools/bench_perf.py --quick
-
-# 仅测试长上下文（1K → 5K → ... → 200K）
-python3 tools/bench_perf.py --long-ctx-only
-
-# 模型质量评测（14 项代码/数学/指令/格式/常识）
-python3 tools/bench_quality.py
-```
-
-> 注：如需长上下文安全测试，使用 `python3 tools/bench_perf.py --long-ctx-only`（通过代理串行执行并监控内存）。
-> 数据处理能力评测使用 `python3 tools/bench_quality.py`。
