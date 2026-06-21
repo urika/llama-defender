@@ -1,10 +1,12 @@
-"""Auto-extracted lifecycle module."""
+"""Lifecycle stage classification and dynamic max_tokens computation."""
 import proxy_state as _ps
 from backend_strategy import BackendStrategy
 _strategy = BackendStrategy.create(_ps.IS_CLOUD)
 from message_converter import _estimate_message_chars
-# External function delegates — set by anthropic_proxy after import
-_get_system_memory = None  # delegate
+
+# External function delegate — set by anthropic_proxy after import via
+#   lifecycle._get_system_memory = admin_server._get_system_memory
+_get_system_memory = None  # set by caller before first request
 
 # --- _normalize_system_messages ---
 def _normalize_system_messages(messages):

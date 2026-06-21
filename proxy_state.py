@@ -294,6 +294,7 @@ TOOL_RESULT_HIGH_VALUE_PATTERNS = [
 # Structured request logging
 # ---------------------------------------------------------------------------
 _LOG_DIR = os.path.join(_SCRIPT_DIR, "logs")
+_LOG_PATH = os.path.join(_LOG_DIR, "llama-server.log")
 _JSONL_PATH = os.path.join(_LOG_DIR, "proxy_requests.jsonl")
 _jsonl_lock = threading.Lock()
 _jsonl_output_map = {}
@@ -529,7 +530,7 @@ __all__ = [
     # Semantic priority
     "TOOL_SEMANTIC_PRIORITY", "TOOL_RESULT_HIGH_VALUE_PATTERNS",
     # Logging
-    "_LOG_DIR", "_JSONL_PATH", "_jsonl_lock", "_jsonl_output_map", "_jsonl_counter",
+    "_LOG_DIR", "_LOG_PATH", "_JSONL_PATH", "_jsonl_lock", "_jsonl_output_map", "_jsonl_counter",
     "PROXY_METRICS_ENABLED", "PROXY_METRICS_DIR", "_METRICS_PATH", "_metrics_lock",
     "_state_lock", "MODEL_ALIASES", "_log_ctx", "_metrics_ctx",
     # Reload

@@ -1,4 +1,9 @@
-"""Auto-extracted admin_server module."""
+"""Admin server: status page, system monitoring, metrics, and observability.
+
+Functions for building the HTML status page at /status, collecting system
+memory stats, parsing backend/proxy logs, and managing request snapshots.
+All functions are stateless — they read from proxy_state and file system.
+"""
 import json
 import os, re, subprocess, time, threading
 from datetime import datetime
@@ -820,8 +825,8 @@ def _build_status_html():
     {cache_row}
     <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
     <div class="row"><span class="label">Prefix Cache</span><span class="value" style="color:{cache_rate_color}" title="统计范围: {cache_stats['since']} (跨session累计请查看 /status 页面历史)">{cache_stats["hit"]}/{cache_stats["total"]} ({cache_stats["rate_str"]})</span></div>
-    <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={_ps.PROXY_MAX_CONCURRENT}</span></div>
-    <div class="row"><span class="label">Model</span><span class="value">{MODEL_NAME}</span></div>
+    <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if _ps.PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if _ps.PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={_ps.PROXY_MAX_CONCURRENT}</span></div>
+    <div class="row"><span class="label">Model</span><span class="value">{_ps.MODEL_NAME}</span></div>
     {'<div class="row"><span class="label">Memory Alert</span><span class="value" style="color:#e74c3c">⚠️ Used ' + str(mem_used_pct) + '% (reject threshold ' + str(_ps.PROXY_MEMORY_REJECT_THRESHOLD) + '%)</span></div>' if mem_warn else ''}
   </div>
 
