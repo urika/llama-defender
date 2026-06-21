@@ -352,6 +352,7 @@ def _ensure_jsonl_dir():
     """Create logs/ directory if it doesn't exist."""
     try:
         os.makedirs(_LOG_DIR, exist_ok=True)
+        os.chmod(_LOG_DIR, 0o700)
     except OSError:
         pass
 
