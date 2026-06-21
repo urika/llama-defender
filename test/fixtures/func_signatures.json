@@ -418,6 +418,13 @@
     ],
     "defaults": {}
   },
+  "_fix_tool_pairings": {
+    "name": "_fix_tool_pairings",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
   "_generate_tool_summary": {
     "name": "_generate_tool_summary",
     "params": [
