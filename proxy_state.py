@@ -10,6 +10,7 @@ anthropic_proxy.py and proxy_config.py both import from this module.
 
 import collections
 import os
+import re
 import threading
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -261,12 +262,11 @@ TOOL_SEMANTIC_PRIORITY = {
     "Read": 3, "Agent": 3, "WebFetch": 2, "WebSearch": 2,
     "Bash": 1, "Edit": 1, "Write": 1,
 }
-import re as _re
 TOOL_RESULT_HIGH_VALUE_PATTERNS = [
-    (_re.compile(r'(function |class |def |import |from |\{\s*"[a-z]|\#include)', _re.IGNORECASE), 3),
-    (_re.compile(r'(total \d+|drwx|\.py$|\.js$|\.ts$)', _re.IGNORECASE), 1),
-    (_re.compile(r'(error|traceback|exception)', _re.IGNORECASE), 2),
-    (_re.compile(r'Wasted call', _re.IGNORECASE), 0),
+    (re.compile(r'(function |class |def |import |from |\{\s*"[a-z]|\#include)', re.IGNORECASE), 3),
+    (re.compile(r'(total \d+|drwx|\.py$|\.js$|\.ts$)', re.IGNORECASE), 1),
+    (re.compile(r'(error|traceback|exception)', re.IGNORECASE), 2),
+    (re.compile(r'Wasted call', re.IGNORECASE), 0),
 ]
 
 # ---------------------------------------------------------------------------

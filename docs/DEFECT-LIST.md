@@ -79,9 +79,9 @@
 |------|------|
 | **数据源** | `logs/llama-server.log` |
 | **错误模式** | `ERROR:vllm_mlx.scheduler:Error in batch generation step: [metal::malloc] Resource limit (499000) exceeded.` |
-| **已实施缓解** | **DEF-001 Part A**: PROXY_PRE_TRUNCATE_CHARS=400000 预截断大 payload<br>**DEF-001 Part C**: _classify_exception OOM→503 + Retry-After<br>**DEF-005 新增**: PROXY_OOM_SAFE_TOKENS=60000, 所有 pipeline 步骤后再次检查预估 token 数 (含 system prompt), 超限时强制 FIFO 截断 (仅 local 模式) |
-| **新增常量** | `PROXY_OOM_SAFE_TOKENS` (默认 60000, 约 120K chars), 设 0 禁用 |
-| **最新改进** | OOM 安全检查现已包含 system prompt 字符数估算, 避免低估实际 token 数。7 个单元测试覆盖 |
+| **已实施缓解** | **DEF-001 Part A**: PROXY_PRE_TRUNCATE_CHARS=400000 预截断大 payload<br>**DEF-001 Part C**: _classify_exception OOM→503 + Retry-After<br>**DEF-005 新增**: PROXY_OOM_SAFE_TOKENS=60000, 所有 pipeline 步骤后再次检查预估 token 数 (含 system prompt), 超限时强制 FIFO 截断 (仅 local 模式)<br>**DEF-005 补充**: PROXY_MAX_REQUEST_BYTES=512000 (500KB) 请求体大小硬上限, 超限返回 413 Payload Too Large, 在读 body 前拦截 (防 359KB tool+dialog 触发 OOM) |
+| **新增常量** | `PROXY_OOM_SAFE_TOKENS` (默认 60000, 约 120K chars), 设 0 禁用<br>`PROXY_MAX_REQUEST_BYTES` (默认 512000 bytes / 500KB, 0 禁用) |
+| **最新改进** | OOM 安全检查现已包含 system prompt 字符数估算, 避免低估实际 token 数。7 个单元测试覆盖。413 请求体硬上限有 4 个单元测试 (`test/unit/test_payload_limit.py`) |
 
 ### DEF-006: Apple Silicon Kernel Panic 风险 — 🟡 已缓解
 

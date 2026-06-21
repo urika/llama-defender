@@ -331,7 +331,8 @@ _extract_content_tool_calls (line 417)  # 非流式
 | 分组 | 参数 | 默认 (local/cloud) | 说明 |
 |------|------|---------------------|------|
 | **请求控制** | `PROXY_MAX_CONCURRENT` | 1 / 4 | 并发控制 |
-| | `PROXY_BACKEND_TIMEOUT` | 300 | 后端超时 (秒) |
+| | `PROXY_BACKEND_TIMEOUT` | 600 | 后端超时 (秒)，100K+ token prefill 可需 ~5 分钟 |
+| | `PROXY_MAX_REQUEST_BYTES` | 512000 (500KB) | 请求体大小硬上限，超过返回 413（防止 Metal OOM） |
 | | `PROXY_MAX_TOKENS_OVERRIDE` | 0 | 强制 max_tokens |
 | | `PROXY_OUTPUT_TOKEN_LIMIT_RATIO` | 2.0 | 输出 token 倍率 |
 | **工具内容管理** | `PROXY_CLEAR_ENABLED` | true / false | 清除开关 |

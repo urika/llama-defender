@@ -28,6 +28,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
+import proxy_state
 
 
 def _write_conf(path, lines):
@@ -102,14 +103,16 @@ class TestReloadConfigScalars(unittest.TestCase):
     """_reload_config: Tier 1 scalar updates."""
 
     def setUp(self):
-        # Save original values to restore after test
+        # Save original values to restore after test (both proxy and proxy_state)
         self._saved = {}
+        self._saved_ps = {}
         for attr in ["LLAMA_BASE", "BACKEND_TYPE", "IS_CLOUD", "MODEL_NAME",
                      "PROXY_CLEAR_ENABLED", "PROXY_CLEAR_THRESHOLD",
                      "PROXY_FROZEN_HEAD", "PROXY_CTX_LIMIT_ENABLED",
                      "PROXY_MAX_CONCURRENT", "PROXY_CHARS_EXPANSION",
                      "PROXY_BLOCKER_ENABLED", "PROXY_TOOL_FILTER_ENABLED"]:
             self._saved[attr] = getattr(proxy, attr)
+            self._saved_ps[attr] = getattr(proxy_state, attr)
         self._tmpdir = tempfile.mkdtemp()
         self._confpath = os.path.join(self._tmpdir, "test.conf")
         # Always create the file so tearDown can unlink it safely
@@ -118,13 +121,15 @@ class TestReloadConfigScalars(unittest.TestCase):
     def tearDown(self):
         for attr, val in self._saved.items():
             setattr(proxy, attr, val)
+        for attr, val in self._saved_ps.items():
+            setattr(proxy_state, attr, val)
         if os.path.exists(self._confpath):
             os.unlink(self._confpath)
         os.rmdir(self._tmpdir)
 
     def test_local_to_cloud_switch(self):
         """Switching local→cloud: clearing disabled, ctx_limit disabled,
-        frozen_head=0, blocker disabled."""
+        frozen_head=0, blocker disabled. proxy_state must mirror proxy."""
         _write_conf(self._confpath, [
             'LLAMA_BACKEND="deepseek-cloud"',
             'LLAMA_BASE_URL="https://api.deepseek.com/v1"',
@@ -142,10 +147,19 @@ class TestReloadConfigScalars(unittest.TestCase):
         self.assertFalse(proxy.PROXY_CTX_LIMIT_ENABLED)
         self.assertEqual(proxy.PROXY_FROZEN_HEAD, 0)
         self.assertFalse(proxy.PROXY_BLOCKER_ENABLED)
+        # proxy_state must be synced with proxy (P0 regression guard)
+        self.assertEqual(proxy_state.BACKEND_TYPE, "cloud")
+        self.assertTrue(proxy_state.IS_CLOUD)
+        self.assertEqual(proxy_state.LLAMA_BASE, "https://api.deepseek.com/v1")
+        self.assertEqual(proxy_state.MODEL_NAME, "deepseek-v4-flash")
+        self.assertFalse(proxy_state.PROXY_CLEAR_ENABLED)
+        self.assertFalse(proxy_state.PROXY_CTX_LIMIT_ENABLED)
+        self.assertEqual(proxy_state.PROXY_FROZEN_HEAD, 0)
+        self.assertFalse(proxy_state.PROXY_BLOCKER_ENABLED)
 
     def test_cloud_to_local_switch(self):
         """Switching cloud→local: clearing enabled, ctx_limit enabled,
-        frozen_head=12, blocker enabled."""
+        frozen_head=12, blocker enabled. proxy_state must mirror proxy."""
         _write_conf(self._confpath, [
             'LLAMA_BACKEND="rapid-mlx"',
             'LLAMA_BASE_URL="http://127.0.0.1:8081/v1"',
@@ -160,6 +174,13 @@ class TestReloadConfigScalars(unittest.TestCase):
         self.assertTrue(proxy.PROXY_CTX_LIMIT_ENABLED)
         self.assertEqual(proxy.PROXY_FROZEN_HEAD, 12)
         self.assertTrue(proxy.PROXY_BLOCKER_ENABLED)
+        # proxy_state sync (P0 regression guard)
+        self.assertEqual(proxy_state.BACKEND_TYPE, "local")
+        self.assertFalse(proxy_state.IS_CLOUD)
+        self.assertTrue(proxy_state.PROXY_CLEAR_ENABLED)
+        self.assertTrue(proxy_state.PROXY_CTX_LIMIT_ENABLED)
+        self.assertEqual(proxy_state.PROXY_FROZEN_HEAD, 12)
+        self.assertTrue(proxy_state.PROXY_BLOCKER_ENABLED)
 
     def test_explicit_override_takes_precedence(self):
         """Conf explicit values override is_cloud defaults."""
@@ -309,6 +330,70 @@ class TestReloadDependentDefaults(unittest.TestCase):
             proxy._reload_config()
         self.assertEqual(proxy.PROXY_OOM_SAFE_CHARS, 123456)
         self.assertEqual(proxy.PROXY_PRE_TRUNCATE_CHARS, 123456)
+
+
+class TestProxyStateSync(unittest.TestCase):
+    """P0 regression guard: _reload_config must update proxy_state module,
+    not just anthropic_proxy's namespace. Without this, sub-modules that read
+    proxy_state.PROXY_* at call time see stale values after SIGHUP reload."""
+
+    def setUp(self):
+        self._saved_ps = {}
+        for attr in ["LLAMA_BASE", "BACKEND_TYPE", "IS_CLOUD", "MODEL_NAME",
+                     "PROXY_MAX_CONCURRENT", "PROXY_BACKEND_TIMEOUT",
+                     "PROXY_CLEAR_ENABLED", "_llama_lock", "MODEL_ALIASES"]:
+            self._saved_ps[attr] = getattr(proxy_state, attr)
+        self._tmpdir = tempfile.mkdtemp()
+        self._confpath = os.path.join(self._tmpdir, "test.conf")
+
+    def tearDown(self):
+        for attr, val in self._saved_ps.items():
+            setattr(proxy_state, attr, val)
+        if os.path.exists(self._confpath):
+            os.unlink(self._confpath)
+        os.rmdir(self._tmpdir)
+
+    def test_proxy_state_synced_on_reload(self):
+        """After _reload_config, proxy_state.PROXY_* matches anthropic_proxy.PROXY_*."""
+        _write_conf(self._confpath, [
+            'LLAMA_BASE_URL="http://127.0.0.1:9999/v1"',
+            'MODEL_NAME="sync-test-model"',
+            'PROXY_MAX_CONCURRENT="7"',
+            'PROXY_BACKEND_TIMEOUT="777"',
+            'PROXY_CLEAR_ENABLED="false"',
+        ])
+        with patch.object(proxy, "RELOAD_CONFIG_PATH", self._confpath):
+            proxy._reload_config()
+        # Every reload-updated attr must be synced between the two modules
+        for attr in ["LLAMA_BASE", "MODEL_NAME", "PROXY_MAX_CONCURRENT",
+                     "PROXY_BACKEND_TIMEOUT", "PROXY_CLEAR_ENABLED"]:
+            self.assertEqual(
+                getattr(proxy, attr), getattr(proxy_state, attr),
+                msg="%s mismatch: proxy=%r proxy_state=%r"
+                    % (attr, getattr(proxy, attr), getattr(proxy_state, attr)))
+
+    def test_proxy_state_semaphore_rebuilt(self):
+        """When PROXY_MAX_CONCURRENT changes, proxy_state._llama_lock is replaced."""
+        _write_conf(self._confpath, [
+            'LLAMA_BASE_URL="http://127.0.0.1:8081/v1"',
+            'PROXY_MAX_CONCURRENT="5"',
+        ])
+        old_lock = proxy_state._llama_lock
+        with patch.object(proxy, "RELOAD_CONFIG_PATH", self._confpath):
+            proxy._reload_config()
+        self.assertEqual(proxy_state.PROXY_MAX_CONCURRENT, 5)
+        self.assertIsNot(proxy_state._llama_lock, old_lock)
+
+    def test_proxy_state_aliases_rebuilt(self):
+        """proxy_state.MODEL_ALIASES is rebuilt to include the new MODEL_NAME."""
+        _write_conf(self._confpath, [
+            'LLAMA_BASE_URL="http://127.0.0.1:8081/v1"',
+            'MODEL_NAME="alias-test-model"',
+        ])
+        with patch.object(proxy, "RELOAD_CONFIG_PATH", self._confpath):
+            proxy._reload_config()
+        self.assertIn("alias-test-model", proxy_state.MODEL_ALIASES)
+        self.assertEqual(proxy_state.MODEL_ALIASES, proxy.MODEL_ALIASES)
 
 
 if __name__ == "__main__":

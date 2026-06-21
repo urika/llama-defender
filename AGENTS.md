@@ -240,7 +240,7 @@ Rapid-MLX specific variables:
 > and `--kv-cache-turboquant-bits` from `RAPID_MLX_EXTRA_ARGS`. FP16 KV cache for
 > 84K tokens uses ~3.8GB, well within the ~14GB available on a 48GB Mac.
 > See `configs/rapid-mlx-35b.conf` for the corrected configuration.
-| `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags. <br>Common values:<br>`--use-paged-cache` — enable PagedCacheManager block-level KV cache (vllm-mlx BatchedEngine)<br>`--gpu-memory-utilization 0.80` — cap Metal memory at 80% of total<br>`--continuous-batching` — redundant (BatchedEngine is default in v0.6.71+) |
+| `RAPID_MLX_EXTRA_ARGS` | `` | Extra Rapid-MLX CLI flags. <br>Common values:<br>`--use-paged-cache` — enable PagedCacheManager block-level KV cache (vllm-mlx BatchedEngine)<br>`--gpu-memory-utilization 0.80` — cap Metal memory at 80% of total<br>`--continuous-batching` — redundant (BatchedEngine is default in v0.6.71+)<br>`--default-repetition-penalty 1.05` — gentle repetition suppression for prose; ⚠️ 1.1+ suppresses normal code identifiers (`self`/`return`/`import`), 1.5+ severely degrades code quality. Validate with `tools/bench_quality.py` before raising |
 
 Watchdog variables:
 
@@ -409,7 +409,7 @@ Environment variables:
 | `PROXY_CTX_TOKEN_RATIO` | `2.0` | Chars-to-tokens estimation ratio for budget calculation |
 | `PROXY_MAX_TOKENS_OVERRIDE` | `0` | Hard cap on `max_tokens` (0 = disabled); works around rapid-mlx ignoring max_tokens |
 | `PROXY_OUTPUT_TOKEN_LIMIT_RATIO` | `2.0` | Multiplier applied to max_tokens for output safety margin |
-| `PROXY_BACKEND_TIMEOUT` | `300` | Backend request timeout in seconds. Increased to `600` for long-context support (100K+ tokens prefill can take ~5 minutes) |
+| `PROXY_BACKEND_TIMEOUT` | `600` | Backend request timeout in seconds. Increased to `600` for long-context support (100K+ tokens prefill can take ~5 minutes) |
 | `PROXY_MAX_REQUEST_BYTES` | `512000` (500KB) | **P0: Hard limit on request body size.** Returns 413 Payload Too Large before any pipeline processing. Prevents Metal OOM from oversized payloads (e.g. 359KB tool+dialog that crashed the backend). Set higher for cloud/API use cases |
 | `PROXY_PRE_TRUNCATE_CHARS` | `400000` | Pre-truncate very large payloads to prevent OOM/timeout |
 | `PROXY_RETRY_AFTER_SECONDS` | `30` | Retry-After header value (seconds) for 503/504 responses |

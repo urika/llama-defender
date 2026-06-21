@@ -1117,7 +1117,7 @@ pattern = (text前200 chars, 工具名sorted集合)
 RAPID_MLX_EXTRA_ARGS="--no-mllm --gpu-memory-utilization 0.75 --cache-memory-mb 4096 --max-num-seqs 1 --kv-cache-turboquant --kv-cache-turboquant-bits 4 --pin-system-prompt"
 PROXY_MAX_TOKENS_OVERRIDE=16384
 PROXY_OUTPUT_TOKEN_LIMIT_RATIO=2.0
-PROXY_BACKEND_TIMEOUT=300
+PROXY_BACKEND_TIMEOUT=600
 PROXY_TOOL_KEEP=8
 PROXY_CTX_TOKEN_BUDGET=30000
 ```

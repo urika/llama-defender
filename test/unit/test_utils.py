@@ -6,8 +6,13 @@ _next_jsonl_token, _ensure_jsonl_dir, _mask_sensitive.
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
 

@@ -128,7 +128,8 @@ _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
 | 参数 | 默认值 (local/cloud) | 说明 |
 |------|---------------------|------|
 | `PROXY_MAX_CONCURRENT` | 1 / 4 | 最大并发请求数 |
-| `PROXY_BACKEND_TIMEOUT` | 300 | 后端超时(秒) |
+| `PROXY_BACKEND_TIMEOUT` | 600 | 后端超时(秒)，100K+ token prefill 可需 ~5 分钟 |
+| `PROXY_MAX_REQUEST_BYTES` | 512000 (500KB) | 请求体大小硬上限，超过返回 413（防止 Metal OOM） |
 | `PROXY_DEDUP_WINDOW` | 2 | 请求去重时间窗口(秒) |
 
 ---
@@ -987,7 +988,7 @@ max_tokens (请求值)
 | 参数 | 默认 (local/cloud) | 说明 |
 |------|-------------------|------|
 | `PROXY_MAX_CONCURRENT` | 1 / 4 | 并发控制 |
-| `PROXY_BACKEND_TIMEOUT` | 300 | 后端超时(秒) |
+| `PROXY_BACKEND_TIMEOUT` | 600 | 后端超时(秒)，100K+ token prefill 可需 ~5 分钟 |
 | `PROXY_MAX_TOKENS_OVERRIDE` | 0 | 强制 max_tokens |
 | `PROXY_OUTPUT_TOKEN_LIMIT_RATIO` | 2.0 | 输出 token 倍率 |
 

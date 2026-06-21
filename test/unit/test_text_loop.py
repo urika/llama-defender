@@ -3,7 +3,13 @@
 Covers _detect_text_loop, _compute_text_similarity, and edge cases.
 Currently only 1 test case exists in test_proxy_fallback.py.
 """
+import os
+import sys
 import unittest
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
 

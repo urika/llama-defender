@@ -3,7 +3,13 @@
 Covers _extract_xml_params, _extract_xml_tool_name, _is_truncated_json,
 _parse_tools_block_body, _generate_tool_summary.
 """
+import os
+import sys
 import unittest
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import anthropic_proxy as proxy
 

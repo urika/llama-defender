@@ -4,6 +4,51 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ---
 
+## [Unreleased] - 2026-06-21
+
+### 安全加固 + 长上下文支持 + 配置一致性修复
+
+本次更新解决 code review 发现的 P0/P1 问题：请求体大小硬限制、长上下文超时统一、Qwen3.6 系列配置一致性、以及 repetition-penalty 副作用缓解。
+
+### Added
+
+- **`PROXY_MAX_REQUEST_BYTES` (P0)**: 请求体大小硬上限（默认 512000 bytes / 500KB），
+  在 `do_POST` 读取 body 前检查 Content-Length，超限返回 413 Payload Too Large。
+  防止 359KB+ tool+dialog 大 payload 触发 Metal OOM。所有 6 个本地/cloud 配置已显式设置。
+  单元测试覆盖：`test/unit/test_payload_limit.py`（4 个用例：超限→413、等于/小于/零长度→不拒）。
+  关联缺陷：DEF-005 (Metal OOM) 补充缓解。
+
+### Changed
+
+- **`PROXY_BACKEND_TIMEOUT` 300→600**: 所有本地配置统一提升至 600s，`manage.sh`/`anthropic_proxy.py`/
+  `proxy_config.py` 默认值同步。100K+ token prefill 可需 ~5 分钟，300s 会误判超时。
+  涉及配置：`rapid-mlx-35b-opt`、`mlx_vlm-27b`、`qwen3-8b`、`qwen2.5-coder-14b`、`gemma4-26b`。
+
+- **`PROXY_MAX_TOKENS_OVERRIDE` 16384→32768**: `rapid-mlx-35b-opt`、`qwen3-8b`、`gemma4-26b` 提升至 32768，
+  匹配 long-context 场景下的输出需求。
+
+- **`RAPID_MLX_REASONING_PARSER` 统一为 `qwen3`**: `mlx_vlm-27b` 和 `qwen3-8b` 从 `""` 改为 `"qwen3"`，
+  与 `rapid-mlx-35b-opt` 一致。正确剥离  nondel 块，输出纯回复，避免非推理场景下 think 标签泄漏到输出。
+
+- **`--default-repetition-penalty` 1.1→1.05**: 1.1 对代码生成副作用过大，抑制 `self`/`return`/`import`
+  等正常重复标识符；1.05 轻微抑制站点名/短语重复且不损害代码质量。调整前建议用 `tools/bench_quality.py` 验证。
+
+### Fixed
+
+- **`rapid-mlx-35b-opt.conf` 注释与实际值矛盾**: 头注释 `temp=0.3/推理解析器清空` 与实际
+  `LLAMA_TEMP=0.7/RAPID_MLX_REASONING_PARSER=qwen3` 不符；`CONFIG_DESC` 同步修正。
+- **`test/README.md` 引用不存在的 `/tmp/` 脚本**: `/tmp/safe_longctx_test.py` 和
+  `/tmp/gemma_eval/test_gemma_processing.py` 是临时文件（重启即失），已移除，改为指向
+  `tools/bench_perf.py --long-ctx-only` 和 `tools/bench_quality.py`。
+- **`manage.sh` 默认值未同步**: `PROXY_BACKEND_TIMEOUT` 默认 300→600；
+  新增 `PROXY_MAX_REQUEST_BYTES` 环境变量传递（与 proxy 自身默认值兜底一致）。
+- **文档同步**: `AGENTS.md`、`docs/01-requirements-product/PRD-anthropic-proxy.md`、
+  `docs/02-architecture-design/proxy-pipeline-reference.md`、`docs/02-architecture-design/proxy-context-window-design.md`
+  中 `PROXY_BACKEND_TIMEOUT` 默认值 300→600，新增 `PROXY_MAX_REQUEST_BYTES` 行。
+  `AGENTS.md` `RAPID_MLX_EXTRA_ARGS` 表新增 `--default-repetition-penalty` 说明及副作用警告。
+
+---
+
 ## [Unreleased] - 2026-06-19
 
 ### 配置优化：27B 模型 + rapid-mlx v0.6.71 后端加固

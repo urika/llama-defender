@@ -4,8 +4,13 @@ Verifies config invariants, shared state consistency, and config helpers
 from the canonical source of truth (not through anthropic_proxy re-exports).
 """
 import os
+import sys
 import tempfile
 import unittest
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import proxy_state
 import proxy_config

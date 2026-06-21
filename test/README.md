@@ -97,3 +97,6 @@ python3 tools/bench_perf.py --long-ctx-only
 # 模型质量评测（14 项代码/数学/指令/格式/常识）
 python3 tools/bench_quality.py
 ```
+
+> 注：如需长上下文安全测试，使用 `python3 tools/bench_perf.py --long-ctx-only`（通过代理串行执行并监控内存）。
+> 数据处理能力评测使用 `python3 tools/bench_quality.py`。
