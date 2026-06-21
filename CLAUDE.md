@@ -16,18 +16,27 @@ Backend switching is done entirely at the proxy layer — **never modify Claude 
 configuration directly** (no `~/.claude/settings.local.json` changes, no
 `ANTHROPIC_BASE_URL` env vars in Claude Code).
 
-Three core pieces:
+Core pieces:
 
-- **`manage.sh`** — Bash service manager. Sources `configs/active.conf` (a symlink to the currently selected `configs/*.conf`), applies defaults, and starts either a local backend (`llama-server` or `rapid-mlx`) or a cloud-only proxy (`start-cloud`).
-- **`anthropic_proxy.py`** — Python 3 stdlib-only HTTP proxy (port 4000). Dual-mode:
-  - **Local mode**: Translates Anthropic ↔ OpenAI for `llama-server`/`rapid-mlx`
-  - **Cloud mode**: Forwards to DeepSeek/OpenAI APIs with real API key, using `BACKEND_TYPE` auto-detection
-  - Bidirectional message/tool/tool_choice/SSE conversion
-  - XML→JSON fallback for Qwen tool-calling quirks (llama.cpp issue #21495)
-  - Reasoning content extraction for Qwen thinking mode
-  - Model aliases — all Claude model IDs map to the active model (local or cloud)
-  - Optional `tool_result` truncation for long agentic sessions
-- **`qwen35-template.jinja`** — Strict Jinja template for Qwen3.5/3.6 (local mode only).
+- **`manage.sh`** — Bash service manager. Sources `configs/active.conf`, applies defaults, starts local backend or cloud-only proxy.
+- **`anthropic_proxy.py`** — Python 3 stdlib-only HTTP proxy (port 4000). Entry point: `Handler` class (HTTP), request pipeline, truncation, `main()`. ~2891 lines (down from 5525 after Phase 0-3 refactoring, -48%).
+- **`proxy_state.py`** — Single source of truth for all PROXY_* config, shared mutable state, SIGHUP reload spec.
+- **`proxy_config.py`** — Canonical CONFIG_REGISTRY with per-variable defaults, types, scopes, validation.
+
+Extracted modules (Phase 1-3):
+
+| Module | Lines | Purpose |
+|--------|------|---------|
+| `tool_parser.py` | ~330 | XML→JSON fallback, content-tools extraction, streaming extractor |
+| `content_compressor.py` | ~320 | TokenSieve semantic compression for tool results |
+| `message_converter.py` | ~520 | Anthropic↔OpenAI bidirectional format conversion |
+| `lifecycle.py` | ~205 | Lifecycle stage classification, dynamic token budget |
+| `loop_detection.py` | ~332 | Loop/bloker detection, text similarity, intervention |
+| `tool_filter.py` | ~190 | Tool definition filtering, keyword extraction, error translation |
+| `admin_server.py` | ~980 | Status HTML dashboard, metrics, memory checks, concurrency |
+| `proxy_logging.py` | ~110 | Structured logging, JSONL requests/metrics |
+
+**`tools/extract_module.py`** — AST-based extraction tool with dual-patch test migration.
 
 `AGENTS.md` contains the full reference (config variables, format conversion details, known issues, security notes); keep it in sync with this file when architectural changes happen.
 
