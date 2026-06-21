@@ -12,6 +12,7 @@ sys.path.insert(0, REPO_ROOT)
 
 # Patch before importing anthropic_proxy
 import anthropic_proxy as proxy
+import admin_server
 
 
 def _fake_system_memory():
@@ -28,7 +29,7 @@ def _fake_system_memory():
     }
 
 
-proxy._get_system_memory = _fake_system_memory
+admin_server._get_system_memory = _fake_system_memory
 
 if __name__ == "__main__":
     proxy.main()
