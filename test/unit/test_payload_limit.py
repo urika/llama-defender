@@ -44,7 +44,7 @@ class TestPayloadSizeLimit(unittest.TestCase):
         h._respond_json = fake_respond_json
         return h
 
-    @patch.object(proxy, "PROXY_METRICS_ENABLED", False)
+    @patch.object(proxy, "PROXY_METRICS_ENABLED", False), patch.object(proxy_state, "PROXY_METRICS_ENABLED", False)
     @patch.object(proxy, "PROXY_MAX_REQUEST_BYTES", 1000)
     def test_oversized_request_returns_413(self):
         """Content-Length > PROXY_MAX_REQUEST_BYTES → 413 payload_too_large."""
@@ -58,7 +58,7 @@ class TestPayloadSizeLimit(unittest.TestCase):
         self.assertEqual(err["received_bytes"], 2000)
         self.assertEqual(err["max_bytes"], 1000)
 
-    @patch.object(proxy, "PROXY_METRICS_ENABLED", False)
+    @patch.object(proxy, "PROXY_METRICS_ENABLED", False), patch.object(proxy_state, "PROXY_METRICS_ENABLED", False)
     @patch.object(proxy, "PROXY_MAX_REQUEST_BYTES", 1000)
     def test_exact_limit_not_rejected(self):
         """Content-Length == PROXY_MAX_REQUEST_BYTES → not 413-rejected (boundary)."""
@@ -67,7 +67,7 @@ class TestPayloadSizeLimit(unittest.TestCase):
         rejected = [r for r in h._responses if r["status"] == 413]
         self.assertEqual(rejected, [], "exact-limit request must not be 413-rejected")
 
-    @patch.object(proxy, "PROXY_METRICS_ENABLED", False)
+    @patch.object(proxy, "PROXY_METRICS_ENABLED", False), patch.object(proxy_state, "PROXY_METRICS_ENABLED", False)
     @patch.object(proxy, "PROXY_MAX_REQUEST_BYTES", 1000)
     def test_under_limit_not_rejected(self):
         """Content-Length < PROXY_MAX_REQUEST_BYTES → not 413-rejected."""
@@ -76,7 +76,7 @@ class TestPayloadSizeLimit(unittest.TestCase):
         rejected = [r for r in h._responses if r["status"] == 413]
         self.assertEqual(rejected, [], "under-limit request must not be 413-rejected")
 
-    @patch.object(proxy, "PROXY_METRICS_ENABLED", False)
+    @patch.object(proxy, "PROXY_METRICS_ENABLED", False), patch.object(proxy_state, "PROXY_METRICS_ENABLED", False)
     @patch.object(proxy, "PROXY_MAX_REQUEST_BYTES", 1000)
     def test_zero_content_length_not_rejected(self):
         """Content-Length=0 → not 413-rejected."""

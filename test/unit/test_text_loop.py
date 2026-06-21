@@ -112,11 +112,15 @@ class TestTextLoopEdgeCases(unittest.TestCase):
         try:
             proxy.PROXY_TEXT_LOOP_ENABLED = False
             proxy_state.PROXY_TEXT_LOOP_ENABLED = False
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = False
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = False
             run, is_loop = proxy._detect_text_loop(msgs, threshold=3)
             self.assertFalse(is_loop)
             self.assertEqual(run, 0)
         finally:
             proxy.PROXY_TEXT_LOOP_ENABLED = old
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = old
+            proxy_state.PROXY_TEXT_LOOP_ENABLED = old
             proxy_state.PROXY_TEXT_LOOP_ENABLED = old
 
 

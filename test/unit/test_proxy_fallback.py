@@ -335,7 +335,7 @@ class TestBlockerDetection(unittest.TestCase):
         return {"role": "user", "content": text}
 
     def test_disabled_short_circuits(self):
-        with patch.object(proxy, "PROXY_BLOCKER_ENABLED", False), patch.object(proxy_state, "PROXY_BLOCKER_ENABLED", False), patch.object(proxy_state, "PROXY_BLOCKER_ENABLED", False):
+        with patch.object(proxy, "PROXY_BLOCKER_ENABLED", False), patch.object(proxy_state, "PROXY_BLOCKER_ENABLED", False):
             msgs = [
                 self._assistant_tool_use("Read"),
                 self._user_tool_result("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，然后使用正确的文件路径。]"),
@@ -347,7 +347,7 @@ class TestBlockerDetection(unittest.TestCase):
         self.assertEqual(r.get("reason"), "disabled")
 
     def test_below_threshold(self):
-        with patch.object(proxy, "PROXY_BLOCKER_THRESHOLD", 3), patch.object(proxy_state, "PROXY_BLOCKER_THRESHOLD", 3), patch.object(proxy_state, "PROXY_BLOCKER_THRESHOLD", 3):
+        with patch.object(proxy, "PROXY_BLOCKER_THRESHOLD", 3), patch.object(proxy_state, "PROXY_BLOCKER_THRESHOLD", 3):
             msgs = [
                 self._assistant_tool_use("Read"),
                 self._user_tool_result("[System: 文件不存在]"),
@@ -2040,6 +2040,8 @@ class TestCacheAligner(unittest.TestCase):
         orig = proxy.PROXY_CACHE_ALIGN_ENABLED
         proxy.PROXY_CACHE_ALIGN_ENABLED = False
         proxy_state.PROXY_CACHE_ALIGN_ENABLED = False
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = False
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = False
         try:
             msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
             prefix, dynamic = proxy._apply_cache_aligner(msgs)
@@ -2048,13 +2050,19 @@ class TestCacheAligner(unittest.TestCase):
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
 
     def test_protects_head(self):
         orig = proxy.PROXY_CACHE_ALIGN_ENABLED
         orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
         proxy.PROXY_CACHE_ALIGN_ENABLED = True
         proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
         proxy.PROXY_CACHE_ALIGN_HEAD = 2
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 2
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 2
         proxy_state.PROXY_CACHE_ALIGN_HEAD = 2
         try:
             msgs = [
@@ -2071,7 +2079,11 @@ class TestCacheAligner(unittest.TestCase):
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
             proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
 
     def test_head_larger_than_messages(self):
@@ -2079,7 +2091,11 @@ class TestCacheAligner(unittest.TestCase):
         orig_head = proxy.PROXY_CACHE_ALIGN_HEAD
         proxy.PROXY_CACHE_ALIGN_ENABLED = True
         proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
+        proxy_state.PROXY_CACHE_ALIGN_ENABLED = True
         proxy.PROXY_CACHE_ALIGN_HEAD = 10
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 10
+        proxy_state.PROXY_CACHE_ALIGN_HEAD = 10
         proxy_state.PROXY_CACHE_ALIGN_HEAD = 10
         try:
             msgs = [{"role": "system", "content": "sys"}]
@@ -2089,7 +2105,11 @@ class TestCacheAligner(unittest.TestCase):
         finally:
             proxy.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
+            proxy_state.PROXY_CACHE_ALIGN_ENABLED = orig
             proxy.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
+            proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
             proxy_state.PROXY_CACHE_ALIGN_HEAD = orig_head
 
 
@@ -2099,6 +2119,7 @@ class TestToolFilterStableOrder(unittest.TestCase):
     def test_always_keep_order_stable(self):
         orig_max = proxy.PROXY_TOOL_FILTER_MAX
         proxy.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
+        proxy_state.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
         proxy_state.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
         proxy_state.PROXY_TOOL_FILTER_MAX = 3  # force filtering with 5 tools
         try:
@@ -2116,6 +2137,7 @@ class TestToolFilterStableOrder(unittest.TestCase):
             self.assertTrue(stats.get("filtered"))
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = orig_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = orig_max
             proxy_state.PROXY_TOOL_FILTER_MAX = orig_max
             proxy_state.PROXY_TOOL_FILTER_MAX = orig_max
 
@@ -2319,6 +2341,7 @@ class TestFilterToolsSorting(unittest.TestCase):
         proxy.PROXY_TOOL_FILTER_MAX = 5
         proxy_state.PROXY_TOOL_FILTER_MAX = 5
         proxy_state.PROXY_TOOL_FILTER_MAX = 5
+        proxy_state.PROXY_TOOL_FILTER_MAX = 5
         proxy.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         proxy_state.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         try:
@@ -2329,6 +2352,7 @@ class TestFilterToolsSorting(unittest.TestCase):
             self.assertEqual(names, ["Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"])
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = original_max
+            proxy_state.PROXY_TOOL_FILTER_MAX = original_max
             proxy_state.PROXY_TOOL_FILTER_MAX = original_max
             proxy_state.PROXY_TOOL_FILTER_MAX = original_max
             proxy.TOOL_ALWAYS_KEEP = original_keep
@@ -2652,7 +2676,7 @@ class TestFrozenZoneToolClearing(unittest.TestCase):
 
     def test_frozen_zero_clears_all(self):
         """When PROXY_FROZEN_HEAD=0, all tool_results are eligible."""
-        with patch.object(proxy, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0):
+        with patch.object(proxy, "PROXY_FROZEN_HEAD", 0), patch.object(proxy_state, "PROXY_FROZEN_HEAD", 0):
             msgs = self._msgs_with_frozen(n_frozen_reads=2, n_dynamic_reads=4)
             result, stats = proxy.clear_old_tool_results(msgs)
             self.assertEqual(stats["frozen_used"], 0)
@@ -2763,7 +2787,7 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_init_stage(self):
         """Below PROXY_CLEAR_THRESHOLD → stage=init, no compression."""
-        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
             msgs = self._msgs_chars(10000)
             stage = proxy._classify_lifecycle_stage(msgs)
             self.assertEqual(stage["stage"], "init")
@@ -2773,8 +2797,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_growth_stage(self):
         """PROXY_CLEAR_THRESHOLD ≤ chars < PROXY_CHARS_GROWTH → growth."""
-        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
-            with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
+        with patch.object(proxy, "PROXY_CLEAR_THRESHOLD", 15000), patch.object(proxy_state, "PROXY_CLEAR_THRESHOLD", 15000):
+            with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
                 msgs = self._msgs_chars(25000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "growth")
@@ -2784,8 +2808,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_expansion_stage(self):
         """PROXY_CHARS_GROWTH ≤ chars < PROXY_CHARS_EXPANSION → expansion."""
-        with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
-            with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
+        with patch.object(proxy, "PROXY_CHARS_GROWTH", 40000), patch.object(proxy_state, "PROXY_CHARS_GROWTH", 40000):
+            with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
                 msgs = self._msgs_chars(60000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "expansion")
@@ -2795,8 +2819,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_saturation_stage(self):
         """PROXY_CHARS_EXPANSION ≤ chars < PROXY_CHARS_SATURATION."""
-        with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
-            with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
+        with patch.object(proxy, "PROXY_CHARS_EXPANSION", 90000), patch.object(proxy_state, "PROXY_CHARS_EXPANSION", 90000):
+            with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
                 msgs = self._msgs_chars(120000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "saturation")
@@ -2804,8 +2828,8 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_oom_danger_stage(self):
         """PROXY_CHARS_SATURATION ≤ chars < PROXY_CHARS_OOM_DANGER."""
-        with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
-            with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
+        with patch.object(proxy, "PROXY_CHARS_SATURATION", 180000), patch.object(proxy_state, "PROXY_CHARS_SATURATION", 180000):
+            with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
                 msgs = self._msgs_chars(250000)
                 stage = proxy._classify_lifecycle_stage(msgs)
                 self.assertEqual(stage["stage"], "oom_danger")
@@ -2815,7 +2839,7 @@ class TestLifecycleStage(unittest.TestCase):
 
     def test_pre_trunc_stage(self):
         """chars ≥ PROXY_CHARS_OOM_DANGER → pre_trunc."""
-        with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
+        with patch.object(proxy, "PROXY_CHARS_OOM_DANGER", 350000), patch.object(proxy_state, "PROXY_CHARS_OOM_DANGER", 350000):
             msgs = self._msgs_chars(500000)
             stage = proxy._classify_lifecycle_stage(msgs)
             self.assertEqual(stage["stage"], "pre_trunc")
@@ -3000,7 +3024,7 @@ class TestPhase1SessionContinuation(unittest.TestCase):
         """When PROXY_SESSION_CONTINUATION_ENABLED is false, the counter
         is not consulted regardless of count, and the function does not
         increment it."""
-        with patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", False), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", False), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", False):
+        with patch.object(proxy, "PROXY_SESSION_CONTINUATION_ENABLED", False), patch.object(proxy_state, "PROXY_SESSION_CONTINUATION_ENABLED", False):
             # Pre-seed the counter to verify it is not advanced.
             proxy._SESSION_REQUEST_COUNT["sess_disabled"] = 100
             before = proxy._SESSION_REQUEST_COUNT["sess_disabled"]
@@ -3382,14 +3406,14 @@ class TestMemoryRejection(unittest.TestCase):
 
     def test_reject_when_above_threshold(self):
         mem = {"used_pct": "95.0"}
-        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
+        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0), patch.object(proxy_state, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
             rejected, used = proxy._should_reject_for_memory(mem)
             self.assertTrue(rejected)
             self.assertEqual(used, 95.0)
 
     def test_not_reject_when_below_threshold(self):
         mem = {"used_pct": "70.0"}
-        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
+        with patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0), patch.object(proxy_state, "PROXY_MEMORY_REJECT_THRESHOLD", 90.0):
             rejected, used = proxy._should_reject_for_memory(mem)
             self.assertFalse(rejected)
             self.assertEqual(used, 70.0)
@@ -3404,8 +3428,8 @@ class TestDynamicMaxTokens(unittest.TestCase):
     """Phase 3.4: lifecycle-stage-aware max_tokens."""
 
     def test_init_stage_unchanged(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
                 mem = {"available_gb": 20, "total_gb": 48}
                 adjusted, reason = proxy._compute_dynamic_max_tokens(
                     4096, {"stage": "init"}, mem=mem)
@@ -3413,9 +3437,9 @@ class TestDynamicMaxTokens(unittest.TestCase):
                 self.assertIn("stage=init", reason)
 
     def test_saturation_stage_capped(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
                     mem = {"available_gb": 20, "total_gb": 48}
                     adjusted, reason = proxy._compute_dynamic_max_tokens(
                         8192, {"stage": "saturation"}, mem=mem)
@@ -3423,19 +3447,19 @@ class TestDynamicMaxTokens(unittest.TestCase):
                     self.assertIn("stage=saturation", reason)
 
     def test_rapid_mlx_discount(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "rapid-mlx/Qwen"), patch.object(proxy_state, "MODEL_NAME", "rapid-mlx/Qwen"), patch.object(proxy_state, "MODEL_NAME", "rapid-mlx/Qwen"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
-                    with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "rapid-mlx/Qwen"), patch.object(proxy_state, "MODEL_NAME", "rapid-mlx/Qwen"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+                    with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", 0.8):
                         mem = {"available_gb": 20, "total_gb": 48}
                         adjusted, _ = proxy._compute_dynamic_max_tokens(
                             8192, {"stage": "saturation"}, mem=mem)
                         self.assertEqual(adjusted, int(2048 * 0.8))
 
     def test_low_memory_discount(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
-            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
-                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            with patch.object(proxy, "MODEL_NAME", "test-model"), patch.object(proxy_state, "MODEL_NAME", "test-model"):
+                with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048):
                     mem = {"available_gb": 5, "total_gb": 48}
                     adjusted, reason = proxy._compute_dynamic_max_tokens(
                         8192, {"stage": "saturation"}, mem=mem)
@@ -3443,7 +3467,7 @@ class TestDynamicMaxTokens(unittest.TestCase):
                     self.assertIn("low_memory", reason)
 
     def test_disabled_returns_original(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False):
+        with patch.object(proxy, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False), patch.object(proxy_state, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", False):
             adjusted, reason = proxy._compute_dynamic_max_tokens(
                 4096, {"stage": "saturation"})
             self.assertEqual(adjusted, 4096)
@@ -3454,6 +3478,7 @@ class TestRequestSnapshots(unittest.TestCase):
     """Phase 3.5: failure request snapshots."""
 
     def setUp(self):
+        proxy_state.PROXY_SNAPSHOT_ENABLED = True
         self.snapshot_dir = os.path.join(_REPO_ROOT, "logs", "snapshots")
         if os.path.exists(self.snapshot_dir):
             for f in os.listdir(self.snapshot_dir):
@@ -3467,7 +3492,7 @@ class TestRequestSnapshots(unittest.TestCase):
                     os.remove(os.path.join(self.snapshot_dir, f))
 
     def test_snapshot_writes_before_and_after(self):
-        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", True):
+        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", True), patch.object(proxy_state, "PROXY_SNAPSHOT_ENABLED", True):
             req_id = "test_snap_1"
             before = {"messages": [{"role": "user", "content": "hi"}]}
             written = proxy._write_request_snapshot(req_id, before)
@@ -3484,7 +3509,7 @@ class TestRequestSnapshots(unittest.TestCase):
             self.assertEqual(data["error"]["type"], "RuntimeError")
 
     def test_snapshot_disabled_returns_false(self):
-        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", False):
+        with patch.object(proxy, "PROXY_SNAPSHOT_ENABLED", False), patch.object(proxy_state, "PROXY_SNAPSHOT_ENABLED", False):
             written = proxy._write_request_snapshot("test_snap_2", {"x": 1})
             self.assertFalse(written)
 
@@ -3505,12 +3530,17 @@ class TestDynamicConcurrency(unittest.TestCase):
         proxy._ERROR_WINDOW.clear()
         proxy._ERROR_WINDOW.extend(self._orig_errors)
         proxy.PROXY_MAX_CONCURRENT = self._orig_max
+        proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
+        proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
+        proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
 
     def test_high_latency_triggers_downgrade(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
-            with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MIN", 1):
-                with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MAX", 4):
+        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
+            with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MIN", 1), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_MIN", 1):
+                with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MAX", 4), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_MAX", 4):
                     proxy.PROXY_MAX_CONCURRENT = 4
+                    proxy_state.PROXY_MAX_CONCURRENT = 4
+                    proxy_state.PROXY_MAX_CONCURRENT = 4
                     for _ in range(10):
                         proxy._record_request_for_concurrency(60000, 200)
                     result = proxy._adjust_concurrency()
@@ -3518,8 +3548,10 @@ class TestDynamicConcurrency(unittest.TestCase):
                     self.assertLess(proxy.PROXY_MAX_CONCURRENT, 4)
 
     def test_low_latency_stable_does_not_change(self):
-        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
+        with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
             proxy.PROXY_MAX_CONCURRENT = 2
+            proxy_state.PROXY_MAX_CONCURRENT = 2
+            proxy_state.PROXY_MAX_CONCURRENT = 2
             # Latency in the stable band: below threshold but above threshold/2
             for _ in range(5):
                 proxy._record_request_for_concurrency(20000, 200)

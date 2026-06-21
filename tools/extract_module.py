@@ -125,21 +125,15 @@ def fix_tests(vars_list):
         with open(path) as f: c = f.read()
         changed = False
         for v in vars_list:
-            # Pattern 1: 'with patch.object(proxy, "VAR", val):' → dual context
-            p1 = re.compile(rf'(\s*)with patch\.object\(proxy, "{v}", ([^)]+)\):')
-            c2 = p1.sub(rf'\1with patch.object(proxy, "{v}", \2), patch.object(proxy_state, "{v}", \2):', c)
-            if c2 != c: c = c2; changed = True
-            # Pattern 2: list-based patches: patch.object(proxy, "VAR", val) → also add proxy_state
-            p2 = re.compile(rf'patch\.object\(proxy, "{v}", ([^)]+)\)')
-            # For each match, add a proxy_state equivalent right after
-            def add_dual(m):
+            if f'patch.object(proxy_state, "{v}"' in c: continue  # idempotent
+            c = re.sub(rf'(\s*)with patch\.object\(proxy, "{v}", ([^)]+)\):',
+                       rf'\1with patch.object(proxy, "{v}", \2), patch.object(proxy_state, "{v}", \2):', c)
+            def _dual(m):
                 return f'{m.group(0)}, patch.object(proxy_state, "{v}", {m.group(1)})'
-            c3 = p2.sub(add_dual, c)
-            if c3 != c: c = c3; changed = True
-            # Pattern 3: direct assignment proxy.VAR = val → also proxy_state.VAR = val
-            p3 = re.compile(rf'^(\s*)(proxy)\.({v})\s*=\s*(.+)$', re.MULTILINE)
-            c4 = p3.sub(rf'\1\2.\3 = \4\n\1proxy_state.\3 = \4', c)
-            if c4 != c: c = c4; changed = True
+            c = re.sub(rf'patch\.object\(proxy, "{v}", ([^)]+)\)', _dual, c)
+            c = re.sub(rf'^(\s*)(proxy)\.({v})\s*=\s*(.+)$',
+                       rf'\1\2.\3 = \4\n\1proxy_state.\3 = \4', c, flags=re.MULTILINE)
+            changed = True
         if changed:
             with open(path,'w') as f: f.write(c)
             print(f"Updated {tf}")
