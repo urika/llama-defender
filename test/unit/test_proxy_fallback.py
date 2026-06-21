@@ -1654,6 +1654,7 @@ class TestMetrics(unittest.TestCase):
         self._metrics_path = os.path.join(self._tmpdir, "metrics.jsonl")
         self._patches = [
             patch.object(proxy, "_METRICS_PATH", self._metrics_path),
+            patch.object(proxy_state, "_METRICS_PATH", self._metrics_path),
             patch.object(proxy, "_ensure_jsonl_dir", lambda: None),
         ]
         for p in self._patches:
