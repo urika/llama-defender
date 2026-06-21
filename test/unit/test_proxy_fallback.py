@@ -3533,12 +3533,14 @@ class TestDynamicConcurrency(unittest.TestCase):
         proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
         proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
         proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
+        proxy_state.PROXY_MAX_CONCURRENT = self._orig_max
 
     def test_high_latency_triggers_downgrade(self):
         with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
             with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MIN", 1), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_MIN", 1):
                 with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_MAX", 4), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_MAX", 4):
                     proxy.PROXY_MAX_CONCURRENT = 4
+                    proxy_state.PROXY_MAX_CONCURRENT = 4
                     proxy_state.PROXY_MAX_CONCURRENT = 4
                     proxy_state.PROXY_MAX_CONCURRENT = 4
                     for _ in range(10):
@@ -3550,6 +3552,7 @@ class TestDynamicConcurrency(unittest.TestCase):
     def test_low_latency_stable_does_not_change(self):
         with patch.object(proxy, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True), patch.object(proxy_state, "PROXY_DYNAMIC_CONCURRENT_ENABLED", True):
             proxy.PROXY_MAX_CONCURRENT = 2
+            proxy_state.PROXY_MAX_CONCURRENT = 2
             proxy_state.PROXY_MAX_CONCURRENT = 2
             proxy_state.PROXY_MAX_CONCURRENT = 2
             # Latency in the stable band: below threshold but above threshold/2
