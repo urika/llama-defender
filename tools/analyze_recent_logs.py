@@ -106,6 +106,34 @@ def analyze_period(label, metrics, total_all):
     summarize_latency("cloud", cloud_durs)
     summarize_latency("local", local_durs)
 
+    # Latency by char-size bucket (建议3 per-bucket analysis)
+    bucket_order = ["xs", "sm", "md", "lg", "xl", "xxl", "unknown"]
+    bucket_latencies = defaultdict(list)
+    bucket_disp = defaultdict(list)
+    for m in metrics:
+        bd = m.get("pipeline", {}).get("backend_dispatcher", {})
+        bucket = bd.get("input_chars_bucket")
+        if bucket is None:
+            continue
+        bucket_latencies[bucket].append(m.get("duration_ms") or 0)
+        disp = bd.get("dispatch_latency_ms")
+        if disp is not None and disp >= 0:
+            bucket_disp[bucket].append(disp)
+    has_bucket_data = any(bucket_latencies.values()) or any(bucket_disp.values())
+    if has_bucket_data:
+        print("\n📦 延迟（按输入大小分桶）")
+        print(f"  {'bucket':8s} {'count':>6s}  {'req_dur avg/p95':>22s}  {'dispatch_lat avg/p95':>22s}")
+        for bucket in bucket_order:
+            reqs = bucket_latencies.get(bucket, [])
+            disps = bucket_disp.get(bucket, [])
+            if not reqs and not disps:
+                continue
+            req_str = (f"avg={sum(reqs)/len(reqs)/1000:.2f}s p95={percentile(reqs,0.95)/1000:.2f}s"
+                       if reqs else "N/A")
+            disp_str = (f"avg={sum(disps)/len(disps):.0f}ms p95={percentile(disps,0.95):.0f}ms"
+                        if disps else "N/A")
+            print(f"  {bucket:8s} {len(reqs) or len(disps):>6d}  {req_str:>22s}  {disp_str:>22s}")
+
     # Stages
     stages = Counter()
     for m in metrics:

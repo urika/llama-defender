@@ -1049,7 +1049,7 @@ def _build_status_html():
             + '</div>'
         )
 
-    route_card = f"""<div class="card">
+    route_card = f"""<div class="card" style="grid-column: 1 / -1;">
     <h2>🔀 Intelligent Routing</h2>
     <div class="row"><span class="label">Status</span><span class="value">{route_status_icon} {route_status_text}</span></div>
     <div class="row"><span class="label">API Key</span><span class="value">{api_key_badge}</span></div>
