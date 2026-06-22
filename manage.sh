@@ -620,7 +620,7 @@ _start_proxy() {
     PROXY_OUTPUT_TOKEN_LIMIT_RATIO="${PROXY_OUTPUT_TOKEN_LIMIT_RATIO:-1.5}" \
     PROXY_BACKEND_TIMEOUT="${PROXY_BACKEND_TIMEOUT:-600}" \
     PROXY_MAX_REQUEST_BYTES="${PROXY_MAX_REQUEST_BYTES:-512000}" \
-    PROXY_OOM_SAFE_CHARS="${PROXY_OOM_SAFE_CHARS:-${PROXY_PRE_TRUNCATE_CHARS:-}}" \
+    PROXY_OOM_SAFE_CHARS="${PROXY_OOM_SAFE_CHARS:-${PROXY_PRE_TRUNCATE_CHARS:-200000}}" \
     PROXY_SESSION_CONTINUATION_ENABLED="${PROXY_SESSION_CONTINUATION_ENABLED:-true}" \
     PROXY_SESSION_CONTINUATION_MIN_REQUESTS="${PROXY_SESSION_CONTINUATION_MIN_REQUESTS:-2}" \
     PROXY_CHARS_EXPANSION="${PROXY_CHARS_EXPANSION:-90000}" \
@@ -1393,6 +1393,33 @@ cmd_watchdog() {
 }
 
 # ============================================================
+# 智能路由管理命令
+# ============================================================
+cmd_route_force_local() {
+    local sid="${1:-}"
+    if [[ -z "$sid" ]]; then
+        error "Usage: ./manage.sh route-force-local <session_id>"
+        return 1
+    fi
+    info "Forcing session $sid to local..."
+    curl -sf -X POST "http://127.0.0.1:${PORT:-4000}/admin/route/force-local" \
+        -H "Content-Type: application/json" \
+        -d "{\"session_id\":\"$sid\"}" && echo "" || warn "Proxy not reachable on port ${PORT:-4000}"
+}
+
+cmd_route_force_cloud() {
+    local sid="${1:-}"
+    if [[ -z "$sid" ]]; then
+        error "Usage: ./manage.sh route-force-cloud <session_id>"
+        return 1
+    fi
+    info "Forcing session $sid to cloud..."
+    curl -sf -X POST "http://127.0.0.1:${PORT:-4000}/admin/route/force-cloud" \
+        -H "Content-Type: application/json" \
+        -d "{\"session_id\":\"$sid\"}" && echo "" || warn "Proxy not reachable on port ${PORT:-4000}"
+}
+
+# ============================================================
 # 帮助信息
 # ============================================================
 cmd_help() {
@@ -1469,6 +1496,12 @@ main() {
             ;;
         reload)
             cmd_reload
+            ;;
+        route-force-local)
+            cmd_route_force_local "$2"
+            ;;
+        route-force-cloud)
+            cmd_route_force_cloud "$2"
             ;;
         start-backend)
             cmd_start_backend

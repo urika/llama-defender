@@ -13,9 +13,12 @@ Usage:
     pipeline = InstrumentedPipeline([LifecycleClassifier(), ..., BackendDispatcher(...)])
     pipeline.run(ctx)
 """
+import collections
+import io
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -58,6 +61,41 @@ def _import_message_converter():
 def _import_admin_server():
     import admin_server
     return admin_server
+
+
+# Phase 3+ (建议3): coarse character buckets for latency long-tail analysis.
+# Boundaries aligned with smart-router lifecycle thresholds (init/growth/
+# saturation/oom).  Used in metrics JSONL so the analyzer can group
+# `dispatch_latency_ms` by request size without re-parsing the body.
+_CHAR_BUCKET_BOUNDARIES = (
+    (10000,    "xs"),    # 0–10K
+    (50000,    "sm"),    # 10K–50K
+    (150000,   "md"),    # 50K–150K
+    (400000,   "lg"),    # 150K–400K
+    (1_000_000, "xl"),   # 400K–1M
+)
+_CHAR_BUCKET_DEFAULT = "xxl"          # > 1M
+
+
+def _char_bucket(total_chars: int) -> str:
+    """Return a coarse size code (xs/sm/md/lg/xl/xxl) for the input character count.
+
+    Empty string or 0 → 'xs' (numeric falsy kept as zero). Other non-numeric
+    inputs (None, non-numeric strings) → 'unknown'.
+    """
+    if total_chars is None:
+        return "unknown"
+    try:
+        n = int(total_chars)
+    except (TypeError, ValueError):
+        # Empty string was historically treated as 0 / xs.
+        if total_chars == "" or total_chars == 0 or total_chars is False:
+            return "xs"
+        return "unknown"
+    for boundary, label in _CHAR_BUCKET_BOUNDARIES:
+        if n < boundary:
+            return label
+    return _CHAR_BUCKET_DEFAULT
 
 
 # ============================================================================
@@ -114,6 +152,15 @@ class PipelineContext:
     # --- CacheAligner internal state ---
     _cache_prefix: list = field(default_factory=list, repr=False)
     _cache_dynamic: list = field(default_factory=list, repr=False)
+
+    # --- Route fields (Phase 1) ---
+    _route_target: str = "local"          # "local" | "cloud" | "local_forced"
+    _route_reason: str = ""               # decision reason tag
+    _route_header_override: str = ""      # X-Proxy-Route-To header value
+    _route_actual_cost: float = 0.0       # actual cloud cost (post-request)
+    _route_cloud_model: str = ""          # selected cloud model name
+    _emergency_fallback: bool = False     # emergency fallback mode flag
+    _agent_model_tier: str = "sonnet"     # Agent-selected tier ("opus"/"sonnet"/"haiku")
 
 
 # ============================================================================
@@ -293,6 +340,13 @@ class RequestParser(PipelineStage):
         # Initialize messages from body
         ctx.messages = body.get("messages", [])
 
+        # Extract X-Proxy-Route-To header override (pre-extracted by Handler.do_POST)
+        route_override = body.get("_x_proxy_route_to", "")
+        ctx._route_header_override = route_override if route_override in ("local", "cloud") else ""
+
+        # Classify Agent model tier from request body
+        ctx._agent_model_tier = _classify_tier(body.get("model", ""))
+
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
@@ -382,6 +436,293 @@ class DynamicMaxTokens(ConditionalStage):
 
         ctx.max_tokens_curr = ctx.body.get("max_tokens", ctx.max_tokens_orig)
         return ctx
+
+
+# ============================================================================
+# Stage 2.5: SmartRouter — decide local vs cloud backend
+# ============================================================================
+
+def _classify_tier(model_id: str) -> str:
+    """Extract agent model tier from model ID."""
+    m = model_id.lower()
+    if "opus" in m:
+        return "opus"
+    if "haiku" in m:
+        return "haiku"
+    return "sonnet"
+
+
+def _is_sensitive_request(ctx) -> bool:
+    """Check if request touches sensitive file paths (best-effort).
+
+    Only scans tool_use parameters (file_path / path fields).
+    Does NOT scan free-text user/assistant message content.
+    Patterns are compiled once and cached in proxy_state.
+    """
+    sensitive_re = _ps._compile_sensitive_patterns()
+    if sensitive_re is None:
+        return False
+    for msg in ctx.messages:
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") != "tool_use":
+                continue
+            inp = block.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            file_path = inp.get("file_path") or inp.get("path") or ""
+            if file_path and sensitive_re.search(file_path):
+                return True
+    return False
+
+
+class SmartRouter(PipelineStage):
+    """Stage 2.5: Decide local vs cloud backend for this request.
+
+    Position: after LifecycleClassifier (2) and DynamicMaxTokens (2),
+              before ErrorTranslator (3) and all content-processing stages.
+
+    Reads total_chars + stage from ctx.stage_config, memory pressure,
+    session route state, and header override to make a 10-level
+    priority decision.  Model ID preference adjusts thresholds but
+    does NOT force route direction (safety always overrides).
+    """
+
+    name = "smart_router"
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        target, reason = self._routing_decision(ctx)
+        ctx._route_target = target
+        ctx._route_reason = reason
+        log(f"  -> [smart_router] {target} ({reason})")
+        return ctx
+
+    def _routing_decision(self, ctx):
+        # Priority 0: routing disabled
+        if not _ps.PROXY_ROUTE_ENABLED:
+            return "local", "disabled"
+
+        # Priority 0.5: Model ID preference → adjust thresholds (do NOT force route)
+        requested_model = ctx.body.get("model", "")
+        pref = _ps.MODEL_ROUTE_PREFERENCES.get(requested_model, {})
+        effective_threshold = int(
+            _ps.PROXY_ROUTE_THRESHOLD_CHARS * pref.get("threshold_factor", 1.0)
+        )
+        effective_memory_pct = _ps.PROXY_ROUTE_MEMORY_PCT + pref.get("memory_bias", 0)
+        ctx._route_cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
+        ctx._agent_model_tier = _classify_tier(requested_model)
+
+        # Priority 0.6: X-Proxy-Route-To header (single-request, no session sticky)
+        if ctx._route_header_override in ("local", "cloud"):
+            return ctx._route_header_override, "header_override"
+
+        session_id = ctx.session_id
+
+        # Priority 1: Cloud cooldown active — check expiration
+        if session_id:
+            with _ps._state_lock:
+                cooldown_start = _ps._cloud_cooldown_start.get(session_id)
+            if cooldown_start:
+                elapsed = time.monotonic() - cooldown_start
+                if elapsed < _ps.PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS:
+                    return "local", "cloud_cooldown_active"
+                # Cooldown expired — clean up all session state
+                with _ps._state_lock:
+                    _ps._cloud_fail_count.pop(session_id, None)
+                    _ps._cloud_cooldown_start.pop(session_id, None)
+                    _ps._SESSION_ROUTE_MAP.pop(session_id, None)
+                    _ps._SESSION_ROUTE_FORCE_SOURCE.pop(session_id, None)
+                    _ps._ROUTE_NOTIFIED_SESSIONS.discard(session_id)
+                    _ps._SESSION_BELOW_THRESHOLD.pop(session_id, None)
+
+        # Priority 2/3: Session-level route state
+        if session_id:
+            with _ps._state_lock:
+                session_route = _ps._SESSION_ROUTE_MAP.get(session_id)
+            if session_route == "cloud":
+                SUGGESTION1_RETURN_ROUNDS = _ps.PROXY_ROUTE_STICKY_RETURN_ROUNDS
+                SUGGESTION1_RETURN_RATIO = _ps.PROXY_ROUTE_STICKY_RETURN_RATIO
+                # In sticky default mode, once cloud, forever cloud — no early
+                # return even if context drops. This is the existing behavior.
+                if _ps.PROXY_ROUTE_STICKY:
+                    return "cloud", "session_already_cloud"
+                # Non-sticky: allow session to return to local if context has
+                # dropped below threshold for N consecutive requests.  This
+                # saves cloud cost when an agentic session's early rounds were
+                # large but subsequent rounds settled to short replies.
+                total_chars = (
+                    ctx.stage_config.get("total_chars", 0)
+                    if ctx.stage_config else ctx.total_chars
+                )
+                is_below = total_chars <= int(
+                    effective_threshold * SUGGESTION1_RETURN_RATIO
+                )
+                with _ps._state_lock:
+                    if is_below:
+                        _ps._SESSION_BELOW_THRESHOLD[session_id] = (
+                            _ps._SESSION_BELOW_THRESHOLD.get(session_id, 0) + 1
+                        )
+                    else:
+                        _ps._SESSION_BELOW_THRESHOLD[session_id] = 0
+                    below_count = _ps._SESSION_BELOW_THRESHOLD.get(session_id, 0)
+                if below_count >= SUGGESTION1_RETURN_ROUNDS:
+                    with _ps._state_lock:
+                        _ps._SESSION_ROUTE_MAP.pop(session_id, None)
+                        _ps._SESSION_BELOW_THRESHOLD.pop(session_id, None)
+                    target_local = "local"
+                    return target_local, (
+                        f"sticky_expired({below_count}/{SUGGESTION1_RETURN_ROUNDS})"
+                    )
+                return "cloud", (
+                    f"session_already_cloud(below={below_count}/{SUGGESTION1_RETURN_ROUNDS})"
+                )
+            if session_route == "local_forced":
+                return "local", "session_force_local"
+
+        # Priority 3.5: Daily budget exceeded
+        if _ps.PROXY_ROUTE_DAILY_BUDGET > 0:
+            with _ps._state_lock:
+                daily_date = getattr(_ps, '_route_daily_date', '')
+                daily_cost = getattr(_ps, '_route_daily_cost', 0.0)
+            today = time.strftime("%Y-%m-%d")
+            if daily_date == today and daily_cost >= _ps.PROXY_ROUTE_DAILY_BUDGET:
+                return "local", f"daily_budget_exceeded(¥{daily_cost:.2f}/¥{_ps.PROXY_ROUTE_DAILY_BUDGET:.0f})"
+
+        # Priority 6: Memory pressure
+        try:
+            mem = _ps._get_system_memory()
+            used_pct = float(mem.get("used_pct", 0))
+            available_gb = float(mem.get("available_gb", 48))
+            if used_pct > effective_memory_pct and available_gb < 5:
+                if session_id:
+                    with _ps._state_lock:
+                        _ps._SESSION_ROUTE_MAP[session_id] = "cloud"
+                return "cloud", f"memory_pressure({used_pct:.0f}%/{available_gb:.0f}GB)"
+        except Exception:
+            pass  # memory check is best-effort
+
+        # Priority 7: Context size threshold
+        total_chars = (
+            ctx.stage_config.get("total_chars", 0)
+            if ctx.stage_config else ctx.total_chars
+        )
+        if total_chars > effective_threshold:
+            if session_id:
+                with _ps._state_lock:
+                    _ps._SESSION_ROUTE_MAP[session_id] = "cloud"
+            return "cloud", f"chars_exceed_threshold({total_chars}>{effective_threshold})"
+
+        # Priority 8: Lifecycle stage (belt-and-suspenders)
+        stage = ctx.stage_config.get("stage", "init") if ctx.stage_config else "init"
+        if stage in ("saturation", "oom_danger", "pre_trunc"):
+            if session_id:
+                with _ps._state_lock:
+                    _ps._SESSION_ROUTE_MAP[session_id] = "cloud"
+            return "cloud", f"lifecycle_stage({stage})"
+
+        # Priority 9: Default local
+        return "local", "under_threshold"
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        # Determine route_bias from model preference
+        requested_model = ctx.body.get("model", "")
+        pref = _ps.MODEL_ROUTE_PREFERENCES.get(requested_model, {})
+        return {
+            "target": ctx._route_target,
+            "reason": ctx._route_reason,
+            "agent_tier": ctx._agent_model_tier,
+            "route_bias": pref.get("route_bias", "auto"),
+            "chars": (
+                ctx.stage_config.get("total_chars", 0)
+                if ctx.stage_config else 0
+            ),
+            "stage": (
+                ctx.stage_config.get("stage", "")
+                if ctx.stage_config else ""
+            ),
+        }
+
+
+# ============================================================================
+# Stage 2.6: RouteNotification — log route-switch events (Phase 1: log only)
+# ============================================================================
+
+class RouteNotification(PipelineStage):
+    """Stage 2.6: Inject route-switch notification when target changes.
+
+    Phase 2: Full message injection — appends a [System: ...] user message
+    so the model sees the switch.  Differentiates first-route vs emergency-fallback.
+    Each session is notified at most once.
+    """
+
+    name = "route_notification"
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        target = getattr(ctx, '_route_target', 'local')
+        if target != 'cloud':
+            return ctx
+
+        session_id = ctx.session_id
+        if session_id:
+            with _ps._state_lock:
+                if session_id in _ps._ROUTE_NOTIFIED_SESSIONS:
+                    return ctx
+
+        if getattr(ctx, '_emergency_fallback', False):
+            notice = self._build_emergency_notice(ctx)
+        else:
+            notice = self._build_first_route_notice(ctx)
+
+        ctx.messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": notice}],
+        })
+
+        log(
+            f"  -> [route_notification] Session {session_id} switched to cloud "
+            f"(model={getattr(ctx, '_route_cloud_model', _ps.PROXY_CLOUD_MODEL)}, "
+            f"reason={ctx._route_reason})"
+        )
+
+        if session_id:
+            with _ps._state_lock:
+                _ps._ROUTE_NOTIFIED_SESSIONS.add(session_id)
+
+        return ctx
+
+    def _build_first_route_notice(self, ctx):
+        total_chars = (ctx.stage_config.get("total_chars", 0)
+                       if ctx.stage_config else ctx.total_chars)
+        threshold = _ps.PROXY_ROUTE_THRESHOLD_CHARS
+        model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+        # Dynamic cost estimation based on actual config
+        price_in = _ps.PROXY_CLOUD_PRICE_INPUT
+        price_out = _ps.PROXY_CLOUD_PRICE_OUTPUT
+        est_input_cost = total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1) * price_in / 1_000_000
+        est_output_cost = est_input_cost * (price_out / price_in) if price_in else 0
+        est_total = est_input_cost + est_output_cost
+        return (
+            f"[System: Switched to cloud model — context {total_chars:,} chars "
+            f"exceeds local {threshold:,} limit. Using {model}. "
+            f"Estimated cost ~¥{est_total:.4f}/request "
+            f"(input ¥{price_in:.2f}/M, output ¥{price_out:.2f}/M). "
+            f"Session will stay on cloud. New sessions return to local. "
+            f"To force local: `./manage.sh route-force-local {ctx.session_id or 'SESSION_ID'}`.]"
+        )
+
+    def _build_emergency_notice(self, ctx):
+        total_chars = (ctx.stage_config.get("total_chars", 0)
+                       if ctx.stage_config else ctx.total_chars)
+        target = min(_ps.PROXY_OOM_SAFE_CHARS // 2, _ps.PROXY_CHARS_EXPANSION)
+        return (
+            f"[System: Cloud API unavailable, emergency fallback to local. "
+            f"Context severely truncated from {total_chars:,} to ~{target:,} chars "
+            f"(kept last 3 rounds). "
+            f"Consider /compact or retry when cloud recovers. "
+            f"To force cloud retry: `./manage.sh route-force-cloud {ctx.session_id or 'SESSION_ID'}`.]"
+        )
 
 
 # ============================================================================
@@ -479,7 +820,7 @@ class SystemNormalizer(PipelineStage):
 # Stage 6: CacheAligner — protect prefix messages from compression/truncation
 # ============================================================================
 
-class CacheAligner(PipelineStage):
+class CacheAligner(ConditionalStage):
     """Stage 6: Split messages into protected prefix and mutable dynamic zone.
 
     Calls _apply_cache_aligner() from lifecycle.py. The prefix is protected
@@ -487,9 +828,16 @@ class CacheAligner(PipelineStage):
     Places the split parts into ctx._cache_prefix / ctx._cache_dynamic,
     and sets ctx.messages = ctx._cache_dynamic so downstream stages only
     see the dynamic portion.
+
+    Skipped when routing to cloud (no local KV cache to align).
     """
 
     name = "cache_aligner"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
+        return _ps.PROXY_CACHE_ALIGN_ENABLED
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         lifecycle = _import_lifecycle()
@@ -509,16 +857,23 @@ class CacheAligner(PipelineStage):
 # Stage 7: ContentCompressor — single-pass tool clearing + thinking strip + semantic compress
 # ============================================================================
 
-class ContentCompressor(PipelineStage):
+class ContentCompressor(ConditionalStage):
     """Stage 7: Compress tool results, strip thinking blocks, semantic compression.
 
     Operates on ctx.messages (which is the dynamic zone set by CacheAligner).
     After compression, reassembles: ctx.messages = _cache_prefix + _cache_dynamic.
 
     Calls _compress_content_pass() from truncation.py.
+
+    Skipped when routing to cloud (cloud has ample context window, no need to compress).
     """
 
     name = "content_compressor"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
+        return True  # always runs for local
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         truncation = _import_truncation()
@@ -964,6 +1319,8 @@ class ContextTruncator(ConditionalStage):
     name = "truncate"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
         return _ps.PROXY_CTX_LIMIT_ENABLED
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
@@ -1054,13 +1411,19 @@ class ContextTruncator(ConditionalStage):
 # Stage 15: HighDropRatioNotice — warn when context loss is severe
 # ============================================================================
 
-class HighDropRatioNotice(PipelineStage):
+class HighDropRatioNotice(ConditionalStage):
     """Stage 15: Inject a context-loss notice when >85% of messages were dropped.
 
     DEF-107: Prevents silent context loss that degrades response quality.
+    Skipped when routing to cloud (no truncation occurs on cloud path).
     """
 
     name = "high_drop_ratio_notice"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
+        return ctx.trunc_stats is not None
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         trunc_stats = ctx.trunc_stats or {}
@@ -1112,6 +1475,8 @@ class OOMSafetyFIFO(ConditionalStage):
     name = "oom_safety"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
         if not ctx.stage_config:
             return False
         return (ctx.stage_config.get("oom_safety", False)
@@ -1305,9 +1670,13 @@ class FormatConverter(PipelineStage):
             if system_text.strip():
                 messages = [{"role": "system", "content": system_text}] + messages
 
-        # 3. Build OpenAI body
+        # 3. Build OpenAI body — route-aware model selection
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
+            openai_body_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+        else:
+            openai_body_model = _ps.MODEL_NAME
         openai_body = {
-            "model": _ps.MODEL_NAME,
+            "model": openai_body_model,
             "messages": messages,
             "max_tokens": body.get("max_tokens", 4096),
             "temperature": body.get("temperature", 0.7),
@@ -1377,59 +1746,285 @@ class FormatConverter(PipelineStage):
 # Stage 21: BackendDispatcher — send request to backend and handle response
 # ============================================================================
 
-class BackendDispatcher(PipelineStage):
-    """Stage 21: Forward the OpenAI-format request to the backend LLM.
+class _BytesIOResponse:
+    """Tiny wrapper to let a pre-read bytes body be consumed like urlopen response."""
 
-    Acquires _llama_lock (concurrency semaphore), sends an HTTP POST to
-    {LLAMA_BASE}/chat/completions, and dispatches the response to the
-    handler's streaming or non-streaming handler methods.
+    def __init__(self, status, body_bytes):
+        self.status = status
+        self._body = io.BytesIO(body_bytes)
+
+    def read(self, amt=-1):
+        return self._body.read(amt)
+
+    def getheader(self, name, default=None):
+        return default
+
+    def getheaders(self):
+        return []
+
+
+class BackendDispatcher(PipelineStage):
+    """Stage 21: Forward the OpenAI-format request to local or cloud backend.
+
+    Routes based on ctx._route_target:
+      - "local" / "local_forced": use LLAMA_BASE + _llama_lock
+      - "cloud": use PROXY_CLOUD_BASE_URL + _cloud_lock
+
+    If PROXY_CLOUD_API_KEY is unset and target is cloud, falls back to local
+    automatically.
+    Phase 2: Cloud HTTPError triggers fallback to local with emergency truncation.
 
     Constructor args:
-      - llama_lock: threading.Semaphore for concurrency control
+      - llama_lock: threading.Semaphore for local concurrency
+      - cloud_lock: threading.Semaphore for cloud concurrency
       - handler: the Handler instance for writing the HTTP response
-
-    HTTPError is caught and handled inline (calls handler._respond_json).
     """
 
     name = "backend_dispatcher"
 
-    def __init__(self, llama_lock=None, handler=None):
+    def __init__(self, llama_lock=None, cloud_lock=None, handler=None):
         self._llama_lock = llama_lock
+        self._cloud_lock = cloud_lock
         self._handler = handler
         self._backend_status = None
+        self._route_fallback = False
+        self._emergency_fallback = False
+        self._fallback_reason = ""
+        self._sensitive_blocked = False
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._dispatch_latency_ms = 0.0
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
-        log(f"  -> Forwarding to {_ps.LLAMA_BASE}/chat/completions")
+        target = getattr(ctx, '_route_target', 'local')
+        self._route_fallback = False
+        self._emergency_fallback = False
+        self._fallback_reason = ""
+        self._sensitive_blocked = False
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._dispatch_latency_ms = 0.0
 
-        try:
-            with self._llama_lock:
-                req = urllib.request.Request(
-                    f"{_ps.LLAMA_BASE}/chat/completions",
-                    data=json.dumps(ctx.openai_body).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {_ps.LLAMA_API_KEY}",
-                    },
-                    method="POST",
-                )
-                resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
-                self._backend_status = resp.status
-                log(f"  <- backend status: {resp.status}")
+        # Validate cloud API key — fall back to local if missing
+        if target == 'cloud' and not _ps.PROXY_CLOUD_API_KEY:
+            log("  -> [ERROR] Cloud API key not configured — falling back to local")
+            ctx._route_target = 'local'
+            ctx._route_reason = 'cloud_no_api_key'
+            target = 'local'
+            # FormatConverter already built openai_body with the cloud model;
+            # switch to local MODEL_NAME so the local backend recognises it.
+            if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                ctx.openai_body["model"] = _ps.MODEL_NAME
 
-                if ctx.is_stream:
-                    self._handler._handle_streaming_response(resp, ctx.body)
-                else:
-                    self._handler._handle_non_streaming_response(resp, ctx.body)
-        except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8")
-            self._backend_status = e.code
-            log(f"  <- backend error: {e.code} - {err[:500]}")
-            self._handler._respond_json({"error": {"message": err}}, e.code)
+        # Set X-* route response headers for client awareness
+        route_headers = {}
+        if target == 'cloud':
+            actual_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+        else:
+            actual_model = _ps.MODEL_NAME
+        route_headers["X-Actual-Model"] = actual_model
+        route_headers["X-Route-Target"] = target
+        if ctx._route_reason:
+            route_headers["X-Route-Reason"] = ctx._route_reason
+        self._handler._route_response_headers = route_headers
+
+        if target == 'cloud':
+            base_url = _ps.PROXY_CLOUD_BASE_URL
+            api_key = _ps.PROXY_CLOUD_API_KEY
+            model_name = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+            log(f"  -> Forwarding to {base_url}/chat/completions (cloud, model={model_name})")
+            try:
+                with self._cloud_lock:
+                    self._do_dispatch(ctx, base_url, api_key)
+            except urllib.error.HTTPError as e:
+                # Cloud failed — attempt fallback
+                err = e.read().decode("utf-8")[:500]
+                self._backend_status = e.code
+                self._fallback_reason = str(e.code)
+                log(f"  <- Cloud API failed ({e.code}), checking fallback...")
+
+                if not _ps.PROXY_ROUTE_FALLBACK_ENABLED:
+                    log(f"  -> Fallback disabled — returning 503")
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "cloud_unavailable",
+                            "message": f"Cloud API failed with status {e.code} and fallback is disabled.",
+                        }
+                    }, 503)
+                    return ctx
+
+                if _is_sensitive_request(ctx):
+                    log(f"  -> Sensitive path detected — blocking fallback")
+                    self._sensitive_blocked = True
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "sensitive_fallback_blocked",
+                            "message": "Cloud API failed and request contains sensitive file paths.",
+                        }
+                    }, 403)
+                    return ctx
+
+                # Record failure and manage cooldown
+                self._record_cloud_failure(ctx)
+                self._route_fallback = True
+
+                # Emergency truncation before retrying on local
+                self._emergency_truncate(ctx)
+                ctx._emergency_fallback = True
+                ctx._route_target = 'local_forced'
+
+                # Retry with local backend
+                log(f"  -> Fallback to local backend")
+                # openai_body.model still holds the cloud model name from
+                # FormatConverter; re-point to local MODEL_NAME for the retry.
+                if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                    ctx.openai_body["model"] = _ps.MODEL_NAME
+                with self._llama_lock:
+                    self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
+        else:
+            base_url = _ps.LLAMA_BASE
+            api_key = _ps.LLAMA_API_KEY
+            log(f"  -> Forwarding to {base_url}/chat/completions (local)")
+            try:
+                with self._llama_lock:
+                    self._do_dispatch(ctx, base_url, api_key)
+            except urllib.error.HTTPError as e:
+                err = e.read().decode("utf-8")[:500]
+                self._backend_status = e.code
+                log(f"  <- backend error: {e.code} - {err}")
+                self._handler._respond_json({"error": {"message": err}}, e.code)
 
         return ctx
+
+    def _do_dispatch(self, ctx, base_url, api_key):
+        """Send HTTP POST to backend and dispatch response to handler.
+
+        Caller must already hold the appropriate concurrency lock.
+        """
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(ctx.openai_body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        _dispatch_t0 = time.monotonic()
+        resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
+        self._backend_status = resp.status
+        log(f"  <- backend status: {resp.status}")
+
+        # Estimate input tokens once for cost tracking (used for both streaming
+        # and non-streaming; non-streaming is refined with actual usage below).
+        self._input_tokens = max(1, int(ctx.total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1)))
+        self._output_tokens = int(ctx.body.get("max_tokens", 4096))
+
+        if ctx.is_stream:
+            self._handler._handle_streaming_response(resp, ctx.body)
+        else:
+            # Pre-read non-streaming body so we can extract actual usage for
+            # accurate cost tracking, then hand a BytesIO wrapper to the handler.
+            body_bytes = resp.read()
+            try:
+                openai_resp = json.loads(body_bytes.decode("utf-8"))
+                usage = openai_resp.get("usage") or {}
+                self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
+                self._output_tokens = usage.get("completion_tokens", self._output_tokens)
+            except Exception:
+                pass
+            wrapped = _BytesIOResponse(resp.status, body_bytes)
+            self._handler._handle_non_streaming_response(wrapped, ctx.body)
+
+        # Phase 3+ (建议3): record backend-only dispatch latency so cloud vs
+        # long-tail comparison is decoupled from proxy-side pipeline overhead.
+        dispatch_ms = (time.monotonic() - _dispatch_t0) * 1000
+        self._dispatch_latency_ms = dispatch_ms
+        try:
+            target_key = getattr(ctx, '_route_target', 'local')
+            # Only record primary route latencies; fallback retries would
+            # contaminate the cloud bucket with local timing.
+            if not self._route_fallback:
+                _ps._LATENCY_BY_TARGET.setdefault(
+                    target_key, collections.deque(maxlen=100)
+                ).append(dispatch_ms)
+        except Exception:
+            pass
+
+        # Accumulate daily route cost if cloud succeeded
+        if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
+            self._accumulate_daily_cost(ctx)
+
+    def _record_cloud_failure(self, ctx):
+        """Record cloud failure and manage cooldown state."""
+        session_id = ctx.session_id
+        if not session_id:
+            return
+        with _ps._state_lock:
+            _ps._cloud_fail_count[session_id] = _ps._cloud_fail_count.get(session_id, 0) + 1
+            fail_count = _ps._cloud_fail_count[session_id]
+            if fail_count >= _ps.PROXY_ROUTE_MAX_CLOUD_FAILS:
+                _ps._cloud_cooldown_start[session_id] = time.monotonic()
+                _ps._SESSION_ROUTE_MAP[session_id] = "local_forced"
+                _ps._SESSION_ROUTE_FORCE_SOURCE[session_id] = "cloud_failures"
+                # Reset failure count so cooldown can eventually clear cleanly.
+                _ps._cloud_fail_count[session_id] = 0
+                log(f"  -> Cloud cooldown activated for session {session_id} "
+                    f"({fail_count} failures, {_ps.PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS}s)")
+
+    def _emergency_truncate(self, ctx):
+        """Emergency context reduction when cloud fallback to overloaded local."""
+        total_chars = (ctx.stage_config.get("total_chars", 0)
+                       if ctx.stage_config else ctx.total_chars)
+        target = min(_ps.PROXY_OOM_SAFE_CHARS // 2, _ps.PROXY_CHARS_EXPANSION)
+
+        if total_chars <= target:
+            log(f"  -> Emergency truncation skipped: {total_chars} chars within {target} limit")
+            return
+
+        # Keep last 3 assistant rounds (walk backwards, count assistant messages)
+        msgs = ctx.messages
+        assistant_count = 0
+        cutoff = len(msgs)
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "assistant":
+                assistant_count += 1
+                if assistant_count >= 3:
+                    cutoff = i
+                    break
+
+        if cutoff > 0 and len(msgs) - cutoff < len(msgs):
+            dropped = cutoff
+            kept = len(msgs) - cutoff
+            ctx.messages = msgs[cutoff:]
+            log(f"  -> EMERGENCY TRUNCATION: {dropped} messages dropped, "
+                f"{kept} kept (target={target:,} chars, kept last 3 rounds)")
+            self._emergency_fallback = True
+
+    def _accumulate_daily_cost(self, ctx):
+        """Accumulate daily cloud API cost (best-effort estimation)."""
+        try:
+            total = _ps._accumulate_route_daily_cost(
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+            )
+            log(f"  -> [route_cost] daily cost now ¥{total:.4f}")
+        except Exception:
+            pass
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         return {
             "backend_status": self._backend_status,
             "stream": 1 if ctx.is_stream else 0,
+            "route_target": getattr(ctx, '_route_target', 'local'),
+            "route_reason": getattr(ctx, '_route_reason', ''),
+            "route_cloud_model": getattr(ctx, '_route_cloud_model', ''),
+            "route_fallback": self._route_fallback,
+            "emergency_fallback": self._emergency_fallback,
+            "fallback_reason": self._fallback_reason,
+            "sensitive_blocked": self._sensitive_blocked,
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+            "dispatch_latency_ms": round(getattr(self, '_dispatch_latency_ms', 0.0), 1),
+            "input_chars_bucket": _char_bucket(ctx.total_chars),
         }

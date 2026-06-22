@@ -269,14 +269,14 @@ class TestReloadModelAliases(unittest.TestCase):
         os.rmdir(self._tmpdir)
 
     def test_aliases_include_new_model(self):
-        """MODEL_ALIASES is rebuilt to include the new MODEL_NAME."""
+        """MODEL_ALIASES is rebuilt via get_model_aliases() — does NOT expose MODEL_NAME."""
         _write_conf(self._confpath, [
             'LLAMA_BASE_URL="http://127.0.0.1:8081/v1"',
             'MODEL_NAME="test-model-v2"',
         ])
         with patch.object(proxy, "RELOAD_CONFIG_PATH", self._confpath):
             proxy._reload_config()
-        self.assertIn("test-model-v2", proxy.MODEL_ALIASES)
+        self.assertNotIn("test-model-v2", proxy.MODEL_ALIASES)  # MODEL_NAME not exposed
         self.assertIn("claude-sonnet-4-6", proxy.MODEL_ALIASES)
 
 
@@ -385,14 +385,14 @@ class TestProxyStateSync(unittest.TestCase):
         self.assertIsNot(proxy_state._llama_lock, old_lock)
 
     def test_proxy_state_aliases_rebuilt(self):
-        """proxy_state.MODEL_ALIASES is rebuilt to include the new MODEL_NAME."""
+        """proxy_state.MODEL_ALIASES rebuilt via get_model_aliases() — does NOT expose MODEL_NAME."""
         _write_conf(self._confpath, [
             'LLAMA_BASE_URL="http://127.0.0.1:8081/v1"',
             'MODEL_NAME="alias-test-model"',
         ])
         with patch.object(proxy, "RELOAD_CONFIG_PATH", self._confpath):
             proxy._reload_config()
-        self.assertIn("alias-test-model", proxy_state.MODEL_ALIASES)
+        self.assertNotIn("alias-test-model", proxy_state.MODEL_ALIASES)  # MODEL_NAME not exposed
         self.assertEqual(proxy_state.MODEL_ALIASES, proxy.MODEL_ALIASES)
 
 

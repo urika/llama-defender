@@ -55,11 +55,24 @@ def reload_config(signum=None, frame=None, target_module=None):
             setattr(target_module, "_llama_lock", threading.Semaphore(new_max))
             log("[RELOAD] Semaphore rebuilt: %d -> %d" % (old_max, new_max))
 
-        aliases = ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229",
-                   "claude-3-5-haiku-20241022", "claude-sonnet-4-6",
-                   "claude-haiku-4-5", "claude-opus-4-7", "default", model]
+        aliases = proxy_state.get_model_aliases()
         proxy_state.MODEL_ALIASES = aliases
         setattr(target_module, "MODEL_ALIASES", aliases)
+
+        # Invalidate model aliases cache so get_model_aliases() rebuilds
+        proxy_state.invalidate_model_aliases_cache()
+
+        # Invalidate sensitive path regex cache so pattern changes take effect
+        proxy_state.invalidate_sensitive_patterns_cache()
+
+        # Rebuild cloud lock if route cloud concurrent changed
+        new_cloud_cc = int(env.get("PROXY_ROUTE_CLOUD_CONCURRENT",
+                           str(getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2))))
+        old_cloud_cc = getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2)
+        if new_cloud_cc != old_cloud_cc:
+            proxy_state._cloud_lock = threading.Semaphore(new_cloud_cc)
+            setattr(target_module, "_cloud_lock", threading.Semaphore(new_cloud_cc))
+            log("[RELOAD] Cloud semaphore rebuilt: %d -> %d" % (old_cloud_cc, new_cloud_cc))
 
         for env_key, py_name, cast, cloud_def, local_def in target_module._RELOAD_SPEC if hasattr(target_module, "_RELOAD_SPEC") else proxy_state._RELOAD_SPEC:
             default = cloud_def if is_cloud else local_def

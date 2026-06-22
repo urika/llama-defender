@@ -11,9 +11,48 @@ anthropic_proxy.py and proxy_config.py both import from this module.
 import collections
 import os
 import re
+import subprocess
 import threading
+import time
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _run(cmd, timeout=3):
+    """Run a shell command and return stripped stdout, or empty string on error."""
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout).strip()
+    except Exception:
+        return ""
+
+
+def _get_system_memory():
+    """Return macOS system memory stats used by routing and status page.
+
+    Keys: total_gb, used_gb, available_gb, used_pct (string like "85.3").
+    """
+    out = _run("vm_stat")
+    data = {}
+    page_size = 16384
+    for line in out.splitlines():
+        if "Pages free:" in line:
+            data["free_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages wired down:" in line:
+            data["wired_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages active:" in line:
+            data["active_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages inactive:" in line:
+            data["inactive_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+        elif "Pages stored in compressor:" in line:
+            data["compress_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
+    total = 48.0
+    true_used = data.get("wired_gb", 0) + data.get("active_gb", 0)
+    available = data.get("free_gb", 0) + data.get("inactive_gb", 0)
+    data["total_gb"] = total
+    data["used_gb"] = true_used
+    data["available_gb"] = available
+    data["used_pct"] = f"{true_used/total*100:.1f}"
+    return data
 
 # ---------------------------------------------------------------------------
 # Backend routing
@@ -139,10 +178,14 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "600"))
 # effectively disabled (10M chars threshold). Local backends cap at 200K
 # to prevent Metal OOM.
 _default_oom = _strategy.get_default("PROXY_OOM_SAFE_CHARS", "200000")
-PROXY_OOM_SAFE_CHARS = int(os.environ.get(
-    "PROXY_OOM_SAFE_CHARS",
-    os.environ.get("PROXY_PRE_TRUNCATE_CHARS", _default_oom),
-))
+# Treat empty string like unset (manage.sh may pass PROXY_OOM_SAFE_CHARS=""
+# when neither PROXY_OOM_SAFE_CHARS nor PROXY_PRE_TRUNCATE_CHARS is defined).
+# `int("")` raises ValueError, so use `or` to fall through to the default.
+PROXY_OOM_SAFE_CHARS = int(
+    os.environ.get("PROXY_OOM_SAFE_CHARS")
+    or os.environ.get("PROXY_PRE_TRUNCATE_CHARS")
+    or _default_oom
+)
 PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS  # Legacy alias
 
 # P0: Hard limit on request body size
@@ -223,6 +266,8 @@ _DEDUP_CACHE = {}
 # Phase 3: sliding windows for dynamic concurrency control
 _LATENCY_WINDOW = collections.deque(maxlen=50)
 _ERROR_WINDOW = collections.deque(maxlen=50)
+# Phase 3+ (建议3): per-backend latency deques — segmented p95 by route_target
+_LATENCY_BY_TARGET = {}  # {'local': deque(maxlen=100), 'cloud': deque(maxlen=100)}
 
 # Phase 3: metrics schema v1 fixed field set
 _METRICS_V1_FIELDS = {
@@ -315,6 +360,102 @@ _jsonl_output_map = {}
 _jsonl_counter = 0
 
 # ---------------------------------------------------------------------------
+# Intelligent model routing
+# ---------------------------------------------------------------------------
+PROXY_ROUTE_ENABLED = os.environ.get("PROXY_ROUTE_ENABLED", "false").lower() in ("1", "true", "yes")
+PROXY_ROUTE_THRESHOLD_CHARS = int(os.environ.get("PROXY_ROUTE_THRESHOLD_CHARS", "90000"))
+PROXY_CLOUD_BASE_URL = os.environ.get("PROXY_CLOUD_BASE_URL", "https://api.deepseek.com/v1")
+PROXY_CLOUD_API_KEY = os.environ.get("PROXY_CLOUD_API_KEY", "")
+PROXY_CLOUD_MODEL = os.environ.get("PROXY_CLOUD_MODEL", "deepseek-v4-flash")
+PROXY_ROUTE_CLOUD_CONCURRENT = int(os.environ.get("PROXY_ROUTE_CLOUD_CONCURRENT", "2"))
+PROXY_ROUTE_MEMORY_PCT = int(os.environ.get("PROXY_ROUTE_MEMORY_PCT", "90"))
+PROXY_ROUTE_FALLBACK_ENABLED = os.environ.get("PROXY_ROUTE_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
+PROXY_ROUTE_MAX_CLOUD_FAILS = int(os.environ.get("PROXY_ROUTE_MAX_CLOUD_FAILS", "3"))
+PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS = int(os.environ.get("PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", "1800"))
+PROXY_CLOUD_PRICE_INPUT = float(os.environ.get("PROXY_CLOUD_PRICE_INPUT", "0.5"))
+PROXY_CLOUD_PRICE_OUTPUT = float(os.environ.get("PROXY_CLOUD_PRICE_OUTPUT", "1.5"))
+PROXY_ROUTE_SENSITIVE_PATTERNS = os.environ.get("PROXY_ROUTE_SENSITIVE_PATTERNS", "")
+PROXY_ROUTE_PROFILE = os.environ.get("PROXY_ROUTE_PROFILE", "")
+PROXY_ROUTE_DAILY_BUDGET = float(os.environ.get("PROXY_ROUTE_DAILY_BUDGET", "0"))
+# --- Sticky session routing (建议1) ---
+# When sticky=true (default), a session routed to cloud stays cloud forever.
+# When sticky=false, allow a cloud session to return to local if context drops
+# below threshold for PROXY_ROUTE_STICKY_RETURN_ROUNDS consecutive requests.
+PROXY_ROUTE_STICKY = os.environ.get("PROXY_ROUTE_STICKY", "true").lower() in ("1", "true", "yes")
+PROXY_ROUTE_STICKY_RETURN_ROUNDS = int(os.environ.get("PROXY_ROUTE_STICKY_RETURN_ROUNDS", "5"))
+PROXY_ROUTE_STICKY_RETURN_RATIO = float(os.environ.get("PROXY_ROUTE_STICKY_RETURN_RATIO", "0.7"))
+# Per-session counter of consecutive cloud requests that fell below the
+# threshold (cleared when session returns to local or session_route changes).
+_SESSION_BELOW_THRESHOLD: dict = {}  # {session_id: int count}
+
+# Cached compiled regex for sensitive path detection.
+# Rebuilt when PROXY_ROUTE_SENSITIVE_PATTERNS changes (via reload or init).
+_SENSITIVE_PATTERNS_RE = None
+_SENSITIVE_PATTERNS_SOURCE = ""
+
+
+def _compile_sensitive_patterns():
+    """Compile and cache sensitive path patterns regex.
+
+    Returns a compiled regex object, or None if no patterns configured.
+    Invalid patterns are logged and ignored.
+    """
+    global _SENSITIVE_PATTERNS_RE, _SENSITIVE_PATTERNS_SOURCE
+    patterns_str = PROXY_ROUTE_SENSITIVE_PATTERNS
+    if patterns_str == _SENSITIVE_PATTERNS_SOURCE and _SENSITIVE_PATTERNS_RE is not None:
+        return _SENSITIVE_PATTERNS_RE
+
+    _SENSITIVE_PATTERNS_SOURCE = patterns_str
+    if not patterns_str:
+        _SENSITIVE_PATTERNS_RE = None
+        return None
+
+    raw_patterns = [p.strip() for p in patterns_str.split(",") if p.strip()]
+    if not raw_patterns:
+        _SENSITIVE_PATTERNS_RE = None
+        return None
+
+    # Treat each configured fragment as a literal substring by default.
+    # This avoids regex-injection surprises from user config.
+    escaped = [re.escape(p) for p in raw_patterns]
+    try:
+        _SENSITIVE_PATTERNS_RE = re.compile("|".join(escaped), re.IGNORECASE)
+    except re.error as e:
+        # Should not happen after escaping, but keep fallback.
+        print(f"[proxy_state] Invalid sensitive patterns: {e}")
+        _SENSITIVE_PATTERNS_RE = None
+    return _SENSITIVE_PATTERNS_RE
+
+
+def invalidate_sensitive_patterns_cache():
+    """Force recompilation of sensitive path regex (called on SIGHUP reload)."""
+    global _SENSITIVE_PATTERNS_RE, _SENSITIVE_PATTERNS_SOURCE
+    _SENSITIVE_PATTERNS_RE = None
+    _SENSITIVE_PATTERNS_SOURCE = ""
+
+# Model ID → route preference mapping (preference only, safety always overrides)
+MODEL_ROUTE_PREFERENCES = {
+    "claude-sonnet-4-6": {
+        "route_bias": "auto",
+        "threshold_factor": 1.0,
+        "memory_bias": 0,
+        "cloud_model": PROXY_CLOUD_MODEL,
+    },
+    "claude-opus-4-7": {
+        "route_bias": "prefer_cloud",
+        "threshold_factor": 0.8,
+        "memory_bias": -5,
+        "cloud_model": "deepseek-v4-pro",
+    },
+    "claude-haiku-4-5": {
+        "route_bias": "prefer_local",
+        "threshold_factor": 1.33,
+        "memory_bias": 0,
+        "cloud_model": PROXY_CLOUD_MODEL,
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Structured metrics logging
 # ---------------------------------------------------------------------------
 PROXY_METRICS_ENABLED = os.environ.get("PROXY_METRICS_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -323,6 +464,74 @@ _METRICS_PATH = os.path.join(_SCRIPT_DIR, PROXY_METRICS_DIR, "proxy_metrics.json
 _metrics_lock = threading.Lock()
 _state_lock = threading.Lock()
 
+# Cloud concurrency lock (rebuilt on SIGHUP if PROXY_ROUTE_CLOUD_CONCURRENT changes)
+_cloud_lock = threading.Semaphore(PROXY_ROUTE_CLOUD_CONCURRENT)
+
+# Session-level routing state (all access under _state_lock)
+_SESSION_ROUTE_MAP: dict[str, str] = {}             # session_id → "local"|"cloud"|"local_forced"
+_SESSION_ROUTE_FORCE_SOURCE: dict[str, str] = {}     # session_id → "cloud_failures"|"user_manual"
+_cloud_fail_count: dict[str, int] = {}               # session_id → int
+_cloud_cooldown_start: dict[str, float] = {}          # session_id → monotonic timestamp
+_ROUTE_NOTIFIED_SESSIONS: set[str] = set()           # sessions already shown route switch notice
+
+# Daily cloud cost tracking (all access under _state_lock)
+_route_daily_cost: float = 0.0
+_route_daily_date: str = ""   # YYYY-MM-DD, cross-day auto-reset
+
+
+def _accumulate_route_daily_cost(input_tokens: int = 0, output_tokens: int = 0) -> float:
+    """Atomically add estimated cloud API cost and return new daily total.
+
+    Tokens are estimated; output_tokens may be max_tokens upper-bound for streaming.
+    Cost is in CNY. Cross-day reset is handled automatically.
+    """
+    global _route_daily_cost, _route_daily_date
+    today = time.strftime("%Y-%m-%d")
+    with _state_lock:
+        if _route_daily_date != today:
+            _route_daily_date = today
+            _route_daily_cost = 0.0
+        input_cost = input_tokens * PROXY_CLOUD_PRICE_INPUT / 1_000_000
+        output_cost = output_tokens * PROXY_CLOUD_PRICE_OUTPUT / 1_000_000
+        _route_daily_cost += input_cost + output_cost
+        return _route_daily_cost
+
+# Model aliases cache (rebuilt on SIGHUP via invalidate_model_aliases_cache())
+_MODEL_ALIASES_CACHE = None
+
+
+def get_model_aliases():
+    """Return stable Agent-facing model aliases. Never exposes MODEL_NAME.
+    Thread-safe: uses double-checked locking under _state_lock.
+    """
+    global _MODEL_ALIASES_CACHE
+    if _MODEL_ALIASES_CACHE is not None:
+        return _MODEL_ALIASES_CACHE
+    with _state_lock:
+        if _MODEL_ALIASES_CACHE is not None:
+            return _MODEL_ALIASES_CACHE
+        aliases = [
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "default",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-5-haiku-20241022",
+        ]
+        if IS_CLOUD or PROXY_ROUTE_ENABLED:
+            aliases.append("claude-opus-4-7")
+        _MODEL_ALIASES_CACHE = aliases
+        return aliases
+
+
+def invalidate_model_aliases_cache():
+    """Invalidate the model aliases cache (called on SIGHUP reload)."""
+    global _MODEL_ALIASES_CACHE
+    _MODEL_ALIASES_CACHE = None
+
+
+# Legacy static list — kept for backward compat in reload_config.py / tests.
+# New code should call get_model_aliases().
 MODEL_ALIASES = [
     "claude-3-5-sonnet-20241022",
     "claude-3-opus-20240229",
@@ -423,6 +632,24 @@ _RELOAD_SPEC = [
     ("PROXY_HISTORY_MAX_CHARS", "PROXY_HISTORY_MAX_CHARS", "int", "500", "500"),
     # Metrics
     ("PROXY_METRICS_ENABLED", "PROXY_METRICS_ENABLED", "bool", "true", "true"),
+    # Route
+    ("PROXY_ROUTE_ENABLED", "PROXY_ROUTE_ENABLED", "bool", "false", "false"),
+    ("PROXY_ROUTE_THRESHOLD_CHARS", "PROXY_ROUTE_THRESHOLD_CHARS", "int", "90000", "90000"),
+    ("PROXY_CLOUD_BASE_URL", "PROXY_CLOUD_BASE_URL", "str", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1"),
+    ("PROXY_CLOUD_MODEL", "PROXY_CLOUD_MODEL", "str", "deepseek-v4-flash", "deepseek-v4-flash"),
+    ("PROXY_ROUTE_CLOUD_CONCURRENT", "PROXY_ROUTE_CLOUD_CONCURRENT", "int", "2", "2"),
+    ("PROXY_ROUTE_MEMORY_PCT", "PROXY_ROUTE_MEMORY_PCT", "int", "90", "90"),
+    ("PROXY_ROUTE_FALLBACK_ENABLED", "PROXY_ROUTE_FALLBACK_ENABLED", "bool", "true", "true"),
+    ("PROXY_ROUTE_MAX_CLOUD_FAILS", "PROXY_ROUTE_MAX_CLOUD_FAILS", "int", "3", "3"),
+    ("PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", "int", "1800", "1800"),
+    ("PROXY_CLOUD_PRICE_INPUT", "PROXY_CLOUD_PRICE_INPUT", "float", "0.5", "0.5"),
+    ("PROXY_CLOUD_PRICE_OUTPUT", "PROXY_CLOUD_PRICE_OUTPUT", "float", "1.5", "1.5"),
+    ("PROXY_ROUTE_SENSITIVE_PATTERNS", "PROXY_ROUTE_SENSITIVE_PATTERNS", "str", "", ""),
+    ("PROXY_ROUTE_DAILY_BUDGET", "PROXY_ROUTE_DAILY_BUDGET", "float", "0", "0"),
+    ("PROXY_ROUTE_PROFILE", "PROXY_ROUTE_PROFILE", "str", "", ""),
+    ("PROXY_ROUTE_STICKY", "PROXY_ROUTE_STICKY", "bool", "true", "true"),
+    ("PROXY_ROUTE_STICKY_RETURN_ROUNDS", "PROXY_ROUTE_STICKY_RETURN_ROUNDS", "int", "5", "5"),
+    ("PROXY_ROUTE_STICKY_RETURN_RATIO", "PROXY_ROUTE_STICKY_RETURN_RATIO", "float", "0.7", "0.7"),
 ]
 
 
@@ -531,7 +758,7 @@ __all__ = [
     # Dedup
     "PROXY_DEDUP_WINDOW", "_DEDUP_CACHE",
     # Sliding windows
-    "_LATENCY_WINDOW", "_ERROR_WINDOW", "_METRICS_V1_FIELDS",
+    "_LATENCY_WINDOW", "_ERROR_WINDOW", "_LATENCY_BY_TARGET", "_METRICS_V1_FIELDS",
     # Re-read
     "PROXY_REREAD_PREVIEW_CHARS",
     # Blocker
@@ -554,4 +781,22 @@ __all__ = [
     "_RELOAD_LOCK", "RELOAD_CONFIG_PATH", "RELOAD_SECRET_PATH", "_RELOAD_SPEC",
     # Config helpers
     "_parse_conf_env", "_cast_config_value",
+    # Intelligent model routing
+    "PROXY_ROUTE_ENABLED", "PROXY_ROUTE_THRESHOLD_CHARS",
+    "PROXY_CLOUD_BASE_URL", "PROXY_CLOUD_API_KEY", "PROXY_CLOUD_MODEL",
+    "PROXY_ROUTE_CLOUD_CONCURRENT", "PROXY_ROUTE_MEMORY_PCT",
+    "PROXY_ROUTE_FALLBACK_ENABLED", "PROXY_ROUTE_MAX_CLOUD_FAILS",
+    "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", "PROXY_CLOUD_PRICE_INPUT",
+    "PROXY_CLOUD_PRICE_OUTPUT", "PROXY_ROUTE_SENSITIVE_PATTERNS",
+    "PROXY_ROUTE_PROFILE", "PROXY_ROUTE_DAILY_BUDGET",
+    "PROXY_ROUTE_STICKY", "PROXY_ROUTE_STICKY_RETURN_ROUNDS",
+    "PROXY_ROUTE_STICKY_RETURN_RATIO",
+    "MODEL_ROUTE_PREFERENCES",
+    "_cloud_lock", "_SESSION_ROUTE_MAP", "_SESSION_ROUTE_FORCE_SOURCE",
+    "_cloud_fail_count", "_cloud_cooldown_start", "_ROUTE_NOTIFIED_SESSIONS",
+    "_route_daily_cost", "_route_daily_date", "_SESSION_BELOW_THRESHOLD",
+    "_MODEL_ALIASES_CACHE", "_SENSITIVE_PATTERNS_RE", "_SENSITIVE_PATTERNS_SOURCE",
+    "get_model_aliases", "invalidate_model_aliases_cache",
+    "_compile_sensitive_patterns", "invalidate_sensitive_patterns_cache",
+    "_accumulate_route_daily_cost",
 ]

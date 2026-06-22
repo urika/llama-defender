@@ -5,9 +5,12 @@ known inputs, running the stage, and asserting on the output context fields.
 Existing functions (lifecycle.py, loop_detection.py, etc.) are called
 through the stages — their own unit tests already cover edge cases.
 """
+import io
 import json
+import threading
 import unittest
-from unittest.mock import patch
+import urllib.error
+from unittest.mock import patch, MagicMock
 
 import proxy_state as _ps
 from pipeline import (
@@ -20,6 +23,7 @@ from pipeline import (
     SystemNormalizer,
     CacheAligner,
     ContentCompressor,
+    _char_bucket,
     ToolLoopDetector,
     TextLoopDetector,
     SessionLoopState,
@@ -824,10 +828,87 @@ class TestFormatConverter(unittest.TestCase):
 
 
 # ===========================================================================
+# Phase 3+ (建议3): _char_bucket() helper for latency long-tail analysis
+# ===========================================================================
+
+class TestCharBucket(unittest.TestCase):
+    """The coarse size buckets used to group dispatch_latency_ms in metrics JSONL."""
+
+    def test_xs_below_10k(self):
+        self.assertEqual(_char_bucket(0), "xs")
+        self.assertEqual(_char_bucket(5000), "xs")
+        self.assertEqual(_char_bucket(9999), "xs")
+
+    def test_sm_10k_to_50k(self):
+        self.assertEqual(_char_bucket(10000), "sm")
+        self.assertEqual(_char_bucket(49999), "sm")
+
+    def test_md_50k_to_150k(self):
+        self.assertEqual(_char_bucket(50000), "md")
+        self.assertEqual(_char_bucket(149999), "md")
+
+    def test_lg_150k_to_400k(self):
+        self.assertEqual(_char_bucket(150000), "lg")
+        self.assertEqual(_char_bucket(399999), "lg")
+
+    def test_xl_400k_to_1m(self):
+        self.assertEqual(_char_bucket(400000), "xl")
+        self.assertEqual(_char_bucket(999999), "xl")
+
+    def test_xxl_above_1m(self):
+        self.assertEqual(_char_bucket(1_000_000), "xxl")
+        self.assertEqual(_char_bucket(10_000_000), "xxl")
+
+    def test_none_returns_unknown(self):
+        self.assertEqual(_char_bucket(None), "unknown")
+
+    def test_invalid_returns_unknown(self):
+        self.assertEqual(_char_bucket("not a number"), "unknown")
+
+
+# ===========================================================================
 # BackendDispatcher — stage 21
 # ===========================================================================
 
 class TestBackendDispatcher(unittest.TestCase):
+    """Comprehensive BackendDispatcher tests — local/cloud dispatch, fallback, headers."""
+
+    def setUp(self):
+        self._patches = []
+        self._mock_handler = MagicMock()
+        self._mock_handler._handle_streaming_response = MagicMock()
+        self._mock_handler._handle_non_streaming_response = MagicMock()
+        self._mock_handler._respond_json = MagicMock()
+        self._mock_handler._route_response_headers = None
+        self._mock_lock = MagicMock()
+        self._mock_lock.__enter__ = MagicMock(return_value=None)
+        self._mock_lock.__exit__ = MagicMock(return_value=None)
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        _ps._cloud_fail_count.clear()
+        _ps._cloud_cooldown_start.clear()
+        _ps._SESSION_ROUTE_MAP.clear()
+
+    def _make_ctx(self, target="local", is_stream=False, total_chars=5000, session_id="s1"):
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6", "max_tokens": 4096},
+            is_stream=is_stream,
+            total_chars=total_chars,
+            session_id=session_id,
+            openai_body={"model": "test-model", "messages": []},
+        )
+        ctx._route_target = target
+        ctx._route_cloud_model = "deepseek-v4-flash"
+        return ctx
+
+    def _mock_urlopen(self, status=200, body=b'{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20}}'):
+        mock_resp = MagicMock()
+        mock_resp.status = status
+        mock_resp.read.return_value = body
+        return mock_resp
+
     def test_requires_constructor_args(self):
         stage = BackendDispatcher(llama_lock=None, handler=None)
         self.assertEqual(stage.name, "backend_dispatcher")
@@ -836,13 +917,238 @@ class TestBackendDispatcher(unittest.TestCase):
         stage = BackendDispatcher(llama_lock=None, handler=None)
         self.assertIsNone(stage._backend_status)
 
+    def test_fallback_flags_initialized(self):
+        stage = BackendDispatcher(llama_lock=None, handler=None)
+        self.assertFalse(stage._route_fallback)
+        self.assertFalse(stage._emergency_fallback)
+        self.assertEqual(stage._fallback_reason, "")
+
+    def test_local_dispatch_success(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="local")
+        mock_resp = self._mock_urlopen(200)
+        with patch("pipeline.urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            stage.process(ctx)
+            mock_open.assert_called_once()
+            self.assertIn(_ps.LLAMA_BASE, mock_open.call_args[0][0].full_url)
+
+    def test_local_dispatch_http_error(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="local")
+        http_err = urllib.error.HTTPError("http://x", 500, "Internal Error", {}, io.BytesIO(b"boom"))
+        with patch("pipeline.urllib.request.urlopen", side_effect=http_err):
+            stage.process(ctx)
+        self._mock_handler._respond_json.assert_called_once()
+        self.assertEqual(stage._backend_status, 500)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "")
+    def test_cloud_without_api_key_falls_back_to_local(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud", total_chars=200000)
+        mock_resp = self._mock_urlopen(200)
+        with patch("pipeline.urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            stage.process(ctx)
+            self.assertIn(_ps.LLAMA_BASE, mock_open.call_args[0][0].full_url)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "cloud_no_api_key")
+        # Regression: FormatConverter set openai_body["model"] to the cloud model
+        # before the fallback; BackendDispatcher must rewrite it to the local
+        # MODEL_NAME so the local backend doesn't 404 on a foreign model id.
+        self.assertEqual(ctx.openai_body["model"], _ps.MODEL_NAME)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
+    def test_cloud_dispatch_success(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud")
+        mock_resp = self._mock_urlopen(200)
+        with patch("pipeline.urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            stage.process(ctx)
+            self.assertIn(_ps.PROXY_CLOUD_BASE_URL, mock_open.call_args[0][0].full_url)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    def test_cloud_httperror_fallback_to_local(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud", total_chars=5000, session_id="s_fb")
+        call_count = [0]
+
+        def side_effect(req, timeout):
+            call_count[0] += 1
+            if "deepseek" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b"down"))
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            stage.process(ctx)
+        self.assertEqual(call_count[0], 2)
+        self.assertTrue(stage._route_fallback)
+        self.assertEqual(ctx._route_target, "local_forced")
+        # Regression: openai_body["model"] must be rewritten to local
+        # MODEL_NAME when falling back from cloud so local backend recognises it.
+        self.assertEqual(ctx.openai_body["model"], _ps.MODEL_NAME)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", False)
+    def test_cloud_httperror_fallback_disabled_503(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud")
+        http_err = urllib.error.HTTPError("http://x", 503, "Unavailable", {}, io.BytesIO(b"down"))
+        with patch("pipeline.urllib.request.urlopen", side_effect=http_err):
+            stage.process(ctx)
+        self._mock_handler._respond_json.assert_called_once()
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_SENSITIVE_PATTERNS", ".env,.secret")
+    def test_cloud_fallback_blocked_by_sensitive_path(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud", session_id="s_sens")
+        ctx.messages = [{"role": "user", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/app/.env"}}
+        ]}]
+        http_err = urllib.error.HTTPError("http://x", 503, "Unavailable", {}, io.BytesIO(b"err"))
+        with patch("pipeline.urllib.request.urlopen", side_effect=http_err):
+            stage.process(ctx)
+        self._mock_handler._respond_json.assert_called_once()
+        self.assertTrue(stage._sensitive_blocked)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_MAX_CLOUD_FAILS", 3)
+    def test_cooldown_activated_after_max_failures(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+
+        def side_effect(req, timeout):
+            if "deepseek" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b"down"))
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            for _ in range(3):
+                ctx = self._make_ctx(target="cloud", session_id="s_cool")
+                ctx.messages = []
+                stage.process(ctx)
+
+        with _ps._state_lock:
+            # Failure count is reset when cooldown activates so the session can
+            # recover after the cooldown period expires.
+            self.assertEqual(_ps._cloud_fail_count.get("s_cool", 0), 0)
+            self.assertIn("s_cool", _ps._cloud_cooldown_start)
+            self.assertEqual(_ps._SESSION_ROUTE_MAP.get("s_cool"), "local_forced")
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    def test_emergency_truncation_triggers_after_fallback(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        msgs = [{"role": "user", "content": f"msg{i}"} for i in range(40)]
+        for i in range(4):
+            msgs.append({"role": "assistant", "content": f"resp{i}"})
+        ctx = self._make_ctx(target="cloud", total_chars=300000, session_id="s_et")
+        ctx.messages = list(msgs)
+        ctx.stage_config = {"total_chars": 300000, "stage": "oom_danger"}
+        msg_count_before = len(ctx.messages)
+
+        def side_effect(req, timeout):
+            if "deepseek" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b"down"))
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            stage.process(ctx)
+        self.assertLess(len(ctx.messages), msg_count_before)
+        self.assertTrue(stage._emergency_fallback)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    def test_route_response_headers_set_on_handler(self):
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud")
+        ctx._route_reason = "chars_exceed_threshold"
+        mock_resp = self._mock_urlopen(200)
+        with patch("pipeline.urllib.request.urlopen", return_value=mock_resp):
+            stage.process(ctx)
+        headers = self._mock_handler._route_response_headers
+        self.assertIsNotNone(headers)
+        self.assertEqual(headers["X-Route-Target"], "cloud")
+        self.assertEqual(headers["X-Route-Reason"], "chars_exceed_threshold")
+        self.assertIn("X-Actual-Model", headers)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
+    def test_cloud_concurrency_lock_held_during_dispatch(self):
+        """Verify cloud backend dispatch holds concurrency lock.
+        
+        Regression guard: P0#1 — if code drops `with self._cloud_lock:`,
+        this test blocks (second thread is not serialised) and eventually
+        detects `urlopen` calls without lock protection.
+        """
+        real_lock = threading.Semaphore(1)
+        real_lock.acquire()  # Pre-occupy the lock
+        stage = BackendDispatcher(cloud_lock=real_lock, llama_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud")
+        call_count = [0]
+
+        def blocking_urlopen(req, timeout=None):
+            call_count[0] += 1
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=blocking_urlopen) as mock_open:
+            t = threading.Thread(target=stage.process, args=(ctx,))
+            t.start()
+            import time
+            time.sleep(0.05)
+            mock_open.assert_not_called()  # Lock held → no urlopen yet
+            real_lock.release()             # Release so dispatch can proceed
+            t.join(timeout=2)
+        self.assertEqual(call_count[0], 1)  # Exactly one dispatch
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
+    def test_local_concurrency_lock_held_during_dispatch(self):
+        """Verify local backend dispatch holds concurrency lock.
+        
+        Regression guard: same as test_cloud_concurrency_lock_held_during_dispatch
+        but for the local backend path.
+        """
+        real_lock = threading.Semaphore(1)
+        real_lock.acquire()  # Pre-occupy the lock
+        stage = BackendDispatcher(llama_lock=real_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="local")
+        call_count = [0]
+
+        def blocking_urlopen(req, timeout=None):
+            call_count[0] += 1
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=blocking_urlopen) as mock_open:
+            t = threading.Thread(target=stage.process, args=(ctx,))
+            t.start()
+            import time
+            time.sleep(0.05)
+            mock_open.assert_not_called()  # Lock held → blocked
+            real_lock.release()
+            t.join(timeout=2)
+        self.assertEqual(call_count[0], 1)
+
     def test_output_metrics_structure(self):
         stage = BackendDispatcher(llama_lock=None, handler=None)
         ctx = PipelineContext(openai_body={"model": "test"}, is_stream=True)
+        ctx._route_target = "cloud"
+        ctx._route_cloud_model = "pro"
         metrics = stage.output_metrics(ctx)
-        self.assertIn("backend_status", metrics)
-        self.assertIn("stream", metrics)
-        self.assertEqual(metrics["stream"], 1)
+        for k in ("backend_status", "stream", "route_target", "route_cloud_model",
+                  "route_fallback", "emergency_fallback"):
+            self.assertIn(k, metrics)
+        self.assertEqual(metrics["route_target"], "cloud")
+
+    def test_output_metrics_contains_latency_buckets(self):
+        """Phase 3+ (建议3): output_metrics must include dispatch_latency_ms and input_chars_bucket."""
+        stage = BackendDispatcher(llama_lock=None, handler=None)
+        ctx = PipelineContext(openai_body={"model": "test"}, total_chars=75000)
+        ctx._route_target = "cloud"
+        ctx._route_cloud_model = "deepseek-v4-flash"
+        metrics = stage.output_metrics(ctx)
+        self.assertIn("dispatch_latency_ms", metrics)
+        self.assertIsInstance(metrics["dispatch_latency_ms"], (int, float))
+        self.assertIn("input_chars_bucket", metrics)
+        self.assertEqual(metrics["input_chars_bucket"], "md")  # 75K is in md bucket (50K-150K)
 
 
 # ===========================================================================
@@ -921,6 +1227,23 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertIsNotNone(ctx.stage_config)
         self.assertIsNotNone(ctx.trunc_stats)
         self.assertIn("DATE_PLACEHOLDER", str(ctx.messages[0]))
+
+
+class TestBytesIOResponse(unittest.TestCase):
+    """Wraps raw bytes into a file-like response for non-streaming dispatch."""
+
+    def test_wraps_status_and_bytes(self):
+        from pipeline import _BytesIOResponse
+        body = b'{"key": "value"}'
+        wrapped = _BytesIOResponse(200, body)
+        self.assertEqual(wrapped.status, 200)
+        self.assertEqual(wrapped.read(), body)
+
+    def test_empty_body(self):
+        from pipeline import _BytesIOResponse
+        wrapped = _BytesIOResponse(503, b"")
+        self.assertEqual(wrapped.status, 503)
+        self.assertEqual(wrapped.read(), b"")
 
 
 if __name__ == "__main__":

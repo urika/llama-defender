@@ -17,7 +17,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 from proxy_state import *
-import proxy_state
+import proxy_state as _ps
 import proxy_config
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +53,8 @@ from pipeline import (
     RequestParser,
     LifecycleClassifier,
     DynamicMaxTokens,
+    SmartRouter,
+    RouteNotification,
     ErrorTranslator,
     BlockerDetector,
     SystemNormalizer,
@@ -381,8 +383,9 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"GET {self.path}")
                 log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
             if self.path == "/v1/models":
-                models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "anthropic"}
-                          for name in MODEL_ALIASES]
+                aliases = _ps.get_model_aliases()
+                models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "proxy-router"}
+                          for name in aliases]
                 self._respond_json({"object": "list", "data": models})
             elif self.path == "/status":
                 html = _build_status_html()
@@ -440,6 +443,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 parsed = json.loads(body)
+                # Extract X-Proxy-Route-To header for single-request route override
+                parsed["_x_proxy_route_to"] = self.headers.get("X-Proxy-Route-To", "")
             except json.JSONDecodeError:
                 log(f"  Body (invalid JSON): {body[:500]}")
                 self._respond_json(
@@ -454,6 +459,14 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 log(f"  debug body write failed: {e}")
             log(f"  Body: {json.dumps(parsed, ensure_ascii=False)[:1500]}")
+
+            # Admin: force route target for a session
+            if self.path == "/admin/route/force-local":
+                self._handle_admin_route_force(parsed, "local")
+                return
+            if self.path == "/admin/route/force-cloud":
+                self._handle_admin_route_force(parsed, "cloud")
+                return
 
             if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
                 # Phase 3: memory pressure active rejection
@@ -658,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
             RequestParser(),              # 0
             LifecycleClassifier(),        # 1
             DynamicMaxTokens(),           # 2
+            SmartRouter(),                # 2.5 — route decision (local vs cloud)
+            RouteNotification(),          # 2.6 — route notification (log only in Phase 1)
             ErrorTranslator(),            # 3
             BlockerDetector(),            # 4
             SystemNormalizer(),           # 5
@@ -678,6 +693,7 @@ class Handler(BaseHTTPRequestHandler):
             FormatConverter(),            # 20
             BackendDispatcher(            # 21
                 llama_lock=_llama_lock,
+                cloud_lock=_ps._cloud_lock,
                 handler=self,
             ),
         ]).run(ctx)
@@ -748,6 +764,10 @@ class Handler(BaseHTTPRequestHandler):
         if not getattr(self, "_request_id", None):
             self._request_id = f"req_{os.urandom(8).hex()}"
         self.send_header("request-id", self._request_id)
+        route_headers = getattr(self, '_route_response_headers', None) or {}
+        for hk, hv in route_headers.items():
+            self.send_header(hk, str(hv))
+        self._route_response_headers = None
         self.end_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
@@ -996,6 +1016,21 @@ class Handler(BaseHTTPRequestHandler):
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
+    def _handle_admin_route_force(self, parsed, target):
+        """Handle POST /admin/route/force-local|force-cloud — force route target for a session."""
+        session_id = parsed.get("session_id", "")
+        if not session_id:
+            self._respond_json({"error": {"message": "Missing session_id"}}, 400)
+            return
+        with _ps._state_lock:
+            _ps._SESSION_ROUTE_MAP[session_id] = "local_forced" if target == "local" else "cloud"
+            _ps._SESSION_ROUTE_FORCE_SOURCE[session_id] = "user_manual"
+            # Clear any existing cooldown/failure state
+            _ps._cloud_cooldown_start.pop(session_id, None)
+            _ps._cloud_fail_count.pop(session_id, None)
+        log(f"  -> [admin] Session {session_id} route forced to {target} (user_manual)")
+        self._respond_json({"ok": True, "session_id": session_id, "route_target": target})
+
     def _respond_json(self, data, status=200, extra_headers=None):
         raw = json.dumps(data, ensure_ascii=False)
         raw_bytes = raw.encode("utf-8")
@@ -1006,6 +1041,10 @@ class Handler(BaseHTTPRequestHandler):
         if not getattr(self, "_request_id", None):
             self._request_id = f"req_{os.urandom(8).hex()}"
         self.send_header("request-id", self._request_id)
+        route_headers = getattr(self, '_route_response_headers', None) or {}
+        for hk, hv in route_headers.items():
+            self.send_header(hk, str(hv))
+        self._route_response_headers = None
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, str(v))

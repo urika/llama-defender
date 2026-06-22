@@ -46,31 +46,9 @@ def _get_process_info(pattern, name, fallback_port=None):
         }
     return {"running": False, "name": name}
 # --- _get_system_memory ---
-def _get_system_memory():
-    out = _run("vm_stat")
-    data = {}
-    page_size = 16384
-    for line in out.splitlines():
-        if "Pages free:" in line:
-            data["free_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages wired down:" in line:
-            data["wired_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages active:" in line:
-            data["active_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages inactive:" in line:
-            data["inactive_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages stored in compressor:" in line:
-            data["compress_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-    total = 48.0
-    # macOS: Free is always tiny; Inactive is reclaimable cache.
-    # Show meaningful metrics: true used (wired+active) vs available (free+inactive).
-    true_used = data.get("wired_gb", 0) + data.get("active_gb", 0)
-    available = data.get("free_gb", 0) + data.get("inactive_gb", 0)
-    data["total_gb"] = total
-    data["used_gb"] = true_used          # Wired + Active (truly in use)
-    data["available_gb"] = available     # Free + Inactive (reclaimable)
-    data["used_pct"] = f"{true_used/total*100:.1f}"
-    return data
+# _get_system_memory() moved to proxy_state.py so pipeline.py can use it without
+# creating a circular import.  Keep this module-level alias for backward compat.
+_get_system_memory = _ps._get_system_memory
 # --- _should_reject_for_memory ---
 def _should_reject_for_memory(mem=None):
     """Return (rejected: bool, used_pct: float) based on memory pressure threshold."""
@@ -495,6 +473,271 @@ def _empty_context_optimization_stats():
         "max_concurrent": _ps.PROXY_MAX_CONCURRENT,
         "dynamic_concurrent_enabled": _ps.PROXY_DYNAMIC_CONCURRENT_ENABLED,
     }
+def _get_route_stats():
+    """Gather intelligent routing statistics for the /status page.
+
+    Returns a dict with three layers of routing information:
+      1. Configuration snapshot — enabled, threshold, profile, cloud model/endpoint.
+      2. Aggregate counters from proxy_metrics.jsonl — local/cloud/fallback totals,
+         last route reason, recent fallback details.
+      3. Real-time session state from proxy_state — session map, cooldown map,
+         per-session request counts, active session detail.
+    """
+    route_enabled = _ps.PROXY_ROUTE_ENABLED
+    # --- Aggregate counters from metrics JSONL ---
+    local_count = 0
+    cloud_count = 0
+    fallback_count = 0
+    last_route_reason = ""
+    last_route_target = ""
+    last_route_timestamp = ""
+    recent_fallbacks = []  # last 5 fallback events
+    try:
+        metrics_file = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
+        with open(metrics_file, "r") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    p = rec.get("pipeline", {})
+                    bd = p.get("backend_dispatcher", {})
+                    rt = bd.get("route_target", "local")
+                    if rt == "cloud":
+                        cloud_count += 1
+                    else:
+                        local_count += 1
+                    reason = bd.get("route_reason", "")
+                    ts = rec.get("timestamp", rec.get("ts", ""))
+                    if ts:
+                        last_route_timestamp = ts
+                    if reason:
+                        last_route_reason = reason
+                        last_route_target = rt
+                    if bd.get("route_fallback"):
+                        fallback_count += 1
+                        if len(recent_fallbacks) < 5:
+                            recent_fallbacks.append({
+                                "timestamp": ts,
+                                "reason": reason,
+                                "cloud_model": bd.get("route_cloud_model", ""),
+                                "target": rt,
+                            })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    except OSError:
+        pass
+
+    # --- Real-time session state from proxy_state ---
+    with _ps._state_lock:
+        daily_date = getattr(_ps, '_route_daily_date', '')
+        daily_cost = getattr(_ps, '_route_daily_cost', 0.0)
+        today = time.strftime("%Y-%m-%d")
+        if daily_date != today:
+            daily_cost = 0.0
+
+        # Real-time session counts
+        session_cloud = sum(1 for t in _ps._SESSION_ROUTE_MAP.values() if t == "cloud")
+        session_local = sum(1 for t in _ps._SESSION_ROUTE_MAP.values()
+                            if t in ("local", "local_forced"))
+        session_total = len(_ps._SESSION_ROUTE_MAP)
+
+        # Active sessions detail — enrich with request count, cooldown, and reason
+        active_sessions = []
+        for sid, target in sorted(_ps._SESSION_ROUTE_MAP.items()):
+            cd_start = _ps._cloud_cooldown_start.get(sid, 0)
+            cooldown_remaining = 0
+            if cd_start > 0:
+                elapsed = getattr(time, 'monotonic', time.time)() - cd_start
+                cooldown_total = getattr(_ps, 'PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS', 1800)
+                cooldown_remaining = max(0, int(cooldown_total - elapsed))
+            active_sessions.append({
+                "session_id": sid,
+                "target": target,
+                "source": _ps._SESSION_ROUTE_FORCE_SOURCE.get(sid, ""),
+                "failures": _ps._cloud_fail_count.get(sid, 0),
+                "requests": _ps._SESSION_REQUEST_COUNT.get(sid, 0),
+                "cooldown_remaining": cooldown_remaining,
+            })
+
+        # Sessions in cool-down
+        cooldown_sessions = [
+            {
+                "session_id": sid,
+                "remaining_s": cooldown_remaining,
+            }
+            for sid, cd_start in _ps._cloud_cooldown_start.items()
+            if cd_start > 0
+            for elapsed in [getattr(time, 'monotonic', time.time)() - cd_start]
+            for cooldown_total in [getattr(_ps, 'PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS', 1800)]
+            for cooldown_remaining in [max(0, int(cooldown_total - elapsed))]
+            if cooldown_remaining > 0
+        ]
+
+    total = local_count + cloud_count
+    cloud_pct = (cloud_count / total * 100) if total > 0 else 0.0
+
+    return {
+        # Configuration snapshot
+        "route_enabled": route_enabled,
+        "threshold": _ps.PROXY_ROUTE_THRESHOLD_CHARS,
+        "memory_pct": _ps.PROXY_ROUTE_MEMORY_PCT,
+        "profile": _ps.PROXY_ROUTE_PROFILE or "custom",
+        "cloud_model": _ps.PROXY_CLOUD_MODEL,
+        "cloud_base_url": _ps.PROXY_CLOUD_BASE_URL,
+        "fallback_enabled": _ps.PROXY_ROUTE_FALLBACK_ENABLED,
+        "max_cloud_fails": _ps.PROXY_ROUTE_MAX_CLOUD_FAILS,
+        "cloud_concurrent": _ps.PROXY_ROUTE_CLOUD_CONCURRENT,
+        "cloud_api_key_configured": bool(_ps.PROXY_CLOUD_API_KEY),
+        # Aggregate counters
+        "local_count": local_count,
+        "cloud_count": cloud_count,
+        "cloud_pct": cloud_pct,
+        "fallback_count": fallback_count,
+        "last_route_reason": last_route_reason,
+        "last_route_target": last_route_target,
+        "last_route_timestamp": last_route_timestamp,
+        "recent_fallbacks": recent_fallbacks,
+        # Cost tracking
+        "daily_cost": daily_cost,
+        "daily_budget": _ps.PROXY_ROUTE_DAILY_BUDGET,
+        # Phase 3+ (建议3): per-backend segmented latency (last 100 samples each)
+        "local_latency": _latency_summary(_ps._LATENCY_BY_TARGET.get("local")),
+        "cloud_latency": _latency_summary(_ps._LATENCY_BY_TARGET.get("cloud")),
+        # Real-time session state
+        "session_cloud": session_cloud,
+        "session_local": session_local,
+        "session_total": session_total,
+        "active_sessions": active_sessions,
+        "cooldown_sessions": cooldown_sessions,
+    }
+
+
+def _latency_summary(deq):
+    """Compute avg/p95/max/count from a deque of latency samples (ms).
+
+    None and non-finite values are skipped.  Returns dict of 0s when empty.
+    """
+    if not deq:
+        return {"count": 0, "avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+    try:
+        vals = [float(v) for v in list(deq) if v is not None]
+    except (TypeError, ValueError):
+        return {"count": 0, "avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+    if not vals:
+        return {"count": 0, "avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+    return {
+        "count": len(vals),
+        "avg_ms": round(sum(vals) / len(vals), 1),
+        "p50_ms": round(_percentile(vals, 0.50), 1),
+        "p95_ms": round(_percentile(vals, 0.95), 1),
+        "max_ms": round(max(vals), 1),
+    }
+
+
+def _build_active_sessions_table(sessions: list) -> str:
+    """Build an HTML table showing active session routing state.
+
+    Columns: Session ID | Target (colored badge) | Source | Reqs | Fails | Cooldown
+    Sessions in cool-down are highlighted with a warning row style.
+    """
+    if not sessions:
+        return ""
+    rows = ""
+    for s in sessions:
+        target = s["target"]
+        # Color-code target: cloud=blue, local=green, local_forced=orange
+        if target == "cloud":
+            color = "#3498db"
+        elif target == "local_forced":
+            color = "#e67e22"
+        else:
+            color = "#27ae60"
+        badge = f'<span style="color:{color};font-weight:bold">{target}</span>'
+        cd = s.get("cooldown_remaining", 0)
+        cd_html = f'<span style="color:#e74c3c">{cd}s</span>' if cd > 0 else "—"
+        row_style = ' style="background:rgba(231,76,60,0.1)"' if cd > 0 else ""
+        rows += (
+            f'<tr{row_style}>'
+            f'<td>{s["session_id"][:12]}…</td>'
+            f'<td>{badge}</td>'
+            f'<td>{s.get("source") or "—"}</td>'
+            f'<td>{s.get("requests", 0)}</td>'
+            f'<td>{s.get("failures", 0)}</td>'
+            f'<td>{cd_html}</td>'
+            f'</tr>'
+        )
+    return (
+        '<table style="width:100%;margin-top:8px;font-size:0.85em;border-collapse:collapse">'
+        '<tr style="border-bottom:1px solid #444">'
+        '<th>Session</th><th>Target</th><th>Source</th><th>Reqs</th><th>Fails</th><th>Cooldown</th>'
+        '</tr>'
+        f'{rows}</table>'
+    )
+
+
+def _build_route_reason_legend() -> str:
+    """Return a small inline explanation of common route_reason codes for the /status page."""
+    reasons = [
+        ("under_threshold", "上下文 < 阈值，本地处理"),
+        ("chars_exceed_threshold", "上下文超阈值，路由到云端"),
+        ("session_already_cloud", "会话已锁定云端"),
+        ("session_force_local", "会话强制本地"),
+        ("cloud_cooldown_active", "云端冷却中，走本地"),
+        ("cloud_no_api_key", "未配置云端 API Key，回退本地"),
+        ("cloud_fallback", "云端请求失败，回退本地"),
+    ]
+    items = "".join(
+        f'<div style="font-size:0.8em;color:#888"><code>{code}</code> — {desc}</div>'
+        for code, desc in reasons
+    )
+    return f'<div style="margin-top:6px;padding:6px;border:1px solid #333;border-radius:4px">{items}</div>'
+
+
+def _build_recent_fallbacks_table(fallbacks: list) -> str:
+    """Build a compact table of recent fallback events (last 5)."""
+    if not fallbacks:
+        return ""
+    rows = ""
+    for fb in fallbacks:
+        ts = fb.get("timestamp", "")
+        ts_short = ts[11:19] if len(ts) >= 19 else ts
+        rows += (
+            f'<tr><td>{ts_short}</td>'
+            f'<td>{fb.get("reason", "—")}</td>'
+            f'<td>{fb.get("cloud_model", "—")}</td></tr>'
+        )
+    return (
+        '<table style="width:100%;margin-top:6px;font-size:0.82em;border-collapse:collapse">'
+        '<tr style="border-bottom:1px solid #444"><th>Time</th><th>Reason</th><th>Cloud Model</th></tr>'
+        f'{rows}</table>'
+    )
+
+
+def _format_latency(lat: dict) -> str:
+    """Render a per-backend latency summary as a compact inline string.
+
+    Shows avg / p95 / max and the sample count.  Highlighted red when p95
+    exceeds the dynamic-concurrency threshold, amber when above 2× avg.
+    """
+    count = lat.get("count", 0)
+    if not count:
+        return '<span style="color:#888">No samples yet</span>'
+    avg = lat.get("avg_ms", 0.0)
+    p95 = lat.get("p95_ms", 0.0)
+    mx = lat.get("max_ms", 0.0)
+    threshold = _ps.PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS
+    if p95 > threshold:
+        color = "#e74c3c"
+    elif p95 > avg * 2 and p95 > 1000:
+        color = "#f39c12"
+    else:
+        color = "#27ae60"
+    return (
+        f'<span style="color:{color}">'
+        f'avg {avg:.0f}ms / p95 {p95:.0f}ms / max {mx:.0f}ms'
+        f'</span> <span style="color:#888">({count})</span>'
+    )
+
+
 # --- _get_session_trace ---
 def _get_session_trace():
     """Parse /tmp/anthropic_request_body.json and build an HTML snippet showing
@@ -644,6 +887,7 @@ def _build_status_html():
     session_trace, tools_detail, errors_detail = _get_session_trace()
     cache_stats = _get_cache_stats()
     ctx_opt = _get_context_optimization_stats()
+    route = _get_route_stats()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     backend_color = "#2ecc71" if backend_info.get("running") else "#e74c3c"
@@ -690,6 +934,105 @@ def _build_status_html():
     <div class="row"><span class="label">Blocker Triggered (10m)</span><span class="value">{ctx_opt.get("blocker_triggered_10m", 0)}</span></div>
     {recent_blocker_html}
     <div class="row"><span class="label">Max Concurrent</span><span class="value">{ctx_opt.get("max_concurrent", _ps.PROXY_MAX_CONCURRENT)}{" (dynamic)" if ctx_opt.get("dynamic_concurrent_enabled") else ""}</span></div>
+  </div>"""
+
+    # --- Route card ---
+    route_status_icon = "✅" if route["route_enabled"] else "❌"
+    route_status_text = "Enabled" if route["route_enabled"] else "Disabled"
+    route_target_text = "Cloud" if route["cloud_count"] > route["local_count"] else "Local"
+    # Cloud API key indicator — visual health check for prerequisite cloud configs
+    api_key_ok = route.get("cloud_api_key_configured", False)
+    if not _ps.PROXY_ROUTE_ENABLED:
+        api_key_badge = '<span style="color:#888">—（路由已禁用）</span>'
+    elif api_key_ok:
+        api_key_badge = '<span style="color:#27ae60">✅ 已配置</span>'
+    else:
+        api_key_badge = '<span style="color:#e74c3c">❌ 未配置（路由会回退本地）</span>'
+    route_budget_warn = ""
+    if route["daily_budget"] > 0 and route["daily_cost"] > 0:
+        pct = route["daily_cost"] / route["daily_budget"] * 100
+        if pct > 80:
+            route_budget_warn = f' <span style="color:#e74c3c">({pct:.0f}% used)</span>'
+        else:
+            route_budget_warn = f' <span style="color:#f39c12">({pct:.0f}% used)</span>'
+
+    # Cloud ratio bar — visual indicator of local/cloud split
+    total_reqs = route["local_count"] + route["cloud_count"]
+    if total_reqs > 0:
+        local_bar_pct = route["local_count"] / total_reqs * 100
+        cloud_bar_pct = route["cloud_count"] / total_reqs * 100
+        route_bar = (
+            f'<div style="margin-top:4px;display:flex;height:18px;border-radius:3px;overflow:hidden;font-size:0.75em">'
+            f'<div style="width:{local_bar_pct:.1f}%;background:#27ae60;color:#fff;text-align:center;line-height:18px">Local {route["local_count"]}</div>'
+            f'<div style="width:{cloud_bar_pct:.1f}%;background:#3498db;color:#fff;text-align:center;line-height:18px">Cloud {route["cloud_count"]}</div>'
+            f'</div>'
+        )
+    else:
+        route_bar = '<div style="margin-top:4px;color:#888;font-size:0.85em">No requests yet</div>'
+
+    # Last route decision — highlight the most recent routing decision
+    last_reason_html = ""
+    if route.get("last_route_reason"):
+        last_target = route.get("last_route_target", "local")
+        rc = "#27ae60" if last_target != "cloud" else "#3498db"
+        last_ts = route.get("last_route_timestamp", "")
+        ts_display = last_ts[11:19] if len(last_ts) >= 19 else ""
+        ts_span = f'<span style="color:#888">  {ts_display}</span>' if ts_display else ""
+        last_reason_html = (
+            f'<div style="margin-top:6px;padding:6px 8px;border-left:3px solid {rc};'
+            f'background:rgba(0,0,0,0.2);font-size:0.85em">'
+            f'<b>Last Decision:</b> <span style="color:{rc}">{last_target}</span>'
+            f' — <code>{route["last_route_reason"]}</code>'
+            f'{ts_span}'
+            f'</div>'
+        )
+
+    # Cooldown sessions summary
+    cooldown_html = ""
+    cooldown_sessions = route.get("cooldown_sessions", [])
+    if cooldown_sessions:
+        cooldown_html = (
+            f'<div style="margin-top:6px;padding:6px;background:rgba(231,76,60,0.15);border-radius:4px;font-size:0.85em">'
+            f'⚠️ <b>{len(cooldown_sessions)}</b> session(s) in cloud cooldown: '
+            + ", ".join(
+                f'<code>{cs["session_id"][:8]}…</code> ({cs["remaining_s"]}s)'
+                for cs in cooldown_sessions
+            )
+            + '</div>'
+        )
+
+    # Recent fallbacks table
+    fallbacks_html = ""
+    if route.get("recent_fallbacks"):
+        fallbacks_html = (
+            '<div style="margin-top:6px"><b style="font-size:0.85em">Recent Fallbacks (last 5):</b>'
+            + _build_recent_fallbacks_table(route["recent_fallbacks"])
+            + '</div>'
+        )
+
+    route_card = f"""<div class="card">
+    <h2>🔀 Intelligent Routing</h2>
+    <div class="row"><span class="label">Status</span><span class="value">{route_status_icon} {route_status_text}</span></div>
+    <div class="row"><span class="label">API Key</span><span class="value">{api_key_badge}</span></div>
+    <div class="row"><span class="label">Cloud Model</span><span class="value">{route["cloud_model"]}</span></div>
+    <div class="row"><span class="label">Cloud Endpoint</span><span class="value" style="font-size:0.8em">{route["cloud_base_url"]}</span></div>
+    <div class="row"><span class="label">Threshold</span><span class="value">{route["threshold"]:,} chars</span></div>
+    <div class="row"><span class="label">Memory Trigger</span><span class="value">{route["memory_pct"]}% used</span></div>
+    <div class="row"><span class="label">Profile</span><span class="value">{route["profile"]}</span></div>
+    <div class="row"><span class="label">Fallback</span><span class="value">{"✅ enabled (max " + str(route["max_cloud_fails"]) + " fails)" if route["fallback_enabled"] else "❌ disabled"}</span></div>
+    <div class="row"><span class="label">Cloud Concurrent</span><span class="value">{route["cloud_concurrent"]}</span></div>
+    {route_bar}
+    <div class="row" style="margin-top:6px"><span class="label">Cloud Ratio</span><span class="value">{route["cloud_pct"]:.1f}%</span></div>
+    <div class="row"><span class="label">Fallbacks</span><span class="value">{route["fallback_count"]}</span></div>
+    {last_reason_html}
+    {fallbacks_html}
+    {cooldown_html}
+    <div class="row" style="margin-top:6px"><span class="label">Latency (Local)</span><span class="value">{_format_latency(route.get("local_latency", {}))}</span></div>
+    <div class="row"><span class="label">Latency (Cloud)</span><span class="value">{_format_latency(route.get("cloud_latency", {}))}</span></div>
+    <div class="row" style="margin-top:6px"><span class="label">Active Sessions</span><span class="value">{route.get("session_cloud", "?")} cloud / {route.get("session_local", "?")} local / {route.get("session_total", 0)} total</span></div>
+    <div class="row"><span class="label">Daily Cost</span><span class="value">¥{route["daily_cost"]:.2f} / ¥{route["daily_budget"]:.0f}{route_budget_warn}</span></div>
+    {_build_active_sessions_table(route.get("active_sessions", [])) if route.get("active_sessions") else ""}
+    {_build_route_reason_legend()}
   </div>"""
 
     # --- Alerts card ---
@@ -831,6 +1174,8 @@ def _build_status_html():
   </div>
 
   {traffic_card}
+
+  {route_card}
 
   {ctx_opt_card}
 

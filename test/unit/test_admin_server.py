@@ -150,6 +150,83 @@ class TestBuildStatusHtml(unittest.TestCase):
         self.assertNotIn("{LLAMA_BASE}", html)
         self.assertNotIn("{MODEL_NAME}", html)
 
+    def test_route_card_contains_rich_fields(self):
+        """Route card must include all new routing-supervision fields."""
+        html = admin_server._build_status_html()
+        for label in ("Cloud Model", "Cloud Endpoint", "Cloud Ratio",
+                      "Cloud Concurrent", "Profile", "Fallback", "API Key"):
+            self.assertIn(label, html, f"Route card missing '{label}'")
+
+
+class TestGetRouteStats(unittest.TestCase):
+    """Test the enriched _get_route_stats() returns all expected keys."""
+
+    def test_returns_config_snapshot_keys(self):
+        rs = admin_server._get_route_stats()
+        for key in ("route_enabled", "threshold", "memory_pct", "profile",
+                     "cloud_model", "cloud_base_url", "fallback_enabled",
+                     "max_cloud_fails", "cloud_concurrent",
+                     "cloud_api_key_configured"):
+            self.assertIn(key, rs, f"_get_route_stats() missing '{key}'")
+
+    def test_returns_aggregate_counter_keys(self):
+        rs = admin_server._get_route_stats()
+        for key in ("local_count", "cloud_count", "cloud_pct",
+                     "fallback_count", "last_route_reason", "last_route_target",
+                     "recent_fallbacks"):
+            self.assertIn(key, rs)
+
+    def test_returns_session_state_keys(self):
+        rs = admin_server._get_route_stats()
+        for key in ("session_cloud", "session_local", "session_total",
+                     "active_sessions", "cooldown_sessions"):
+            self.assertIn(key, rs)
+
+    def test_cloud_pct_is_float(self):
+        rs = admin_server._get_route_stats()
+        self.assertIsInstance(rs["cloud_pct"], float)
+
+    def test_active_sessions_contains_enriched_fields(self):
+        rs = admin_server._get_route_stats()
+        for s in rs["active_sessions"]:
+            self.assertIn("requests", s)
+            self.assertIn("cooldown_remaining", s)
+
+    def test_returns_latency_summary_keys(self):
+        """Phase 3+ (建议3): _get_route_stats() must include local/cloud latency summaries."""
+        rs = admin_server._get_route_stats()
+        for key in ("local_latency", "cloud_latency"):
+            self.assertIn(key, rs, f"_get_route_stats() missing latency key '{key}'")
+            summary = rs[key]
+            for field in ("count", "avg_ms", "p50_ms", "p95_ms", "max_ms"):
+                self.assertIn(field, summary, f"latency summary missing '{field}'")
+
+    def test_latency_summary_empty_deque(self):
+        """_latency_summary(None) returns zeroed dict, not None."""
+        s = admin_server._latency_summary(None)
+        self.assertEqual(s["count"], 0)
+        self.assertEqual(s["p95_ms"], 0.0)
+
+    def test_latency_summary_with_samples(self):
+        """_latency_summary() with [10,20,30,40,50] should compute avg=30, p95=50."""
+        import collections
+        d = collections.deque([10, 20, 30, 40, 50])
+        s = admin_server._latency_summary(d)
+        self.assertEqual(s["count"], 5)
+        self.assertEqual(s["avg_ms"], 30.0)
+        self.assertGreater(s["p95_ms"], s["avg_ms"])
+
+    def test_status_html_contains_latency_rows(self):
+        """The /status HTML must include per-backend latency rows."""
+        html = admin_server._build_status_html()
+        self.assertIn("Latency (Local)", html)
+        self.assertIn("Latency (Cloud)", html)
+
+    def test_status_html_contains_api_key_badge(self):
+        """The /status HTML must include the API Key indicator row."""
+        html = admin_server._build_status_html()
+        self.assertIn("API Key", html)
+
 
 class TestGetCacheStats(unittest.TestCase):
 

@@ -60,7 +60,9 @@ Startup polls `http://host:port/v1/models` for up to 60 s to confirm readiness, 
 Additional commands (see `./manage.sh help`):
 
 ```bash
-./manage.sh watchdog [--daemon]       # Monitor backend health, auto-restart on degradation
+./manage.sh watchdog [--daemon]             # Monitor backend health, auto-restart on degradation
+./manage.sh route-force-local <session_id>  # Force session to local (sensitive code, privacy)
+./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
                                       # --daemon: background process, logs to logs/watchdog.log
 ./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
 ./manage.sh fix-template <dir>        # Repair Qwen chat_template (DEF-007: prevents system message crashes)
@@ -110,6 +112,25 @@ but rarely needed.
 
 When using DeepSeek's Anthropic-compatible endpoint, `claude-opus` maps to
 `deepseek-v4-pro` and `claude-haiku`/`sonnet` map to `deepseek-v4-flash`.
+
+**Intelligent Model Routing** (Phase 1-3): The proxy can auto-route requests between
+local and cloud backends based on context size, memory pressure, and session state.
+- **Enable**: `PROXY_ROUTE_ENABLED=true` in config (default: `false`, backward-compatible)
+- **Threshold**: `PROXY_ROUTE_THRESHOLD_CHARS=90000` — requests above this route to cloud
+- **Cloud model**: `PROXY_CLOUD_MODEL=deepseek-v4-flash` (default), `deepseek-v4-pro` for quality
+- **API Key**: `PROXY_CLOUD_API_KEY` must be set in `secret.local.conf` for cloud routing
+- **Fallback**: `PROXY_ROUTE_FALLBACK_ENABLED=true` — cloud failure → emergency truncation → local retry
+- **Daily budget**: `PROXY_ROUTE_DAILY_BUDGET=5.0` — caps daily cloud cost (0 = unlimited)
+- **Cost tracking**: `/status` page shows real-time cloud cost, `/v1/models` returns stable aliases
+- **Session control**: `./manage.sh route-force-local <sid>` / `route-force-cloud <sid>`
+- **Response headers**: `X-Actual-Model`, `X-Route-Target`, `X-Route-Reason` on every response
+
+Model ID → route preference mapping (preference only, safety always overrides):
+| Agent Model ID | Route Bias | Threshold | Cloud Model |
+|---------------|-----------|-----------|-------------|
+| `claude-sonnet-4-6` | auto | 90K | flash |
+| `claude-opus-4-7` | prefer_cloud | 72K | pro |
+| `claude-haiku-4-5` | prefer_local | 120K | flash |
 
 ## Key implementation details
 

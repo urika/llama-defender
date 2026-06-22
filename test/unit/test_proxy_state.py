@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -45,9 +46,14 @@ class TestProxyStateImports(unittest.TestCase):
         self.assertGreater(len(proxy_state._RELOAD_SPEC), 40)
 
     def test_model_aliases(self):
+        """MODEL_ALIASES static list has backward compat entries.
+        get_model_aliases() never exposes MODEL_NAME."""
         self.assertIsInstance(proxy_state.MODEL_ALIASES, list)
         self.assertIn("default", proxy_state.MODEL_ALIASES)
-        self.assertIn(proxy_state.MODEL_NAME, proxy_state.MODEL_ALIASES)
+        # P0#3: static list still has MODEL_NAME (legacy), but get_model_aliases() does not
+        from proxy_state import get_model_aliases
+        stable_aliases = get_model_aliases()
+        self.assertNotIn(proxy_state.MODEL_NAME, stable_aliases)
 
 
 class TestProxyStateConfigInvariants(unittest.TestCase):
@@ -267,6 +273,47 @@ class TestProxyStateAll(unittest.TestCase):
         self.assertIn("_parse_conf_env", proxy_state.__all__)
         self.assertIn("_cast_config_value", proxy_state.__all__)
 
+    def test_all_covers_route_vars(self):
+        """__all__ must include all PROXY_ROUTE_* config names.
+        
+        Regression guard: P2#10 — newly added routing names omitted from __all__.
+        """
+        route_names = {n for n in dir(proxy_state) if n.startswith("PROXY_ROUTE_")}
+        missing = route_names - set(proxy_state.__all__)
+        if missing:
+            self.fail(f"__all__ missing route names: {sorted(missing)}")
+
+
+class TestRouteCost(unittest.TestCase):
+    """Cost accumulation accuracy."""
+
+    def test_accumulate_input_output(self):
+        from proxy_state import _accumulate_route_daily_cost
+        with proxy_state._state_lock:
+            proxy_state._route_daily_cost = 0.0
+            proxy_state._route_daily_date = ""
+        total = _accumulate_route_daily_cost(input_tokens=1000, output_tokens=500)
+        expected = 1000 * 0.5 / 1_000_000 + 500 * 1.5 / 1_000_000
+        self.assertAlmostEqual(total, expected, places=6)
+        self.assertGreater(total, 0)
+
+    def test_accumulate_additive(self):
+        from proxy_state import _accumulate_route_daily_cost
+        with proxy_state._state_lock:
+            proxy_state._route_daily_cost = 0.0
+            proxy_state._route_daily_date = ""
+        first = _accumulate_route_daily_cost(input_tokens=1000, output_tokens=0)
+        second = _accumulate_route_daily_cost(input_tokens=500, output_tokens=0)
+        self.assertAlmostEqual(second, first + 500 * 0.5 / 1_000_000, places=6)
+
+    def test_accumulate_cross_day_reset(self):
+        from proxy_state import _accumulate_route_daily_cost
+        with proxy_state._state_lock:
+            proxy_state._route_daily_date = "2099-01-01"
+            proxy_state._route_daily_cost = 999.0
+        total = _accumulate_route_daily_cost(input_tokens=1000, output_tokens=0)
+        self.assertAlmostEqual(total, 1000 * 0.5 / 1_000_000, places=6)
+
 
 class TestReloadSpecDefaultsConsistency(unittest.TestCase):
     """Verify _RELOAD_SPEC defaults match CONFIG_REGISTRY canonical defaults.
@@ -346,6 +393,38 @@ class TestReloadSpecDefaultsConsistency(unittest.TestCase):
         names = {entry[1] for entry in proxy_state._RELOAD_SPEC}
         self.assertIn("PROXY_COMPRESS_ENABLED", names)
         self.assertIn("PROXY_COMPRESS_AUDIT", names)
+
+
+class TestSensitivePatternCache(unittest.TestCase):
+    """Sensitive pattern compilation and cache invalidation."""
+
+    def setUp(self):
+        proxy_state.invalidate_sensitive_patterns_cache()
+
+    @patch.object(proxy_state, "PROXY_ROUTE_SENSITIVE_PATTERNS", ".env,.secret")
+    def test_compile_returns_regex(self):
+        result = proxy_state._compile_sensitive_patterns()
+        self.assertIsNotNone(result)
+        self.assertTrue(result.search("/app/.env"))
+        self.assertFalse(result.search("/app/public.py"))
+
+    @patch.object(proxy_state, "PROXY_ROUTE_SENSITIVE_PATTERNS", "")
+    def test_empty_patterns_returns_none(self):
+        self.assertIsNone(proxy_state._compile_sensitive_patterns())
+
+    def test_cache_reused_on_second_call(self):
+        with patch.object(proxy_state, "PROXY_ROUTE_SENSITIVE_PATTERNS", "secret"):
+            first = proxy_state._compile_sensitive_patterns()
+            second = proxy_state._compile_sensitive_patterns()
+            self.assertIs(first, second)
+
+    def test_invalidate_forces_recompile(self):
+        with patch.object(proxy_state, "PROXY_ROUTE_SENSITIVE_PATTERNS", "token"):
+            first = proxy_state._compile_sensitive_patterns()
+            proxy_state.invalidate_sensitive_patterns_cache()
+            with patch.object(proxy_state, "PROXY_ROUTE_SENSITIVE_PATTERNS", "secret"):
+                second = proxy_state._compile_sensitive_patterns()
+                self.assertIsNot(first, second)
 
 
 if __name__ == "__main__":

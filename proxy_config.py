@@ -536,6 +536,93 @@ CONFIG_REGISTRY = {
         "type": "str", "scope": "module",
         "doc": "Log file path. Written alongside stdout.",
     },
+
+    # ---- Intelligent model routing ----
+    "PROXY_ROUTE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Enable intelligent model routing: auto-switch between local and cloud backends.",
+    },
+    "PROXY_ROUTE_THRESHOLD_CHARS": {
+        "defaults": {"all": "90000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Context character threshold above which requests route to cloud.",
+    },
+    "PROXY_CLOUD_BASE_URL": {
+        "defaults": {"all": "https://api.deepseek.com/v1"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Cloud API endpoint URL for routed requests.",
+    },
+    "PROXY_CLOUD_MODEL": {
+        "defaults": {"all": "deepseek-v4-flash"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Cloud model identifier used for routed requests.",
+    },
+    "PROXY_ROUTE_CLOUD_CONCURRENT": {
+        "defaults": {"all": "2"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max concurrent requests to the cloud backend.",
+    },
+    "PROXY_ROUTE_MEMORY_PCT": {
+        "defaults": {"all": "90"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Memory pressure threshold (% used) that triggers cloud routing.",
+    },
+    "PROXY_ROUTE_FALLBACK_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Whether to fall back to local backend when cloud is unavailable.",
+    },
+    "PROXY_ROUTE_MAX_CLOUD_FAILS": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max consecutive cloud failures before entering cooldown.",
+    },
+    "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS": {
+        "defaults": {"all": "1800"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Cooldown duration (seconds) after max cloud failures reached.",
+    },
+    "PROXY_CLOUD_PRICE_INPUT": {
+        "defaults": {"all": "0.5"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Cloud API input price (CNY per million tokens).",
+    },
+    "PROXY_CLOUD_PRICE_OUTPUT": {
+        "defaults": {"all": "1.5"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Cloud API output price (CNY per million tokens).",
+    },
+    "PROXY_ROUTE_SENSITIVE_PATTERNS": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "Comma-separated literal substring patterns for sensitive file paths (force local routing).",
+    },
+    "PROXY_ROUTE_DAILY_BUDGET": {
+        "defaults": {"all": "0"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Daily cloud API cost cap (CNY). 0 = unlimited.",
+    },
+    "PROXY_ROUTE_PROFILE": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "Route config profile name: safe / balanced / cost-aware.",
+    },
+    "PROXY_ROUTE_STICKY": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Sticky sessions: once cloud, always cloud (recommended true for cost-predictable workflows; false allows session to return to local after N rounds below threshold).",
+    },
+    "PROXY_ROUTE_STICKY_RETURN_ROUNDS": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Non-sticky: consecutive below-threshold rounds before a cloud session returns to local.",
+    },
+    "PROXY_ROUTE_STICKY_RETURN_RATIO": {
+        "defaults": {"all": "0.7"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Non-sticky: ratio of effective_threshold below which a cloud request counts as 'below' for return counter (0.7 = below 70% of threshold).",
+    },
 }
 
 # ---------------------------------------------------------------------------
