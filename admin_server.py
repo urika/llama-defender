@@ -754,13 +754,32 @@ def _format_latency(lat: dict) -> str:
 # Session-level analysis (timeline / switches / performance)
 # ---------------------------------------------------------------------------
 
+# M-3: Simple LRU cache for session metrics — cleared when file mtime changes.
+_SESSION_METRICS_CACHE = {}  # session_id -> list[dict]
+_SESSION_METRICS_CACHE_MTIME = 0.0
+_SESSION_METRICS_CACHE_MAXSIZE = 16
+
 
 def _load_session_metrics(session_id: str, max_lines: int = 200000):
     """Load all metrics rows for a given session_id from proxy_metrics.jsonl.
 
     Returns rows sorted by timestamp (oldest first).
+    Uses a simple bounded cache invalidated by file mtime.
     """
+    global _SESSION_METRICS_CACHE, _SESSION_METRICS_CACHE_MTIME
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
+    # Check if file changed since last cache build
+    try:
+        current_mtime = os.path.getmtime(metrics_path)
+    except OSError:
+        current_mtime = 0.0
+    if current_mtime != _SESSION_METRICS_CACHE_MTIME:
+        _SESSION_METRICS_CACHE.clear()
+        _SESSION_METRICS_CACHE_MTIME = current_mtime
+    # Return cached result if present
+    cached = _SESSION_METRICS_CACHE.get(session_id)
+    if cached is not None:
+        return cached
     rows = []
     try:
         with open(metrics_path, "r", encoding="utf-8") as f:
@@ -779,6 +798,10 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
     except FileNotFoundError:
         pass
     rows.sort(key=lambda r: r.get("ts") or "")
+    # Cache with LRU eviction (pop oldest when at maxsize)
+    if len(_SESSION_METRICS_CACHE) >= _SESSION_METRICS_CACHE_MAXSIZE:
+        _SESSION_METRICS_CACHE.pop(next(iter(_SESSION_METRICS_CACHE)), None)
+    _SESSION_METRICS_CACHE[session_id] = rows
     return rows
 
 
@@ -933,6 +956,7 @@ def _analyze_session(session_id: str) -> dict:
         except Exception:
             pass
 
+    force_source = _ps._SESSION_ROUTE_FORCE_SOURCE.get(session_id, "")
     return {
         "session_id": session_id,
         "total": total,
@@ -943,6 +967,7 @@ def _analyze_session(session_id: str) -> dict:
         "cloud_count": cloud_count,
         "unknown_count": unknown_count,
         "error_count": error_count,
+        "force_source": force_source,
         "avg_duration_ms": sum(durations) / total if total else 0,
         "p95_duration_ms": _session_percentile(durations, 0.95),
         "p99_duration_ms": _session_percentile(durations, 0.99),
@@ -1155,6 +1180,7 @@ def _build_session_html(session_id: str) -> str:
     <div class="row"><span>Cloud</span><span style="color:#3498db;font-weight:bold">{data['cloud_count']}</span></div>
     <div class="row"><span>Unknown</span><span style="color:#888">{data['unknown_count']}</span></div>
     <div class="row"><span>Errors</span><span style="color:#e74c3c;font-weight:bold">{data['error_count']}</span></div>
+    {'<div class="row"><span>Route source</span><span style="color:#e67e22">{}</span></div>'.format(data['force_source']) if data.get('force_source') else ''}
   </div>
   <div class="card"><h2>延迟</h2>
     <div class="row"><span>Avg</span><span>{_fmt_ms(data['avg_duration_ms'])}</span></div>

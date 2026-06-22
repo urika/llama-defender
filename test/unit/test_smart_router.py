@@ -222,6 +222,18 @@ class TestSmartRouterHeaderOverride(unittest.TestCase):
         self.assertEqual(ctx._route_target, "cloud")
         self.assertEqual(ctx._route_reason, "header_override")
 
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    def test_header_override_opus_local(self):
+        """P0-1: claude-opus-4-7 with X-Proxy-Route-To: local should route local."""
+        ctx = PipelineContext(
+            body={"model": "claude-opus-4-7"},
+            total_chars=999999,
+        )
+        ctx._route_header_override = "local"
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "header_override")
+
 
 class TestSmartRouterPreference(unittest.TestCase):
     """Priority 0.5: Model ID preference adjusts thresholds."""
@@ -229,7 +241,7 @@ class TestSmartRouterPreference(unittest.TestCase):
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
     def test_opus_prefers_cloud_now_force(self):
-        """opus behavior is now 'force' — always routes to cloud regardless of context."""
+        """opus behavior is 'force_fallback' — routes to cloud, falls back to local on failure."""
         ctx = PipelineContext(
             body={"model": "claude-opus-4-7"},
             session_id="sess_opus_force",
@@ -237,7 +249,7 @@ class TestSmartRouterPreference(unittest.TestCase):
         ctx.stage_config = {"total_chars": 80000, "stage": "expansion"}
         ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "cloud")
-        self.assertIn("model_forced_cloud", ctx._route_reason)
+        self.assertIn("model_forced_fallback_cloud", ctx._route_reason)
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
@@ -267,7 +279,7 @@ class TestSmartRouterPreference(unittest.TestCase):
         ctx.stage_config = {"total_chars": 5000, "stage": "init"}
         ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "cloud")
-        self.assertIn("model_forced_cloud", ctx._route_reason)
+        self.assertIn("model_forced_fallback_cloud", ctx._route_reason)
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
@@ -280,6 +292,7 @@ class TestSmartRouterPreference(unittest.TestCase):
         ctx.stage_config = {"total_chars": 0, "stage": "init"}
         ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("model_forced_fallback", ctx._route_reason)
         self.assertIn("claude-opus-4-7", ctx._route_reason)
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
@@ -840,18 +853,19 @@ class TestV1ModelsRouting(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", False)
     @patch.object(_ps, "IS_CLOUD", False)
-    def test_routing_disabled_no_opus(self):
+    def test_routing_disabled_includes_opus(self):
+        """opus is always included (M-5: prevent 404 on existing sessions)."""
         _ps.invalidate_model_aliases_cache()
         aliases = _ps.get_model_aliases()
         self.assertIn("claude-sonnet-4-6", aliases)
         self.assertIn("claude-haiku-4-5", aliases)
-        self.assertNotIn("claude-opus-4-7", aliases)
+        self.assertIn("claude-opus-4-7", aliases)
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "IS_CLOUD", False)
     @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
     def test_routing_enabled_includes_opus(self):
-        """opus appears only when routing is enabled AND cloud key is configured."""
+        """opus always appears (M-5). With cloud key, routes via cloud; without, falls back to local."""
         _ps.invalidate_model_aliases_cache()
         aliases = _ps.get_model_aliases()
         self.assertIn("claude-opus-4-7", aliases)

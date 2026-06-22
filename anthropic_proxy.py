@@ -384,8 +384,24 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
             if self.path == "/v1/models":
                 aliases = _ps.get_model_aliases()
-                models = [{"id": name, "object": "model", "created": 1677610602, "owned_by": "proxy-router"}
-                          for name in aliases]
+                models = []
+                for name in aliases:
+                    pref = _ps.MODEL_ROUTE_PREFERENCES.get(name, {})
+                    route = pref.get("route_bias", "auto")
+                    behavior = pref.get("behavior", "prefer")
+                    if behavior in ("force", "force_fallback") and route == "prefer_cloud":
+                        meta_route = "cloud"
+                    elif behavior in ("force", "force_fallback") and route == "prefer_local":
+                        meta_route = "local"
+                    else:
+                        meta_route = "auto"
+                    models.append({
+                        "id": name,
+                        "object": "model",
+                        "created": 1677610602,
+                        "owned_by": "proxy-router",
+                        "metadata": {"route": meta_route},
+                    })
                 self._respond_json({"object": "list", "data": models})
             elif self.path == "/status":
                 html = _build_status_html()
@@ -406,15 +422,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not sid:
                     self._respond_json({"detail": "missing sid"}, 400)
                 else:
-                    html = _build_session_html(sid)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    if not getattr(self, "_request_id", None):
-                        self._request_id = f"req_{os.urandom(8).hex()}"
-                    self.send_header("request-id", self._request_id)
-                    self.end_headers()
-                    self.wfile.write(html.encode("utf-8"))
+                    analysis = _analyze_session(sid)
+                    accept = self.headers.get("Accept", "")
+                    if "application/json" in accept:
+                        self._respond_json(analysis)
+                    else:
+                        html = _build_session_html(sid)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        if not getattr(self, "_request_id", None):
+                            self._request_id = f"req_{os.urandom(8).hex()}"
+                        self.send_header("request-id", self._request_id)
+                        self.end_headers()
+                        self.wfile.write(html.encode("utf-8"))
             else:
                 self._respond_json({"detail": "Not found"}, 404)
         finally:

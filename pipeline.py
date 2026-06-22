@@ -157,6 +157,7 @@ class PipelineContext:
     _route_target: str = "local"          # "local" | "cloud" | "local_forced"
     _route_reason: str = ""               # decision reason tag
     _route_header_override: str = ""      # X-Proxy-Route-To header value
+    _route_model_bias: str = ""           # model force direction ("prefer_cloud"/"prefer_local"/"")
     _route_actual_cost: float = 0.0       # actual cloud cost (post-request)
     _route_cloud_model: str = ""          # selected cloud model name
     _emergency_fallback: bool = False     # emergency fallback mode flag
@@ -443,11 +444,21 @@ class DynamicMaxTokens(ConditionalStage):
 # ============================================================================
 
 def _classify_tier(model_id: str) -> str:
-    """Extract agent model tier from model ID."""
+    """Extract agent model tier from model ID.
+
+    Uses exact match for known model IDs first, then substring match
+    with protection against false positives (e.g. \"opus\" in \"my-opus-model\").
+    """
     m = model_id.lower()
-    if "opus" in m:
+    # Exact known tiers
+    if m in ("claude-opus-4-7", "claude-opus-4", "claude-3-opus-20240229"):
         return "opus"
-    if "haiku" in m:
+    if m in ("claude-haiku-4-5", "claude-haiku-4", "claude-3-5-haiku-20241022"):
+        return "haiku"
+    # Loose substring match — protect against "sonnetopus" or "haiku-sonnet-mix"
+    if "opus" in m and "sonnet" not in m:
+        return "opus"
+    if "haiku" in m and "sonnet" not in m:
         return "haiku"
     return "sonnet"
 
@@ -504,7 +515,7 @@ class SmartRouter(PipelineStage):
         if not _ps.PROXY_ROUTE_ENABLED:
             return "local", "disabled"
 
-	# Priority 0.5: Model ID preference → adjust thresholds (do NOT force route)
+        # Priority 0.5: Model ID preference → adjust thresholds (do NOT force route)
         requested_model = ctx.body.get("model", "")
         pref = _ps.MODEL_ROUTE_PREFERENCES.get(requested_model, {})
         effective_threshold = int(
@@ -514,21 +525,33 @@ class SmartRouter(PipelineStage):
         ctx._route_cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
         ctx._agent_model_tier = _classify_tier(requested_model)
 
-        # Force mode: direct route, skip SmartRouter entirely
-        # User explicitly chose this model → respect the choice
+        # Store model force direction in ctx, don't return yet.
+        # This allows Priority 0.6 (header override) to run first.
         behavior = pref.get("behavior", "prefer")
-        if behavior == "force":
-            route_bias = pref.get("route_bias", "auto")
-            if route_bias == "prefer_cloud":
-                cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
-                return "cloud", f"model_forced_cloud({requested_model}->{cloud_model})"
-            elif route_bias == "prefer_local":
-                return "local", f"model_forced_local({requested_model})"
-            # route_bias="auto" + behavior="force" → fall through, treat as prefer
+        route_bias = pref.get("route_bias", "auto")
+        if behavior in ("force", "force_fallback") and route_bias in ("prefer_cloud", "prefer_local"):
+            ctx._route_model_bias = route_bias
+        else:
+            ctx._route_model_bias = ""
 
         # Priority 0.6: X-Proxy-Route-To header (single-request, no session sticky)
-        if ctx._route_header_override in ("local", "cloud"):
-            return ctx._route_header_override, "header_override"
+        if ctx._route_header_override == "local":
+            ctx._route_model_bias = ""  # header explicitly overrides model bias
+            return "local", "header_override"
+        if ctx._route_header_override == "cloud":
+            ctx._route_model_bias = ""
+            return "cloud", "header_override"
+        # M-1: log warning for invalid header values
+        if ctx._route_header_override:
+            log(f"  [warn] Invalid X-Proxy-Route-To value: {ctx._route_header_override!r} — ignored")
+
+        # Priority 0.55: Model force bias (after header check, so header always wins)
+        if ctx._route_model_bias == "prefer_cloud":
+            if behavior == "force_fallback":
+                return "cloud", f"model_forced_fallback_cloud({requested_model}->{ctx._route_cloud_model})"
+            return "cloud", f"model_forced_cloud({requested_model}->{ctx._route_cloud_model})"
+        if ctx._route_model_bias == "prefer_local":
+            return "local", f"model_forced_local({requested_model})"
 
         session_id = ctx.session_id
 
@@ -1820,10 +1843,11 @@ class BackendDispatcher(PipelineStage):
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
 
-        # Validate cloud API key — force mode: error; prefer mode: fallback to local
+        # Validate cloud API key — force mode: error; force_fallback/prefer: fallback to local
         if target == 'cloud' and not _ps.PROXY_CLOUD_API_KEY:
             route_reason = getattr(ctx, '_route_reason', '')
-            if route_reason and route_reason.startswith("model_forced_"):
+            if route_reason and route_reason.startswith("model_forced_") \
+                    and not route_reason.startswith("model_forced_fallback_"):
                 log("  -> [ERROR] Force mode but no cloud API key configured — returning 503")
                 self._handler._respond_json({
                     "error": {
@@ -1872,9 +1896,10 @@ class BackendDispatcher(PipelineStage):
                 self._fallback_reason = str(e.code)
                 log(f"  <- Cloud API failed ({e.code}), checking fallback...")
 
-                # Force mode: do NOT fallback — let user /model to switch
+                # Force mode: do NOT fallback (model_forced_cloud) unless force_fallback
                 route_reason = getattr(ctx, '_route_reason', '')
-                if route_reason and route_reason.startswith("model_forced_"):
+                if route_reason and route_reason.startswith("model_forced_") \
+                        and not route_reason.startswith("model_forced_fallback_"):
                     log(f"  <- Force mode ('{route_reason}') — no fallback, returning 503")
                     req_model = str(ctx.body.get("model", "unknown")) if hasattr(ctx, 'body') else "?"
                     self._handler._respond_json({

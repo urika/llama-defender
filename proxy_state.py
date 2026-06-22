@@ -454,7 +454,7 @@ MODEL_ROUTE_PREFERENCES = {
         "threshold_factor": 0.8,
         "memory_bias": -5,
         "cloud_model": "deepseek-v4-pro",
-        "behavior": "force",
+        "behavior": "force_fallback",
     },
     "claude-haiku-4-5": {
         "route_bias": "prefer_local",
@@ -569,8 +569,9 @@ def get_model_aliases():
             "claude-3-opus-20240229",
             "claude-3-5-haiku-20241022",
         ]
-        if IS_CLOUD or (PROXY_ROUTE_ENABLED and PROXY_CLOUD_API_KEY):
-            aliases.append("claude-opus-4-7")
+        # Always expose claude-opus-4-7 so existing sessions never get 404.
+        # Without cloud API key the proxy falls back to local gracefully.
+        aliases.append("claude-opus-4-7")
         _MODEL_ALIASES_CACHE = aliases
         return aliases
 
