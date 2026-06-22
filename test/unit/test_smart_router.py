@@ -228,17 +228,16 @@ class TestSmartRouterPreference(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
-    def test_opus_prefers_cloud_lower_threshold(self):
-        """opus model lowers threshold to 72K (90K * 0.8)."""
+    def test_opus_prefers_cloud_now_force(self):
+        """opus behavior is now 'force' — always routes to cloud regardless of context."""
         ctx = PipelineContext(
             body={"model": "claude-opus-4-7"},
-            session_id="sess_opus",
+            session_id="sess_opus_force",
         )
         ctx.stage_config = {"total_chars": 80000, "stage": "expansion"}
         ctx = SmartRouter().process(ctx)
-        # 80000 > 72000 (90000 * 0.8) → cloud
         self.assertEqual(ctx._route_target, "cloud")
-        self.assertIn("chars_exceed_threshold", ctx._route_reason)
+        self.assertIn("model_forced_cloud", ctx._route_reason)
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
@@ -259,15 +258,68 @@ class TestSmartRouterPreference(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
-    def test_opus_short_context_still_local(self):
-        """opus preference does NOT force cloud for short context."""
+    def test_opus_force_short_context_cloud(self):
+        """opus force routes to cloud even for very short context (no SmartRouter override)."""
         ctx = PipelineContext(
             body={"model": "claude-opus-4-7"},
             session_id="sess_opus_short",
         )
         ctx.stage_config = {"total_chars": 5000, "stage": "init"}
         ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("model_forced_cloud", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
+    def test_opus_force_includes_model_name_in_reason(self):
+        """force reason tag should include the model name for tracing."""
+        ctx = PipelineContext(
+            body={"model": "claude-opus-4-7"},
+            session_id="sess_opus_reason",
+        )
+        ctx.stage_config = {"total_chars": 0, "stage": "init"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("claude-opus-4-7", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
+    def test_sonnet_prefer_still_uses_smart_router(self):
+        """sonnet (prefer) still routes via SmartRouter — short context = local."""
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_sonnet_pref",
+        )
+        ctx.stage_config = {"total_chars": 5000, "stage": "init"}
+        ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "under_threshold")
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
+    def test_sonnet_prefer_long_context_routes_to_cloud(self):
+        """sonnet (prefer) still routes via SmartRouter — long context = cloud."""
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_sonnet_long",
+        )
+        ctx.stage_config = {"total_chars": 100000, "stage": "expansion"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("chars_exceed_threshold", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
+    def test_haiku_prefer_still_uses_bias(self):
+        """haiku (prefer) still uses threshold bias — short context = local."""
+        ctx = PipelineContext(
+            body={"model": "claude-haiku-4-5"},
+            session_id="sess_haiku_pref",
+        )
+        ctx.stage_config = {"total_chars": 5000, "stage": "init"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "under_threshold")
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
@@ -797,7 +849,9 @@ class TestV1ModelsRouting(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "IS_CLOUD", False)
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
     def test_routing_enabled_includes_opus(self):
+        """opus appears only when routing is enabled AND cloud key is configured."""
         _ps.invalidate_model_aliases_cache()
         aliases = _ps.get_model_aliases()
         self.assertIn("claude-opus-4-7", aliases)

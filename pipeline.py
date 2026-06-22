@@ -504,7 +504,7 @@ class SmartRouter(PipelineStage):
         if not _ps.PROXY_ROUTE_ENABLED:
             return "local", "disabled"
 
-        # Priority 0.5: Model ID preference → adjust thresholds (do NOT force route)
+	# Priority 0.5: Model ID preference → adjust thresholds (do NOT force route)
         requested_model = ctx.body.get("model", "")
         pref = _ps.MODEL_ROUTE_PREFERENCES.get(requested_model, {})
         effective_threshold = int(
@@ -513,6 +513,18 @@ class SmartRouter(PipelineStage):
         effective_memory_pct = _ps.PROXY_ROUTE_MEMORY_PCT + pref.get("memory_bias", 0)
         ctx._route_cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
         ctx._agent_model_tier = _classify_tier(requested_model)
+
+        # Force mode: direct route, skip SmartRouter entirely
+        # User explicitly chose this model → respect the choice
+        behavior = pref.get("behavior", "prefer")
+        if behavior == "force":
+            route_bias = pref.get("route_bias", "auto")
+            if route_bias == "prefer_cloud":
+                cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
+                return "cloud", f"model_forced_cloud({requested_model}->{cloud_model})"
+            elif route_bias == "prefer_local":
+                return "local", f"model_forced_local({requested_model})"
+            # route_bias="auto" + behavior="force" → fall through, treat as prefer
 
         # Priority 0.6: X-Proxy-Route-To header (single-request, no session sticky)
         if ctx._route_header_override in ("local", "cloud"):
@@ -1808,8 +1820,22 @@ class BackendDispatcher(PipelineStage):
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
 
-        # Validate cloud API key — fall back to local if missing
+        # Validate cloud API key — force mode: error; prefer mode: fallback to local
         if target == 'cloud' and not _ps.PROXY_CLOUD_API_KEY:
+            route_reason = getattr(ctx, '_route_reason', '')
+            if route_reason and route_reason.startswith("model_forced_"):
+                log("  -> [ERROR] Force mode but no cloud API key configured — returning 503")
+                self._handler._respond_json({
+                    "error": {
+                        "type": "cloud_unavailable",
+                        "message": (
+                            f"Cloud API key not configured for force-routed model. "
+                            f"Set PROXY_CLOUD_API_KEY in your config, or switch to a "
+                            f"prefer-routed model via `/model claude-sonnet-4-6`."
+                        ),
+                    }
+                }, 503)
+                return ctx
             log("  -> [ERROR] Cloud API key not configured — falling back to local")
             ctx._route_target = 'local'
             ctx._route_reason = 'cloud_no_api_key'
@@ -1845,6 +1871,25 @@ class BackendDispatcher(PipelineStage):
                 self._backend_status = e.code
                 self._fallback_reason = str(e.code)
                 log(f"  <- Cloud API failed ({e.code}), checking fallback...")
+
+                # Force mode: do NOT fallback — let user /model to switch
+                route_reason = getattr(ctx, '_route_reason', '')
+                if route_reason and route_reason.startswith("model_forced_"):
+                    log(f"  <- Force mode ('{route_reason}') — no fallback, returning 503")
+                    req_model = str(ctx.body.get("model", "unknown")) if hasattr(ctx, 'body') else "?"
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "cloud_unavailable",
+                            "message": (
+                                f"Cloud API unavailable in force mode. "
+                                f"The model you selected ({req_model}) requires the cloud backend, "
+                                f"but it is currently unreachable. "
+                                f"Use `/model claude-sonnet-4-6` or `/model claude-haiku-4-5` to switch "
+                                f"to a prefer-routed model that can use the local backend."
+                            ),
+                        }
+                    }, 503)
+                    return ctx
 
                 if not _ps.PROXY_ROUTE_FALLBACK_ENABLED:
                     log(f"  -> Fallback disabled — returning 503")

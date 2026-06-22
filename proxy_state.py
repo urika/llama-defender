@@ -447,18 +447,21 @@ MODEL_ROUTE_PREFERENCES = {
         "threshold_factor": 1.0,
         "memory_bias": 0,
         "cloud_model": PROXY_CLOUD_MODEL,
+        "behavior": "prefer",
     },
     "claude-opus-4-7": {
         "route_bias": "prefer_cloud",
         "threshold_factor": 0.8,
         "memory_bias": -5,
         "cloud_model": "deepseek-v4-pro",
+        "behavior": "force",
     },
     "claude-haiku-4-5": {
         "route_bias": "prefer_local",
         "threshold_factor": 1.33,
         "memory_bias": 0,
         "cloud_model": PROXY_CLOUD_MODEL,
+        "behavior": "prefer",
     },
 }
 
@@ -566,7 +569,7 @@ def get_model_aliases():
             "claude-3-opus-20240229",
             "claude-3-5-haiku-20241022",
         ]
-        if IS_CLOUD or PROXY_ROUTE_ENABLED:
+        if IS_CLOUD or (PROXY_ROUTE_ENABLED and PROXY_CLOUD_API_KEY):
             aliases.append("claude-opus-4-7")
         _MODEL_ALIASES_CACHE = aliases
         return aliases

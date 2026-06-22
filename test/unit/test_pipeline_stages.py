@@ -1127,6 +1127,34 @@ class TestBackendDispatcher(unittest.TestCase):
             t.join(timeout=2)
         self.assertEqual(call_count[0], 1)
 
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
+    def test_force_cloud_does_not_fallback_on_503(self):
+        """Force mode cloud failure returns 503, does NOT fallback to local.
+        
+        Regression guard: force mode (model_forced_cloud reason) should never
+        trigger auto-fallback to local backend. User should /model to switch.
+        """
+        ctx = self._make_ctx(target="cloud")
+        ctx._route_reason = "model_forced_cloud(claude-opus-4-7)"
+        stage = BackendDispatcher(llama_lock=MagicMock(), cloud_lock=self._mock_lock, handler=self._mock_handler)
+        err_resp = MagicMock()
+        err_resp.read.return_value = b'{"error":"cloud down"}'
+        err_resp.code = 503
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=urllib.error.HTTPError(
+            "http://cloud/api", 503, "Service Unavailable", {}, err_resp
+        )):
+            stage.process(ctx)
+
+        self.assertEqual(stage._backend_status, 503)
+        self.assertFalse(stage._route_fallback)
+        # Handler should have received a 503 JSON response
+        written = self._mock_handler._respond_json.call_args
+        self.assertIsNotNone(written)
+        self.assertEqual(written[0][1], 503)
+        self.assertIn("cloud_unavailable", written[0][0].get("error", {}).get("type", ""))
+
     def test_output_metrics_structure(self):
         stage = BackendDispatcher(llama_lock=None, handler=None)
         ctx = PipelineContext(openai_body={"model": "test"}, is_stream=True)
