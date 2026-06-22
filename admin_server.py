@@ -782,6 +782,45 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
     return rows
 
 
+def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
+    """Return the most recently active session_ids from proxy_metrics.jsonl.
+
+    Returns a list of dicts: [{"session_id": str, "count": int, "last_ts": str}, ...]
+    ordered by most recent last seen time.
+    """
+    metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
+    counts = {}
+    last_ts = {}
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = rec.get("session_id")
+                if not sid:
+                    continue
+                counts[sid] = counts.get(sid, 0) + 1
+                ts = rec.get("ts", "")
+                if ts and ts > last_ts.get(sid, ""):
+                    last_ts[sid] = ts
+    except FileNotFoundError:
+        pass
+
+    sessions = [
+        {"session_id": sid, "count": counts[sid], "last_ts": last_ts.get(sid, "")}
+        for sid in counts
+    ]
+    sessions.sort(key=lambda s: s["last_ts"], reverse=True)
+    return sessions[:n]
+
+
 def _session_percentile(vals, p):
     if not vals:
         return 0
@@ -1165,9 +1204,15 @@ def _get_session_trace():
 
     try:
         mtime = os.path.getmtime("/tmp/anthropic_request_body.json")
-        saved_at = datetime.fromtimestamp(mtime).strftime("%H:%M:%S")
+        saved_dt = datetime.fromtimestamp(mtime)
+        saved_at = saved_dt.strftime("%Y-%m-%d %H:%M:%S")
+        saved_time = saved_dt.strftime("%H:%M:%S")
+        age_seconds = (datetime.now() - saved_dt).total_seconds()
+        stale = age_seconds > 300  # older than 5 minutes considered stale
+        very_stale = age_seconds > 3600  # older than 1 hour
     except OSError:
-        saved_at = None
+        saved_at = saved_time = None
+        stale = very_stale = False
 
     msgs = body.get("messages", [])
     model = body.get("model", "unknown")
@@ -1213,7 +1258,7 @@ def _get_session_trace():
 
     # Build timeline HTML (last 8 messages)
     timeline = []
-    ts_html = f'<span class="evt-ts">{saved_at}</span> ' if saved_at else ''
+    ts_html = f'<span class="evt-ts">{saved_time}</span> ' if saved_time else ''
     for idx, m in enumerate(msgs):
         if idx < len(msgs) - 8:
             continue
@@ -1287,7 +1332,13 @@ def _get_session_trace():
         f'<span class="value clickable" style="color:{"#e74c3c" if errors else "#2ecc71"}" onclick="showModal(' + "'errors', '❌ Errors Detail')" + f'">{errors}</span></div>'
     )
     if saved_at:
-        summary += f'<div class="row"><span class="label">Captured At</span><span class="value">{saved_at}</span></div>'
+        if very_stale:
+            stale_badge = '<span style="color:#e74c3c;font-weight:bold;margin-left:6px">● 已过期 (>1h)</span>'
+        elif stale:
+            stale_badge = '<span style="color:#f39c12;font-weight:bold;margin-left:6px">● 非实时 (>5min)</span>'
+        else:
+            stale_badge = '<span style="color:#2ecc71;margin-left:6px">● 实时</span>'
+        summary += f'<div class="row"><span class="label">Captured At</span><span class="value">{saved_at}{stale_badge}</span></div>'
 
     return summary + "\n".join(timeline), tools_detail, errors_detail
 # --- _build_status_html ---
@@ -1298,6 +1349,16 @@ def _build_status_html():
     log = _get_log_stats()
     traffic = _get_traffic_stats()
     session_trace, tools_detail, errors_detail = _get_session_trace()
+    recent_sessions = _load_recent_session_ids()
+    if recent_sessions:
+        rs_rows = "".join(
+            f'<div class="row"><span><a href="/session?sid={s["session_id"]}">{s["session_id"]}</a></span>'
+            f'<span style="color:#888">{s["count"]} req · {s["last_ts"][:19]}</span></div>'
+            for s in recent_sessions
+        )
+        recent_sessions_card = f'<div class="card" style="grid-column: 1 / -1;"><h2>📁 Recent Sessions</h2>{rs_rows}</div>'
+    else:
+        recent_sessions_card = ""
     cache_stats = _get_cache_stats()
     ctx_opt = _get_context_optimization_stats()
     route = _get_route_stats()
@@ -1661,6 +1722,8 @@ def _build_status_html():
     {session_trace}
   </div>
 
+  {recent_sessions_card}
+
   <div class="card" style="grid-column: 1 / -1;">
     <h2>Recent Events</h2>
     {events_html}
@@ -1803,6 +1866,7 @@ __all__ = [
     "_get_session_trace",
     "_build_status_html",
     "_load_session_metrics",
+    "_load_recent_session_ids",
     "_analyze_session",
     "_build_session_html",
     "_finalize_metrics",

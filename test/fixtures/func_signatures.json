@@ -773,6 +773,17 @@
     ],
     "defaults": {}
   },
+  "_load_recent_session_ids": {
+    "name": "_load_recent_session_ids",
+    "params": [
+      "max_lines",
+      "n"
+    ],
+    "defaults": {
+      "max_lines": 5000,
+      "n": 12
+    }
+  },
   "_load_session_metrics": {
     "name": "_load_session_metrics",
     "params": [
