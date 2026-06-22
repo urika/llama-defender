@@ -595,6 +595,58 @@ class TestSmartRouterDailyBudget(unittest.TestCase):
         ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "cloud")
 
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_DAILY_BUDGET", 5.0)
+    @patch.object(_ps, "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", True)
+    def test_budget_exceeded_with_hard_stop(self):
+        import time
+        today = time.strftime("%Y-%m-%d")
+        with _ps._state_lock:
+            _ps._route_daily_date = today
+            _ps._route_daily_cost = 6.0
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_hard_stop",
+        )
+        ctx.stage_config = {"total_chars": 200000, "stage": "oom_danger"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertIn("daily_budget_exceeded", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_DAILY_BUDGET", 5.0)
+    @patch.object(_ps, "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", False)
+    def test_budget_exceeded_without_hard_stop_allows_cloud(self):
+        import time
+        today = time.strftime("%Y-%m-%d")
+        with _ps._state_lock:
+            _ps._route_daily_date = today
+            _ps._route_daily_cost = 6.0
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_no_hard_stop",
+        )
+        ctx.stage_config = {"total_chars": 200000, "stage": "oom_danger"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+
+    def test_budget_alert_levels(self):
+        self.assertEqual(_ps._get_budget_alert_level(0.0), "")
+        self.assertEqual(_ps._get_budget_alert_level(49.9), "")
+        self.assertEqual(_ps._get_budget_alert_level(50.0), "warning")
+        self.assertEqual(_ps._get_budget_alert_level(79.9), "warning")
+        self.assertEqual(_ps._get_budget_alert_level(80.0), "danger")
+        self.assertEqual(_ps._get_budget_alert_level(99.9), "danger")
+        self.assertEqual(_ps._get_budget_alert_level(100.0), "critical")
+
+    def test_budget_alert_tiers_parsing(self):
+        with patch.object(_ps, "PROXY_ROUTE_BUDGET_ALERT_TIERS", "25,75,90"):
+            self.assertEqual(_ps._parse_budget_alert_tiers(), (25, 75, 90))
+            self.assertEqual(_ps._get_budget_alert_level(24.0), "")
+            self.assertEqual(_ps._get_budget_alert_level(25.0), "warning")
+            self.assertEqual(_ps._get_budget_alert_level(75.0), "danger")
+            self.assertEqual(_ps._get_budget_alert_level(90.0), "critical")
+
 
 class TestSessionLifecycle(unittest.TestCase):
     """Full session lifecycle: new → cloud → stay cloud → new session → local."""

@@ -377,6 +377,13 @@ PROXY_CLOUD_PRICE_OUTPUT = float(os.environ.get("PROXY_CLOUD_PRICE_OUTPUT", "1.5
 PROXY_ROUTE_SENSITIVE_PATTERNS = os.environ.get("PROXY_ROUTE_SENSITIVE_PATTERNS", "")
 PROXY_ROUTE_PROFILE = os.environ.get("PROXY_ROUTE_PROFILE", "")
 PROXY_ROUTE_DAILY_BUDGET = float(os.environ.get("PROXY_ROUTE_DAILY_BUDGET", "0"))
+# Optional hard-stop: when true, block new cloud requests once daily budget is reached.
+# When false, cloud routing continues and /status still shows tiered budget alerts.
+PROXY_ROUTE_DAILY_BUDGET_HARD_STOP = os.environ.get(
+    "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", "true"
+).lower() in ("1", "true", "yes")
+# Tiered budget alert thresholds (percentage) shown on /status. Comma-separated.
+PROXY_ROUTE_BUDGET_ALERT_TIERS = os.environ.get("PROXY_ROUTE_BUDGET_ALERT_TIERS", "50,80,100")
 # --- Sticky session routing (建议1) ---
 # When sticky=true (default), a session routed to cloud stays cloud forever.
 # When sticky=false, allow a cloud session to return to local if context drops
@@ -495,6 +502,47 @@ def _accumulate_route_daily_cost(input_tokens: int = 0, output_tokens: int = 0) 
         output_cost = output_tokens * PROXY_CLOUD_PRICE_OUTPUT / 1_000_000
         _route_daily_cost += input_cost + output_cost
         return _route_daily_cost
+
+
+def _parse_budget_alert_tiers() -> tuple:
+    """Parse PROXY_ROUTE_BUDGET_ALERT_TIERS into sorted integer thresholds.
+
+    Invalid values are ignored; default returns (50, 80, 100).
+    """
+    raw = PROXY_ROUTE_BUDGET_ALERT_TIERS
+    if not raw:
+        return (50, 80, 100)
+    tiers = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            val = int(part)
+            if 0 < val <= 10000:
+                tiers.append(val)
+        except ValueError:
+            continue
+    return tuple(sorted(set(tiers))) if tiers else (50, 80, 100)
+
+
+def _get_budget_alert_level(used_pct: float) -> str:
+    """Return alert level based on configured budget tiers.
+
+    Levels: "" (none), "warning" (crossed first tier), "danger" (second tier),
+    "critical" (third/highest tier).
+    """
+    tiers = _parse_budget_alert_tiers()
+    if not tiers or used_pct <= 0:
+        return ""
+    if used_pct >= tiers[-1]:
+        return "critical"
+    if len(tiers) >= 2 and used_pct >= tiers[-2]:
+        return "danger"
+    if used_pct >= tiers[0]:
+        return "warning"
+    return ""
+
 
 # Model aliases cache (rebuilt on SIGHUP via invalidate_model_aliases_cache())
 _MODEL_ALIASES_CACHE = None
@@ -646,6 +694,8 @@ _RELOAD_SPEC = [
     ("PROXY_CLOUD_PRICE_OUTPUT", "PROXY_CLOUD_PRICE_OUTPUT", "float", "1.5", "1.5"),
     ("PROXY_ROUTE_SENSITIVE_PATTERNS", "PROXY_ROUTE_SENSITIVE_PATTERNS", "str", "", ""),
     ("PROXY_ROUTE_DAILY_BUDGET", "PROXY_ROUTE_DAILY_BUDGET", "float", "0", "0"),
+    ("PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", "bool", "true", "true"),
+    ("PROXY_ROUTE_BUDGET_ALERT_TIERS", "PROXY_ROUTE_BUDGET_ALERT_TIERS", "str", "50,80,100", "50,80,100"),
     ("PROXY_ROUTE_PROFILE", "PROXY_ROUTE_PROFILE", "str", "", ""),
     ("PROXY_ROUTE_STICKY", "PROXY_ROUTE_STICKY", "bool", "true", "true"),
     ("PROXY_ROUTE_STICKY_RETURN_ROUNDS", "PROXY_ROUTE_STICKY_RETURN_ROUNDS", "int", "5", "5"),
@@ -789,6 +839,7 @@ __all__ = [
     "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", "PROXY_CLOUD_PRICE_INPUT",
     "PROXY_CLOUD_PRICE_OUTPUT", "PROXY_ROUTE_SENSITIVE_PATTERNS",
     "PROXY_ROUTE_PROFILE", "PROXY_ROUTE_DAILY_BUDGET",
+    "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP", "PROXY_ROUTE_BUDGET_ALERT_TIERS",
     "PROXY_ROUTE_STICKY", "PROXY_ROUTE_STICKY_RETURN_ROUNDS",
     "PROXY_ROUTE_STICKY_RETURN_RATIO",
     "MODEL_ROUTE_PREFERENCES",
@@ -799,4 +850,5 @@ __all__ = [
     "get_model_aliases", "invalidate_model_aliases_cache",
     "_compile_sensitive_patterns", "invalidate_sensitive_patterns_cache",
     "_accumulate_route_daily_cost",
+    "_parse_budget_alert_tiers", "_get_budget_alert_level",
 ]

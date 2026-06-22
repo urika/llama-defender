@@ -575,6 +575,13 @@ def _get_route_stats():
     total = local_count + cloud_count
     cloud_pct = (cloud_count / total * 100) if total > 0 else 0.0
 
+    # Budget tiered alert state
+    budget_used_pct = 0.0
+    budget_alert_level = ""
+    if _ps.PROXY_ROUTE_DAILY_BUDGET > 0 and daily_cost >= 0:
+        budget_used_pct = daily_cost / _ps.PROXY_ROUTE_DAILY_BUDGET * 100
+        budget_alert_level = _ps._get_budget_alert_level(budget_used_pct)
+
     return {
         # Configuration snapshot
         "route_enabled": route_enabled,
@@ -599,6 +606,10 @@ def _get_route_stats():
         # Cost tracking
         "daily_cost": daily_cost,
         "daily_budget": _ps.PROXY_ROUTE_DAILY_BUDGET,
+        "daily_budget_hard_stop": _ps.PROXY_ROUTE_DAILY_BUDGET_HARD_STOP,
+        "budget_used_pct": budget_used_pct,
+        "budget_alert_level": budget_alert_level,
+        "budget_alert_tiers": _ps._parse_budget_alert_tiers(),
         # Phase 3+ (建议3): per-backend segmented latency (last 100 samples each)
         "local_latency": _latency_summary(_ps._LATENCY_BY_TARGET.get("local")),
         "cloud_latency": _latency_summary(_ps._LATENCY_BY_TARGET.get("cloud")),
@@ -948,13 +959,41 @@ def _build_status_html():
         api_key_badge = '<span style="color:#27ae60">✅ 已配置</span>'
     else:
         api_key_badge = '<span style="color:#e74c3c">❌ 未配置（路由会回退本地）</span>'
-    route_budget_warn = ""
-    if route["daily_budget"] > 0 and route["daily_cost"] > 0:
-        pct = route["daily_cost"] / route["daily_budget"] * 100
-        if pct > 80:
-            route_budget_warn = f' <span style="color:#e74c3c">({pct:.0f}% used)</span>'
+    # Tiered budget alert badge and progress bar
+    budget_pct = route.get("budget_used_pct", 0.0)
+    alert_level = route.get("budget_alert_level", "")
+    if route["daily_budget"] > 0 and budget_pct > 0:
+        if alert_level == "critical":
+            budget_color = "#e74c3c"
+            budget_badge = "🔴 预算耗尽"
+        elif alert_level == "danger":
+            budget_color = "#e67e22"
+            budget_badge = "🟠 高使用率"
+        elif alert_level == "warning":
+            budget_color = "#f39c12"
+            budget_badge = "🟡 注意"
         else:
-            route_budget_warn = f' <span style="color:#f39c12">({pct:.0f}% used)</span>'
+            budget_color = "#27ae60"
+            budget_badge = ""
+        route_budget_warn = f' <span style="color:{budget_color}">({budget_pct:.0f}% used)</span>'
+    else:
+        budget_color = "#27ae60"
+        budget_badge = ""
+        route_budget_warn = ""
+
+    budget_bar_width = min(100.0, max(0.0, budget_pct))
+    budget_bar = (
+        f'<div style="margin-top:4px;display:flex;height:18px;border-radius:3px;overflow:hidden;'
+        f'font-size:0.75em;background:rgba(255,255,255,0.1)">'
+        f'<div style="width:{budget_bar_width:.1f}%;background:{budget_color};color:#fff;'
+        f'text-align:center;line-height:18px">¥{route["daily_cost"]:.2f}</div>'
+        f'</div>'
+    )
+    hard_stop_badge = (
+        '<span style="color:#e74c3c;margin-left:6px">🛑 硬停止已启用</span>'
+        if route.get("daily_budget_hard_stop") else
+        '<span style="color:#888;margin-left:6px">（硬停止关闭）</span>'
+    )
 
     # Cloud ratio bar — visual indicator of local/cloud split
     total_reqs = route["local_count"] + route["cloud_count"]
@@ -1031,12 +1070,43 @@ def _build_status_html():
     <div class="row"><span class="label">Latency (Cloud)</span><span class="value">{_format_latency(route.get("cloud_latency", {}))}</span></div>
     <div class="row" style="margin-top:6px"><span class="label">Active Sessions</span><span class="value">{route.get("session_cloud", "?")} cloud / {route.get("session_local", "?")} local / {route.get("session_total", 0)} total</span></div>
     <div class="row"><span class="label">Daily Cost</span><span class="value">¥{route["daily_cost"]:.2f} / ¥{route["daily_budget"]:.0f}{route_budget_warn}</span></div>
+    {budget_bar}
+    <div class="row" style="margin-top:4px"><span class="label">Hard Stop</span><span class="value">{hard_stop_badge}</span></div>
+    {budget_badge and f'<div style="margin-top:6px;padding:6px 8px;border-radius:4px;background:rgba(231,76,60,0.15);font-size:0.85em">{budget_badge}</div>' or ''}
     {_build_active_sessions_table(route.get("active_sessions", [])) if route.get("active_sessions") else ""}
     {_build_route_reason_legend()}
   </div>"""
 
     # --- Alerts card ---
-    alerts = traffic.get("alerts", [])
+    alerts = list(traffic.get("alerts", []))
+    # Inject budget tiered alert into the global alert stream
+    if route.get("budget_alert_level") == "critical":
+        alerts.insert(
+            0,
+            (
+                "critical",
+                f"Daily cloud budget exceeded: ¥{route['daily_cost']:.2f} / ¥{route['daily_budget']:.0f} "
+                f"({route['budget_used_pct']:.0f}%). Cloud routing is hard-stopped.",
+            ),
+        )
+    elif route.get("budget_alert_level") == "danger":
+        alerts.insert(
+            0,
+            (
+                "warning",
+                f"Daily cloud budget high: ¥{route['daily_cost']:.2f} / ¥{route['daily_budget']:.0f} "
+                f"({route['budget_used_pct']:.0f}%).",
+            ),
+        )
+    elif route.get("budget_alert_level") == "warning":
+        alerts.insert(
+            0,
+            (
+                "warning",
+                f"Daily cloud budget over 50%: ¥{route['daily_cost']:.2f} / ¥{route['daily_budget']:.0f} "
+                f"({route['budget_used_pct']:.0f}%).",
+            ),
+        )
     if alerts:
         alerts_html = ""
         for severity, msg in alerts:

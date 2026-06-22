@@ -603,6 +603,16 @@ CONFIG_REGISTRY = {
         "type": "float", "scope": "reloadable",
         "doc": "Daily cloud API cost cap (CNY). 0 = unlimited.",
     },
+    "PROXY_ROUTE_DAILY_BUDGET_HARD_STOP": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "When true, block new cloud requests once daily_budget is reached. When false, only emit tiered alerts.",
+    },
+    "PROXY_ROUTE_BUDGET_ALERT_TIERS": {
+        "defaults": {"all": "50,80,100"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Comma-separated daily budget usage percentages that trigger warning/danger/critical alerts on /status.",
+    },
     "PROXY_ROUTE_PROFILE": {
         "defaults": {"all": ""},
         "type": "str", "scope": "reloadable",

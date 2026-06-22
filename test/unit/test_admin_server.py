@@ -166,8 +166,17 @@ class TestGetRouteStats(unittest.TestCase):
         for key in ("route_enabled", "threshold", "memory_pct", "profile",
                      "cloud_model", "cloud_base_url", "fallback_enabled",
                      "max_cloud_fails", "cloud_concurrent",
-                     "cloud_api_key_configured"):
+                     "cloud_api_key_configured", "daily_budget_hard_stop",
+                     "budget_alert_tiers"):
             self.assertIn(key, rs, f"_get_route_stats() missing '{key}'")
+
+    def test_returns_budget_alert_keys(self):
+        rs = admin_server._get_route_stats()
+        for key in ("daily_cost", "daily_budget", "budget_used_pct",
+                     "budget_alert_level"):
+            self.assertIn(key, rs)
+        self.assertIsInstance(rs["budget_used_pct"], float)
+        self.assertIsInstance(rs["daily_budget_hard_stop"], bool)
 
     def test_returns_aggregate_counter_keys(self):
         rs = admin_server._get_route_stats()

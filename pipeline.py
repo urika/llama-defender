@@ -581,8 +581,11 @@ class SmartRouter(PipelineStage):
             if session_route == "local_forced":
                 return "local", "session_force_local"
 
-        # Priority 3.5: Daily budget exceeded
-        if _ps.PROXY_ROUTE_DAILY_BUDGET > 0:
+        # Priority 3.5: Daily budget exceeded (hard-stop)
+        if (
+            _ps.PROXY_ROUTE_DAILY_BUDGET > 0
+            and _ps.PROXY_ROUTE_DAILY_BUDGET_HARD_STOP
+        ):
             with _ps._state_lock:
                 daily_date = getattr(_ps, '_route_daily_date', '')
                 daily_cost = getattr(_ps, '_route_daily_cost', 0.0)

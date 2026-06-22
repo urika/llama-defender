@@ -1,4 +1,17 @@
 {
+  "BackendDispatcher": {
+    "name": "BackendDispatcher",
+    "params": [
+      "llama_lock",
+      "cloud_lock",
+      "handler"
+    ],
+    "defaults": {
+      "llama_lock": null,
+      "cloud_lock": null,
+      "handler": null
+    }
+  },
   "BaseHTTPRequestHandler": {
     "name": "BaseHTTPRequestHandler",
     "params": [
@@ -8,6 +21,46 @@
     ],
     "defaults": {}
   },
+  "BlockerDetector": {
+    "name": "BlockerDetector",
+    "params": [],
+    "defaults": {}
+  },
+  "CacheAligner": {
+    "name": "CacheAligner",
+    "params": [],
+    "defaults": {}
+  },
+  "ContentCompressor": {
+    "name": "ContentCompressor",
+    "params": [],
+    "defaults": {}
+  },
+  "ContextTruncator": {
+    "name": "ContextTruncator",
+    "params": [],
+    "defaults": {}
+  },
+  "DateNormalizer": {
+    "name": "DateNormalizer",
+    "params": [],
+    "defaults": {}
+  },
+  "DynamicMaxTokens": {
+    "name": "DynamicMaxTokens",
+    "params": [],
+    "defaults": {}
+  },
+  "ErrorTranslator": {
+    "name": "ErrorTranslator",
+    "params": [],
+    "defaults": {}
+  },
+  "FormatConverter": {
+    "name": "FormatConverter",
+    "params": [],
+    "defaults": {}
+  },
   "Handler": {
     "name": "Handler",
     "params": [
@@ -15,6 +68,163 @@
       "client_address",
       "server"
     ],
+    "defaults": {}
+  },
+  "HighDropRatioNotice": {
+    "name": "HighDropRatioNotice",
+    "params": [],
+    "defaults": {}
+  },
+  "InstrumentedPipeline": {
+    "name": "InstrumentedPipeline",
+    "params": [
+      "stages"
+    ],
+    "defaults": {}
+  },
+  "LifecycleClassifier": {
+    "name": "LifecycleClassifier",
+    "params": [],
+    "defaults": {}
+  },
+  "LoopIntervention": {
+    "name": "LoopIntervention",
+    "params": [],
+    "defaults": {}
+  },
+  "MessageHashDebug": {
+    "name": "MessageHashDebug",
+    "params": [],
+    "defaults": {}
+  },
+  "OOMSafetyFIFO": {
+    "name": "OOMSafetyFIFO",
+    "params": [],
+    "defaults": {}
+  },
+  "PipelineContext": {
+    "name": "PipelineContext",
+    "params": [
+      "request_id",
+      "model",
+      "is_stream",
+      "max_tokens_orig",
+      "raw_tools_orig",
+      "session_id",
+      "total_chars",
+      "tools_list",
+      "messages",
+      "body",
+      "stage_config",
+      "max_tokens_curr",
+      "error_count",
+      "blocker_info",
+      "cleared_files",
+      "compress_stats",
+      "max_run",
+      "consecutive",
+      "pattern_tool_name",
+      "is_text_loop",
+      "text_loop_run",
+      "loop_level",
+      "loop_tool_name",
+      "re_read_info",
+      "trunc_stats",
+      "common_prefix_ratio",
+      "openai_messages",
+      "openai_body",
+      "oom_iterations",
+      "high_drop_notice_injected",
+      "_cache_prefix",
+      "_cache_dynamic",
+      "_route_target",
+      "_route_reason",
+      "_route_header_override",
+      "_route_actual_cost",
+      "_route_cloud_model",
+      "_emergency_fallback",
+      "_agent_model_tier"
+    ],
+    "defaults": {
+      "request_id": "",
+      "model": "unknown",
+      "is_stream": false,
+      "max_tokens_orig": 4096,
+      "raw_tools_orig": "<factory>",
+      "session_id": "",
+      "total_chars": 0,
+      "tools_list": "<factory>",
+      "messages": "<factory>",
+      "body": "<factory>",
+      "stage_config": null,
+      "max_tokens_curr": null,
+      "error_count": null,
+      "blocker_info": null,
+      "cleared_files": null,
+      "compress_stats": null,
+      "max_run": 0,
+      "consecutive": "<factory>",
+      "pattern_tool_name": null,
+      "is_text_loop": false,
+      "text_loop_run": 0,
+      "loop_level": 0,
+      "loop_tool_name": null,
+      "re_read_info": null,
+      "trunc_stats": null,
+      "common_prefix_ratio": 0.0,
+      "openai_messages": null,
+      "openai_body": null,
+      "oom_iterations": 0,
+      "high_drop_notice_injected": false,
+      "_cache_prefix": "<factory>",
+      "_cache_dynamic": "<factory>",
+      "_route_target": "local",
+      "_route_reason": "",
+      "_route_header_override": "",
+      "_route_actual_cost": 0.0,
+      "_route_cloud_model": "",
+      "_emergency_fallback": false,
+      "_agent_model_tier": "sonnet"
+    }
+  },
+  "PrefixRatioComputer": {
+    "name": "PrefixRatioComputer",
+    "params": [],
+    "defaults": {}
+  },
+  "RequestParser": {
+    "name": "RequestParser",
+    "params": [],
+    "defaults": {}
+  },
+  "RereadDetector": {
+    "name": "RereadDetector",
+    "params": [],
+    "defaults": {}
+  },
+  "RouteNotification": {
+    "name": "RouteNotification",
+    "params": [],
+    "defaults": {}
+  },
+  "SessionLoopState": {
+    "name": "SessionLoopState",
+    "params": [],
+    "defaults": {}
+  },
+  "SmartRouter": {
+    "name": "SmartRouter",
+    "params": [],
+    "defaults": {}
+  },
+  "SystemNormalizer": {
+    "name": "SystemNormalizer",
+    "params": [],
+    "defaults": {}
+  },
+  "TextLoopDetector": {
+    "name": "TextLoopDetector",
+    "params": [],
     "defaults": {}
   },
   "ThreadingHTTPServer": {
@@ -28,10 +238,31 @@
       "bind_and_activate": true
     }
   },
+  "ToolLoopDetector": {
+    "name": "ToolLoopDetector",
+    "params": [],
+    "defaults": {}
+  },
+  "ToolPairingRepair": {
+    "name": "ToolPairingRepair",
+    "params": [],
+    "defaults": {}
+  },
   "_StreamingToolsExtractor": {
     "name": "_StreamingToolsExtractor",
     "params": [],
     "defaults": {}
+  },
+  "_accumulate_route_daily_cost": {
+    "name": "_accumulate_route_daily_cost",
+    "params": [
+      "input_tokens",
+      "output_tokens"
+    ],
+    "defaults": {
+      "input_tokens": 0,
+      "output_tokens": 0
+    }
   },
   "_adjust_concurrency": {
     "name": "_adjust_concurrency",
@@ -173,6 +404,11 @@
     "params": [
       "obj"
     ],
+    "defaults": {}
+  },
+  "_compile_sensitive_patterns": {
+    "name": "_compile_sensitive_patterns",
+    "params": [],
     "defaults": {}
   },
   "_compress_assistant_message": {
@@ -433,6 +669,13 @@
     ],
     "defaults": {}
   },
+  "_get_budget_alert_level": {
+    "name": "_get_budget_alert_level",
+    "params": [
+      "used_pct"
+    ],
+    "defaults": {}
+  },
   "_get_cache_stats": {
     "name": "_get_cache_stats",
     "params": [],
@@ -559,6 +802,11 @@
     "params": [
       "messages"
     ],
+    "defaults": {}
+  },
+  "_parse_budget_alert_tiers": {
+    "name": "_parse_budget_alert_tiers",
+    "params": [],
     "defaults": {}
   },
   "_parse_conf_env": {
@@ -764,6 +1012,21 @@
       "openai_resp",
       "anthropic_model"
     ],
+    "defaults": {}
+  },
+  "get_model_aliases": {
+    "name": "get_model_aliases",
+    "params": [],
+    "defaults": {}
+  },
+  "invalidate_model_aliases_cache": {
+    "name": "invalidate_model_aliases_cache",
+    "params": [],
+    "defaults": {}
+  },
+  "invalidate_sensitive_patterns_cache": {
+    "name": "invalidate_sensitive_patterns_cache",
+    "params": [],
     "defaults": {}
   },
   "log": {
