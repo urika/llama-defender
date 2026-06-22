@@ -399,6 +399,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(html.encode("utf-8"))
             elif self.path == "/metrics" or self.path.startswith("/metrics?"):
                 self._handle_metrics_endpoint()
+            elif self.path == "/session" or self.path.startswith("/session?"):
+                from urllib.parse import parse_qs, urlparse
+                params = parse_qs(urlparse(self.path).query)
+                sid = params.get("sid", [""])[0].strip()
+                if not sid:
+                    self._respond_json({"detail": "missing sid"}, 400)
+                else:
+                    html = _build_session_html(sid)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    if not getattr(self, "_request_id", None):
+                        self._request_id = f"req_{os.urandom(8).hex()}"
+                    self.send_header("request-id", self._request_id)
+                    self.end_headers()
+                    self.wfile.write(html.encode("utf-8"))
             else:
                 self._respond_json({"detail": "Not found"}, 404)
         finally:

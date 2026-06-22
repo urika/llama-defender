@@ -269,6 +269,13 @@
     "params": [],
     "defaults": {}
   },
+  "_analyze_session": {
+    "name": "_analyze_session",
+    "params": [
+      "session_id"
+    ],
+    "defaults": {}
+  },
   "_apply_cache_aligner": {
     "name": "_apply_cache_aligner",
     "params": [
@@ -337,6 +344,13 @@
       "tool_name",
       "error_type",
       "run_length"
+    ],
+    "defaults": {}
+  },
+  "_build_session_html": {
+    "name": "_build_session_html",
+    "params": [
+      "session_id"
     ],
     "defaults": {}
   },
@@ -758,6 +772,16 @@
       "raw"
     ],
     "defaults": {}
+  },
+  "_load_session_metrics": {
+    "name": "_load_session_metrics",
+    "params": [
+      "session_id",
+      "max_lines"
+    ],
+    "defaults": {
+      "max_lines": 200000
+    }
   },
   "_mask_sensitive": {
     "name": "_mask_sensitive",

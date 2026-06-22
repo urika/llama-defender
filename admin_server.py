@@ -666,9 +666,10 @@ def _build_active_sessions_table(sessions: list) -> str:
         cd = s.get("cooldown_remaining", 0)
         cd_html = f'<span style="color:#e74c3c">{cd}s</span>' if cd > 0 else "—"
         row_style = ' style="background:rgba(231,76,60,0.1)"' if cd > 0 else ""
+        sid = s["session_id"]
         rows += (
             f'<tr{row_style}>'
-            f'<td>{s["session_id"][:12]}…</td>'
+            f'<td><a href="/session?sid={sid}" title="查看完整会话分析">{sid[:12]}…</a></td>'
             f'<td>{badge}</td>'
             f'<td>{s.get("source") or "—"}</td>'
             f'<td>{s.get("requests", 0)}</td>'
@@ -747,6 +748,407 @@ def _format_latency(lat: dict) -> str:
         f'avg {avg:.0f}ms / p95 {p95:.0f}ms / max {mx:.0f}ms'
         f'</span> <span style="color:#888">({count})</span>'
     )
+
+
+# ---------------------------------------------------------------------------
+# Session-level analysis (timeline / switches / performance)
+# ---------------------------------------------------------------------------
+
+
+def _load_session_metrics(session_id: str, max_lines: int = 200000):
+    """Load all metrics rows for a given session_id from proxy_metrics.jsonl.
+
+    Returns rows sorted by timestamp (oldest first).
+    """
+    metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
+    rows = []
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("session_id") == session_id:
+                    rows.append(rec)
+    except FileNotFoundError:
+        pass
+    rows.sort(key=lambda r: r.get("ts") or "")
+    return rows
+
+
+def _session_percentile(vals, p):
+    if not vals:
+        return 0
+    s = sorted(vals)
+    idx = int(len(s) * p)
+    return s[min(idx, len(s) - 1)]
+
+
+def _analyze_session(session_id: str) -> dict:
+    """Analyze a single session from metrics logs.
+
+    Returns a dict with:
+      - session_id, total, time_range, duration_seconds
+      - counts: local/cloud/unknown/errors
+      - performance: avg/p95/p99 duration, max input_chars, total output_chars
+      - switches: list of target transitions
+      - timeline: per-request detail rows
+      - cost: estimated cloud cost if pricing is available
+    """
+    rows = _load_session_metrics(session_id)
+    if not rows:
+        return {"session_id": session_id, "total": 0, "timeline": []}
+
+    timeline = []
+    prev_target = None
+    switches = []
+    durations = []
+    input_chars_all = []
+    output_chars_total = 0
+    local_count = cloud_count = unknown_count = error_count = 0
+    cloud_cost = 0.0
+
+    for idx, r in enumerate(rows, start=1):
+        ts = r.get("ts", "")
+        bd = r.get("pipeline", {}).get("backend_dispatcher", {})
+        target = bd.get("route_target")
+        if target is None:
+            # Fallback: infer from session route map if this is the active session
+            target = _ps._SESSION_ROUTE_MAP.get(session_id, "unknown")
+        reason = bd.get("route_reason", "") or ""
+        stage = r.get("pipeline", {}).get("smart_router", {}).get("stage", "")
+        if not stage:
+            stage = r.get("pipeline", {}).get("lifecycle_stage", {}).get("stage", "unknown")
+        disp = bd.get("dispatch_latency_ms")
+        dur = r.get("duration_ms") or 0
+        in_chars = r.get("input_chars") or 0
+        out_chars = r.get("output_chars") or 0
+        status = r.get("status", 200)
+
+        if target == "cloud":
+            cloud_count += 1
+        elif target in ("local", "local_forced"):
+            local_count += 1
+        else:
+            unknown_count += 1
+
+        if status not in (200, None):
+            error_count += 1
+
+        durations.append(dur)
+        input_chars_all.append(in_chars)
+        output_chars_total += out_chars
+
+        # Switch detection
+        if prev_target is not None and target != prev_target:
+            switches.append({
+                "index": idx,
+                "ts": ts,
+                "from": prev_target,
+                "to": target,
+                "reason": reason,
+            })
+        prev_target = target
+
+        # Cost estimation (best-effort)
+        if target == "cloud" and not bd.get("route_fallback"):
+            in_tok = r.get("est_input_tokens") or int(in_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1))
+            out_tok = r.get("est_output_tokens") or int(out_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1))
+            cloud_cost += (in_tok * _ps.PROXY_CLOUD_PRICE_INPUT + out_tok * _ps.PROXY_CLOUD_PRICE_OUTPUT) / 1_000_000
+
+        timeline.append({
+            "index": idx,
+            "ts": ts,
+            "target": target,
+            "reason": reason,
+            "stage": stage,
+            "input_chars": in_chars,
+            "input_msgs": r.get("input_msgs") or 0,
+            "input_tools": r.get("input_tools") or 0,
+            "output_chars": out_chars,
+            "duration_ms": dur,
+            "dispatch_latency_ms": disp,
+            "status": status,
+            "fallback": bool(bd.get("route_fallback")),
+            "emergency": bool(bd.get("emergency_fallback")),
+            "loop_max_run": r.get("pipeline", {}).get("loop_detect", {}).get("max_run", 0),
+            "blocker": bool(r.get("pipeline", {}).get("blocker_detect", {}).get("triggered")),
+            "truncate": bool(r.get("pipeline", {}).get("truncate", {}).get("triggered")),
+        })
+
+    total = len(rows)
+    start_ts = rows[0].get("ts", "")
+    end_ts = rows[-1].get("ts", "")
+    duration_seconds = 0
+    if start_ts and end_ts:
+        try:
+            t0 = datetime.fromisoformat(start_ts)
+            t1 = datetime.fromisoformat(end_ts)
+            duration_seconds = (t1 - t0).total_seconds()
+        except Exception:
+            pass
+
+    return {
+        "session_id": session_id,
+        "total": total,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration_seconds": duration_seconds,
+        "local_count": local_count,
+        "cloud_count": cloud_count,
+        "unknown_count": unknown_count,
+        "error_count": error_count,
+        "avg_duration_ms": sum(durations) / total if total else 0,
+        "p95_duration_ms": _session_percentile(durations, 0.95),
+        "p99_duration_ms": _session_percentile(durations, 0.99),
+        "max_input_chars": max(input_chars_all) if input_chars_all else 0,
+        "total_output_chars": output_chars_total,
+        "switches": switches,
+        "timeline": timeline,
+        "cloud_cost": cloud_cost,
+    }
+
+
+def _target_badge(target: str) -> str:
+    if target == "cloud":
+        color = "#3498db"
+    elif target in ("local_forced",):
+        color = "#e67e22"
+    elif target == "local":
+        color = "#27ae60"
+    else:
+        color = "#888"
+    return f'<span style="color:{color};font-weight:bold">{target}</span>'
+
+
+def _fmt_ms(ms):
+    if ms is None or ms == 0:
+        return "—"
+    if ms >= 1000:
+        return f"{ms/1000:.2f}s"
+    return f"{ms:.0f}ms"
+
+
+def _svg_line_chart(values, width=800, height=120, color="#3498db", fill=True):
+    """Render a simple SVG line chart with points.
+
+    values is a list of numeric y values (x is evenly spaced).
+    """
+    if not values:
+        return "<div style='color:#888'>无数据</div>"
+    n = len(values)
+    max_v = max(values) or 1
+    min_v = min(values)
+    rng = max_v - min_v or 1
+    pad = 4
+    pts = []
+    for i, v in enumerate(values):
+        x = pad + (width - 2 * pad) * i / max(n - 1, 1)
+        y = height - pad - (v - min_v) / rng * (height - 2 * pad)
+        pts.append(f"{x:.1f},{y:.1f}")
+    path_d = "M" + " L".join(pts)
+    circles = ""
+    for i, v in enumerate(values):
+        x = pad + (width - 2 * pad) * i / max(n - 1, 1)
+        y = height - pad - (v - min_v) / rng * (height - 2 * pad)
+        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{color}" />'
+    area = ""
+    if fill:
+        area_d = f"M{pad:.1f},{height-pad:.1f} L{path_d.split('L',1)[1] if 'L' in path_d else ''} L{width-pad:.1f},{height-pad:.1f} Z"
+        # Simpler area: just the line path + bottom corners
+        area = f'<path d="{path_d} L{width-pad:.1f},{height-pad:.1f} L{pad:.1f},{height-pad:.1f} Z" fill="{color}" opacity="0.15" />'
+    return (
+        f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}" '
+        f'style="background:rgba(255,255,255,0.03);border-radius:4px">'
+        f'{area}<path d="{path_d}" fill="none" stroke="{color}" stroke-width="2" />{circles}</svg>'
+    )
+
+
+def _svg_dual_chart(rows, width=800, height=120):
+    """Render input_chars line with local/cloud colored points."""
+    if not rows:
+        return "<div style='color:#888'>无数据</div>"
+    values = [r["input_chars"] for r in rows]
+    n = len(values)
+    max_v = max(values) or 1
+    min_v = min(values)
+    rng = max_v - min_v or 1
+    pad = 4
+    # Main line in neutral color
+    pts = []
+    for i, v in enumerate(values):
+        x = pad + (width - 2 * pad) * i / max(n - 1, 1)
+        y = height - pad - (v - min_v) / rng * (height - 2 * pad)
+        pts.append(f"{x:.1f},{y:.1f}")
+    path_d = "M" + " L".join(pts)
+    circles = ""
+    for i, r in enumerate(rows):
+        x = pad + (width - 2 * pad) * i / max(n - 1, 1)
+        y = height - pad - (r["input_chars"] - min_v) / rng * (height - 2 * pad)
+        color = "#3498db" if r["target"] == "cloud" else "#27ae60"
+        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}" />'
+    return (
+        f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}" '
+        f'style="background:rgba(255,255,255,0.03);border-radius:4px">'
+        f'<path d="{path_d}" fill="none" stroke="#888" stroke-width="1.5" />{circles}</svg>'
+    )
+
+
+def _build_session_html(session_id: str) -> str:
+    """Build an HTML page showing a single session timeline and performance."""
+    data = _analyze_session(session_id)
+    if data["total"] == 0:
+        return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Session {session_id}</title></head>
+        <body style="background:#1a1a2e;color:#eee;font-family:sans-serif;padding:20px">
+        <h2>未找到会话数据</h2><p>session_id = <code>{session_id}</code></p>
+        <p><a href="/status" style="color:#3498db">← 返回 /status</a></p></body></html>"""
+
+    total = data["total"]
+    timeline = data["timeline"]
+    switches = data["switches"]
+
+    # Summary cards
+    duration_str = f"{data['duration_seconds']:.0f}s" if data["duration_seconds"] < 120 else f"{data['duration_seconds']/60:.1f}min"
+    switch_html = ""
+    if switches:
+        switch_items = ""
+        for sw in switches:
+            ts_short = sw["ts"][11:19] if len(sw["ts"]) >= 19 else sw["ts"]
+            switch_items += (
+                f'<div style="font-size:0.85em;padding:4px 0;border-bottom:1px solid #2a2a4a">'
+                f'<b>{ts_short}</b> #{sw["index"]}: {_target_badge(sw["from"])} → {_target_badge(sw["to"])}'
+                f'<span style="color:#888;margin-left:8px">{sw["reason"]}</span></div>'
+            )
+        switch_html = (
+            f'<div class="card"><h2>🔄 路由切换 ({len(switches)} 次)</h2>{switch_items}</div>'
+        )
+    else:
+        switch_html = '<div class="card"><h2>🔄 路由切换</h2><div style="color:#888">无切换，全程同一目标</div></div>'
+
+    # Timeline rows
+    rows_html = ""
+    for r in timeline:
+        ts_short = r["ts"][11:19] if len(r["ts"]) >= 19 else r["ts"]
+        dur_bar_width = min(100, max(1, r["duration_ms"] / max(data["p99_duration_ms"], 1) * 100))
+        dur_bar = (
+            f'<div style="width:80px;background:#2a2a4a;height:6px;border-radius:3px;overflow:hidden">'
+            f'<div style="width:{dur_bar_width:.0f}%;background:#3498db;height:100%"></div></div>'
+        )
+        flags = []
+        if r["fallback"]:
+            flags.append('<span style="color:#e74c3c">fallback</span>')
+        if r["emergency"]:
+            flags.append('<span style="color:#e74c3c">emergency</span>')
+        if r["blocker"]:
+            flags.append('<span style="color:#e67e22">blocker</span>')
+        if r["loop_max_run"] >= _ps.PROXY_LOOP_THRESHOLD:
+            flags.append(f'<span style="color:#f39c12">loop({r["loop_max_run"]})</span>')
+        if r["truncate"]:
+            flags.append('<span style="color:#f39c12">truncate</span>')
+        flag_html = ", ".join(flags) if flags else "—"
+        status_color = "#e74c3c" if r["status"] not in (200, None) else "#27ae60"
+        rows_html += (
+            f'<tr>'
+            f'<td>#{r["index"]}</td>'
+            f'<td>{ts_short}</td>'
+            f'<td>{_target_badge(r["target"])}</td>'
+            f'<td style="font-size:0.85em;color:#888">{r["reason"][:40]}</td>'
+            f'<td>{r["stage"]}</td>'
+            f'<td>{r["input_chars"]:,}</td>'
+            f'<td>{r["output_chars"]:,}</td>'
+            f'<td>{_fmt_ms(r["duration_ms"])} {dur_bar}</td>'
+            f'<td>{_fmt_ms(r["dispatch_latency_ms"])}</td>'
+            f'<td><span style="color:{status_color}">{r["status"]}</span></td>'
+            f'<td style="font-size:0.8em">{flag_html}</td>'
+            f'</tr>'
+        )
+
+    timeline_table = (
+        '<table style="width:100%;font-size:0.85em;border-collapse:collapse">'
+        '<tr style="border-bottom:1px solid #444;text-align:left">'
+        '<th>#</th><th>Time</th><th>Target</th><th>Reason</th><th>Stage</th>'
+        '<th>In chars</th><th>Out chars</th><th>Duration</th><th>Dispatch</th><th>Status</th><th>Flags</th>'
+        '</tr>'
+        f'{rows_html}</table>'
+    )
+
+    # Charts
+    dur_values = [r["duration_ms"] for r in timeline]
+    chars_svg = _svg_dual_chart(timeline)
+    dur_svg = _svg_line_chart(dur_values, color="#9b59b6")
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Session {session_id}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
+  h1 {{ font-size: 20px; margin-bottom: 4px; }}
+  .subtitle {{ color: #888; font-size: 13px; margin-bottom: 16px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-bottom: 16px; }}
+  .card {{ background: #16213e; border-radius: 10px; padding: 14px; }}
+  .card h2 {{ font-size: 13px; margin: 0 0 10px 0; color: #a0a0c0; text-transform: uppercase; letter-spacing: 1px; }}
+  .big {{ font-size: 22px; font-weight: 700; }}
+  .muted {{ color: #888; font-size: 12px; }}
+  .row {{ display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #2a2a4a; font-size: 13px; }}
+  .row:last-child {{ border-bottom: none; }}
+  a {{ color: #3498db; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  td, th {{ padding: 6px 8px; }}
+  tr:nth-child(even) {{ background: rgba(255,255,255,0.03); }}
+</style>
+</head>
+<body>
+<h1>📊 Session Analysis</h1>
+<div class="subtitle">{session_id} &nbsp;•&nbsp; {data['start_ts']} → {data['end_ts']} &nbsp;•&nbsp; 时长 {duration_str}</div>
+
+<div class="grid">
+  <div class="card"><h2>总请求数</h2><div class="big">{total}</div></div>
+  <div class="card"><h2>路由分布</h2>
+    <div class="row"><span>Local</span><span style="color:#27ae60;font-weight:bold">{data['local_count']}</span></div>
+    <div class="row"><span>Cloud</span><span style="color:#3498db;font-weight:bold">{data['cloud_count']}</span></div>
+    <div class="row"><span>Unknown</span><span style="color:#888">{data['unknown_count']}</span></div>
+    <div class="row"><span>Errors</span><span style="color:#e74c3c;font-weight:bold">{data['error_count']}</span></div>
+  </div>
+  <div class="card"><h2>延迟</h2>
+    <div class="row"><span>Avg</span><span>{_fmt_ms(data['avg_duration_ms'])}</span></div>
+    <div class="row"><span>P95</span><span>{_fmt_ms(data['p95_duration_ms'])}</span></div>
+    <div class="row"><span>P99</span><span>{_fmt_ms(data['p99_duration_ms'])}</span></div>
+  </div>
+  <div class="card"><h2>上下文</h2>
+    <div class="row"><span>Peak chars</span><span>{data['max_input_chars']:,}</span></div>
+    <div class="row"><span>Total out</span><span>{data['total_output_chars']:,}</span></div>
+    <div class="row"><span>Cloud cost</span><span>¥{data['cloud_cost']:.4f}</span></div>
+  </div>
+  {switch_html}
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>📈 输入字符变化（绿=Local，蓝=Cloud）</h2>
+  {chars_svg}
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h2>⏱️ 请求耗时变化</h2>
+  {dur_svg}
+</div>
+
+<div class="card">
+  <h2>🕒 请求时间线</h2>
+  {timeline_table}
+</div>
+
+<div style="margin-top:16px"><a href="/status">← 返回 /status</a></div>
+</body>
+</html>"""
+    return html
 
 
 # --- _get_session_trace ---
@@ -1400,6 +1802,9 @@ __all__ = [
     "_empty_context_optimization_stats",
     "_get_session_trace",
     "_build_status_html",
+    "_load_session_metrics",
+    "_analyze_session",
+    "_build_session_html",
     "_finalize_metrics",
     "_mc_put",
 ]
