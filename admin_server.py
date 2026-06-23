@@ -812,13 +812,15 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     Ranks by a combined score of recency × activity so high-activity sessions
     are visible even when many one-shot requests flood the metrics log.
 
-    Returns a list of dicts: [{"session_id": str, "count": int, "last_ts": str, "score": float}, ...]
+    Returns a list of dicts with keys:
+      session_id, count, last_ts, score, model, models_count, client_type
     ordered by score descending.
     """
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
     counts = {}
     last_ts = {}
     models = {}  # sid -> set of model names
+    client_types = {}  # sid -> {type: count}
     try:
         with open(metrics_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
@@ -848,9 +850,12 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
                 else:
                     m = ""
                 if m:
-                    if sid not in models:
-                        models[sid] = set()
-                    models[sid].add(m)
+                    models.setdefault(sid, set()).add(m)
+                # Track client type
+                ct = rec.get("client_type", "")
+                if ct:
+                    client_types.setdefault(sid, {})
+                    client_types[sid][ct] = client_types[sid].get(ct, 0) + 1
     except FileNotFoundError:
         pass
 
@@ -879,10 +884,13 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
         score = recency * (cnt ** 0.5)
         session_models = models.get(sid, set())
         first_model = next(iter(sorted(session_models))) if session_models else ""
+        ct_counts = client_types.get(sid, {})
+        client_type = max(ct_counts, key=ct_counts.get) if ct_counts else "unknown"
         sessions.append({
             "session_id": sid, "count": cnt, "last_ts": ts, "score": round(score, 2),
             "model": first_model,
             "models_count": len(session_models),
+            "client_type": client_type,
             "route_type": "",
         })
 
@@ -892,8 +900,11 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     if not sessions:
         for sid in sorted(counts, key=lambda s: last_ts.get(s, ""), reverse=True):
             ts = last_ts.get(sid, "")
+            ct_counts = client_types.get(sid, {})
+            client_type = max(ct_counts, key=ct_counts.get) if ct_counts else "unknown"
             sessions.append({
                 "session_id": sid, "count": counts[sid], "last_ts": ts, "score": 0.0,
+                "client_type": client_type,
             })
             if len(sessions) >= n:
                 break
@@ -906,6 +917,29 @@ def _session_percentile(vals, p):
     s = sorted(vals)
     idx = int(len(s) * p)
     return s[min(idx, len(s) - 1)]
+
+
+def _fallback_client_type_from_log(session_id: str) -> str:
+    """Scan anthropic_proxy.log for the first User-Agent of a session.
+
+    Metrics written before client_type was captured do not include the field.
+    This fallback allows historical sessions to still show a meaningful client
+    type label after the feature is deployed.
+    """
+    log_path = os.path.join(_ps._SCRIPT_DIR, "logs", "anthropic_proxy.log")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            needle = f"[sess={session_id}]"
+            for line in f:
+                if needle not in line:
+                    continue
+                if "User-Agent" in line:
+                    m = re.search(r"'User-Agent': '([^']+)'", line)
+                    if m:
+                        return _ps._detect_client_type(m.group(1))
+    except (OSError, FileNotFoundError):
+        pass
+    return "unknown"
 
 
 def _analyze_session(session_id: str) -> dict:
@@ -933,14 +967,18 @@ def _analyze_session(session_id: str) -> dict:
     cloud_cost = 0.0
     models_seen = set()
     first_model = ""
+    client_types = {}
 
     for idx, r in enumerate(rows, start=1):
         ts = r.get("ts", "")
         bd = r.get("pipeline", {}).get("backend_dispatcher", {})
         target = bd.get("route_target")
         if target is None:
-            # Fallback: infer from session route map if this is the active session
-            target = _ps._SESSION_ROUTE_MAP.get(session_id, "unknown")
+            # Fallback: smart_router sets target before BackendDispatcher
+            target = r.get("pipeline", {}).get("smart_router", {}).get("target")
+        if target is None:
+            # Last resort: infer from session route map if this is the active session
+            target = _ps._SESSION_ROUTE_MAP.get(session_id, "local")
         reason = bd.get("route_reason", "") or r.get("pipeline", {}).get("smart_router", {}).get("reason", "") or ""
         stage = r.get("pipeline", {}).get("smart_router", {}).get("stage", "")
         if not stage:
@@ -959,6 +997,11 @@ def _analyze_session(session_id: str) -> dict:
             if not first_model:
                 first_model = model_name
             models_seen.add(model_name)
+
+        # Track client type from metrics (newer records) or fall back later
+        ct = r.get("client_type", "")
+        if ct:
+            client_types[ct] = client_types.get(ct, 0) + 1
 
         if target == "cloud":
             cloud_count += 1
@@ -1023,13 +1066,17 @@ def _analyze_session(session_id: str) -> dict:
         except Exception:
             pass
 
-    # Determine session type
+    # Determine session type (routing) and client type
     if cloud_count > 0 and local_count > 0:
         session_type = "mixed"
     elif cloud_count > 0:
         session_type = "cloud"
     else:
         session_type = "local"
+    if client_types:
+        client_type = max(client_types, key=client_types.get)
+    else:
+        client_type = _fallback_client_type_from_log(session_id)
     force_source = _ps._SESSION_ROUTE_FORCE_SOURCE.get(session_id, "")
     return {
         "session_id": session_id,
@@ -1043,6 +1090,8 @@ def _analyze_session(session_id: str) -> dict:
         "error_count": error_count,
         "force_source": force_source,
         "session_type": session_type,
+        "client_type": client_type,
+        "client_types": sorted(client_types.keys()) if client_types else [],
         "models": sorted(models_seen) if models_seen else [],
         "first_model": first_model,
         "avg_duration_ms": sum(durations) / total if total else 0,
@@ -1263,7 +1312,8 @@ def _build_session_html(session_id: str) -> str:
 <div class="grid">
   <div class="card"><h2>总请求数</h2><div class="big">{total}</div></div>
   <div class="card"><h2>客户端</h2>
-    <div class="row"><span>Type</span><span>{data['session_type']}</span></div>
+    <div class="row"><span>Type</span><span style="font-weight:bold">{data['client_type']}</span></div>
+    <div class="row"><span>Route</span><span>{data['session_type']}</span></div>
     <div class="row"><span>Model</span><span style="font-size:0.85em">{data['first_model'] or '—'}</span></div>
     {'<div class="row"><span>Models</span><span style="font-size:0.8em;color:#888">' + ', '.join(data['models']) + '</span></div>' if len(data.get('models',[])) > 1 else ''}
   </div>

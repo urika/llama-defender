@@ -180,6 +180,22 @@ class TestParseConfEnv(unittest.TestCase):
         os.unlink(f.name)
         self.assertEqual(result["KEY"], "   ")
 
+    def test_export_prefix_stripped(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write('export KEY="value"\n')
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result["KEY"], "value")
+
+    def test_declare_prefix_stripped(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
+            f.write('declare -x KEY="value"\n')
+            f.flush()
+            result = proxy_state._parse_conf_env(f.name)
+        os.unlink(f.name)
+        self.assertEqual(result["KEY"], "value")
+
 
 class TestCastConfigValue(unittest.TestCase):
     """Tests for _cast_config_value."""

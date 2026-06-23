@@ -450,6 +450,42 @@ def invalidate_sensitive_patterns_cache():
     _SENSITIVE_PATTERNS_RE = None
     _SENSITIVE_PATTERNS_SOURCE = ""
 
+
+def _detect_client_type(user_agent: str) -> str:
+    """Normalize User-Agent header into a short client type label.
+
+    Recognized clients:
+      - opencode
+      - claude-code / Claude
+      - kimi
+      - curl / wget / httpie
+      - browser (Mozilla/AppleWebKit)
+    Returns 'unknown' for empty/unrecognized agents.
+    """
+    if not user_agent:
+        return "unknown"
+    ua = user_agent.lower()
+    if "opencode" in ua:
+        return "opencode"
+    if "claude-code" in ua or ua.startswith("claude/"):
+        return "claude-code"
+    if "kimi" in ua:
+        return "kimi"
+    if "curl" in ua:
+        return "curl"
+    if "wget" in ua:
+        return "wget"
+    if "httpie" in ua:
+        return "httpie"
+    if "mozilla" in ua or "applewebkit" in ua:
+        return "browser"
+    # Fallback to first token if it looks like a product name
+    first = user_agent.split("/")[0].strip()
+    if first and " " not in first and len(first) <= 30:
+        return first
+    return "unknown"
+
+
 # Model ID → route preference mapping (preference only, safety always overrides)
 MODEL_ROUTE_PREFERENCES = {
     "claude-sonnet-4-6": {
@@ -723,6 +759,12 @@ _RELOAD_SPEC = [
     ("PROXY_ROUTE_STICKY", "PROXY_ROUTE_STICKY", "bool", "true", "true"),
     ("PROXY_ROUTE_STICKY_RETURN_ROUNDS", "PROXY_ROUTE_STICKY_RETURN_ROUNDS", "int", "5", "5"),
     ("PROXY_ROUTE_STICKY_RETURN_RATIO", "PROXY_ROUTE_STICKY_RETURN_RATIO", "float", "0.7", "0.7"),
+    # Dynamic max_tokens
+    ("PROXY_DYNAMIC_MAX_TOKENS_ENABLED", "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", "bool", "true", "true"),
+    ("PROXY_DYNAMIC_MAX_TOKENS_INIT", "PROXY_DYNAMIC_MAX_TOKENS_INIT", "int", "4096", "4096"),
+    ("PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "int", "4096", "4096"),
+    ("PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "int", "2048", "2048"),
+    ("PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "float", "0.8", "0.8"),
 ]
 
 
@@ -750,6 +792,14 @@ def _parse_conf_env(path):
                     continue
                 key, val = line.split("=", 1)
                 key = key.strip()
+                # Strip bash export/declare prefixes so both
+                #   export VAR="value"
+                #   declare -x VAR="value"
+                # are parsed correctly.
+                if key.startswith("export "):
+                    key = key[len("export "):].strip()
+                elif key.startswith("declare -x "):
+                    key = key[len("declare -x "):].strip()
                 val = val.strip()
                 if len(val) >= 2 and val[0] in ('"', "'"):
                     quote = val[0]
@@ -877,6 +927,7 @@ __all__ = [
     "_MODEL_ALIASES_CACHE", "_SENSITIVE_PATTERNS_RE", "_SENSITIVE_PATTERNS_SOURCE",
     "get_model_aliases", "invalidate_model_aliases_cache",
     "_compile_sensitive_patterns", "invalidate_sensitive_patterns_cache",
+    "_detect_client_type",
     "_accumulate_route_daily_cost",
     "_parse_budget_alert_tiers", "_get_budget_alert_level",
 ]

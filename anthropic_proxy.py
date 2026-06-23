@@ -485,6 +485,7 @@ class Handler(BaseHTTPRequestHandler):
             _metrics_ctx.mc = {
                 "ts": datetime.now().isoformat(),
                 "session_id": getattr(_log_ctx, 'session_id', None) or "",
+                "client_type": _detect_client_type(self.headers.get('User-Agent', '')),
                 "pipeline": {},
             }
         try:
