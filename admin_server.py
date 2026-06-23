@@ -818,6 +818,7 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
     counts = {}
     last_ts = {}
+    models = {}  # sid -> set of model names
     try:
         with open(metrics_path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
@@ -837,6 +838,19 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
                 ts = rec.get("ts", "")
                 if ts and ts > last_ts.get(sid, ""):
                     last_ts[sid] = ts
+                # Track model used
+                bd = rec.get("pipeline", {}).get("backend_dispatcher", {})
+                target = bd.get("route_target", "")
+                if target == "cloud":
+                    m = bd.get("route_cloud_model", "") or _ps.PROXY_CLOUD_MODEL
+                elif target in ("local", "local_forced"):
+                    m = _ps.MODEL_NAME
+                else:
+                    m = ""
+                if m:
+                    if sid not in models:
+                        models[sid] = set()
+                    models[sid].add(m)
     except FileNotFoundError:
         pass
 
@@ -864,8 +878,13 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
         else:
             recency = 0.0
         score = recency * (cnt ** 0.5)
+        session_models = models.get(sid, set())
+        first_model = next(iter(sorted(session_models))) if session_models else ""
         sessions.append({
             "session_id": sid, "count": cnt, "last_ts": ts, "score": round(score, 2),
+            "model": first_model,
+            "models_count": len(session_models),
+            "route_type": "",
         })
 
     # Sort by score descending, then by count descending
@@ -913,6 +932,8 @@ def _analyze_session(session_id: str) -> dict:
     output_chars_total = 0
     local_count = cloud_count = unknown_count = error_count = 0
     cloud_cost = 0.0
+    models_seen = set()
+    first_model = ""
 
     for idx, r in enumerate(rows, start=1):
         ts = r.get("ts", "")
@@ -921,7 +942,7 @@ def _analyze_session(session_id: str) -> dict:
         if target is None:
             # Fallback: infer from session route map if this is the active session
             target = _ps._SESSION_ROUTE_MAP.get(session_id, "unknown")
-        reason = bd.get("route_reason", "") or ""
+        reason = bd.get("route_reason", "") or r.get("pipeline", {}).get("smart_router", {}).get("reason", "") or ""
         stage = r.get("pipeline", {}).get("smart_router", {}).get("stage", "")
         if not stage:
             stage = r.get("pipeline", {}).get("lifecycle_stage", {}).get("stage", "unknown")
@@ -930,6 +951,15 @@ def _analyze_session(session_id: str) -> dict:
         in_chars = r.get("input_chars") or 0
         out_chars = r.get("output_chars") or 0
         status = r.get("status", 200)
+        # Track model used (route_cloud_model for cloud, MODEL_NAME for local)
+        if target == "cloud":
+            model_name = bd.get("route_cloud_model", "") or _ps.PROXY_CLOUD_MODEL
+        else:
+            model_name = _ps.MODEL_NAME
+        if model_name:
+            if not first_model:
+                first_model = model_name
+            models_seen.add(model_name)
 
         if target == "cloud":
             cloud_count += 1
@@ -994,6 +1024,13 @@ def _analyze_session(session_id: str) -> dict:
         except Exception:
             pass
 
+    # Determine session type
+    if cloud_count > 0 and local_count > 0:
+        session_type = "mixed"
+    elif cloud_count > 0:
+        session_type = "cloud"
+    else:
+        session_type = "local"
     force_source = _ps._SESSION_ROUTE_FORCE_SOURCE.get(session_id, "")
     return {
         "session_id": session_id,
@@ -1006,6 +1043,9 @@ def _analyze_session(session_id: str) -> dict:
         "unknown_count": unknown_count,
         "error_count": error_count,
         "force_source": force_source,
+        "session_type": session_type,
+        "models": sorted(models_seen) if models_seen else [],
+        "first_model": first_model,
         "avg_duration_ms": sum(durations) / total if total else 0,
         "p95_duration_ms": _session_percentile(durations, 0.95),
         "p99_duration_ms": _session_percentile(durations, 0.99),
@@ -1129,10 +1169,13 @@ def _build_session_html(session_id: str) -> str:
         switch_items = ""
         for sw in switches:
             ts_short = _fmt_ts(sw["ts"])
+            swap_icon = "☁️" if sw["to"] == "cloud" else "🖥️"
+            reason_text = sw["reason"].replace("_", " ").replace("(", " (").replace(">", " > ") if sw["reason"] else "—"
             switch_items += (
-                f'<div style="font-size:0.85em;padding:4px 0;border-bottom:1px solid #2a2a4a">'
-                f'<b>{ts_short}</b> #{sw["index"]}: {_target_badge(sw["from"])} → {_target_badge(sw["to"])}'
-                f'<span style="color:#888;margin-left:8px">{sw["reason"]}</span></div>'
+                f'<div style="font-size:0.85em;padding:5px 0;border-bottom:1px solid #2a2a4a">'
+                f'<b>{ts_short}</b> #{sw["index"]}: {_target_badge(sw["from"])} {swap_icon} {_target_badge(sw["to"])}'
+                f'<div style="color:#a0a0c0;font-size:0.9em;margin-top:2px;padding-left:12px">'
+                f'⬅ 原因: <code style="color:#f0c674">{reason_text}</code></div></div>'
             )
         switch_html = (
             f'<div class="card"><h2>🔄 路由切换 ({len(switches)} 次)</h2>{switch_items}</div>'
@@ -1220,6 +1263,11 @@ def _build_session_html(session_id: str) -> str:
 
 <div class="grid">
   <div class="card"><h2>总请求数</h2><div class="big">{total}</div></div>
+  <div class="card"><h2>客户端</h2>
+    <div class="row"><span>Type</span><span>{data['session_type']}</span></div>
+    <div class="row"><span>Model</span><span style="font-size:0.85em">{data['first_model'] or '—'}</span></div>
+    {'<div class="row"><span>Models</span><span style="font-size:0.8em;color:#888">' + ', '.join(data['models']) + '</span></div>' if len(data.get('models',[])) > 1 else ''}
+  </div>
   <div class="card"><h2>路由分布</h2>
     <div class="row"><span>Local</span><span style="color:#27ae60;font-weight:bold">{data['local_count']}</span></div>
     <div class="row"><span>Cloud</span><span style="color:#3498db;font-weight:bold">{data['cloud_count']}</span></div>
@@ -1423,9 +1471,13 @@ def _build_status_html():
     recent_sessions = _load_recent_session_ids()
     if recent_sessions:
         rs_rows = "".join(
-            f'<div class="row"><span><a href="/session?sid={s["session_id"]}">'
+            f'<div class="row">'
+            f'<span><a href="/session?sid={s["session_id"]}" title="{s["session_id"]}">'
             f'{s["session_id"][:16]}{"…" if len(s["session_id"]) > 16 else ""}</a>'
-            f'<span style="color:#888;font-size:0.85em"> {s["count"]} req</span></span>'
+            f'<span style="color:#888;font-size:0.85em;margin-left:4px">{s["count"]} req'
+            + (f' · <span style="font-size:0.8em">{s["model"][:20]}</span>' if s.get("model") else '')
+            + (f' · +{s["models_count"]-1} more' if s.get("models_count",0) > 1 else '')
+            + f'</span></span>'
             f'<span style="color:#888">{_fmt_ts(s["last_ts"])}</span></div>'
             for s in recent_sessions
         )

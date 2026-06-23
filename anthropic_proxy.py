@@ -368,6 +368,37 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    @staticmethod
+    def _early_route_decision(parsed, total_chars):
+        """Fast cloud/local heuristic used before OOM safety pre-truncation.
+
+        Returns 'cloud' only when the request is unambiguously a cloud candidate
+        based on model preference or context size. The full pipeline SmartRouter
+        may still override this early hint (e.g. cloud cooldown / memory pressure).
+        """
+        if not PROXY_ROUTE_ENABLED:
+            return "local"
+        route_override = parsed.get("_x_proxy_route_to", "")
+        if route_override == "cloud":
+            return "cloud"
+        if route_override == "local":
+            return "local"
+
+        requested_model = parsed.get("model", "")
+        pref = MODEL_ROUTE_PREFERENCES.get(requested_model, {})
+        behavior = pref.get("behavior", "prefer")
+        route_bias = pref.get("route_bias", "auto")
+
+        if behavior in ("force", "force_fallback") and route_bias == "prefer_cloud":
+            return "cloud"
+        if behavior == "prefer_cloud":
+            return "cloud"
+
+        threshold = int(PROXY_ROUTE_THRESHOLD_CHARS * pref.get("threshold_factor", 1.0))
+        if total_chars > threshold:
+            return "cloud"
+        return "local"
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -547,7 +578,13 @@ class Handler(BaseHTTPRequestHandler):
                 # OOM and 500 errors. Evidence: 65/67 of v0.5.0-baseline 500s came
                 # from input_chars > 400K (session a309b181). Force rounds truncation
                 # with tight budget when payload exceeds threshold.
-                if total_chars > PROXY_OOM_SAFE_CHARS and msgs:
+                # Skip pre-truncation if the request is already a clear cloud candidate;
+                # otherwise aggressive pre-truncation can drop context below the routing
+                # threshold and prevent automatic cloud fallback.
+                early_route = self._early_route_decision(parsed, total_chars)
+                if early_route == "cloud":
+                    log(f"  -> OOM safety pre-truncation skipped: early route decision=cloud ({total_chars:,} chars)")
+                elif total_chars > PROXY_OOM_SAFE_CHARS and msgs:
                     log(f"  -> OOM safety pre-truncation triggered: {total_chars:,} chars > {PROXY_OOM_SAFE_CHARS:,} threshold")
                     pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
                     msgs_truncated, pre_stats = _apply_rounds_truncation(
