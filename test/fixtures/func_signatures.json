@@ -297,15 +297,17 @@
       "level3_threshold",
       "pattern_tool_name",
       "is_text_loop",
-      "text_loop_run"
+      "text_loop_run",
+      "session_id"
     ],
     "defaults": {
-      "threshold": 3,
-      "level2_threshold": 6,
-      "level3_threshold": 9,
+      "threshold": null,
+      "level2_threshold": null,
+      "level3_threshold": null,
       "pattern_tool_name": null,
       "is_text_loop": false,
-      "text_loop_run": 0
+      "text_loop_run": 0,
+      "session_id": ""
     }
   },
   "_apply_rounds_truncation": {
@@ -541,9 +543,12 @@
   "_detect_blocker_pattern": {
     "name": "_detect_blocker_pattern",
     "params": [
-      "messages"
+      "messages",
+      "session_id"
     ],
-    "defaults": {}
+    "defaults": {
+      "session_id": ""
+    }
   },
   "_detect_content_type": {
     "name": "_detect_content_type",
@@ -560,14 +565,44 @@
     "params": [
       "tail_assistant",
       "threshold",
+      "session_id",
       "min_chars",
       "similarity_threshold"
     ],
     "defaults": {
-      "threshold": 3,
-      "min_chars": 100,
-      "similarity_threshold": 0.85
+      "threshold": null,
+      "session_id": "",
+      "min_chars": null,
+      "similarity_threshold": null
     }
+  },
+  "_effective_blocker_threshold": {
+    "name": "_effective_blocker_threshold",
+    "params": [
+      "session_id"
+    ],
+    "defaults": {}
+  },
+  "_effective_loop_threshold": {
+    "name": "_effective_loop_threshold",
+    "params": [
+      "session_id"
+    ],
+    "defaults": {}
+  },
+  "_effective_session_tier": {
+    "name": "_effective_session_tier",
+    "params": [
+      "session_id"
+    ],
+    "defaults": {}
+  },
+  "_effective_text_loop_threshold": {
+    "name": "_effective_text_loop_threshold",
+    "params": [
+      "session_id"
+    ],
+    "defaults": {}
   },
   "_empty_context_optimization_stats": {
     "name": "_empty_context_optimization_stats",
@@ -1043,11 +1078,32 @@
     ],
     "defaults": {}
   },
+  "convert_openai_request_to_anthropic": {
+    "name": "convert_openai_request_to_anthropic",
+    "params": [
+      "body"
+    ],
+    "defaults": {}
+  },
   "convert_openai_response_to_anthropic": {
     "name": "convert_openai_response_to_anthropic",
     "params": [
       "openai_resp",
       "anthropic_model"
+    ],
+    "defaults": {}
+  },
+  "convert_openai_tool_choice_to_anthropic": {
+    "name": "convert_openai_tool_choice_to_anthropic",
+    "params": [
+      "tool_choice"
+    ],
+    "defaults": {}
+  },
+  "convert_openai_tools_to_anthropic": {
+    "name": "convert_openai_tools_to_anthropic",
+    "params": [
+      "tools"
     ],
     "defaults": {}
   },

@@ -100,6 +100,202 @@ def convert_anthropic_tool_choice_to_openai(tool_choice):
     return None
 
 
+def convert_openai_tools_to_anthropic(tools):
+    """Convert OpenAI tool definitions to Anthropic tool format.
+
+    OpenAI: {"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}
+    Anthropic: {"type": "custom", "name": ..., "description": ..., "input_schema": {...}}
+    """
+    if not tools:
+        return None
+    anthropic_tools = []
+    for tool in tools:
+        tool_type = tool.get("type", "")
+        if tool_type == "function":
+            func = tool.get("function", {})
+            anthropic_tools.append({
+                "type": "custom",
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "input_schema": func.get("parameters", {}),
+            })
+        elif "name" in tool:
+            # Fallback for simple/non-standard tool definitions
+            anthropic_tools.append({
+                "type": "custom",
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("parameters", tool.get("input_schema", {})),
+            })
+    return anthropic_tools if anthropic_tools else None
+
+
+def convert_openai_tool_choice_to_anthropic(tool_choice):
+    """Convert OpenAI tool_choice to Anthropic tool_choice."""
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        if tool_choice == "auto":
+            return "auto"
+        if tool_choice == "none":
+            return "none"
+        if tool_choice == "required":
+            return "any"
+    elif isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type", "")
+        if tc_type == "function":
+            return {
+                "type": "tool",
+                "name": tool_choice.get("function", {}).get("name", "")
+            }
+        if tc_type == "auto":
+            return "auto"
+        if tc_type == "none":
+            return "none"
+        if tc_type in ("required", "any"):
+            return "any"
+    return None
+
+
+def _openai_content_to_anthropic(content):
+    """Convert OpenAI message content (str or list of parts) to Anthropic content blocks."""
+    if isinstance(content, str):
+        if content:
+            return [{"type": "text", "text": content}]
+        return []
+    if isinstance(content, list):
+        blocks = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            pt = part.get("type", "")
+            if pt == "text":
+                blocks.append({"type": "text", "text": part.get("text", "")})
+            # image_url / multi-modal parts are skipped for now
+        return blocks
+    return []
+
+
+def _convert_openai_user_msg(msg):
+    """Convert an OpenAI user message to Anthropic format."""
+    return {"role": "user", "content": _openai_content_to_anthropic(msg.get("content", ""))}
+
+
+def _convert_openai_assistant_msg(msg):
+    """Convert an OpenAI assistant message (with optional tool_calls) to Anthropic format."""
+    content = msg.get("content", "")
+    tool_calls = msg.get("tool_calls") or []
+    blocks = _openai_content_to_anthropic(content)
+    for tc in tool_calls:
+        if tc.get("type") != "function":
+            continue
+        func = tc.get("function", {})
+        raw_args = func.get("arguments", "{}")
+        try:
+            input_data = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            input_data = {}
+        blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", ""),
+            "name": func.get("name", ""),
+            "input": input_data if isinstance(input_data, dict) else {},
+        })
+    return {"role": "assistant", "content": blocks}
+
+
+def _convert_openai_tool_msg(msg):
+    """Convert an OpenAI tool message to an Anthropic tool_result block."""
+    content = msg.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    return {
+        "type": "tool_result",
+        "tool_use_id": msg.get("tool_call_id", ""),
+        "content": content,
+    }
+
+
+def convert_openai_request_to_anthropic(body):
+    """Convert an OpenAI chat-completion request body to Anthropic messages format.
+
+    This allows /v1/chat/completions requests (e.g. OpenCode / OpenWebUI) to enter
+    the same Anthropic-format pipeline as /v1/messages, gaining SmartRouter,
+    lifecycle classification, truncation, compression, etc.
+    """
+    anthropic_body = {
+        "model": body.get("model", ""),
+        "max_tokens": body.get("max_tokens", 4096),
+        "messages": [],
+    }
+    if "temperature" in body:
+        anthropic_body["temperature"] = body["temperature"]
+    if "top_p" in body:
+        anthropic_body["top_p"] = body["top_p"]
+    if "stream" in body:
+        anthropic_body["stream"] = body["stream"]
+    stop = body.get("stop")
+    if stop is not None:
+        if isinstance(stop, str):
+            anthropic_body["stop_sequences"] = [stop]
+        elif isinstance(stop, list):
+            anthropic_body["stop_sequences"] = stop
+
+    # Collect system messages into Anthropic top-level system field
+    system_texts = []
+    for msg in body.get("messages", []):
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_texts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        system_texts.append(part.get("text", ""))
+    if system_texts:
+        anthropic_body["system"] = "\n".join(system_texts)
+
+    # Convert remaining messages
+    anthropic_messages = []
+    for msg in body.get("messages", []):
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "user":
+            anthropic_messages.append(_convert_openai_user_msg(msg))
+        elif role == "assistant":
+            anthropic_messages.append(_convert_openai_assistant_msg(msg))
+        elif role == "tool":
+            # Attach tool_result to the most recent user message to preserve
+            # Anthropic's user/tool_result pairing requirement.
+            if not anthropic_messages:
+                anthropic_messages.append({"role": "user", "content": []})
+            last = anthropic_messages[-1]
+            if last.get("role") != "user":
+                anthropic_messages.append({"role": "user", "content": []})
+                last = anthropic_messages[-1]
+            content = last.get("content", [])
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}] if content else []
+                last["content"] = content
+            content.append(_convert_openai_tool_msg(msg))
+
+    anthropic_body["messages"] = anthropic_messages
+
+    tools = body.get("tools")
+    if tools:
+        anthropic_body["tools"] = convert_openai_tools_to_anthropic(tools)
+    tc = body.get("tool_choice")
+    if tc is not None:
+        anthropic_body["tool_choice"] = convert_openai_tool_choice_to_anthropic(tc)
+
+    # Preserve single-request route override if present
+    if "_x_proxy_route_to" in body:
+        anthropic_body["_x_proxy_route_to"] = body["_x_proxy_route_to"]
+
+    return anthropic_body
+
+
 def _estimate_message_chars(messages):
     """Rough character count for threshold checking (no tokenizer)."""
     total = 0
@@ -492,6 +688,9 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
 __all__ = [
     "convert_anthropic_tools_to_openai",
     "convert_anthropic_tool_choice_to_openai",
+    "convert_openai_tools_to_anthropic",
+    "convert_openai_tool_choice_to_anthropic",
+    "convert_openai_request_to_anthropic",
     "_estimate_message_chars",
     "_extract_text_from_messages",
     "_classify_content_for_ratio",

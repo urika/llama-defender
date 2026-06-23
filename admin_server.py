@@ -806,10 +806,14 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
 
 
 def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
-    """Return the most recently active session_ids from proxy_metrics.jsonl.
+    """Return the most meaningful session_ids from proxy_metrics.jsonl.
 
-    Returns a list of dicts: [{"session_id": str, "count": int, "last_ts": str}, ...]
-    ordered by most recent last seen time.
+    Filters out auto-generated noise sessions (req_* prefix, count < 2).
+    Ranks by a combined score of recency × activity so high-activity sessions
+    are visible even when many one-shot requests flood the metrics log.
+
+    Returns a list of dicts: [{"session_id": str, "count": int, "last_ts": str, "score": float}, ...]
+    ordered by score descending.
     """
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
     counts = {}
@@ -836,11 +840,45 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     except FileNotFoundError:
         pass
 
-    sessions = [
-        {"session_id": sid, "count": counts[sid], "last_ts": last_ts.get(sid, "")}
-        for sid in counts
-    ]
-    sessions.sort(key=lambda s: s["last_ts"], reverse=True)
+    # Compute score: recency (0-1) × sqrt(activity) to surface busy sessions
+    all_ts = [t for t in last_ts.values() if t]
+    max_ts = max(all_ts) if all_ts else ""
+    sessions = []
+    for sid in counts:
+        ts = last_ts.get(sid, "")
+        cnt = counts[sid]
+        # Filter out auto-generated req_* noise sessions with < 2 requests
+        is_noise = sid.startswith("req_") and cnt < 2
+        if is_noise:
+            continue
+        # Recency score: 1.0 for most recent, decays linearly to 0.0 for oldest
+        if max_ts and ts:
+            try:
+                from datetime import datetime
+                t = datetime.fromisoformat(ts)
+                t0 = datetime.fromisoformat(max_ts)
+                age_hours = (t0 - t).total_seconds() / 3600
+                recency = max(0.0, 1.0 - age_hours / 72)  # decay over 72h
+            except Exception:
+                recency = 0.0
+        else:
+            recency = 0.0
+        score = recency * (cnt ** 0.5)
+        sessions.append({
+            "session_id": sid, "count": cnt, "last_ts": ts, "score": round(score, 2),
+        })
+
+    # Sort by score descending, then by count descending
+    sessions.sort(key=lambda s: (-s["score"], -s["count"]))
+    # If no meaningful sessions found, include most recent (up to n)
+    if not sessions:
+        for sid in sorted(counts, key=lambda s: last_ts.get(s, ""), reverse=True):
+            ts = last_ts.get(sid, "")
+            sessions.append({
+                "session_id": sid, "count": counts[sid], "last_ts": ts, "score": 0.0,
+            })
+            if len(sessions) >= n:
+                break
     return sessions[:n]
 
 
@@ -1378,8 +1416,10 @@ def _build_status_html():
     recent_sessions = _load_recent_session_ids()
     if recent_sessions:
         rs_rows = "".join(
-            f'<div class="row"><span><a href="/session?sid={s["session_id"]}">{s["session_id"]}</a></span>'
-            f'<span style="color:#888">{s["count"]} req · {s["last_ts"][:19]}</span></div>'
+            f'<div class="row"><span><a href="/session?sid={s["session_id"]}">'
+            f'{s["session_id"][:16]}{"…" if len(s["session_id"]) > 16 else ""}</a>'
+            f'<span style="color:#888;font-size:0.85em"> {s["count"]} req</span></span>'
+            f'<span style="color:#888">{s["last_ts"][5:19] if s["last_ts"] else "—"}</span></div>'
             for s in recent_sessions
         )
         recent_sessions_card = f'<div class="card" style="grid-column: 1 / -1;"><h2>📁 Recent Sessions</h2>{rs_rows}</div>'
