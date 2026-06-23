@@ -861,9 +861,8 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     for sid in counts:
         ts = last_ts.get(sid, "")
         cnt = counts[sid]
-        # Filter out auto-generated req_* noise sessions with < 2 requests
-        is_noise = sid.startswith("req_") and cnt < 2
-        if is_noise:
+        # Filter out auto-generated req_* noise sessions (per-request, not session)
+        if sid.startswith("req_"):
             continue
         # Recency score: 1.0 for most recent, decays linearly to 0.0 for oldest
         if max_ts and ts:
