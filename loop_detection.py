@@ -3,6 +3,54 @@ import hashlib
 from datetime import datetime
 import proxy_state as _ps
 
+# --- Session-tier helpers (Phase 4 / 建议4) ---
+
+
+def _effective_session_tier(session_id: str) -> str:
+    """Return 'short' | 'long' | 'very_long' based on _SESSION_REQUEST_COUNT.
+
+    Falls back to 'short' when session_id is empty or unknown (backward compatible).
+    """
+    if not session_id:
+        return "short"
+    cnt = _ps._SESSION_REQUEST_COUNT.get(session_id, 0)
+    if cnt <= _ps.PROXY_LOOP_SESSION_SHORT_BOUND:
+        return "short"
+    if cnt <= _ps.PROXY_LOOP_SESSION_LONG_BOUND:
+        return "long"
+    return "very_long"
+
+
+def _effective_loop_threshold(session_id: str) -> int:
+    """Dynamic loop threshold by session tier."""
+    tier = _effective_session_tier(session_id)
+    if tier == "long":
+        return _ps.PROXY_LOOP_THRESHOLD_LONG
+    if tier == "very_long":
+        return _ps.PROXY_LOOP_THRESHOLD_VERY_LONG
+    return _ps.PROXY_LOOP_THRESHOLD
+
+
+def _effective_text_loop_threshold(session_id: str) -> int:
+    """Dynamic text-loop threshold by session tier."""
+    tier = _effective_session_tier(session_id)
+    if tier == "long":
+        return _ps.PROXY_TEXT_LOOP_THRESHOLD_LONG
+    if tier == "very_long":
+        return _ps.PROXY_TEXT_LOOP_THRESHOLD_VERY_LONG
+    return _ps.PROXY_TEXT_LOOP_THRESHOLD
+
+
+def _effective_blocker_threshold(session_id: str) -> int:
+    """Dynamic blocker threshold by session tier."""
+    tier = _effective_session_tier(session_id)
+    if tier == "long":
+        return _ps.PROXY_BLOCKER_THRESHOLD_LONG
+    if tier == "very_long":
+        return _ps.PROXY_BLOCKER_THRESHOLD_VERY_LONG
+    return _ps.PROXY_BLOCKER_THRESHOLD
+
+
 # --- _check_dedup ---
 def _check_dedup(body_str):
     """Hash-based request dedup with TTL.
@@ -34,11 +82,20 @@ def _compute_text_similarity(text1, text2):
     union = len(b1 | b2)
     return intersection / union if union > 0 else 0.0
 # --- _detect_text_loop ---
-def _detect_text_loop(tail_assistant, threshold=_ps.PROXY_TEXT_LOOP_THRESHOLD,
-                      min_chars=_ps.PROXY_TEXT_LOOP_MIN_CHARS,
-                      similarity_threshold=_ps.PROXY_TEXT_LOOP_SIMILARITY):
+def _detect_text_loop(tail_assistant, threshold=None, session_id="",
+                      min_chars=None, similarity_threshold=None):
     """Detect repeated similar text output in assistant messages.
-    Returns (max_run, is_text_loop) tuple."""
+
+    When session_id is provided, threshold is computed dynamically from the
+    session tier (Phase 4 / 建议4).  Pass explicit threshold to override.
+    Returns (max_run, is_text_loop) tuple.
+    """
+    if threshold is None:
+        threshold = _effective_text_loop_threshold(session_id)
+    if min_chars is None:
+        min_chars = _ps.PROXY_TEXT_LOOP_MIN_CHARS
+    if similarity_threshold is None:
+        similarity_threshold = _ps.PROXY_TEXT_LOOP_SIMILARITY
     if not _ps.PROXY_TEXT_LOOP_ENABLED or len(tail_assistant) < threshold:
         return 0, False
 
@@ -101,11 +158,14 @@ def _classify_exception(e):
         return 500, "internal_error", False
     return 500, "unknown_error", False
 # --- _detect_blocker_pattern ---
-def _detect_blocker_pattern(messages):
+def _detect_blocker_pattern(messages, session_id=""):
     """
     Walk messages backward and detect a tail of consecutive same-error-type
     tool_result rejections. Stops at the first non-error tool_result, the first
     plain user text message, or when the run length drops to zero.
+
+    When session_id is provided, threshold is computed dynamically from the
+    session tier (Phase 4 / 建议4).
 
     Returns a dict:
         {
@@ -124,6 +184,7 @@ def _detect_blocker_pattern(messages):
     if not _ps.PROXY_BLOCKER_ENABLED:
         return {"triggered": False, "reason": "disabled"}
 
+    blocker_threshold = _effective_blocker_threshold(session_id)
     last_tool_name = None
     run = []  # list of (tool_name, error_type), index 0 = oldest in run
 
@@ -172,8 +233,8 @@ def _detect_blocker_pattern(messages):
         run.append((last_tool_name or "unknown", matched))
 
     run_length = len(run)
-    if run_length < _ps.PROXY_BLOCKER_THRESHOLD:
-        return {"triggered": False, "run_length": run_length, "threshold": _ps.PROXY_BLOCKER_THRESHOLD}
+    if run_length < blocker_threshold:
+        return {"triggered": False, "run_length": run_length, "threshold": blocker_threshold}
 
     tool_name, error_type = run[-1]  # most recent
     return {
@@ -220,21 +281,26 @@ def _build_tool_use_map(messages):
 # --- _apply_loop_intervention ---
 def _apply_loop_intervention(
     raw_messages, raw_tools, max_run, consecutive,
-    threshold=_ps.PROXY_LOOP_THRESHOLD, level2_threshold=_ps.PROXY_LOOP_LEVEL2,
-    level3_threshold=_ps.PROXY_LOOP_LEVEL3, pattern_tool_name=None,
-    is_text_loop=False, text_loop_run=0,
+    threshold=None, level2_threshold=None,
+    level3_threshold=None, pattern_tool_name=None,
+    is_text_loop=False, text_loop_run=0, session_id="",
 ):
     """Escalating loop intervention (R2.1). Returns (messages, tools, level, tool_name).
 
-    Pure-ish: given the conversation state, returns the (possibly extended) message
-    list and (possibly filtered) tools list. Caller is responsible for assigning
-    them back to body["messages"]/body["tools"] and emitting the metrics step.
+    When session_id is provided, threshold/level2/level3 are computed dynamically
+    from the session tier (Phase 4 / 建议4).  Pass explicit values to override.
 
     - max_run < threshold          → no-op, returns (raw_messages, raw_tools, 0, "")
     - threshold <= max_run < L2    → Level 1: append hint user message
     - L2 <= max_run < L3           → Level 2: remove ALL high-count tools from raw_tools
     - max_run >= L3                → Level 3: strip ALL tools (force plain text)
     """
+    if threshold is None:
+        threshold = _effective_loop_threshold(session_id)
+    if level2_threshold is None:
+        level2_threshold = threshold * 2  # follows existing LEVEL2 = THRESHOLD * 2 pattern
+    if level3_threshold is None:
+        level3_threshold = threshold * 3  # follows existing LEVEL3 = THRESHOLD * 3 pattern
     if max_run < threshold:
         return raw_messages, raw_tools, 0, ""
 
@@ -331,4 +397,8 @@ __all__ = [
     "_build_blocker_message",
     "_build_tool_use_map",
     "_apply_loop_intervention",
+    "_effective_session_tier",
+    "_effective_loop_threshold",
+    "_effective_text_loop_threshold",
+    "_effective_blocker_threshold",
 ]

@@ -487,6 +487,41 @@ class TestBlockerDetection(unittest.TestCase):
         self.assertIn("3", text)
         self.assertIn("[BLOCKER]", text)
 
+    def test_blocker_tier_long_needs_three_not_two(self):
+        """Phase 4 (建议4): long-tier sessions need 3, not 2, consecutive errors."""
+        proxy_state._SESSION_REQUEST_COUNT["sess_long"] = proxy_state.PROXY_LOOP_SESSION_SHORT_BOUND + 1
+        try:
+            msgs = [
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+            ]
+            r = proxy._detect_blocker_pattern(msgs, session_id="sess_long")
+            self.assertFalse(r["triggered"])
+            self.assertEqual(r["run_length"], 2)
+            self.assertLess(r["run_length"], r["threshold"])
+        finally:
+            proxy_state._SESSION_REQUEST_COUNT.clear()
+
+    def test_blocker_tier_very_long_needs_three(self):
+        """Phase 4: very_long-tier sessions need 3 consecutive to trigger (same threshold)."""
+        proxy_state._SESSION_REQUEST_COUNT["sess_vl"] = proxy_state.PROXY_LOOP_SESSION_LONG_BOUND + 1
+        try:
+            msgs = [
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+                self._assistant_tool_use("Read"),
+                self._user_tool_result("[System: 文件不存在]"),
+            ]
+            r = proxy._detect_blocker_pattern(msgs, session_id="sess_vl")
+            self.assertTrue(r["triggered"])
+            self.assertEqual(r["run_length"], 3)
+        finally:
+            proxy_state._SESSION_REQUEST_COUNT.clear()
+
 
 class TestCompressPromptStructure(unittest.TestCase):
     """R1.2: smoke test — the LLM compression prompt enforces the new errors_solutions structure."""

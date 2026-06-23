@@ -802,6 +802,94 @@ class TestFormatConverterRouting(unittest.TestCase):
         self.assertEqual(ctx.openai_body["model"], "deepseek-v4-flash")
 
 
+class TestSessionTierHelpers(unittest.TestCase):
+    """Phase 4 (建议4): dynamic loop threshold by session tier."""
+
+    def setUp(self):
+        _ps._SESSION_REQUEST_COUNT.clear()
+
+    def tearDown(self):
+        _ps._SESSION_REQUEST_COUNT.clear()
+
+    # --- _effective_session_tier ---
+
+    def test_session_tier_short_below_bound(self):
+        _ps._SESSION_REQUEST_COUNT["sess"] = 5
+        self.assertEqual(_ps._SESSION_REQUEST_COUNT["sess"], 5)
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("sess"), "short")
+
+    def test_session_tier_short_at_bound(self):
+        _ps._SESSION_REQUEST_COUNT["sess"] = _ps.PROXY_LOOP_SESSION_SHORT_BOUND
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("sess"), "short")
+
+    def test_session_tier_long_above_short_bound(self):
+        _ps._SESSION_REQUEST_COUNT["sess"] = _ps.PROXY_LOOP_SESSION_SHORT_BOUND + 1
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("sess"), "long")
+
+    def test_session_tier_long_at_long_bound(self):
+        _ps._SESSION_REQUEST_COUNT["sess"] = _ps.PROXY_LOOP_SESSION_LONG_BOUND
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("sess"), "long")
+
+    def test_session_tier_very_long_above_long_bound(self):
+        _ps._SESSION_REQUEST_COUNT["sess"] = _ps.PROXY_LOOP_SESSION_LONG_BOUND + 1
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("sess"), "very_long")
+
+    def test_session_tier_unknown_session_short(self):
+        """session_id not in _SESSION_REQUEST_COUNT → fallback to short."""
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier("nonexistent"), "short")
+
+    def test_session_tier_empty_id_short(self):
+        from loop_detection import _effective_session_tier
+        self.assertEqual(_effective_session_tier(""), "short")
+
+    # --- _effective_loop_threshold ---
+
+    def test_loop_threshold_short_uses_default(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = 1
+        from loop_detection import _effective_loop_threshold
+        self.assertEqual(_effective_loop_threshold("s"), _ps.PROXY_LOOP_THRESHOLD)
+
+    def test_loop_threshold_long_uses_long(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = _ps.PROXY_LOOP_SESSION_SHORT_BOUND + 1
+        from loop_detection import _effective_loop_threshold
+        self.assertEqual(_effective_loop_threshold("s"), _ps.PROXY_LOOP_THRESHOLD_LONG)
+
+    def test_loop_threshold_very_long_uses_very_long(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = _ps.PROXY_LOOP_SESSION_LONG_BOUND + 1
+        from loop_detection import _effective_loop_threshold
+        self.assertEqual(_effective_loop_threshold("s"), _ps.PROXY_LOOP_THRESHOLD_VERY_LONG)
+
+    # --- _effective_text_loop_threshold ---
+
+    def test_text_loop_threshold_short_uses_default(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = 1
+        from loop_detection import _effective_text_loop_threshold
+        self.assertEqual(_effective_text_loop_threshold("s"), _ps.PROXY_TEXT_LOOP_THRESHOLD)
+
+    def test_text_loop_threshold_long(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = _ps.PROXY_LOOP_SESSION_SHORT_BOUND + 1
+        from loop_detection import _effective_text_loop_threshold
+        self.assertEqual(_effective_text_loop_threshold("s"), _ps.PROXY_TEXT_LOOP_THRESHOLD_LONG)
+
+    # --- _effective_blocker_threshold ---
+
+    def test_blocker_threshold_short_uses_default(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = 1
+        from loop_detection import _effective_blocker_threshold
+        self.assertEqual(_effective_blocker_threshold("s"), _ps.PROXY_BLOCKER_THRESHOLD)
+
+    def test_blocker_threshold_long(self):
+        _ps._SESSION_REQUEST_COUNT["s"] = _ps.PROXY_LOOP_SESSION_SHORT_BOUND + 1
+        from loop_detection import _effective_blocker_threshold
+        self.assertEqual(_effective_blocker_threshold("s"), _ps.PROXY_BLOCKER_THRESHOLD_LONG)
+
+
 class TestCharBucket(unittest.TestCase):
     """Context size character bucket (used in metrics).
 

@@ -660,17 +660,49 @@ class Handler(BaseHTTPRequestHandler):
                             mc["snapshot_written"] = _snapshot_written
             elif self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
                 # OpenAI-compatible chat completions endpoint for Open WebUI
-                # Forward directly to backend
-                log(f"  -> Forwarding to {LLAMA_BASE}/chat/completions (passthrough)")
+                # Rewrite model ID and honor MODEL_ROUTE_PREFERENCES for cloud routing.
                 try:
+                    req_json = json.loads(body) if body else {}
+                except Exception as e:
+                    log(f"  -> Error parsing JSON: {e}")
+                    self._respond_json({"error": {"type": "invalid_request", "message": str(e)[:500]}}, 400)
+                    return
+
+                requested_model = req_json.get("model", MODEL_NAME)
+                route_pref = MODEL_ROUTE_PREFERENCES.get(requested_model, {})
+                behavior = route_pref.get("behavior", "prefer")
+                use_cloud = False
+                if behavior in ("force", "force_fallback"):
+                    use_cloud = bool(PROXY_CLOUD_API_KEY)
+                elif behavior == "prefer_cloud":
+                    # For OpenWebUI passthrough, honor user model selection by routing to cloud.
+                    use_cloud = bool(PROXY_CLOUD_API_KEY)
+
+                if use_cloud:
+                    target_url = f"{PROXY_CLOUD_BASE_URL}/chat/completions"
+                    cloud_model = route_pref.get("cloud_model") or PROXY_CLOUD_MODEL
+                    req_json["model"] = cloud_model
+                    auth_key = PROXY_CLOUD_API_KEY
+                    log(f"  -> Routing model {requested_model} to cloud {cloud_model} via {target_url}")
+                else:
+                    target_url = f"{LLAMA_BASE}/chat/completions"
+                    req_json["model"] = MODEL_NAME
+                    auth_key = LLAMA_API_KEY
+                    log(f"  -> Forwarding to {target_url} (passthrough, model={MODEL_NAME})")
+
+                try:
+                    payload = json.dumps(req_json).encode("utf-8")
                     req = urllib.request.Request(
-                        f"{LLAMA_BASE}/chat/completions",
-                        data=body.encode("utf-8"),
-                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLAMA_API_KEY}"},
+                        target_url,
+                        data=payload,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_key}"},
                         method="POST"
                     )
-                    with _llama_lock:
+                    if use_cloud:
                         resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
+                    else:
+                        with _llama_lock:
+                            resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
                     resp_body = resp.read().decode("utf-8")
                     self.send_response(resp.status)
                     resp_body_bytes = resp_body.encode("utf-8")

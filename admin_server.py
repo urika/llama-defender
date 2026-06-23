@@ -1515,6 +1515,28 @@ def _build_status_html():
             f'</div>'
         )
 
+    # Session tier distribution
+    tiers_html = ""
+    tier_counts = {"short": 0, "long": 0, "very_long": 0}
+    for cnt in _ps._SESSION_REQUEST_COUNT.values():
+        if cnt <= _ps.PROXY_LOOP_SESSION_SHORT_BOUND:
+            tier_counts["short"] += 1
+        elif cnt <= _ps.PROXY_LOOP_SESSION_LONG_BOUND:
+            tier_counts["long"] += 1
+        else:
+            tier_counts["very_long"] += 1
+    if any(tier_counts.values()):
+        tier_badges = "".join(
+            f'<span style="margin:0 2px;padding:1px 6px;border-radius:3px;font-size:0.85em;'
+            f'background:{c};color:#fff">{k}: {v}</span>'
+            for k, v, c in [
+                ("short", tier_counts["short"], "#27ae60"),
+                ("long", tier_counts["long"], "#f39c12"),
+                ("very_long", tier_counts["very_long"], "#e74c3c"),
+            ] if v > 0
+        )
+        tiers_html = f'<div class="row"><span class="label">Session Tiers</span><span class="value">{tier_badges}</span></div>'
+
     # Cooldown sessions summary
     cooldown_html = ""
     cooldown_sessions = route.get("cooldown_sessions", [])
@@ -1555,6 +1577,7 @@ def _build_status_html():
     {last_reason_html}
     {fallbacks_html}
     {cooldown_html}
+    {tiers_html}
     <div class="row" style="margin-top:6px"><span class="label">Latency (Local)</span><span class="value">{_format_latency(route.get("local_latency", {}))}</span></div>
     <div class="row"><span class="label">Latency (Cloud)</span><span class="value">{_format_latency(route.get("cloud_latency", {}))}</span></div>
     <div class="row" style="margin-top:6px"><span class="label">Active Sessions</span><span class="value">{route.get("session_cloud", "?")} cloud / {route.get("session_local", "?")} local / {route.get("session_total", 0)} total</span></div>

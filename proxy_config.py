@@ -333,6 +333,48 @@ CONFIG_REGISTRY = {
         "doc": "Consecutive identical calls before Level 3 (force plain-text). Defaults to PROXY_LOOP_THRESHOLD * 3.",
     },
 
+    # ---- Dynamic loop thresholds (Phase 4 / 建议4) ----
+    "PROXY_LOOP_SESSION_SHORT_BOUND": {
+        "defaults": {"all": "10"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Session request count ≤ this value → short tier (strict thresholds).",
+    },
+    "PROXY_LOOP_SESSION_LONG_BOUND": {
+        "defaults": {"all": "25"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Session request count ≤ this value → long tier; > this → very_long tier.",
+    },
+    "PROXY_LOOP_THRESHOLD_LONG": {
+        "defaults": {"all": "4"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Loop threshold for long-tier sessions (11-25 requests).",
+    },
+    "PROXY_LOOP_THRESHOLD_VERY_LONG": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Loop threshold for very_long-tier sessions (26+ requests).",
+    },
+    "PROXY_TEXT_LOOP_THRESHOLD_LONG": {
+        "defaults": {"all": "4"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Text loop threshold for long-tier sessions.",
+    },
+    "PROXY_TEXT_LOOP_THRESHOLD_VERY_LONG": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Text loop threshold for very_long-tier sessions.",
+    },
+    "PROXY_BLOCKER_THRESHOLD_LONG": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Blocker threshold for long-tier sessions.",
+    },
+    "PROXY_BLOCKER_THRESHOLD_VERY_LONG": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Blocker threshold for very_long-tier sessions.",
+    },
+
     # ---- Text loop detection ----
     "PROXY_TEXT_LOOP_ENABLED": {
         "defaults": {"all": "true"},

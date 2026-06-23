@@ -815,7 +815,7 @@ class BlockerDetector(ConditionalStage):
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         loop_detection = _import_loop_detection()
-        blocker_info = loop_detection._detect_blocker_pattern(ctx.messages)
+        blocker_info = loop_detection._detect_blocker_pattern(ctx.messages, session_id=ctx.session_id)
         ctx.blocker_info = blocker_info
 
         if blocker_info.get("triggered"):
@@ -1086,10 +1086,11 @@ class TextLoopDetector(ConditionalStage):
     def process(self, ctx: PipelineContext) -> PipelineContext:
         loop_detection = _import_loop_detection()
         tail_assistant = [m for m in ctx.messages if m.get("role") == "assistant"][-15:]
-        text_loop_run, is_text_loop = loop_detection._detect_text_loop(tail_assistant)
+        text_loop_run, is_text_loop = loop_detection._detect_text_loop(tail_assistant, session_id=ctx.session_id)
+        eff_threshold = loop_detection._effective_text_loop_threshold(ctx.session_id)
 
         if text_loop_run > 1:
-            log(f"  -> Text loop scan: text_run={text_loop_run} (threshold={_ps.PROXY_TEXT_LOOP_THRESHOLD}, "
+            log(f"  -> Text loop scan: text_run={text_loop_run} (threshold={eff_threshold}, "
                 f"similarity>={_ps.PROXY_TEXT_LOOP_SIMILARITY})")
 
         # Merge with tool loop: take the higher count
@@ -1176,6 +1177,7 @@ class LoopIntervention(PipelineStage):
             pattern_tool_name=ctx.pattern_tool_name,
             is_text_loop=ctx.is_text_loop,
             text_loop_run=ctx.text_loop_run,
+            session_id=ctx.session_id,
         )
 
         if loop_level >= 1:
