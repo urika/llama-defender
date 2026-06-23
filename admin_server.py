@@ -886,8 +886,8 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
             "route_type": "",
         })
 
-    # Sort by score descending, then by count descending
-    sessions.sort(key=lambda s: (-s["score"], -s["count"]))
+    # Sort by most recent timestamp first
+    sessions.sort(key=lambda s: s["last_ts"], reverse=True)
     # If no meaningful sessions found, include most recent (up to n)
     if not sessions:
         for sid in sorted(counts, key=lambda s: last_ts.get(s, ""), reverse=True):
