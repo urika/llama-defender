@@ -102,5 +102,132 @@ class TestToolChoiceConversion(unittest.TestCase):
         self.assertIsNone(mc.convert_anthropic_tool_choice_to_openai(None))
 
 
+class TestConvertOpenAIToolsToAnthropic(unittest.TestCase):
+    def test_function_tool_mapping(self):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }]
+        out = mc.convert_openai_tools_to_anthropic(tools)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["type"], "custom")
+        self.assertEqual(out[0]["name"], "Read")
+        self.assertEqual(out[0]["input_schema"]["type"], "object")
+
+    def test_empty_tools(self):
+        self.assertIsNone(mc.convert_openai_tools_to_anthropic([]))
+        self.assertIsNone(mc.convert_openai_tools_to_anthropic(None))
+
+
+class TestConvertOpenAIToolChoiceToAnthropic(unittest.TestCase):
+    def test_auto_string(self):
+        self.assertEqual(mc.convert_openai_tool_choice_to_anthropic("auto"), "auto")
+
+    def test_none_string(self):
+        self.assertEqual(mc.convert_openai_tool_choice_to_anthropic("none"), "none")
+
+    def test_required_string(self):
+        self.assertEqual(mc.convert_openai_tool_choice_to_anthropic("required"), "any")
+
+    def test_function_dict(self):
+        self.assertEqual(
+            mc.convert_openai_tool_choice_to_anthropic({"type": "function", "function": {"name": "Read"}}),
+            {"type": "tool", "name": "Read"},
+        )
+
+
+class TestConvertOpenAIRequestToAnthropic(unittest.TestCase):
+    def test_basic_messages(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        self.assertEqual(out["model"], "claude-sonnet-4-6")
+        self.assertEqual(out["max_tokens"], 1024)
+        self.assertEqual(out["messages"][0]["role"], "user")
+        self.assertEqual(out["messages"][0]["content"], [{"type": "text", "text": "hello"}])
+        self.assertEqual(out["messages"][1]["content"], [{"type": "text", "text": "hi there"}])
+
+    def test_system_messages_collected(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "system", "content": "You are a coder."},
+                {"role": "system", "content": [{"type": "text", "text": "Be concise."}]},
+                {"role": "user", "content": "ok"},
+            ],
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        self.assertEqual(out["system"], "You are a coder.\nBe concise.")
+        self.assertEqual(len(out["messages"]), 1)
+
+    def test_tool_calls_and_results(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": '{"path": "/tmp/a"}'},
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "file content"},
+            ],
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        assistant = out["messages"][0]
+        self.assertEqual(assistant["content"][0]["type"], "tool_use")
+        self.assertEqual(assistant["content"][0]["input"], {"path": "/tmp/a"})
+        user = out["messages"][1]
+        self.assertEqual(user["content"][0]["type"], "tool_result")
+        self.assertEqual(user["content"][0]["tool_use_id"], "call_1")
+
+    def test_tools_and_tool_choice(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "Read", "description": "read", "parameters": {"type": "object"}},
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "Read"}},
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        self.assertEqual(out["tools"][0]["type"], "custom")
+        self.assertEqual(out["tool_choice"], {"type": "tool", "name": "Read"})
+
+    def test_stop_and_sampling_preserved(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "stream": True,
+            "stop": ["end", "stop"],
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        self.assertEqual(out["temperature"], 0.5)
+        self.assertEqual(out["top_p"], 0.9)
+        self.assertTrue(out["stream"])
+        self.assertEqual(out["stop_sequences"], ["end", "stop"])
+
+    def test_preserves_route_override(self):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "_x_proxy_route_to": "cloud",
+        }
+        out = mc.convert_openai_request_to_anthropic(body)
+        self.assertEqual(out["_x_proxy_route_to"], "cloud")
+
+
 if __name__ == "__main__":
     unittest.main()

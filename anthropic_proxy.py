@@ -505,7 +505,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_admin_route_force(parsed, "cloud")
                 return
 
-            if self.path == "/v1/messages" or self.path.startswith("/v1/messages?"):
+            if self.path == "/v1/messages" or self.path.startswith("/v1/messages?") or \
+               self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
+                is_openai_chat = self.path.startswith("/v1/chat/completions")
+                if is_openai_chat:
+                    openai_model = parsed.get("model", MODEL_NAME)
+                    parsed = convert_openai_request_to_anthropic(parsed)
+                    self._openai_mode = True
+                    self._openai_model = openai_model
+                    log(f"  -> OpenAI chat request converted to Anthropic pipeline (model={openai_model})")
                 # Phase 3: memory pressure active rejection
                 mem_rejected, used_pct = _should_reject_for_memory()
                 if mem_rejected:
@@ -649,6 +657,9 @@ class Handler(BaseHTTPRequestHandler):
                             log(f"  -> CRITICAL: failed to send error response: {respond_err}")
                     # No raise — let the connection close cleanly
                 finally:
+                    # Reset OpenAI chat mode flags for this connection
+                    self._openai_mode = False
+                    self._openai_model = None
                     # Phase 3: dynamic concurrency adjustment after every request
                     try:
                         _adjust_concurrency()
@@ -658,71 +669,6 @@ class Handler(BaseHTTPRequestHandler):
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
                             mc["snapshot_written"] = _snapshot_written
-            elif self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
-                # OpenAI-compatible chat completions endpoint for Open WebUI
-                # Rewrite model ID and honor MODEL_ROUTE_PREFERENCES for cloud routing.
-                try:
-                    req_json = json.loads(body) if body else {}
-                except Exception as e:
-                    log(f"  -> Error parsing JSON: {e}")
-                    self._respond_json({"error": {"type": "invalid_request", "message": str(e)[:500]}}, 400)
-                    return
-
-                requested_model = req_json.get("model", MODEL_NAME)
-                route_pref = MODEL_ROUTE_PREFERENCES.get(requested_model, {})
-                behavior = route_pref.get("behavior", "prefer")
-                use_cloud = False
-                if behavior in ("force", "force_fallback"):
-                    use_cloud = bool(PROXY_CLOUD_API_KEY)
-                elif behavior == "prefer_cloud":
-                    # For OpenWebUI passthrough, honor user model selection by routing to cloud.
-                    use_cloud = bool(PROXY_CLOUD_API_KEY)
-
-                if use_cloud:
-                    target_url = f"{PROXY_CLOUD_BASE_URL}/chat/completions"
-                    cloud_model = route_pref.get("cloud_model") or PROXY_CLOUD_MODEL
-                    req_json["model"] = cloud_model
-                    auth_key = PROXY_CLOUD_API_KEY
-                    log(f"  -> Routing model {requested_model} to cloud {cloud_model} via {target_url}")
-                else:
-                    target_url = f"{LLAMA_BASE}/chat/completions"
-                    req_json["model"] = MODEL_NAME
-                    auth_key = LLAMA_API_KEY
-                    log(f"  -> Forwarding to {target_url} (passthrough, model={MODEL_NAME})")
-
-                try:
-                    payload = json.dumps(req_json).encode("utf-8")
-                    req = urllib.request.Request(
-                        target_url,
-                        data=payload,
-                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_key}"},
-                        method="POST"
-                    )
-                    if use_cloud:
-                        resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
-                    else:
-                        with _llama_lock:
-                            resp = urllib.request.urlopen(req, timeout=PROXY_BACKEND_TIMEOUT)
-                    resp_body = resp.read().decode("utf-8")
-                    self.send_response(resp.status)
-                    resp_body_bytes = resp_body.encode("utf-8")
-                    for header, value in resp.getheaders():
-                        hl = header.lower()
-                        if hl not in ("transfer-encoding", "connection", "keep-alive", "content-length"):
-                            self.send_header(header, value)
-                    self.send_header("Content-Length", str(len(resp_body_bytes)))
-                    self.end_headers()
-                    self.wfile.write(resp_body_bytes)
-                    log(f"  <- Response: {resp.status}")
-                except Exception as e:
-                    log(f"  -> Error: {e}")
-                    status_code, error_type, retryable = _classify_exception(e)
-                    hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
-                    self._respond_json(
-                        {"error": {"type": error_type, "message": str(e)[:500], "retryable": retryable}},
-                        status_code,
-                        extra_headers=hdrs,
-                    )
             else:
                 log(f"  -> 404 (unknown path)")
                 self._respond_json({"detail": "Not found"}, 404)
@@ -770,6 +716,49 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_non_streaming_response(self, resp, anthropic_body):
         openai_resp = json.loads(resp.read().decode("utf-8"))
+
+        if getattr(self, '_openai_mode', False):
+            # Pipeline processed an OpenAI-format request; return the backend's
+            # OpenAI-format response directly (after optional output truncation).
+            max_tokens = anthropic_body.get("max_tokens", 4096)
+            output_token_hard_limit = int(max_tokens * PROXY_OUTPUT_TOKEN_LIMIT_RATIO)
+            output_chars_limit = int(output_token_hard_limit / 0.4)
+            output_chars = 0
+            force_stopped = False
+
+            choice = openai_resp.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            content = message.get("content") or ""
+            if content:
+                output_chars += len(content)
+                if output_chars > output_chars_limit:
+                    message["content"] = (
+                        content[:output_chars_limit - (output_chars - len(content))]
+                        + "\n\n[Output truncated by proxy: exceeded token limit]"
+                    )
+                    force_stopped = True
+                    output_chars = output_chars_limit
+
+            for tc in message.get("tool_calls") or []:
+                raw_args = tc.get("function", {}).get("arguments", "{}")
+                output_chars += len(raw_args)
+                if output_chars > output_chars_limit and not force_stopped:
+                    tc["function"]["arguments"] = raw_args[:output_chars_limit - (output_chars - len(raw_args))]
+                    force_stopped = True
+                    output_chars = output_chars_limit
+
+            if force_stopped:
+                choice["finish_reason"] = "length"
+                log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})")
+
+            content_summary = message.get("content", "")[:100]
+            for tc in message.get("tool_calls") or []:
+                content_summary += f"[tool_call: {tc.get('function', {}).get('name', '')}] "
+            _jsonl_output_map[self._last_jsonl_token] = output_chars
+            log(f"  <- Responding OpenAI mode: {content_summary[:200]} (output_chars={output_chars})")
+            self._respond_json(openai_resp)
+            return
+
         anthropic_resp = convert_openai_response_to_anthropic(
             openai_resp,
             anthropic_body.get("model", "claude-3-5-sonnet-20241022")
@@ -826,6 +815,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # TODO(roadmap-U7): Stream reasoning progress — emit partial thinking events during long TTFT
     def _handle_streaming_response(self, resp, anthropic_body):
+        if getattr(self, '_openai_mode', False):
+            self._handle_openai_streaming_response(resp)
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1085,6 +1078,41 @@ class Handler(BaseHTTPRequestHandler):
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
+    def _handle_openai_streaming_response(self, resp):
+        """Passthrough an OpenAI-format streaming response for /v1/chat/completions."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_request_id", None):
+            self._request_id = f"req_{os.urandom(8).hex()}"
+        self.send_header("request-id", self._request_id)
+        route_headers = getattr(self, '_route_response_headers', None) or {}
+        for hk, hv in route_headers.items():
+            self.send_header(hk, str(hv))
+        self._route_response_headers = None
+        self.end_headers()
+
+        total_text = ""
+        try:
+            for line in resp:
+                self.wfile.write(line)
+                try:
+                    decoded = line.decode("utf-8").strip()
+                    if decoded.startswith("data: "):
+                        data_str = decoded[6:].strip()
+                        if data_str and data_str != "[DONE]":
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            total_text += delta.get("content", "") or ""
+                except Exception:
+                    pass
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected
+        _jsonl_output_map[self._last_jsonl_token] = len(total_text)
+        log(f"  <- Streamed OpenAI mode text={len(total_text)} chars")
+
     def _handle_admin_route_force(self, parsed, target):
         """Handle POST /admin/route/force-local|force-cloud — force route target for a session."""
         session_id = parsed.get("session_id", "")
@@ -1101,6 +1129,18 @@ class Handler(BaseHTTPRequestHandler):
         self._respond_json({"ok": True, "session_id": session_id, "route_target": target})
 
     def _respond_json(self, data, status=200, extra_headers=None):
+        # When serving an OpenAI-format client, shape error responses in the
+        # OpenAI style {error: {message, type, param, code}}.
+        if getattr(self, '_openai_mode', False) and status != 200 and isinstance(data, dict) and 'error' in data:
+            err = data['error']
+            data = {
+                "error": {
+                    "message": err.get("message", ""),
+                    "type": err.get("type", "invalid_request_error"),
+                    "param": err.get("param"),
+                    "code": err.get("code", status),
+                }
+            }
         raw = json.dumps(data, ensure_ascii=False)
         raw_bytes = raw.encode("utf-8")
         self.send_response(status)

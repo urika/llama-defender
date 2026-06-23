@@ -711,7 +711,7 @@ def _build_recent_fallbacks_table(fallbacks: list) -> str:
     rows = ""
     for fb in fallbacks:
         ts = fb.get("timestamp", "")
-        ts_short = ts[11:19] if len(ts) >= 19 else ts
+        ts_short = _fmt_ts(ts)
         rows += (
             f'<tr><td>{ts_short}</td>'
             f'<td>{fb.get("reason", "—")}</td>'
@@ -1037,6 +1037,13 @@ def _fmt_ms(ms):
     return f"{ms:.0f}ms"
 
 
+def _fmt_ts(ts: str) -> str:
+    """Format ISO timestamp as MM-DD HH:MM:SS for compact display."""
+    if len(ts) < 19:
+        return ts or "—"
+    return ts[5:10] + " " + ts[11:19]
+
+
 def _svg_line_chart(values, width=800, height=120, color="#3498db", fill=True):
     """Render a simple SVG line chart with points.
 
@@ -1121,7 +1128,7 @@ def _build_session_html(session_id: str) -> str:
     if switches:
         switch_items = ""
         for sw in switches:
-            ts_short = sw["ts"][11:19] if len(sw["ts"]) >= 19 else sw["ts"]
+            ts_short = _fmt_ts(sw["ts"])
             switch_items += (
                 f'<div style="font-size:0.85em;padding:4px 0;border-bottom:1px solid #2a2a4a">'
                 f'<b>{ts_short}</b> #{sw["index"]}: {_target_badge(sw["from"])} → {_target_badge(sw["to"])}'
@@ -1136,7 +1143,7 @@ def _build_session_html(session_id: str) -> str:
     # Timeline rows
     rows_html = ""
     for r in timeline:
-        ts_short = r["ts"][11:19] if len(r["ts"]) >= 19 else r["ts"]
+        ts_short = _fmt_ts(r["ts"])
         dur_bar_width = min(100, max(1, r["duration_ms"] / max(data["p99_duration_ms"], 1) * 100))
         dur_bar = (
             f'<div style="width:80px;background:#2a2a4a;height:6px;border-radius:3px;overflow:hidden">'
@@ -1419,7 +1426,7 @@ def _build_status_html():
             f'<div class="row"><span><a href="/session?sid={s["session_id"]}">'
             f'{s["session_id"][:16]}{"…" if len(s["session_id"]) > 16 else ""}</a>'
             f'<span style="color:#888;font-size:0.85em"> {s["count"]} req</span></span>'
-            f'<span style="color:#888">{s["last_ts"][5:19] if s["last_ts"] else "—"}</span></div>'
+            f'<span style="color:#888">{_fmt_ts(s["last_ts"])}</span></div>'
             for s in recent_sessions
         )
         recent_sessions_card = f'<div class="card" style="grid-column: 1 / -1;"><h2>📁 Recent Sessions</h2>{rs_rows}</div>'
@@ -1544,8 +1551,8 @@ def _build_status_html():
         last_target = route.get("last_route_target", "local")
         rc = "#27ae60" if last_target != "cloud" else "#3498db"
         last_ts = route.get("last_route_timestamp", "")
-        ts_display = last_ts[11:19] if len(last_ts) >= 19 else ""
-        ts_span = f'<span style="color:#888">  {ts_display}</span>' if ts_display else ""
+        ts_display = _fmt_ts(last_ts)
+        ts_span = f'<span style="color:#888">  {ts_display}</span>' if last_ts else ""
         last_reason_html = (
             f'<div style="margin-top:6px;padding:6px 8px;border-left:3px solid {rc};'
             f'background:rgba(0,0,0,0.2);font-size:0.85em">'
