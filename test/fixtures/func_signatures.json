@@ -550,6 +550,13 @@
       "session_id": ""
     }
   },
+  "_detect_client_type": {
+    "name": "_detect_client_type",
+    "params": [
+      "user_agent"
+    ],
+    "defaults": {}
+  },
   "_detect_content_type": {
     "name": "_detect_content_type",
     "params": [
@@ -675,6 +682,13 @@
     "name": "_extract_xml_tool_name",
     "params": [
       "raw"
+    ],
+    "defaults": {}
+  },
+  "_fallback_client_type_from_log": {
+    "name": "_fallback_client_type_from_log",
+    "params": [
+      "session_id"
     ],
     "defaults": {}
   },

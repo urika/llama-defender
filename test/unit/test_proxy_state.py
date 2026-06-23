@@ -443,5 +443,26 @@ class TestSensitivePatternCache(unittest.TestCase):
                 self.assertIsNot(first, second)
 
 
+class TestDetectClientType(unittest.TestCase):
+    """User-Agent normalization for /session client type display."""
+
+    def test_opencode(self):
+        ua = "opencode/1.17.9 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+        self.assertEqual(proxy_state._detect_client_type(ua), "opencode")
+
+    def test_claude_code(self):
+        self.assertEqual(proxy_state._detect_client_type("claude-code/0.1.2"), "claude-code")
+        self.assertEqual(proxy_state._detect_client_type("Claude/1.0"), "claude-code")
+
+    def test_curl_httpie_browser(self):
+        self.assertEqual(proxy_state._detect_client_type("curl/8.0"), "curl")
+        self.assertEqual(proxy_state._detect_client_type("HTTPie/3.0"), "httpie")
+        self.assertEqual(proxy_state._detect_client_type("Mozilla/5.0 (Macintosh)"), "browser")
+
+    def test_empty_and_unknown(self):
+        self.assertEqual(proxy_state._detect_client_type(""), "unknown")
+        self.assertEqual(proxy_state._detect_client_type("SomeCustomAgent/1.0"), "SomeCustomAgent")
+
+
 if __name__ == "__main__":
     unittest.main()

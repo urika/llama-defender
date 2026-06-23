@@ -1524,6 +1524,7 @@ def _build_status_html():
             f'<span><a href="/session?sid={s["session_id"]}" title="{s["session_id"]}">'
             f'{s["session_id"][:16]}{"…" if len(s["session_id"]) > 16 else ""}</a>'
             f'<span style="color:#888;font-size:0.85em;margin-left:4px">{s["count"]} req'
+            + (f' · <span style="font-size:0.8em">{s["client_type"]}</span>' if s.get("client_type") and s["client_type"] != "unknown" else '')
             + (f' · <span style="font-size:0.8em">{s["model"][:20]}</span>' if s.get("model") else '')
             + (f' · +{s["models_count"]-1} more' if s.get("models_count",0) > 1 else '')
             + f'</span></span>'
@@ -2064,6 +2065,7 @@ __all__ = [
     "_build_status_html",
     "_load_session_metrics",
     "_load_recent_session_ids",
+    "_fallback_client_type_from_log",
     "_analyze_session",
     "_build_session_html",
     "_finalize_metrics",
