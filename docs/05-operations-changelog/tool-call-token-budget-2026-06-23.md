@@ -61,8 +61,18 @@ PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO="${PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_R
 | `PROXY_DYNAMIC_MAX_TOKENS_INIT` | init 阶段输出上限 | 4096 | 32768 | 匹配 OpenCode 请求的 32K |
 | `PROXY_DYNAMIC_MAX_TOKENS_GROWTH` | growth 阶段输出上限 | 4096 | 32768 | 同上 |
 | `PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO` | rapid-mlx 折扣 | 0.8 | 1.0 | 不再额外打折 |
+| `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` | saturation/oom/pre_trunc 阶段上限 | 2048 | 2048 | 保持不变，用于上下文极大时的安全兜底 |
+| `PROXY_MAX_TOKENS_OVERRIDE` | 全局硬上限 | 16384 | 32768 | 覆盖客户端请求，避免后端收到过大值 |
 
-由于 `DynamicMaxTokens` 最终取 `min(max_tokens_orig, cap)`，当 OpenCode 请求 `max_tokens=32000` 时，实际生效为 **32000 tokens**。
+`DynamicMaxTokens` 的计算顺序为：
+
+```text
+adjusted = min(max_tokens_orig, stage_cap)
+if rapid-mlx: adjusted *= RAPID_MLX_RATIO
+if available_memory < 20%: adjusted *= 0.7
+```
+
+当 OpenCode 请求 `max_tokens=32000` 且内存充裕时，实际生效为 **32000 tokens**；内存紧张（可用 <20%）时会降至约 **22400 tokens**，仍有足够空间容纳常规 `write`/`edit` 参数。
 
 ## 16K 是否足够？
 
@@ -76,9 +86,16 @@ PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO="${PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_R
 
 ## 验证
 
-调整后重启代理，日志显示：
+代理重启后日志显示 `max_tokens override: 32768`，且 `max_tokens dynamic` 不再被压到 16K 以下：
 
 ```text
+# 调整前（旧进程）
+max_tokens dynamic: 32000 -> 16384 (stage=init)
+
+# 调整后（内存紧张）
+max_tokens dynamic: 32000 -> 22400 (stage=init,low_memory)
+
+# 调整后（内存充裕）
 max_tokens dynamic: 32000 -> 32768 (stage=init)
 ```
 
