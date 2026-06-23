@@ -861,9 +861,9 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     for sid in counts:
         ts = last_ts.get(sid, "")
         cnt = counts[sid]
-        # Filter out auto-generated req_* noise sessions (per-request, not session)
-        if sid.startswith("req_"):
-            continue
+        # Include all sessions regardless of req_* prefix.
+        # req_* = auto-generated ID when Client doesn't send X-Claude-Code-Session-Id;
+        # these are still valid sessions (e.g. opencode client requests).
         # Recency score: 1.0 for most recent, decays linearly to 0.0 for oldest
         if max_ts and ts:
             try:

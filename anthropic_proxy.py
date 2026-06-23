@@ -408,7 +408,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
-        _log_ctx.session_id = raw_sid or f"req_{os.urandom(4).hex()}"
+        if not raw_sid:
+            client_key = f"{self.client_address[0]}:{self.headers.get('User-Agent', '')}:{datetime.now().strftime('%Y-%m-%d')}"
+            raw_sid = "cli_" + hashlib.md5(client_key.encode()).hexdigest()[:8]
+        _log_ctx.session_id = raw_sid[:8]
         try:
             if self.path != "/status":
                 log(f"GET {self.path}")
@@ -474,7 +477,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
-        _log_ctx.session_id = raw_sid or f"req_{os.urandom(4).hex()}"
+        if not raw_sid:
+            client_key = f"{self.client_address[0]}:{self.headers.get('User-Agent', '')}:{datetime.now().strftime('%Y-%m-%d')}"
+            raw_sid = "cli_" + hashlib.md5(client_key.encode()).hexdigest()[:8]
+        _log_ctx.session_id = raw_sid[:8]
         if PROXY_METRICS_ENABLED:
             _metrics_ctx.mc = {
                 "ts": datetime.now().isoformat(),
