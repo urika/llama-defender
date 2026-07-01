@@ -23,6 +23,7 @@ __pycache__/
 # Editor
 .vscode/
 .idea/
+.opencode/
 *.swp
 *.swo
 
