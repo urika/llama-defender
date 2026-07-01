@@ -1038,6 +1038,63 @@ class TestBackendDispatcher(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
     @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    def test_non_retryable_cloud_error_does_not_cooldown(self):
+        """4xx cloud errors do not trigger cooldown."""
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        http_err = urllib.error.HTTPError("http://deepseek", 401, "Unauthorized", {}, io.BytesIO(b"bad key"))
+
+        def side_effect(req, timeout):
+            if "deepseek" in req.full_url:
+                raise http_err
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            ctx = self._make_ctx(target="cloud", session_id="s_401")
+            stage.process(ctx)
+        self.assertNotIn("s_401", _ps._cloud_cooldown_start)
+        self.assertNotIn("s_401", _ps._SESSION_ROUTE_MAP)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    def test_local_urLError_fallback_to_cloud(self):
+        """Local backend connection failure clears cloud cooldown and retries cloud."""
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        _ps._cloud_cooldown_start["s_local_down"] = 0.0
+        _ps._SESSION_ROUTE_MAP["s_local_down"] = "local_forced"
+        _ps._SESSION_ROUTE_FORCE_SOURCE["s_local_down"] = "cloud_failures"
+
+        def side_effect(req, timeout):
+            if _ps.LLAMA_BASE in req.full_url:
+                raise urllib.error.URLError("Connection refused")
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            ctx = self._make_ctx(target="local", session_id="s_local_down")
+            stage.process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertEqual(ctx._route_reason, "local_failure_fallback")
+        self.assertTrue(stage._route_fallback)
+        self.assertNotIn("s_local_down", _ps._cloud_cooldown_start)
+        self.assertNotIn("s_local_down", _ps._SESSION_ROUTE_MAP)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
+    def test_local_manually_forced_does_not_fallback(self):
+        """If user/admin forced local, backend failure does not fallback to cloud."""
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        _ps._SESSION_ROUTE_MAP["s_manual"] = "local_forced"
+        _ps._SESSION_ROUTE_FORCE_SOURCE["s_manual"] = "user_manual"
+        http_err = urllib.error.HTTPError("http://local", 503, "OOM", {}, io.BytesIO(b"oom"))
+        with patch("pipeline.urllib.request.urlopen", side_effect=http_err):
+            ctx = self._make_ctx(target="local", session_id="s_manual")
+            ctx._route_reason = "session_force_local"
+            stage.process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self._mock_handler._respond_json.assert_called_once()
+        self.assertFalse(stage._route_fallback)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    @patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True)
     def test_emergency_truncation_triggers_after_fallback(self):
         stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
         msgs = [{"role": "user", "content": f"msg{i}"} for i in range(40)]

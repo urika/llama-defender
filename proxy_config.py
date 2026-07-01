@@ -621,7 +621,7 @@ CONFIG_REGISTRY = {
         "doc": "Max consecutive cloud failures before entering cooldown.",
     },
     "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS": {
-        "defaults": {"all": "1800"},
+        "defaults": {"all": "300"},
         "type": "int", "scope": "reloadable",
         "doc": "Cooldown duration (seconds) after max cloud failures reached.",
     },

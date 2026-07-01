@@ -98,6 +98,48 @@ def _char_bucket(total_chars: int) -> str:
     return _CHAR_BUCKET_DEFAULT
 
 
+def _log_cloud_error(ctx, status, response_body, exc_info=None):
+    """Log full request/response bodies for cloud API errors to a dedicated JSONL file.
+
+    The log path rotates daily: logs/cloud_errors_YYYYMMDD.jsonl (under the
+    project root by default). Override via PROXY_CLOUD_ERROR_LOG_DIR env var.
+    The request body is deep-copied and sanitized (api_key masked) before writing.
+    """
+    try:
+        log_dir = os.environ.get("PROXY_CLOUD_ERROR_LOG_DIR")
+        if not log_dir:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+        log_path = os.path.join(log_dir, f"cloud_errors_{date_str}.jsonl")
+
+        request_body = {}
+        if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+            request_body = json.loads(json.dumps(ctx.openai_body, ensure_ascii=False))
+            # Sanitize any accidental api_key field.
+            if "api_key" in request_body:
+                request_body["api_key"] = "***"
+
+        record = {
+            "ts": datetime.now().isoformat(),
+            "session_id": getattr(ctx, '_session_id', '') or getattr(ctx, 'request_id', ''),
+            "request_id": getattr(ctx, 'request_id', ''),
+            "route_target": getattr(ctx, '_route_target', ''),
+            "route_reason": getattr(ctx, '_route_reason', ''),
+            "status": status,
+            "response_body": (response_body or "")[:2000],
+            "request_body": request_body,
+            "model": request_body.get("model", ""),
+        }
+        if exc_info:
+            record["exception"] = exc_info
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as le:
+        log(f"  -> Failed to write cloud error log: {le}")
+
+
 # ============================================================================
 # PipelineContext — request-level state container
 # ============================================================================
@@ -122,6 +164,7 @@ class PipelineContext:
     session_id: str = ""
     total_chars: int = 0
     tools_list: list = field(default_factory=list)
+    client_type: str = "unknown"
 
     # --- Mutable primary state ---
     messages: list = field(default_factory=list)
@@ -317,12 +360,12 @@ class RequestParser(PipelineStage):
 
         # REQ_SUMMARY logging
         tools_count = len(ctx.tools_list or [])
-        log(f"  [REQ_SUMMARY] chars={ctx.total_chars} tools={tools_count}")
+        log(f"  [REQ_SUMMARY] client={ctx.client_type} chars={ctx.total_chars} tools={tools_count}")
 
         # Structured REQ_SUMMARY
         from proxy_logging import log_structured
-        log_structured("REQ_SUMMARY", chars=ctx.total_chars, tools=tools_count,
-                       model=ctx.model, stream=ctx.is_stream)
+        log_structured("REQ_SUMMARY", client=ctx.client_type, chars=ctx.total_chars,
+                       tools=tools_count, model=ctx.model, stream=ctx.is_stream)
 
         # Initial metrics
         if _ps.PROXY_METRICS_ENABLED:
@@ -356,6 +399,7 @@ class RequestParser(PipelineStage):
             "tool_count": len(ctx.tools_list or []),
             "input_chars": ctx.total_chars,
             "is_stream": 1 if ctx.is_stream else 0,
+            "client_type": ctx.client_type,
         }
 
 
@@ -555,27 +599,56 @@ class SmartRouter(PipelineStage):
 
         session_id = ctx.session_id
 
-        # Priority 1: Cloud cooldown active — check expiration
+        # Priority 1: Cloud cooldown expiration cleanup.
+        # Cooldown is now a *preference* for local, not a hard lock: safety
+        # conditions (memory pressure, context size, lifecycle stage) can still
+        # override it and route to cloud.
+        cooldown_active = False
         if session_id:
             with _ps._state_lock:
                 cooldown_start = _ps._cloud_cooldown_start.get(session_id)
             if cooldown_start:
                 elapsed = time.monotonic() - cooldown_start
                 if elapsed < _ps.PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS:
-                    return "local", "cloud_cooldown_active"
-                # Cooldown expired — clean up all session state
+                    cooldown_active = True
+                else:
+                    with _ps._state_lock:
+                        _ps._cloud_fail_count.pop(session_id, None)
+                        _ps._cloud_cooldown_start.pop(session_id, None)
+                        _ps._SESSION_ROUTE_MAP.pop(session_id, None)
+                        _ps._SESSION_ROUTE_FORCE_SOURCE.pop(session_id, None)
+                        _ps._ROUTE_NOTIFIED_SESSIONS.discard(session_id)
+                        _ps._SESSION_BELOW_THRESHOLD.pop(session_id, None)
+
+        # Compute the natural target ignoring cooldown-induced local_forced
+        target, reason = self._natural_routing_decision(
+            ctx, session_id, effective_threshold, effective_memory_pct
+        )
+
+        # Cooldown acts as a local preference: safety overrides still route to cloud.
+        if target == "cloud":
+            if cooldown_active:
+                # Reset failure count so the cloud attempt gets a clean slate.
                 with _ps._state_lock:
                     _ps._cloud_fail_count.pop(session_id, None)
-                    _ps._cloud_cooldown_start.pop(session_id, None)
-                    _ps._SESSION_ROUTE_MAP.pop(session_id, None)
-                    _ps._SESSION_ROUTE_FORCE_SOURCE.pop(session_id, None)
-                    _ps._ROUTE_NOTIFIED_SESSIONS.discard(session_id)
-                    _ps._SESSION_BELOW_THRESHOLD.pop(session_id, None)
+                return target, f"{reason}_cooldown_override"
+            return target, reason
 
+        # target == "local"
+        if cooldown_active and not reason.startswith(("session_force_local", "daily_budget_exceeded")):
+            return "local", "cloud_cooldown_active"
+        return target, reason
+
+    def _natural_routing_decision(self, ctx, session_id, effective_threshold, effective_memory_pct):
+        """Determine route target based on session state, memory, threshold and lifecycle.
+
+        Does NOT consider cloud cooldown; cooldown is applied by the caller.
+        """
         # Priority 2/3: Session-level route state
         if session_id:
             with _ps._state_lock:
                 session_route = _ps._SESSION_ROUTE_MAP.get(session_id)
+                force_source = _ps._SESSION_ROUTE_FORCE_SOURCE.get(session_id)
             if session_route == "cloud":
                 SUGGESTION1_RETURN_ROUNDS = _ps.PROXY_ROUTE_STICKY_RETURN_ROUNDS
                 SUGGESTION1_RETURN_RATIO = _ps.PROXY_ROUTE_STICKY_RETURN_RATIO
@@ -606,14 +679,10 @@ class SmartRouter(PipelineStage):
                     with _ps._state_lock:
                         _ps._SESSION_ROUTE_MAP.pop(session_id, None)
                         _ps._SESSION_BELOW_THRESHOLD.pop(session_id, None)
-                    target_local = "local"
-                    return target_local, (
-                        f"sticky_expired({below_count}/{SUGGESTION1_RETURN_ROUNDS})"
-                    )
-                return "cloud", (
-                    f"session_already_cloud(below={below_count}/{SUGGESTION1_RETURN_ROUNDS})"
-                )
-            if session_route == "local_forced":
+                    return "local", f"sticky_expired({below_count}/{SUGGESTION1_RETURN_ROUNDS})"
+                return "cloud", f"session_already_cloud(below={below_count}/{SUGGESTION1_RETURN_ROUNDS})"
+            # Hard local only when the user/admin explicitly forced it.
+            if session_route == "local_forced" and force_source != "cloud_failures":
                 return "local", "session_force_local"
 
         # Priority 3.5: Daily budget exceeded (hard-stop)
@@ -1893,10 +1962,12 @@ class BackendDispatcher(PipelineStage):
                     self._do_dispatch(ctx, base_url, api_key)
             except urllib.error.HTTPError as e:
                 # Cloud failed — attempt fallback
-                err = e.read().decode("utf-8")[:500]
+                raw_err = e.read().decode("utf-8")
+                err = raw_err[:500]
                 self._backend_status = e.code
                 self._fallback_reason = str(e.code)
                 log(f"  <- Cloud API failed ({e.code}), checking fallback...")
+                _log_cloud_error(ctx, e.code, raw_err)
 
                 # Force mode: do NOT fallback (model_forced_cloud) unless force_fallback
                 route_reason = getattr(ctx, '_route_reason', '')
@@ -1939,8 +2010,28 @@ class BackendDispatcher(PipelineStage):
                     }, 403)
                     return ctx
 
+                # Attempt one in-place message repair + cloud retry for
+                # repairable 400 format errors before falling back to local.
+                if self._is_repairable_format_error(e.code, raw_err):
+                    log(f"  -> Detected repairable format error, attempting message repair + cloud retry")
+                    if self._repair_openai_messages(ctx):
+                        try:
+                            with self._cloud_lock:
+                                self._do_dispatch(ctx, base_url, api_key)
+                            log(f"  <- Cloud retry succeeded after message repair")
+                            return ctx
+                        except urllib.error.HTTPError as e2:
+                            raw_err2 = e2.read().decode("utf-8")
+                            err2 = raw_err2[:500]
+                            log(f"  <- Cloud retry failed ({e2.code}: {err2}), proceeding to fallback...")
+                            _log_cloud_error(ctx, e2.code, raw_err2, exc_info="retry_after_repair")
+                        except urllib.error.URLError as ue2:
+                            log(f"  <- Cloud retry failed ({ue2}), proceeding to fallback...")
+                    else:
+                        log(f"  -> No message repair possible, proceeding to fallback...")
+
                 # Record failure and manage cooldown
-                self._record_cloud_failure(ctx)
+                self._record_cloud_failure(ctx, e)
                 self._route_fallback = True
 
                 # Emergency truncation before retrying on local
@@ -1954,8 +2045,21 @@ class BackendDispatcher(PipelineStage):
                 # FormatConverter; re-point to local MODEL_NAME for the retry.
                 if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
                     ctx.openai_body["model"] = _ps.MODEL_NAME
-                with self._llama_lock:
-                    self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
+                try:
+                    with self._llama_lock:
+                        self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
+                except urllib.error.URLError as ue:
+                    # Local backend is also down — surface the original cloud error
+                    # rather than a misleading connection-refused message.
+                    err_body = raw_err[:500]
+                    log(f"  <- Local fallback unavailable ({ue}); returning original cloud error {e.code}")
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "cloud_unavailable",
+                            "message": f"Cloud API failed ({e.code}: {err_body}); local backend also unavailable.",
+                        }
+                    }, e.code)
+                    return ctx
         else:
             base_url = _ps.LLAMA_BASE
             api_key = _ps.LLAMA_API_KEY
@@ -1963,13 +2067,108 @@ class BackendDispatcher(PipelineStage):
             try:
                 with self._llama_lock:
                     self._do_dispatch(ctx, base_url, api_key)
-            except urllib.error.HTTPError as e:
-                err = e.read().decode("utf-8")[:500]
-                self._backend_status = e.code
-                log(f"  <- backend error: {e.code} - {err}")
-                self._handler._respond_json({"error": {"message": err}}, e.code)
+            except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                if isinstance(e, urllib.error.HTTPError):
+                    err_body = e.read().decode("utf-8")[:500]
+                    err_msg = f"{e.code} - {err_body}"
+                    self._backend_status = e.code
+                else:
+                    err_msg = str(e)
+                    self._backend_status = 503
+                self._fallback_reason = err_msg
+                log(f"  <- Local backend failed ({err_msg}), checking fallback...")
+
+                route_reason = getattr(ctx, '_route_reason', '')
+                # Do NOT fallback if the user explicitly forced local.
+                if route_reason == 'session_force_local':
+                    log(f"  <- Local manually forced — no fallback")
+                    self._handler._respond_json({"error": {"message": err_msg}}, self._backend_status)
+                    return ctx
+
+                if not _ps.PROXY_ROUTE_FALLBACK_ENABLED:
+                    log(f"  -> Fallback disabled — returning {self._backend_status}")
+                    self._handler._respond_json({"error": {"message": err_msg}}, self._backend_status)
+                    return ctx
+
+                if _is_sensitive_request(ctx):
+                    log(f"  -> Sensitive path detected — blocking fallback")
+                    self._sensitive_blocked = True
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "sensitive_fallback_blocked",
+                            "message": "Local backend failed and request contains sensitive file paths.",
+                        }
+                    }, 403)
+                    return ctx
+
+                # Clear any cloud cooldown so the retry can actually reach cloud.
+                self._clear_cloud_cooldown(ctx.session_id)
+                self._route_fallback = True
+                ctx._route_target = 'cloud'
+                ctx._route_reason = 'local_failure_fallback'
+
+                # Retry with cloud backend
+                cloud_url = _ps.PROXY_CLOUD_BASE_URL
+                cloud_key = _ps.PROXY_CLOUD_API_KEY
+                cloud_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+                log(f"  -> Fallback to cloud backend ({cloud_model})")
+                if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                    ctx.openai_body["model"] = cloud_model
+                try:
+                    with self._cloud_lock:
+                        self._do_dispatch(ctx, cloud_url, cloud_key)
+                except Exception as e2:
+                    log(f"  <- Cloud fallback also failed: {e2}")
+                    self._handler._respond_json({
+                        "error": {
+                            "message": f"Local failed: {err_msg}; cloud fallback failed: {e2}",
+                            "type": "backend_unavailable",
+                        }
+                    }, 503)
 
         return ctx
+
+    def _is_repairable_format_error(self, status, response_body):
+        """Return True if the cloud error looks like a message-format issue.
+
+        These errors can sometimes be fixed by re-running defensive
+        normalization on the OpenAI-format messages before falling back to
+        local.
+        """
+        if status != 400:
+            return False
+        text = (response_body or "").lower()
+        patterns = [
+            "tool_call_id",
+            "tool_calls",
+            "tool_use",
+            "tool_result",
+            "missing field",
+            "must be followed by tool",
+            "without tool_result",
+            "invalid_request_error",
+        ]
+        return any(p in text for p in patterns)
+
+    def _repair_openai_messages(self, ctx):
+        """Re-run orphan-tool normalization and tombstone injection.
+
+        Returns True if messages were modified.
+        """
+        try:
+            msg_converter = _import_message_converter()
+            messages = ctx.openai_body.get("messages", [])
+            original = json.dumps(messages, sort_keys=True)
+            messages = msg_converter._normalize_orphan_tool_messages(messages)
+            messages = msg_converter._ensure_tool_chain_integrity(messages)
+            ctx.openai_body["messages"] = messages
+            modified = json.dumps(messages, sort_keys=True) != original
+            if modified:
+                log(f"  -> Repaired message chain: normalized orphan tools / injected tombstones")
+            return modified
+        except Exception as ex:
+            log(f"  -> Message repair failed: {ex}")
+            return False
 
     def _do_dispatch(self, ctx, base_url, api_key):
         """Send HTTP POST to backend and dispatch response to handler.
@@ -2030,10 +2229,23 @@ class BackendDispatcher(PipelineStage):
         if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
             self._accumulate_daily_cost(ctx)
 
-    def _record_cloud_failure(self, ctx):
-        """Record cloud failure and manage cooldown state."""
+    def _record_cloud_failure(self, ctx, exc):
+        """Record cloud failure and manage cooldown state.
+
+        Only retryable errors (5xx, timeout, connection issues) trigger cooldown.
+        Authentication/authorization errors (4xx) do not lock the session to local.
+        """
         session_id = ctx.session_id
         if not session_id:
+            return
+        retryable = False
+        if isinstance(exc, urllib.error.HTTPError):
+            retryable = exc.code in (408, 429, 500, 502, 503, 504)
+        elif isinstance(exc, urllib.error.URLError):
+            retryable = True
+        if not retryable:
+            code = getattr(exc, 'code', type(exc).__name__)
+            log(f"  -> Cloud failure non-retryable ({code}), no cooldown")
             return
         with _ps._state_lock:
             _ps._cloud_fail_count[session_id] = _ps._cloud_fail_count.get(session_id, 0) + 1
@@ -2046,6 +2258,22 @@ class BackendDispatcher(PipelineStage):
                 _ps._cloud_fail_count[session_id] = 0
                 log(f"  -> Cloud cooldown activated for session {session_id} "
                     f"({fail_count} failures, {_ps.PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS}s)")
+
+    def _clear_cloud_cooldown(self, session_id):
+        """Clear cloud cooldown state for a session.
+
+        Used when local backend fails so we can immediately retry cloud rather
+        than being stuck in cooldown.
+        """
+        if not session_id:
+            return
+        with _ps._state_lock:
+            _ps._cloud_fail_count.pop(session_id, None)
+            _ps._cloud_cooldown_start.pop(session_id, None)
+            force_source = _ps._SESSION_ROUTE_FORCE_SOURCE.get(session_id)
+            if force_source == "cloud_failures":
+                _ps._SESSION_ROUTE_MAP.pop(session_id, None)
+                _ps._SESSION_ROUTE_FORCE_SOURCE.pop(session_id, None)
 
     def _emergency_truncate(self, ctx):
         """Emergency context reduction when cloud fallback to overloaded local."""
@@ -2102,4 +2330,5 @@ class BackendDispatcher(PipelineStage):
             "output_tokens": self._output_tokens,
             "dispatch_latency_ms": round(getattr(self, '_dispatch_latency_ms', 0.0), 1),
             "input_chars_bucket": _char_bucket(ctx.total_chars),
+            "client_type": ctx.client_type,
         }

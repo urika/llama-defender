@@ -164,12 +164,41 @@ def _unescape_double_escaped_json(obj):
     return obj
 
 
+def _strip_q_in_value(val):
+    """Recursively strip __Q<N>__ from string values in a nested structure."""
+    if isinstance(val, str) and "__Q" in val:
+        cleaned = re.sub(r'__Q\d+__', '', val)
+        return cleaned if cleaned != val else val
+    if isinstance(val, dict):
+        return {k: _strip_q_in_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_strip_q_in_value(v) for v in val]
+    return val
+
+
 def _finalize_parsed_args(parsed):
-    """Apply post-parse fixes: unescape double-escaped JSON, then coerce booleans."""
+    """Apply post-parse fixes: unescape double-escaped JSON, coerce booleans, strip Q-placeholders."""
     if not isinstance(parsed, dict):
         return {}
     parsed = _unescape_double_escaped_json(parsed)
+    parsed = _strip_q_in_value(parsed)
     return _coerce_booleans(parsed)
+
+
+def _sanitize_q_placeholders(raw: str, tool_name_hint: str = "") -> str:
+    """Remove gemma4 __Q<N>__ training artifacts from tool arguments.
+    
+    Gemma-4-26b was fine-tuned on data where __Q0__, __Q1__, etc. were used
+    as variable placeholders. During inference the model leaks these into
+    tool call arguments (e.g. {"todos": "[{content:__Q0__}]"}).
+    Replace with empty string so JSON parsing can proceed.
+    """
+    if not raw or "__Q" not in raw:
+        return raw
+    cleaned = re.sub(r'__Q\d+__', '', raw)
+    if cleaned != raw:
+        _log(f"  [SANITIZE_Q] tool={tool_name_hint}: removed Q-placeholder from args ({len(raw)} -> {len(cleaned)} chars)")
+    return cleaned
 
 
 def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
@@ -183,6 +212,7 @@ def parse_tool_arguments(raw: str, tool_name_hint: str = "") -> dict:
     raw = raw.strip() if raw else ""
     if not raw:
         return {}
+    raw = _sanitize_q_placeholders(raw, tool_name_hint)
 
     # 1. Try standard JSON
     try:

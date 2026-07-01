@@ -229,5 +229,188 @@ class TestConvertOpenAIRequestToAnthropic(unittest.TestCase):
         self.assertEqual(out["_x_proxy_route_to"], "cloud")
 
 
+class TestNormalizeOrphanToolMessages(unittest.TestCase):
+    def test_preserves_matching_tool_calls(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "file contents"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[0]["tool_calls"][0]["id"], "tc_1")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+
+    def test_converts_orphan_tools_after_assistant(self):
+        msgs = [
+            {"role": "assistant", "content": "[Calling tool..."},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result one"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "result two"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "user")
+        self.assertIn("[tool result for tc_1]", out[1]["content"])
+        self.assertEqual(out[2]["role"], "user")
+        self.assertIn("[tool result for tc_2]", out[2]["content"])
+
+    def test_preserves_orphan_tool_after_user(self):
+        # Anthropic-style tool_result that appears alone after a user message
+        # should remain a role="tool" message to keep backward compatibility.
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "standalone result"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+
+    def test_preserves_tool_call_id_on_tool_messages(self):
+        msgs = [{"role": "tool", "tool_call_id": "tc_1", "content": "result"}]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "tool")
+        self.assertEqual(out[0]["tool_call_id"], "tc_1")
+
+    def test_converts_orphan_when_assistant_has_partial_tool_calls(self):
+        # Assistant emits one structured tool_call but an extra orphan result
+        # follows; the orphan must be normalized to a user message.
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result one"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "result two"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[0]["tool_calls"][0]["id"], "tc_1")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+        self.assertEqual(out[2]["role"], "user")
+        self.assertIn("[tool result for tc_2]", out[2]["content"])
+
+    def test_extracts_tool_call_id_from_text(self):
+        text = "[Calling tool bash with id call_abc123abc123abc123abc123]"
+        ids = mc._extract_tool_call_ids_from_text(text)
+        self.assertEqual(ids, {"call_abc123abc123abc123abc123"})
+
+    def test_mentioned_tool_call_id_enriches_orphan_prefix(self):
+        # Assistant text mentions a call id but has no structured tool_calls.
+        # The following orphan tool result should be converted and its prefix
+        # should note that the id was referenced by the assistant.
+        call_id = "call_abc123abc123abc123abc123"
+        msgs = [
+            {"role": "assistant", "content": f"[Calling tool bash with id {call_id}]"},
+            {"role": "tool", "tool_call_id": call_id, "content": "output"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "user")
+        self.assertIn("referenced in previous assistant message", out[1]["content"])
+        self.assertIn("output", out[1]["content"])
+
+    def test_multiple_orphan_runs_separated_by_user(self):
+        msgs = [
+            {"role": "assistant", "content": "[Calling tool...]"},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "r1"},
+            {"role": "user", "content": "ok"},
+            {"role": "assistant", "content": "[Calling tool...]"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "r2"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "user")
+        self.assertEqual(out[2]["role"], "user")
+        self.assertEqual(out[3]["role"], "assistant")
+        self.assertEqual(out[4]["role"], "user")
+
+
+class TestEnsureToolChainIntegrity(unittest.TestCase):
+    def test_injects_tombstone_when_no_tool_response(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}}
+            ]},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+        self.assertIn("not provided", out[1]["content"])
+
+    def test_injects_tombstone_before_user_message(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}}
+            ]},
+            {"role": "user", "content": "continue"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+        self.assertEqual(out[2]["role"], "user")
+
+    def test_no_tombstone_when_all_tool_responses_present(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+            {"role": "user", "content": "ok"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[2]["role"], "user")
+
+    def test_injects_tombstone_for_partial_response(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "tc_2", "name": "Write", "input": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result one"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+        self.assertEqual(out[2]["role"], "tool")
+        self.assertEqual(out[2]["tool_call_id"], "tc_2")
+
+    def test_combined_orphan_and_dangling_tool_call(self):
+        # Assistant declares tc_1 and tc_2. tc_1 has a real response, tc_2 is
+        # missing, and tc_3 is an orphan result referenced in text. After
+        # normalization tc_3 becomes a user message; tc_2 should get a
+        # tombstone so the chain remains valid.
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tc_1", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "tc_2", "name": "Write", "input": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result one"},
+            {"role": "tool", "tool_call_id": "tc_3", "content": "orphan result"},
+        ]
+        out = mc.convert_anthropic_messages_to_openai(msgs)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[0]["role"], "assistant")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["tool_call_id"], "tc_1")
+        self.assertEqual(out[2]["role"], "tool")
+        self.assertEqual(out[2]["tool_call_id"], "tc_2")
+        self.assertEqual(out[3]["role"], "user")
+        self.assertIn("tc_3", out[3]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

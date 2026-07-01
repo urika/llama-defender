@@ -373,17 +373,37 @@ class TestSmartRouterLifecycle(unittest.TestCase):
 
 
 class TestSmartRouterCooldown(unittest.TestCase):
-    """Priority 1: Cloud cooldown active."""
+    """Cloud cooldown is a local preference, not a hard lock."""
 
     def setUp(self):
         _ps._cloud_cooldown_start.clear()
+        _ps._cloud_fail_count.clear()
+        _ps._SESSION_ROUTE_MAP.clear()
 
     def tearDown(self):
         _ps._cloud_cooldown_start.clear()
+        _ps._cloud_fail_count.clear()
+        _ps._SESSION_ROUTE_MAP.clear()
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
-    def test_cooldown_active_forces_local(self):
+    def test_cooldown_active_prefers_local(self):
+        """Below-threshold requests stay local while cooldown is active."""
+        import time
+        _ps._cloud_cooldown_start["sess_cool"] = time.monotonic()
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_cool",
+        )
+        ctx.stage_config = {"total_chars": 5000, "stage": "init"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "cloud_cooldown_active")
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
+    def test_cooldown_active_overridden_by_threshold(self):
+        """Safety override: large contexts still route to cloud despite cooldown."""
         import time
         _ps._cloud_cooldown_start["sess_cool"] = time.monotonic()
         ctx = PipelineContext(
@@ -392,19 +412,68 @@ class TestSmartRouterCooldown(unittest.TestCase):
         )
         ctx.stage_config = {"total_chars": 200000, "stage": "oom_danger"}
         ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("cooldown_override", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
+    def test_cooldown_active_overridden_by_lifecycle_stage(self):
+        """Safety override: saturation/oom_danger/pre_trunc stages route to cloud."""
+        import time
+        _ps._cloud_cooldown_start["sess_cool"] = time.monotonic()
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_cool",
+        )
+        ctx.stage_config = {"total_chars": 5000, "stage": "oom_danger"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("cooldown_override", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
+    def test_cooldown_cloud_failures_local_not_hard(self):
+        """local_forced from cloud_failures is not a hard lock; threshold can override."""
+        import time
+        _ps._cloud_cooldown_start["sess_cool"] = time.monotonic()
+        _ps._SESSION_ROUTE_MAP["sess_cool"] = "local_forced"
+        _ps._SESSION_ROUTE_FORCE_SOURCE["sess_cool"] = "cloud_failures"
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_cool",
+        )
+        ctx.stage_config = {"total_chars": 200000, "stage": "init"}
+        ctx = SmartRouter().process(ctx)
+        self.assertEqual(ctx._route_target, "cloud")
+        self.assertIn("cooldown_override", ctx._route_reason)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
+    def test_cooldown_manual_local_remains_hard(self):
+        """User/admin forced local remains a hard lock regardless of cooldown."""
+        import time
+        _ps._cloud_cooldown_start["sess_cool"] = time.monotonic()
+        _ps._SESSION_ROUTE_MAP["sess_cool"] = "local_forced"
+        _ps._SESSION_ROUTE_FORCE_SOURCE["sess_cool"] = "user_manual"
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_cool",
+        )
+        ctx.stage_config = {"total_chars": 200000, "stage": "oom_danger"}
+        ctx = SmartRouter().process(ctx)
         self.assertEqual(ctx._route_target, "local")
-        self.assertIn("cloud_cooldown_active", ctx._route_reason)
+        self.assertEqual(ctx._route_reason, "session_force_local")
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS", 1800)
     @patch("time.monotonic")
     def test_cooldown_expired_cleans_all_state(self, mock_time):
         """Cooldown expiry triggers full session state clean-up.
-        
+
         Regression guard: P0#4 — after the cooldown window passes, all
         session state dicts/sets must be cleared so the session can
         route normally again.
-        
+
         timing: cooldown_start=100, monotonic() returns 2000,
                 elapsed = 2000-100 = 1900 > 1800 → expired → cleanup
         """

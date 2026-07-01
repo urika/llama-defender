@@ -598,12 +598,201 @@ def convert_anthropic_messages_to_openai(messages):
                     "content": "\n".join(text_parts) if text_parts else json.dumps(content),
                 })
         else:
-            openai_messages.append({
+            openai_msg = {
                 "role": role,
                 "content": str(content) if content else "",
-            })
+            }
+            # Preserve OpenAI-compatible tool message fields when the input
+            # already uses role="tool" with tool_call_id (e.g. OpenCode).
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id:
+                    openai_msg["tool_call_id"] = tool_call_id
+                name = msg.get("name")
+                if name:
+                    openai_msg["name"] = name
+            openai_messages.append(openai_msg)
+
+    # OpenCode (and some other clients) may emit assistant messages that use
+    # plain text like "[Calling tool..." to indicate tool calls, while the
+    # corresponding tool results arrive as standalone role="tool" messages
+    # with a tool_call_id.  OpenAI/DeepSeek requires every role="tool" message
+    # to follow an assistant message that contains a matching tool_calls entry.
+    # When that precondition is violated, downstream APIs reject the request
+    # with a 400 error.  As a safety net, convert orphaned tool messages into
+    # user messages so the conversation remains valid OpenAI format.
+    openai_messages = _normalize_orphan_tool_messages(openai_messages)
+
+    # Then ensure every assistant tool_calls block has matching tool responses.
+    # Inject tombstones for missing responses so strict backends don't reject
+    # the conversation.
+    openai_messages = _ensure_tool_chain_integrity(openai_messages)
 
     return openai_messages
+
+
+def _extract_tool_call_ids_from_text(text):
+    """Extract likely tool_call_ids embedded in assistant text.
+
+    Matches common patterns emitted by clients such as OpenCode
+    (e.g. "[Calling tool bash with id call_abc123...]").
+
+    Returns a set of matched ids; empty set if text is not a string.
+    """
+    if not isinstance(text, str):
+        return set()
+    ids = set()
+    # OpenAI-style ids: call_xxxxxxxxxxxxxxxxxxxxxxxx
+    ids.update(re.findall(r"\bcall_[a-f0-9]{24}\b", text))
+    # Anthropic-style ids: toolu_xxxxxxxxxxxxxxxxxxxxxxxx
+    ids.update(re.findall(r"\btoolu_[a-zA-Z0-9]{24}\b", text))
+    return ids
+
+
+def _tombstone_tool_msg(tool_call_id):
+    """Return a placeholder tool message for a missing tool result."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": json.dumps({
+            "error": "Tool result was not provided in the conversation history.",
+            "tool_call_id": tool_call_id,
+        }, ensure_ascii=False),
+    }
+
+
+def _ensure_tool_chain_integrity(openai_messages):
+    """Inject tombstone tool messages for dangling assistant tool_calls.
+
+    Strict backends (DeepSeek / OpenAI) require that every assistant message
+    with `tool_calls` is followed by one `role="tool"` message for each
+    `tool_call_id`. When the conversation history is missing a response (e.g.
+    an aborted tool call, a context-compaction bug, or a client-side
+    serialization issue), this function inserts a tombstone message so the
+    request remains valid.
+
+    This function is intentionally conservative:
+    - It runs *after* `_normalize_orphan_tool_messages`, so orphan tool
+      results have already been converted to user messages.
+    - It only injects tombstones for `tool_call_id`s that are still pending
+      when the tool-response zone ends (non-tool message or end of list).
+    """
+    result = []
+    pending_tool_calls = {}  # id -> tool_call dict
+
+    for msg in openai_messages:
+        role = msg.get("role")
+
+        if role == "assistant":
+            # Flush any still-pending tool_calls from a previous assistant as
+            # tombstones before starting a new tool-response zone.
+            for tc_id in list(pending_tool_calls.keys()):
+                result.append(_tombstone_tool_msg(tc_id))
+            pending_tool_calls.clear()
+
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        pending_tool_calls[tc_id] = tc
+            result.append(msg)
+
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id")
+            if tc_id and tc_id in pending_tool_calls:
+                del pending_tool_calls[tc_id]
+            result.append(msg)
+
+        else:
+            # Non-tool message ends the current tool-response zone. Flush
+            # tombstones *before* this message so they remain contiguous with
+            # the assistant tool_calls.
+            for tc_id in list(pending_tool_calls.keys()):
+                result.append(_tombstone_tool_msg(tc_id))
+            pending_tool_calls.clear()
+            result.append(msg)
+
+    # End of conversation: flush any remaining pending tool_calls.
+    for tc_id in list(pending_tool_calls.keys()):
+        result.append(_tombstone_tool_msg(tc_id))
+
+    return result
+
+
+def _normalize_orphan_tool_messages(openai_messages):
+    """Convert role="tool" messages that lack a matching assistant tool_calls
+    into role="user" messages.  Preserves the original tool_call_id inside the
+    content so no information is lost, and keeps the message ordering intact.
+
+    This handles clients such as OpenCode that emit plain-text tool calls in
+    assistant messages (e.g. "[Calling tool...") followed by one or more
+    role="tool" results.  OpenAI/DeepSeek requires every role="tool" message
+    to follow an assistant message that contains a matching tool_calls entry.
+    When that precondition is violated, the entire orphaned tool-result run is
+    converted into user messages so the conversation remains valid OpenAI
+    format.
+
+    Enhanced to cover:
+    - assistant messages that contain some tool_calls but are followed by
+      additional tool results whose ids are not in those tool_calls;
+    - multiple consecutive orphan tool messages;
+    - assistant text that explicitly mentions a tool_call_id.
+    """
+    known_tool_call_ids = set()
+    mentioned_tool_call_ids = set()
+    for msg in openai_messages:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else None
+                if tc_id:
+                    known_tool_call_ids.add(tc_id)
+            # Also capture ids mentioned in plain-text assistant messages;
+            # these indicate the assistant intended a tool call even though it
+            # did not emit a structured tool_calls block.
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                mentioned_tool_call_ids.update(_extract_tool_call_ids_from_text(content))
+
+    def _is_in_tool_response_zone(idx):
+        """Return True if the message at idx sits in the tool-response zone
+        immediately following an assistant message (i.e. walking backwards from
+        idx we see only tool messages until we hit an assistant)."""
+        for j in range(idx - 1, -1, -1):
+            role = openai_messages[j].get("role")
+            if role == "assistant":
+                return True
+            if role != "tool":
+                return False
+        return False
+
+    # First pass: mark orphan tool messages that are part of a tool-response
+    # zone following an assistant message.
+    convert_to_user = [False] * len(openai_messages)
+    for i, msg in enumerate(openai_messages):
+        if msg.get("role") != "tool":
+            continue
+        tc_id = msg.get("tool_call_id")
+        if not tc_id or tc_id in known_tool_call_ids:
+            continue
+        if _is_in_tool_response_zone(i):
+            convert_to_user[i] = True
+
+    # Second pass: build normalized messages.
+    normalized = []
+    for i, msg in enumerate(openai_messages):
+        if convert_to_user[i]:
+            tc_id = msg.get("tool_call_id", "")
+            content = msg.get("content", "")
+            prefix = f"[tool result for {tc_id}]:"
+            if tc_id in mentioned_tool_call_ids:
+                prefix = f"[tool result for {tc_id} (referenced in previous assistant message)]:"
+            normalized.append({
+                "role": "user",
+                "content": f"{prefix}\n{content}",
+            })
+        else:
+            normalized.append(msg)
+    return normalized
 
 
 def convert_openai_response_to_anthropic(openai_resp, anthropic_model):

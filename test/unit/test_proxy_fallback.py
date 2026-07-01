@@ -2488,10 +2488,14 @@ class TestConvertAnthropicMessagesToOpenAI(unittest.TestCase):
             {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/foo/bar.py"}}
         ]}]
         result = proxy.convert_anthropic_messages_to_openai(msgs)
-        self.assertEqual(len(result), 1)
+        # A tombstone tool message is injected because the assistant tool_call
+        # lacks a corresponding tool result.
+        self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["role"], "assistant")
         self.assertIn("tool_calls", result[0])
         self.assertEqual(result[0]["tool_calls"][0]["function"]["name"], "Read")
+        self.assertEqual(result[1]["role"], "tool")
+        self.assertEqual(result[1]["tool_call_id"], "tu_1")
 
     def test_tool_result_message(self):
         msgs = [{"role": "user", "content": [
@@ -2509,11 +2513,15 @@ class TestConvertAnthropicMessagesToOpenAI(unittest.TestCase):
             {"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/a.py"}}
         ]}]
         result = proxy.convert_anthropic_messages_to_openai(msgs)
-        self.assertEqual(len(result), 1)
+        # A tombstone tool message is injected because the assistant tool_call
+        # lacks a corresponding tool result.
+        self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["role"], "assistant")
         self.assertIn("content", result[0])
         self.assertIn("tool_calls", result[0])
         self.assertEqual(result[0]["content"], "Let me read that file.")
+        self.assertEqual(result[1]["role"], "tool")
+        self.assertEqual(result[1]["tool_call_id"], "tu_1")
 
     def test_string_content_fallback(self):
         msgs = [{"role": "user", "content": "just a string"}]
