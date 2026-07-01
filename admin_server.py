@@ -6,7 +6,7 @@ All functions are stateless — they read from proxy_state and file system.
 """
 import json
 import os, re, subprocess, time, threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import proxy_state as _ps
 from backend_strategy import BackendStrategy
 _strategy = BackendStrategy.create(_ps.IS_CLOUD)
@@ -492,6 +492,12 @@ def _get_route_stats():
     last_route_target = ""
     last_route_timestamp = ""
     recent_fallbacks = []  # last 5 fallback events
+    # Track per-session latest target / request count from recent metrics so that
+    # sessions which are local-by-default (not in _SESSION_ROUTE_MAP) still show up.
+    recent_cutoff = (datetime.now() - timedelta(minutes=10)).isoformat()
+    metrics_session_targets = {}
+    metrics_session_counts = {}
+    metrics_session_ts = {}
     try:
         metrics_file = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
         with open(metrics_file, "r") as f:
@@ -507,6 +513,13 @@ def _get_route_stats():
                         local_count += 1
                     reason = bd.get("route_reason", "")
                     ts = rec.get("timestamp", rec.get("ts", ""))
+                    sid = rec.get("session_id", "")
+                    # Only consider recent records for active session display
+                    if sid and ts and ts >= recent_cutoff:
+                        if ts >= metrics_session_ts.get(sid, ""):
+                            metrics_session_targets[sid] = rt
+                            metrics_session_ts[sid] = ts
+                        metrics_session_counts[sid] = metrics_session_counts.get(sid, 0) + 1
                     if ts:
                         last_route_timestamp = ts
                     if reason:
@@ -542,7 +555,9 @@ def _get_route_stats():
 
         # Active sessions detail — enrich with request count, cooldown, and reason
         active_sessions = []
+        seen_active = set()
         for sid, target in sorted(_ps._SESSION_ROUTE_MAP.items()):
+            seen_active.add(sid)
             cd_start = _ps._cloud_cooldown_start.get(sid, 0)
             cooldown_remaining = 0
             if cd_start > 0:
@@ -557,6 +572,18 @@ def _get_route_stats():
                 "requests": _ps._SESSION_REQUEST_COUNT.get(sid, 0),
                 "cooldown_remaining": cooldown_remaining,
             })
+        # Include sessions seen in metrics that are not in the live route map
+        # (e.g., local-by-default sessions never got a _SESSION_ROUTE_MAP entry).
+        for sid, target in metrics_session_targets.items():
+            if sid and sid not in seen_active:
+                active_sessions.append({
+                    "session_id": sid,
+                    "target": target,
+                    "source": "",
+                    "failures": _ps._cloud_fail_count.get(sid, 0),
+                    "requests": metrics_session_counts.get(sid, 0),
+                    "cooldown_remaining": 0,
+                })
 
         # Sessions in cool-down
         cooldown_sessions = [
@@ -581,6 +608,12 @@ def _get_route_stats():
     if _ps.PROXY_ROUTE_DAILY_BUDGET > 0 and daily_cost >= 0:
         budget_used_pct = daily_cost / _ps.PROXY_ROUTE_DAILY_BUDGET * 100
         budget_alert_level = _ps._get_budget_alert_level(budget_used_pct)
+
+    # Recompute session summary from the merged active_sessions list so that
+    # metrics-derived local-by-default sessions are also counted.
+    session_cloud = sum(1 for s in active_sessions if s.get("target") == "cloud")
+    session_local = sum(1 for s in active_sessions if s.get("target") in ("local", "local_forced"))
+    session_total = len(active_sessions)
 
     return {
         # Configuration snapshot
@@ -763,16 +796,17 @@ _SESSION_METRICS_CACHE_MAXSIZE = 16
 def _load_session_metrics(session_id: str, max_lines: int = 200000):
     """Load all metrics rows for a given session_id from proxy_metrics.jsonl.
 
-    Returns rows sorted by timestamp (oldest first).
-    Uses a simple bounded cache invalidated by file mtime.
+    Returns rows sorted by timestamp (oldest first). Downstream callers rely
+    on this ordering (e.g. rows[0] is the session start, rows[-1] the end).
+    Uses a simple LRU cache keyed by session_id; the cache is invalidated
+    when the file mtime changes.
     """
-    global _SESSION_METRICS_CACHE, _SESSION_METRICS_CACHE_MTIME
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
-    # Check if file changed since last cache build
+    global _SESSION_METRICS_CACHE, _SESSION_METRICS_CACHE_MTIME
     try:
         current_mtime = os.path.getmtime(metrics_path)
     except OSError:
-        current_mtime = 0.0
+        return []
     if current_mtime != _SESSION_METRICS_CACHE_MTIME:
         _SESSION_METRICS_CACHE.clear()
         _SESSION_METRICS_CACHE_MTIME = current_mtime
@@ -783,9 +817,8 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
     rows = []
     try:
         with open(metrics_path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
+            from collections import deque
+            for line in deque(f, maxlen=max_lines):
                 line = line.strip()
                 if not line:
                     continue
@@ -823,9 +856,8 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     client_types = {}  # sid -> {type: count}
     try:
         with open(metrics_path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
+            from collections import deque
+            for line in deque(f, maxlen=max_lines):
                 line = line.strip()
                 if not line:
                     continue
@@ -872,7 +904,7 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
         # Recency score: 1.0 for most recent, decays linearly to 0.0 for oldest
         if max_ts and ts:
             try:
-                from datetime import datetime
+                from datetime import datetime, timedelta
                 t = datetime.fromisoformat(ts)
                 t0 = datetime.fromisoformat(max_ts)
                 age_hours = (t0 - t).total_seconds() / 3600
@@ -1034,6 +1066,7 @@ def _analyze_session(session_id: str) -> dict:
             out_tok = r.get("est_output_tokens") or int(out_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1))
             cloud_cost += (in_tok * _ps.PROXY_CLOUD_PRICE_INPUT + out_tok * _ps.PROXY_CLOUD_PRICE_OUTPUT) / 1_000_000
 
+        request_count = r.get("pipeline", {}).get("lifecycle_stage", {}).get("request_count", idx)
         timeline.append({
             "index": idx,
             "ts": ts,
@@ -1052,6 +1085,7 @@ def _analyze_session(session_id: str) -> dict:
             "loop_max_run": r.get("pipeline", {}).get("loop_detect", {}).get("max_run", 0),
             "blocker": bool(r.get("pipeline", {}).get("blocker_detect", {}).get("triggered")),
             "truncate": bool(r.get("pipeline", {}).get("truncate", {}).get("triggered")),
+            "request_count": request_count,
         })
 
     total = len(rows)
@@ -1132,10 +1166,11 @@ def _fmt_ts(ts: str) -> str:
     return ts[5:10] + " " + ts[11:19]
 
 
-def _svg_line_chart(values, width=800, height=120, color="#3498db", fill=True):
+def _svg_line_chart(values, rows=None, width=800, height=120, color="#3498db", fill=True):
     """Render a simple SVG line chart with points.
 
     values is a list of numeric y values (x is evenly spaced).
+    rows is an optional list of dicts for per-point tooltips.
     """
     if not values:
         return "<div style='color:#888'>无数据</div>"
@@ -1154,7 +1189,12 @@ def _svg_line_chart(values, width=800, height=120, color="#3498db", fill=True):
     for i, v in enumerate(values):
         x = pad + (width - 2 * pad) * i / max(n - 1, 1)
         y = height - pad - (v - min_v) / rng * (height - 2 * pad)
-        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{color}" />'
+        title = f"#{i + 1}: {_fmt_ms(v)}"
+        if rows and i < len(rows):
+            r = rows[i]
+            ts = r.get("ts", "")[11:19] if r.get("ts") else ""
+            title = f"#{i + 1} {ts}&#10;Duration: {_fmt_ms(v)}&#10;Target: {r.get('target', '')}&#10;Status: {r.get('status', '')}"
+        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{color}"><title>{title}</title></circle>'
     area = ""
     if fill:
         area_d = f"M{pad:.1f},{height-pad:.1f} L{path_d.split('L',1)[1] if 'L' in path_d else ''} L{width-pad:.1f},{height-pad:.1f} Z"
@@ -1168,7 +1208,7 @@ def _svg_line_chart(values, width=800, height=120, color="#3498db", fill=True):
 
 
 def _svg_dual_chart(rows, width=800, height=120):
-    """Render input_chars line with local/cloud colored points."""
+    """Render input_chars line with local/cloud colored points and tooltips."""
     if not rows:
         return "<div style='color:#888'>无数据</div>"
     values = [r["input_chars"] for r in rows]
@@ -1189,7 +1229,16 @@ def _svg_dual_chart(rows, width=800, height=120):
         x = pad + (width - 2 * pad) * i / max(n - 1, 1)
         y = height - pad - (r["input_chars"] - min_v) / rng * (height - 2 * pad)
         color = "#3498db" if r["target"] == "cloud" else "#27ae60"
-        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}" />'
+        ts = r.get("ts", "")[11:19] if r.get("ts") else ""
+        title = (
+            f"#{i + 1} {ts}&#10;"
+            f"Input chars: {r['input_chars']:,}&#10;"
+            f"Target: {r.get('target', '')}&#10;"
+            f"Reason: {r.get('reason', '')}&#10;"
+            f"Duration: {_fmt_ms(r.get('duration_ms', 0))}&#10;"
+            f"Status: {r.get('status', '')}"
+        )
+        circles += f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{color}"><title>{title}</title></circle>'
     return (
         f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}" '
         f'style="background:rgba(255,255,255,0.03);border-radius:4px">'
@@ -1240,6 +1289,14 @@ def _build_session_html(session_id: str) -> str:
             f'<div style="width:80px;background:#2a2a4a;height:6px;border-radius:3px;overflow:hidden">'
             f'<div style="width:{dur_bar_width:.0f}%;background:#3498db;height:100%"></div></div>'
         )
+        # Compute loop threshold for this point in the session (short/long/very_long tier)
+        req_count = r.get("request_count", 1)
+        if req_count <= _ps.PROXY_LOOP_SESSION_SHORT_BOUND:
+            loop_threshold = _ps.PROXY_LOOP_THRESHOLD
+        elif req_count <= _ps.PROXY_LOOP_SESSION_LONG_BOUND:
+            loop_threshold = _ps.PROXY_LOOP_THRESHOLD_LONG
+        else:
+            loop_threshold = _ps.PROXY_LOOP_THRESHOLD_VERY_LONG
         flags = []
         if r["fallback"]:
             flags.append('<span style="color:#e74c3c">fallback</span>')
@@ -1247,7 +1304,7 @@ def _build_session_html(session_id: str) -> str:
             flags.append('<span style="color:#e74c3c">emergency</span>')
         if r["blocker"]:
             flags.append('<span style="color:#e67e22">blocker</span>')
-        if r["loop_max_run"] >= _ps.PROXY_LOOP_THRESHOLD:
+        if r["loop_max_run"] >= loop_threshold:
             flags.append(f'<span style="color:#f39c12">loop({r["loop_max_run"]})</span>')
         if r["truncate"]:
             flags.append('<span style="color:#f39c12">truncate</span>')
@@ -1281,7 +1338,7 @@ def _build_session_html(session_id: str) -> str:
     # Charts
     dur_values = [r["duration_ms"] for r in timeline]
     chars_svg = _svg_dual_chart(timeline)
-    dur_svg = _svg_line_chart(dur_values, color="#9b59b6")
+    dur_svg = _svg_line_chart(dur_values, rows=timeline, color="#9b59b6")
 
     html = f"""<!DOCTYPE html>
 <html>
