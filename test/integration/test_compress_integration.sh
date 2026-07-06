@@ -175,9 +175,9 @@ else
 fi
 
 # ============================================================
-# Verify metrics recorded semantic_compress
+# Verify metrics recorded content_compressor.compression
 # ============================================================
-info "TC3: verify semantic_compress recorded in metrics"
+info "TC3: verify content_compressor compression recorded in metrics"
 if [[ -f "$METRICS_PATH" ]]; then
   COMPRESS_METRIC=$(python3 -c "
 import json
@@ -185,20 +185,24 @@ last = None
 with open('$METRICS_PATH') as f:
     for line in f:
         last = json.loads(line)
-if last and 'pipeline' in last and 'semantic_compress' in last['pipeline']:
-    print(json.dumps(last['pipeline']['semantic_compress']))
+if last and 'pipeline' in last:
+    cc = last['pipeline'].get('content_compressor', {})
+    if isinstance(cc, dict) and 'compression' in cc:
+        print(json.dumps(cc['compression']))
+    else:
+        print('missing')
 else:
     print('missing')
 " 2>/dev/null)
   if [[ "$COMPRESS_METRIC" != "missing" && "$COMPRESS_METRIC" != "" ]]; then
     RATIO=$(python3 -c "import sys, json; d=json.loads(sys.argv[1]); print(d.get('ratio', 1.0))" "$COMPRESS_METRIC")
     if python3 -c "import sys; r=float(sys.argv[1]); sys.exit(0 if r < 1.0 else 1)" "$RATIO"; then
-      pass "TC3 semantic_compress ratio=$RATIO < 1.0"
+      pass "TC3 content_compressor compression ratio=$RATIO < 1.0"
     else
-      fail "TC3 semantic_compress ratio=$RATIO not < 1.0"
+      fail "TC3 content_compressor compression ratio=$RATIO not < 1.0"
     fi
   else
-    fail "TC3 semantic_compress missing from metrics"
+    fail "TC3 content_compressor compression missing from metrics"
   fi
 else
   fail "TC3 metrics file not found: $METRICS_PATH"

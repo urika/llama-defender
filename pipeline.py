@@ -303,10 +303,12 @@ class InstrumentedPipeline(Pipeline):
                 slowest_name = stage.name
             data = stage.output_metrics(ctx)
             if data is not None:
-                # Multi-key mode: if all values are dicts, write each key
-                # separately (supports stages like ContentCompressor that
-                # produce semantic_compress + tool_clear + think_strip).
-                if all(isinstance(v, dict) for v in data.values()):
+                # Multi-key mode: if 2+ values are all dicts, write each key
+                # separately (legacy support for ContentCompressor's old
+                # semantic_compress + tool_clear + think_strip split).
+                # Single-key dicts like {"compression": {...}} write under
+                # stage.name so the metrics path is pipeline.<stage>.compression.
+                if len(data) >= 2 and all(isinstance(v, dict) for v in data.values()):
                     for sub_key, sub_data in data.items():
                         admin._mc_put(sub_key, sub_data)
                 else:
@@ -1040,30 +1042,32 @@ class ContentCompressor(ConditionalStage):
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         if not _ps.PROXY_METRICS_ENABLED:
             return None
-        result = {}
         compress_stats = ctx.compress_stats or {}
-        # Semantic compression metrics
         semantic = compress_stats.get("compress", {"enabled": False})
-        if semantic.get("enabled"):
-            result["semantic_compress"] = semantic
-        # Tool clearing metrics
         clear_stats = compress_stats.get("clear", {})
-        result["tool_clear"] = {
-            "applied": clear_stats.get("cleared", False),
-            "cleared": clear_stats.get("cleared_tool_results", 0),
-            "kept": clear_stats.get("kept", 0),
-            "chars_freed": clear_stats.get("cleared_chars", 0),
-            "total_chars_before": clear_stats.get("total_chars_before", 0),
-            "cleared_files_count": len(ctx.cleared_files or []),
-            "enabled": clear_stats.get("enabled", True),
-            "skipped": clear_stats.get("skipped", False),
-            "reason": clear_stats.get("reason", ""),
-        }
-        # Thinking strip metrics
         think_stats = compress_stats.get("think", {})
-        if think_stats.get("stripped"):
-            result["think_strip"] = {"stripped": think_stats["stripped_count"]}
-        return result
+
+        strategy = compress_stats.get("strategy", "rule_based")
+        ratio = compress_stats.get("compression_ratio", 1.0)
+        dropped = clear_stats.get("cleared_tool_results", 0)
+        protected_n = len(compress_stats.get("protected_indices", []))
+        bm25_scores = compress_stats.get("bm25_scores", {})
+        bm25_avg = round(sum(bm25_scores.values()) / len(bm25_scores), 2) if bm25_scores else 0.0
+
+        return {
+            "compression": {
+                "strategy": strategy,
+                "ratio": ratio,
+                "dropped": dropped,
+                "protected_n": protected_n,
+                "bm25_scores_avg": bm25_avg,
+                "cleared": clear_stats.get("cleared", False),
+                "cleared_chars": clear_stats.get("cleared_chars", 0),
+                "think_stripped": think_stats.get("stripped_count", 0),
+                "semantic_compressed": semantic.get("compressed_count", 0),
+                "semantic_saved_chars": semantic.get("saved_chars", 0),
+            }
+        }
 
 
 # ============================================================================
@@ -1486,34 +1490,36 @@ class ContextTruncator(ConditionalStage):
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         trunc_stats = ctx.trunc_stats or {}
+        strategy = trunc_stats.get("strategy", "char")
+        ratio = trunc_stats.get("compression_ratio", 1.0)
+        skipped_reason = trunc_stats.get("skipped_reason")
+        dropped = trunc_stats.get("dropped_messages", 0)
+        kept = trunc_stats.get("kept_messages", 0)
+        budget_chars = trunc_stats.get("budget_chars", _ps.PROXY_CHARS_EXPANSION)
+
         if not trunc_stats.get("enabled"):
-            return {"applied": False, "enabled": False}
+            return {"compression": {"strategy": strategy, "ratio": 1.0, "enabled": False}}
         if trunc_stats.get("skipped"):
-            return {"applied": False, "enabled": True, "skipped": True}
+            return {"compression": {"strategy": strategy, "ratio": 1.0, "skipped": True,
+                                    "skipped_reason": skipped_reason or "unknown"}}
         if trunc_stats.get("truncated"):
-            strategy = trunc_stats.get("strategy", "char")
-            metrics = {
-                "applied": True,
-                "triggered": True,
-                "strategy": strategy,
-                "dropped": trunc_stats.get("dropped_messages", 0),
-                "kept": trunc_stats.get("kept_messages", 0),
+            result = {
+                "compression": {
+                    "strategy": strategy,
+                    "ratio": ratio,
+                    "skipped_reason": skipped_reason,
+                    "dropped": dropped,
+                    "kept": kept,
+                    "budget_chars": budget_chars,
+                }
             }
             if strategy == "rounds":
-                metrics["compression"] = trunc_stats.get("compression", "folded")
-                metrics["chars_after"] = trunc_stats.get("chars", 0)
-                metrics["budget_chars"] = _ps.PROXY_CHARS_EXPANSION
-                metrics["rounds"] = trunc_stats.get("actual_keep_rounds", "?")
-                metrics["adaptive_rounds"] = trunc_stats.get("adaptive_rounds", "")
-                metrics["budget_iterations"] = trunc_stats.get("budget_iterations", 0)
+                result["compression"]["compression_type"] = trunc_stats.get("compression", "folded")
+                result["compression"]["rounds"] = trunc_stats.get("actual_keep_rounds", "?")
             elif strategy == "smart":
-                metrics["compressed_assistants"] = trunc_stats.get("compressed_assistants", 0)
-                metrics["chars_after"] = trunc_stats.get("kept_chars", 0)
-                metrics["budget_chars"] = trunc_stats.get("budget_chars", _ps.PROXY_CHARS_EXPANSION)
-            return metrics
-        if not trunc_stats.get("enabled") and not trunc_stats.get("truncated") and not trunc_stats.get("skipped"):
-            return {"applied": False, "enabled": True, "strategy": trunc_stats.get("strategy", "")}
-        return {"applied": False, "enabled": True}
+                result["compression"]["compressed_assistants"] = trunc_stats.get("compressed_assistants", 0)
+            return result
+        return {"compression": {"strategy": strategy, "ratio": 1.0, "enabled": True}}
 
 
 # ============================================================================
@@ -1609,6 +1615,7 @@ class OOMSafetyFIFO(ConditionalStage):
 
         iteration = 0
         raw_messages = ctx.messages
+        original_msg_count = len(raw_messages)
         while True:
             est_chars = msg_converter._estimate_message_chars(raw_messages) + static_chars
             est_tokens = msg_converter._estimate_tokens_dynamic(raw_messages) + int(
@@ -1627,16 +1634,18 @@ class OOMSafetyFIFO(ConditionalStage):
                 break
 
         ctx.oom_iterations = iteration
+        ctx.oom_dropped = original_msg_count - len(raw_messages)
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         if ctx.oom_iterations > 0:
             return {
-                "triggered": True,
-                "chars": _ps.PROXY_CHARS_OOM_DANGER,
-                "limit_tokens": _ps.PROXY_OOM_SAFE_TOKENS,
-                "iterations": ctx.oom_iterations,
-                "final_msgs": len(ctx.messages),
+                "compression": {
+                    "strategy": "oom_safety_fifo",
+                    "dropped": getattr(ctx, 'oom_dropped', 0),
+                    "iterations": ctx.oom_iterations,
+                    "budget_chars": _ps.PROXY_CHARS_OOM_DANGER,
+                }
             }
         return None
 

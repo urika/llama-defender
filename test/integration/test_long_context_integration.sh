@@ -127,13 +127,25 @@ try:
     trunc = p.get('truncate', {})
     if isinstance(trunc, dict):
         result['truncate_applied'] = trunc.get('applied', 'N/A')
-    clear = p.get('tool_clear', {})
-    if isinstance(clear, dict):
-        result['tool_clear_applied'] = clear.get('applied', 'N/A')
-        result['tool_clear_cleared'] = clear.get('cleared', 'N/A')
-    comp = p.get('semantic_compress', {})
-    if isinstance(comp, dict):
-        result['semantic_compress_enabled'] = comp.get('enabled', 'N/A')
+        # TS-4: also check new compression path
+        comp_meta = trunc.get('compression', {})
+        if comp_meta:
+            result['truncate_applied'] = 'True' if comp_meta.get('dropped', 0) > 0 else 'False'
+    clear = p.get('content_compressor', {})
+    comp_meta = clear.get('compression', {}) if isinstance(clear, dict) else {}
+    if comp_meta:
+        result['tool_clear_applied'] = 'True' if comp_meta.get('cleared', False) else 'False'
+        result['tool_clear_cleared'] = str(comp_meta.get('dropped', 0))
+        result['semantic_compress_enabled'] = 'True' if comp_meta.get('semantic_compressed', 0) > 0 else 'False'
+    else:
+        # Fallback to old keys for backward compat
+        clear_old = p.get('tool_clear', {})
+        if isinstance(clear_old, dict):
+            result['tool_clear_applied'] = clear_old.get('applied', 'N/A')
+            result['tool_clear_cleared'] = clear_old.get('cleared', 'N/A')
+        comp_old = p.get('semantic_compress', {})
+        if isinstance(comp_old, dict):
+            result['semantic_compress_enabled'] = comp_old.get('enabled', 'N/A')
     pre = p.get('pre_truncate', {})
     if isinstance(pre, dict):
         result['pre_truncate_triggered'] = pre.get('triggered', 'N/A')
@@ -304,23 +316,24 @@ else
   fail "TC-4.1: Expected INIT, got '$STAGE' (${CHARS} chars)"
 fi
 
-# TC-4.2: Large request with tool_results → tool_clear should trigger
-info "TC-4.2: Large request with many tool_results → tool_clear"
+# TC-4.2: Large request with tool_results → content_compressor.compression.cleared should be True
+info "TC-4.2: Large request with many tool_results → content_compressor compression"
 gen_large_request > "$LOG_DIR/body_clear.json"
 send_request "$LOG_DIR/body_clear.json" "tc42" > /dev/null
 sleep 1  # Wait for all metrics to flush (large request may write multiple)
-# Search ALL metrics for a record with tool_clear.applied=True
+# Search ALL metrics for a record with content_compressor.compression.cleared=True
 TC42_RESULT=$(python3 -c "
 import json
 with open('$METRICS_PATH') as f:
     for line in f:
         m = json.loads(line)
         p = m.get('pipeline', {})
-        tc = p.get('tool_clear', {})
-        if isinstance(tc, dict) and tc.get('applied') == True:
+        cc = p.get('content_compressor', {})
+        comp = cc.get('compression', {}) if isinstance(cc, dict) else {}
+        if comp.get('cleared') == True:
             stage = p.get('lifecycle_stage', {})
             s = stage.get('stage','?') if isinstance(stage, dict) else str(stage)
-            print(f'PASS:{tc.get(\"cleared\",0)}:{s}:{m.get(\"input_chars\",0)}')
+            print(f'PASS:{comp.get(\"dropped\",0)}:{s}:{m.get(\"input_chars\",0)}')
             break
     else:
         print('FAIL:0:?')
@@ -330,28 +343,27 @@ TC42_CLEARED=$(echo "$TC42_RESULT" | cut -d: -f2)
 TC42_STAGE=$(echo "$TC42_RESULT" | cut -d: -f3)
 TC42_CHARS=$(echo "$TC42_RESULT" | cut -d: -f4)
 if [[ "$TC42_STATUS" == "PASS" ]]; then
-  pass "TC-4.2: tool_clear applied ($TC42_CLEARED cleared, stage=$TC42_STAGE, chars=$TC42_CHARS)"
+  pass "TC-4.2: content_compressor compression cleared ($TC42_CLEARED cleared, stage=$TC42_STAGE, chars=$TC42_CHARS)"
 else
-  fail "TC-4.2: tool_clear NOT applied in any metrics record"
+  fail "TC-4.2: content_compressor compression NOT cleared in any metrics record"
 fi
 
 # TC-4.3: Pipeline summary — at least one L2-L5 action triggered during the test run
 info "TC-4.3: Pipeline action summary (any L2-L5 triggered)"
 TC43_RESULT=$(python3 -c "
 import json
-actions = {'tool_clear': 0, 'semantic_compress': 0, 'truncate': 0}
+actions = {'content_compressor': 0, 'truncate': 0}
 with open('$METRICS_PATH') as f:
     for line in f:
         m = json.loads(line)
         p = m.get('pipeline', {})
-        tc = p.get('tool_clear', {})
-        if isinstance(tc, dict) and tc.get('applied'):
-            actions['tool_clear'] += 1
-        sc = p.get('semantic_compress', {})
-        if isinstance(sc, dict) and sc.get('enabled'):
-            actions['semantic_compress'] += 1
+        cc = p.get('content_compressor', {})
+        comp = cc.get('compression', {}) if isinstance(cc, dict) else {}
+        if comp.get('cleared') or comp.get('semantic_compressed', 0) > 0:
+            actions['content_compressor'] += 1
         tr = p.get('truncate', {})
-        if isinstance(tr, dict) and tr.get('applied'):
+        tr_comp = tr.get('compression', {}) if isinstance(tr, dict) else {}
+        if tr_comp.get('dropped', 0) > 0:
             actions['truncate'] += 1
 total = sum(actions.values())
 if total > 0:
@@ -368,23 +380,24 @@ else
   fail "TC-4.3: No pipeline actions triggered ($TC43_DETAIL)"
 fi
 
-# TC-4.4: semantic_compress metric should exist
-info "TC-4.4: semantic_compress metric present"
+# TC-4.4: content_compressor.compression metric should exist
+info "TC-4.4: content_compressor compression metric present"
 TC44_RESULT=$(python3 -c "
 import json
 with open('$METRICS_PATH') as f:
     for line in f:
         m = json.loads(line)
         p = m.get('pipeline', {})
-        if 'semantic_compress' in p:
-            sc = p['semantic_compress']
-            print(f'present:{sc.get(\"enabled\", \"?\")}')
+        cc = p.get('content_compressor', {})
+        if isinstance(cc, dict) and 'compression' in cc:
+            comp = cc['compression']
+            print(f'present:{comp.get(\"strategy\", \"?\")}')
             break
     else:
         print('absent')
 " 2>/dev/null)
 if [[ "$TC44_RESULT" == present* ]]; then
-  pass "TC-4.4: semantic_compress metric present ($TC44_RESULT)"
+  pass "TC-4.4: content_compressor compression metric present ($TC44_RESULT)"
 else
   fail "TC-4.4: semantic_compress metric missing"
 fi

@@ -351,7 +351,11 @@ class TestContentCompressor(unittest.TestCase):
         with patch.object(_ps, "PROXY_METRICS_ENABLED", True):
             metrics = ContentCompressor().output_metrics(ctx)
         self.assertIsNotNone(metrics)
-        self.assertIn("tool_clear", metrics)
+        self.assertIn("compression", metrics)
+        comp = metrics["compression"]
+        self.assertIn("strategy", comp)
+        self.assertIn("ratio", comp)
+        self.assertIn("dropped", comp)
 
 
 # ===========================================================================
