@@ -333,7 +333,34 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
             "audit_failures": sum(1 for s in compress_stats_list if not s["audit_pass"]),
         }
 
-    return messages, {"clear": clear_stats, "think": think_stats, "compress": aggregated_compress_stats}
+    # Compute compression_ratio (I-4: 1 - compressed/original, higher = more preserved)
+    original_total_chars = total_chars
+    compressed_total_chars = original_total_chars
+    if aggregated_compress_stats.get("enabled"):
+        compressed_total_chars = original_total_chars - aggregated_compress_stats.get("saved_chars", 0)
+    compression_ratio = 1.0
+    if original_total_chars > 0:
+        compression_ratio = round(compressed_total_chars / original_total_chars, 4)
+
+    # Compute protected_indices from frozen_head
+    protected_indices = list(range(frozen_head)) if frozen_head > 0 else []
+
+    return messages, {
+        "clear": clear_stats,
+        "think": think_stats,
+        "compress": aggregated_compress_stats,
+        "strategy": "bm25" if bm25_scores else "rule_based",
+        "enabled": aggregated_compress_stats.get("enabled", False) or clear_stats.get("cleared", False),
+        "skipped": not (aggregated_compress_stats.get("enabled", False) or clear_stats.get("cleared", False)),
+        "compression_ratio": compression_ratio,
+        "protected_indices": protected_indices,
+        "bm25_scores": {str(k): v for k, v in bm25_scores.items()} if bm25_scores else {},
+        "sub": {
+            "compress": compress_stats_list,
+            "clear": clear_stats,
+            "think": think_stats,
+        },
+    }
 # --- clear_old_tool_results ---
 def clear_old_tool_results(messages, tools_list=None, clear_zone_pct=None):
     """
@@ -364,6 +391,18 @@ def clear_old_tool_results(messages, tools_list=None, clear_zone_pct=None):
     stats.setdefault("dedup_bash", 0)
     stats.setdefault("dedup_chars_saved", 0)
     stats.setdefault("frozen_head", stage_config["frozen_head"])
+    # TS-3: add CompressionResult top-level fields
+    stats["strategy"] = "rule_based"
+    stats["enabled"] = combined.get("enabled", False)
+    stats["skipped"] = combined.get("skipped", True)
+    stats["compression_ratio"] = combined.get("compression_ratio", 1.0)
+    stats["protected_indices"] = combined.get("protected_indices", [])
+    stats["bm25_scores"] = combined.get("bm25_scores", {})
+    stats["sub"] = {
+        "compress": combined.get("sub", {}).get("compress", []),
+        "clear": clear_stats,
+        "think": combined.get("sub", {}).get("think", {}),
+    }
     return messages, stats
 # --- _compute_adaptive_rounds ---
 def _compute_adaptive_rounds(messages, base_rounds):
@@ -685,9 +724,16 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
             "enabled": True,
             "strategy": "smart",
             "skipped": True,
+            "skipped_reason": "below_budget",
             "reason": "below_budget",
             "chars": total_input_chars,
             "budget_chars": budget_chars,
+            "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+            "dropped_indices": [],
+            "dropped_messages": 0,
+            "kept_messages": len(messages),
+            "compressed_assistants": 0,
+            "kept_chars": total_input_chars,
         }
 
     # TS-2: 准备配对保护集 (若调用方未提供, 自行计算).
@@ -743,6 +789,11 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
                 "kept_chars": kept_chars,
                 "unprotected_chars": unprotected_chars,
                 "budget_chars": budget_chars,
+                "protected_indices": list(protected_pairs),
+                "dropped_indices": [],
+                "dropped_messages": 0,
+                "kept_messages": len(messages),
+                "compressed_assistants": 0,
             }
         result = _fix_tool_pairings(kept)
         return result, {
@@ -755,6 +806,10 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
             "kept_chars": _estimate_message_chars(result),
             "budget_chars": budget_chars,
             "reason": "must_keep_exceeds_budget",
+            "skipped_reason": "must_keep_exceeds_budget",
+            "protected_indices": list(protected_pairs),
+            "dropped_indices": [msg_id_to_idx.get(id(m)) for m in other_msgs
+                                if msg_id_to_idx.get(id(m)) is not None],
         }
 
     # Step 3: walk other_msgs newest-first. For each message, try to keep
@@ -835,6 +890,11 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
             "chars": total_input_chars,
             "kept_chars": kept_chars,
             "budget_chars": budget_chars,
+            "protected_indices": list(protected_pairs),
+            "dropped_indices": [],
+            "dropped_messages": 0,
+            "kept_messages": len(messages),
+            "compressed_assistants": 0,
         }
 
     # Reverse `chosen` to restore chronological order, then assemble.
@@ -850,6 +910,8 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
         "compressed_assistants": compressed_count,
         "kept_chars": kept_chars,
         "budget_chars": budget_chars,
+        "protected_indices": list(protected_pairs),
+        "dropped_indices": list(dropped_idxs),
     }
 # --- truncate_messages_if_needed ---
 def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
@@ -877,21 +939,30 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
     effective_strategy = strategy if strategy is not None else _ps.PROXY_CTX_TRUNCATE_STRATEGY
 
     if not _ps.PROXY_CTX_LIMIT_ENABLED and effective_strategy != "rounds":
-        return messages, {"enabled": False}
+        return messages, {"enabled": False, "strategy": effective_strategy, "skipped": True,
+                          "skipped_reason": "disabled"}
 
     # ---------- rounds strategy ----------
     if effective_strategy == "rounds":
         # keep_rounds=None: stage says skip truncation entirely
         if keep_rounds is None:
-            return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "stage_skip"}
+            return messages, {"enabled": True, "strategy": "rounds", "skipped": True,
+                              "skipped_reason": "stage_skip", "reason": "stage_skip"}
         total_chars = _estimate_message_chars(messages)
         # Char-based budget check: skip if within _ps.PROXY_CHARS_EXPANSION
         if total_chars <= _ps.PROXY_CHARS_EXPANSION:
             return messages, {
                 "enabled": True, "strategy": "rounds", "skipped": True,
+                "skipped_reason": "below_budget",
                 "reason": "below_budget",
                 "chars": total_chars,
                 "budget_chars": _ps.PROXY_CHARS_EXPANSION,
+                "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+                "dropped_indices": [],
+                "dropped_messages": 0,
+                "kept_messages": len(messages),
+                "compressed_assistants": 0,
+                "kept_chars": total_chars,
             }
 
         # Use stage-config keep_rounds if provided, else adaptive.
@@ -931,7 +1002,8 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
                     stats["adaptive_rounds"] = adaptive_rounds
                     return result, stats
 
-        return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "no_reduction"}
+        return messages, {"enabled": True, "strategy": "rounds", "skipped": True,
+                          "skipped_reason": "no_reduction", "reason": "no_reduction"}
 
     # ---------- fifo strategy ----------
     if effective_strategy == "fifo":
@@ -940,7 +1012,15 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         if n <= keep_total:
             return messages, {
                 "enabled": True, "strategy": "fifo", "skipped": True,
+                "skipped_reason": "below_limit",
                 "reason": "below_limit", "count": n, "limit": keep_total,
+                "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+                "dropped_indices": [],
+                "dropped_messages": 0,
+                "kept_messages": n,
+                "compressed_assistants": 0,
+                "kept_chars": _estimate_message_chars(messages),
+                "budget_chars": _ps.PROXY_CHARS_EXPANSION,
             }
 
         head = messages[:_ps.PROXY_CTX_KEEP_HEAD]
@@ -1014,6 +1094,11 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
             "kept_messages": len(result),
             "tool_count": tool_count,
             "file_mentions": len(file_mentions),
+            "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+            "dropped_indices": list(range(_ps.PROXY_CTX_KEEP_HEAD, n - tail_count)),
+            "compressed_assistants": 0,
+            "kept_chars": _estimate_message_chars(result),
+            "budget_chars": _ps.PROXY_CHARS_EXPANSION,
         }
 
     # ---------- smart strategy (Phase 2 改进2) ----------
@@ -1039,9 +1124,18 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
     # NoneType object`.
     return messages, {
         "enabled": True,
-            "strategy": effective_strategy,
+        "strategy": effective_strategy,
         "skipped": True,
+        "truncated": False,
+        "skipped_reason": "char_strategy_uses_noop_fallback",
         "reason": "char_strategy_uses_noop_fallback",
+        "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+        "dropped_indices": [],
+        "dropped_messages": 0,
+        "kept_messages": len(messages),
+        "compressed_assistants": 0,
+        "kept_chars": _estimate_message_chars(messages),
+        "budget_chars": _ps.PROXY_CHARS_EXPANSION,
     }
 # --- _find_tool_pairs (TS-2 W1 d1-2) ---
 # Anthropic 工具配对原子单元: 事前识别 assistant tool_use → user tool_result 配对区间.
@@ -1409,7 +1503,17 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
 
     dropped_count = len(messages) - len(head) - len(tail)
     if dropped_count <= 0:
-        return messages, {"enabled": True, "strategy": "rounds", "skipped": True}
+        return messages, {
+            "enabled": True, "strategy": "rounds", "skipped": True,
+            "skipped_reason": "below_limit",
+            "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+            "dropped_indices": [],
+            "dropped_messages": 0,
+            "kept_messages": len(messages),
+            "compressed_assistants": 0,
+            "kept_chars": _estimate_message_chars(messages),
+            "budget_chars": _ps.PROXY_CHARS_EXPANSION,
+        }
 
     dropped = messages[_ps.PROXY_CTX_KEEP_HEAD : len(messages) - len(tail)]
 
@@ -1529,14 +1633,22 @@ def _apply_rounds_truncation(messages, keep_rounds, session_id=None):
 
     return result, {
         "enabled": True,
-         "strategy": "rounds",
-         "truncated": True,
-         "dropped_messages": dropped_count,
-         "kept_messages": len(result),
-         "tool_count": tool_count,
-         "file_mentions": len(file_mentions),
-         "compression": "llm" if "LLM" in compressed_text else ("rules" if "rule-based" in compressed_text else "folded"),
-     }
+        "strategy": "rounds",
+        "truncated": True,
+        "dropped_messages": dropped_count,
+        "kept_messages": len(result),
+        "tool_count": tool_count,
+        "file_mentions": len(file_mentions),
+        "compression": "llm" if "LLM" in compressed_text else ("rules" if "rule-based" in compressed_text else "folded"),
+        "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
+        "dropped_indices": list(range(_ps.PROXY_CTX_KEEP_HEAD, len(messages) - len(tail))),
+        "compressed_assistants": 0,
+        "kept_chars": _estimate_message_chars(result),
+        "budget_chars": _ps.PROXY_CHARS_EXPANSION,
+        "sub": {
+            "rounds_compression": "llm" if "LLM" in compressed_text else ("rules" if "rule-based" in compressed_text else "folded"),
+        },
+    }
 
 __all__ = [
     "_compress_content_pass",

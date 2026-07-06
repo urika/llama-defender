@@ -473,6 +473,108 @@ def _empty_context_optimization_stats():
         "max_concurrent": _ps.PROXY_MAX_CONCURRENT,
         "dynamic_concurrent_enabled": _ps.PROXY_DYNAMIC_CONCURRENT_ENABLED,
     }
+def _get_compression_stats():
+    """Aggregate当日 CompressionResult 统计 (design §4.7).
+
+    从 proxy_metrics.jsonl 解析 pipeline.content_compressor / context_truncator /
+    oom_safety 的 compression 段, 聚合:
+      - strategy_counts: 各 strategy 出现次数
+      - avg_compression_ratio: 平均压缩比
+      - skipped_reason_counts: 各 skipped_reason 出现次数
+      - truncated_total: 实际截断请求数
+      - protected_pair_avg: 平均 protected_indices 长度
+
+    当 metrics 文件不存在或为空时返回 _empty_compression_stats.
+    """
+    try:
+        with open(_ps._METRICS_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return _empty_compression_stats()
+
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts_str = rec.get("ts", "")
+            if ts_str:
+                try:
+                    rec["_ts"] = datetime.fromisoformat(ts_str)
+                    records.append(rec)
+                except ValueError:
+                    pass
+        except json.JSONDecodeError:
+            continue
+
+    if not records:
+        return _empty_compression_stats()
+
+    now = datetime.now()
+    today_records = [r for r in records if (now - r["_ts"]).total_seconds() <= 86400]
+    recent_records = [r for r in records if (now - r["_ts"]).total_seconds() <= 600]
+
+    def _collect(recs):
+        strategy_counts = {}
+        skipped_reason_counts = {}
+        ratios = []
+        truncated_total = 0
+        protected_pair_lens = []
+        for r in recs:
+            p = r.get("pipeline", {})
+            for stage_key in ("content_compressor", "context_truncator", "oom_safety"):
+                comp = p.get(stage_key, {}).get("compression", {})
+                if not comp:
+                    continue
+                s = comp.get("strategy")
+                if s:
+                    strategy_counts[s] = strategy_counts.get(s, 0) + 1
+                sr = comp.get("skipped_reason")
+                if sr:
+                    skipped_reason_counts[sr] = skipped_reason_counts.get(sr, 0) + 1
+                ratio = comp.get("ratio")
+                if isinstance(ratio, (int, float)):
+                    ratios.append(ratio)
+                if comp.get("truncated"):
+                    truncated_total += 1
+                pn = comp.get("protected_n", 0)
+                if isinstance(pn, (int, float)):
+                    protected_pair_lens.append(pn)
+        return {
+            "strategy_counts": strategy_counts,
+            "avg_compression_ratio": round(sum(ratios) / len(ratios), 3) if ratios else 0.0,
+            "skipped_reason_counts": skipped_reason_counts,
+            "truncated_total": truncated_total,
+            "protected_pair_avg": round(sum(protected_pair_lens) / len(protected_pair_lens), 1) if protected_pair_lens else 0.0,
+        }
+
+    return {
+        "today": _collect(today_records),
+        "last_10m": _collect(recent_records),
+    }
+
+
+def _empty_compression_stats():
+    return {
+        "today": {
+            "strategy_counts": {},
+            "avg_compression_ratio": 0.0,
+            "skipped_reason_counts": {},
+            "truncated_total": 0,
+            "protected_pair_avg": 0.0,
+        },
+        "last_10m": {
+            "strategy_counts": {},
+            "avg_compression_ratio": 0.0,
+            "skipped_reason_counts": {},
+            "truncated_total": 0,
+            "protected_pair_avg": 0.0,
+        },
+    }
+
+
 def _get_route_stats():
     """Gather intelligent routing statistics for the /status page.
 
@@ -1642,6 +1744,28 @@ def _build_status_html():
     <div class="row"><span class="label">Max Concurrent</span><span class="value">{ctx_opt.get("max_concurrent", _ps.PROXY_MAX_CONCURRENT)}{" (dynamic)" if ctx_opt.get("dynamic_concurrent_enabled") else ""}</span></div>
   </div>"""
 
+    # --- Compression (TS-3) card ---
+    comp_stats = _get_compression_stats()
+    today_comp = comp_stats.get("today", {})
+    last10m_comp = comp_stats.get("last_10m", {})
+    strategy_counts = today_comp.get("strategy_counts", {})
+    strategy_str = ", ".join(f"{k}={v}" for k, v in sorted(strategy_counts.items()))
+    skipped_reasons = last10m_comp.get("skipped_reason_counts", {})
+    skipped_str = ", ".join(f"{k}={v}" for k, v in sorted(skipped_reasons.items()))
+    comp_card = f"""<div class="card">
+    <h3>Compression (TS-3)</h3>
+    <div class="row"><span class="label">Today / Strategies</span>
+      <span class="value">{strategy_str if strategy_str else "—"}</span></div>
+    <div class="row"><span class="label">Avg Ratio</span>
+      <span class="value">{today_comp.get("avg_compression_ratio", 0.0):.2f}</span></div>
+    <div class="row"><span class="label">Skipped Reasons (10m)</span>
+      <span class="value">{skipped_str if skipped_str else "—"}</span></div>
+    <div class="row"><span class="label">Avg Protected Pairs</span>
+      <span class="value">{today_comp.get("protected_pair_avg", 0.0):.1f}</span></div>
+    <div class="row"><span class="label">Truncated (today)</span>
+      <span class="value">{today_comp.get("truncated_total", 0)}</span></div>
+  </div>"""
+
     # --- Route card ---
     route_status_icon = "✅" if route["route_enabled"] else "❌"
     route_status_text = "Enabled" if route["route_enabled"] else "Disabled"
@@ -1966,6 +2090,8 @@ def _build_status_html():
   {route_card}
 
   {ctx_opt_card}
+
+  {comp_card}
 
   <div class="card" style="grid-column: 1 / -1;">
     <h2>🚨 Alerts (last 10m)</h2>

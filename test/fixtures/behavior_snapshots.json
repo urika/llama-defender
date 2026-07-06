@@ -784,14 +784,45 @@
       "expected": [
         [],
         {
-          "enabled": true,
+          "enabled": false,
           "skipped": true,
           "reason": "below_threshold",
           "chars": 0,
           "high_prio": 0,
           "dedup_bash": 0,
           "dedup_chars_saved": 0,
-          "frozen_head": 12
+          "frozen_head": 12,
+          "strategy": "rule_based",
+          "compression_ratio": 1.0,
+          "protected_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "bm25_scores": {},
+          "sub": {
+            "compress": [],
+            "clear": {
+              "enabled": true,
+              "skipped": true,
+              "reason": "below_threshold",
+              "chars": 0
+            },
+            "think": {
+              "enabled": true,
+              "skipped": true,
+              "reason": "stage_skip"
+            }
+          }
         }
       ],
       "note": "Empty messages"
@@ -815,14 +846,45 @@
           }
         ],
         {
-          "enabled": true,
+          "enabled": false,
           "skipped": true,
           "reason": "below_threshold",
           "chars": 2,
           "high_prio": 0,
           "dedup_bash": 0,
           "dedup_chars_saved": 0,
-          "frozen_head": 12
+          "frozen_head": 12,
+          "strategy": "rule_based",
+          "compression_ratio": 1.0,
+          "protected_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "bm25_scores": {},
+          "sub": {
+            "compress": [],
+            "clear": {
+              "enabled": true,
+              "skipped": true,
+              "reason": "below_threshold",
+              "chars": 2
+            },
+            "think": {
+              "enabled": true,
+              "skipped": true,
+              "reason": "stage_skip"
+            }
+          }
         }
       ],
       "note": "No tool results to clear"

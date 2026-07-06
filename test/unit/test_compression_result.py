@@ -46,13 +46,23 @@ except Exception:
     _TS3_HAS_ORIGINAL_LEN = False
 
 # truncate_messages_if_needed top-level skipped_reason / protected_indices:
-# detect via signature inspection (avoid running real truncation).
-_tr_sig = inspect.signature(tc.truncate_messages_if_needed)
-_TS3_HAS_TRUNCATE_NEW_FIELDS = True   # placeholder; W4 d1 actually tests via runtime call
+# detect via probe call with short messages (no side effect).
+# NOTE: probes use inline dicts because _user_text helper is defined later.
+try:
+    _probe_msgs = [{"role": "user", "content": [{"type": "text", "text": "probe"}]}]
+    _probe_out, _probe_stats = tc.truncate_messages_if_needed(_probe_msgs)
+    _TS3_HAS_TRUNCATE_NEW_FIELDS = "protected_indices" in _probe_stats and "skipped_reason" in _probe_stats
+except Exception:
+    _TS3_HAS_TRUNCATE_NEW_FIELDS = False
 
 # _compress_content_pass sub / compression_ratio top-level
-# W4 d2 verifies at runtime; here just gate on stage presence using hasattr
-_TS3_HAS_SUB_STRUCTURE = False   # unlock at runtime via W4 d2 test class
+# detect via probe call with short messages.
+try:
+    _probe_msgs2 = [{"role": "user", "content": [{"type": "text", "text": "probe"}]}]
+    _probe_out2, _probe_stats2 = tc._compress_content_pass(_probe_msgs2)
+    _TS3_HAS_SUB_STRUCTURE = "sub" in _probe_stats2 and "compression_ratio" in _probe_stats2
+except Exception:
+    _TS3_HAS_SUB_STRUCTURE = False
 
 # _oom_safety_fifo (TS-2 已创建,W2 已落地) — purely available since TS-2
 _TS3_HAS_OOM_SAFETY = hasattr(tc, "_oom_safety_fifo")
@@ -71,8 +81,8 @@ except Exception:
 
 _TS3_TYPES_READY = _TS3_HAS_RESULT_TYPE
 _TS3_COMPRESS_TOOL_RESULT_FIELDS_READY = _TS3_HAS_ORIGINAL_LEN
-_TS3_TRUNCATE_TOPLEVEL_READY = False   # W4 d1 unlocks via real run
-_TS3_SUB_STRUCTURE_READY = False        # W4 d2 unlocks
+_TS3_TRUNCATE_TOPLEVEL_READY = _TS3_HAS_TRUNCATE_NEW_FIELDS
+_TS3_SUB_STRUCTURE_READY = _TS3_HAS_SUB_STRUCTURE
 _TS3_OOM_FIELDS_READY = _TS3_HAS_OOM_SAFETY
 _TS3_ADMIN_STATS_READY = _TS3_HAS_ADMIN_STAT
 
@@ -156,7 +166,7 @@ class TestTruncateReturnsCompressionResult(unittest.TestCase):
         msgs = []
         for i in range(20):
             msgs.append(_assistant_tool_use(f"t{i}"))
-            msgs.append(_user_tool_result(f"t{i}", content="x" * 2000))
+            msgs.append(_user_tool_result(f"t{i}", content="x" * 20000))
         out, stats = tc.truncate_messages_if_needed(msgs, strategy="rounds", keep_rounds=2)
         self.assertEqual(stats.get("strategy"), "rounds")
         sub = stats.get("sub", {})
