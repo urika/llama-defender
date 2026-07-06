@@ -461,39 +461,33 @@ def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
         bm25_keep_threshold = proxy_state.PROXY_BM25_KEEP_THRESHOLD
 
     original = content if isinstance(content, str) else str(content)
+    original_len = len(original)
+
+    def _result(compressed, content_type, strategy, audit_pass, ratio):
+        """Build result dict with TS-3 CompressionSubResult fields."""
+        return {
+            "original": original,
+            "compressed": compressed,
+            "content_type": content_type,
+            "strategy": strategy,
+            "audit_pass": audit_pass,
+            "ratio": round(ratio, 4),
+            "original_len": original_len,
+            "compressed_len": len(compressed),
+            "bm25_score": bm25_score,
+        }
 
     # TS-1: BM25 relevance override.
     if bm25_score is not None:
         if bm25_score >= bm25_keep_threshold:
-            return {
-                "original": original,
-                "compressed": original,
-                "content_type": "bm25_keep",
-                "strategy": "none",
-                "audit_pass": True,
-                "ratio": 1.0,
-            }
+            return _result(original, "bm25_keep", "none", True, 1.0)
         if bm25_score < bm25_drop_threshold:
-            # Force aggressive compression to ~30% of original length.
             compressed = _aggressive_truncate(original, ratio=0.3)
-            return {
-                "original": original,
-                "compressed": compressed,
-                "content_type": "bm25_drop",
-                "strategy": "bm25_aggressive",
-                "audit_pass": True,
-                "ratio": round(len(compressed) / len(original), 4) if original else 1.0,
-            }
+            r = len(compressed) / original_len if original_len else 1.0
+            return _result(compressed, "bm25_drop", "bm25_aggressive", True, r)
 
-    if mode == "lossless" or len(original) < threshold:
-        return {
-            "original": original,
-            "compressed": original,
-            "content_type": "short",
-            "strategy": "none",
-            "audit_pass": True,
-            "ratio": 1.0,
-        }
+    if mode == "lossless" or original_len < threshold:
+        return _result(original, "short", "none", True, 1.0)
 
     # Stage 1: scrub ANSI
     scrubbed = _scrub_ansi(original) if proxy_state.PROXY_SCRUB_ANSI else original
@@ -530,15 +524,8 @@ def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
         compressed = scrubbed
         strategy = "audit_fallback"
 
-    ratio = len(compressed) / len(original) if original else 1.0
-    return {
-        "original": original,
-        "compressed": compressed,
-        "content_type": content_type,
-        "strategy": strategy,
-        "audit_pass": audit_pass,
-        "ratio": round(ratio, 4),
-    }
+    ratio = len(compressed) / original_len if original_len else 1.0
+    return _result(compressed, content_type, strategy, audit_pass, ratio)
 
 
 def _generate_tool_summary(tool_name, meta_info):
