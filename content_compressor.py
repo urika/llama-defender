@@ -1,12 +1,209 @@
 """Content compressor: TokenSieve-inspired semantic compression for tool results.
 """
 import json
+import math
 import re
 
 import proxy_state
 
 # Phase 2: TokenSieve-inspired content compression for tool_result payloads.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TS-1: BM25 scoring for relevance-driven compression decisions (W3 d1-d2)
+# ---------------------------------------------------------------------------
+
+_BM25_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[\u4e00-\u9fff]")
+
+# Module-level cross-request IDF state (process-wide, survives reload).
+_BM25_IDF_MAP = {}
+_BM25_IDF_DOC_FREQ = {}
+_BM25_IDF_TOTAL_DOCS = 0
+
+
+def _bm25_tokenize(text, min_prefix=4):
+    """Tokenize text for BM25 scoring.
+
+    English: identifier-like tokens (letters, digits, underscores).
+    Chinese: single-character segmentation via CJK Unified Ideographs range.
+    Lowercase normalization.
+    Prefix expansion: for each English token >= min_prefix chars, also emit
+    its first min_prefix characters as a variant matching key.
+    """
+    tokens = []
+    for m in _BM25_TOKEN_RE.finditer(text):
+        token = m.group(0)
+        if '\u4e00' <= token[0] <= '\u9fff':
+            tokens.append(token)
+        else:
+            lower = token.lower()
+            tokens.append(lower)
+            if len(lower) >= min_prefix:
+                tokens.append(lower[:min_prefix])
+    return tokens
+
+
+def _bm25_idf(token, min_prefix=4):
+    """Return the IDF for a token.
+
+    Uses the module-level _BM25_IDF_MAP. For unknown tokens, tries prefix
+    expansion: finds the closest known token sharing the first min_prefix
+    characters and returns its IDF. If no prefix match exists, returns the
+    default IDF (log(1 + N/1) ≈ log(1 + total_docs)). When total_docs is 0
+    (IDF not yet initialized), returns 1.0 as a neutral default.
+    """
+    if token in _BM25_IDF_MAP:
+        return _BM25_IDF_MAP[token]
+    if len(token) >= min_prefix:
+        prefix = token[:min_prefix]
+        for known in _BM25_IDF_MAP:
+            if known.startswith(prefix):
+                return _BM25_IDF_MAP[known]
+    n = _BM25_IDF_TOTAL_DOCS
+    if n > 0:
+        return math.log(1.0 + n / 1.0)
+    return 1.0  # neutral default when IDF not yet initialized
+
+
+def _update_idf(messages, min_prefix=4):
+    """Incrementally update IDF from a batch of messages.
+
+    Each message is treated as a document. Token frequencies are accumulated
+    into _BM25_IDF_DOC_FREQ (number of documents containing each token).
+    After update, _BM25_IDF_MAP is recomputed as log(1 + (N - df + 0.5) / (df + 0.5)).
+
+    LRU: if _BM25_IDF_MAP exceeds 10000 entries, prune the lowest-frequency
+    entries (by doc_freq) until under 8000.
+    """
+    global _BM25_IDF_TOTAL_DOCS
+    doc_tokens = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                doc_tokens.update(_bm25_tokenize(block.get("text", ""), min_prefix))
+            elif block.get("type") == "tool_result":
+                tc = block.get("content", "")
+                if isinstance(tc, list):
+                    for sub in tc:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            doc_tokens.update(_bm25_tokenize(sub.get("text", ""), min_prefix))
+                elif isinstance(tc, str):
+                    doc_tokens.update(_bm25_tokenize(tc, min_prefix))
+
+    if not doc_tokens:
+        return
+
+    _BM25_IDF_TOTAL_DOCS += 1
+    for token in doc_tokens:
+        _BM25_IDF_DOC_FREQ[token] = _BM25_IDF_DOC_FREQ.get(token, 0) + 1
+
+    n = _BM25_IDF_TOTAL_DOCS
+    for token, df in _BM25_IDF_DOC_FREQ.items():
+        _BM25_IDF_MAP[token] = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+
+    # LRU prune: keep only the top 8000 by doc_freq when exceeding 10000.
+    if len(_BM25_IDF_MAP) > 10000:
+        sorted_tokens = sorted(_BM25_IDF_MAP.keys(), key=lambda t: _BM25_IDF_DOC_FREQ.get(t, 0))
+        for token in sorted_tokens[:2000]:
+            _BM25_IDF_MAP.pop(token, None)
+            _BM25_IDF_DOC_FREQ.pop(token, None)
+
+
+def bm25_score_message(msg, query, idf_map=None, k1=1.5, b=0.75, min_prefix=4):
+    """Compute Okapi BM25 score for a single message relative to a query.
+
+    Args:
+        msg: Anthropic-format message dict (role + content list/text).
+        query: User intent text (typically the last user message).
+        idf_map: Token → IDF dict; None uses module-level _BM25_IDF_MAP.
+        k1, b: Okapi BM25 parameters (default 1.5/0.75, matching litellm).
+        min_prefix: Minimum prefix length for expansion (default 4).
+
+    Returns:
+        float BM25 score. Higher = more relevant. 0.0 for empty msg/query.
+    """
+    if not isinstance(msg, dict) or not query:
+        return 0.0
+
+    query_tokens = _bm25_tokenize(query, min_prefix)
+    if not query_tokens:
+        return 0.0
+
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return 0.0
+
+    # Extract text from the message content blocks.
+    doc_text_parts = []
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                doc_text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_result":
+                tc = block.get("content", "")
+                if isinstance(tc, list):
+                    for sub in tc:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            doc_text_parts.append(sub.get("text", ""))
+                elif isinstance(tc, str):
+                    doc_text_parts.append(tc)
+    doc_text = " ".join(doc_text_parts)
+    doc_tokens = _bm25_tokenize(doc_text, min_prefix)
+    if not doc_tokens:
+        return 0.0
+
+    # Count term frequencies in the document.
+    tf_map = {}
+    for t in doc_tokens:
+        tf_map[t] = tf_map.get(t, 0) + 1
+
+    doc_len = len(doc_tokens)
+    avg_doc_len = _BM25_IDF_TOTAL_DOCS if _BM25_IDF_TOTAL_DOCS > 0 else 100.0
+
+    score = 0.0
+    for qt in set(query_tokens):
+        tf = tf_map.get(qt, 0)
+        if tf == 0:
+            continue
+        if idf_map is not None:
+            idf = idf_map.get(qt, 0.0)
+        else:
+            idf = _bm25_idf(qt, min_prefix)
+        if idf <= 0:
+            continue
+        numerator = tf * (k1 + 1)
+        denominator = tf + k1 * (1 - b + b * doc_len / avg_doc_len)
+        score += idf * numerator / denominator
+
+    return score
+
+
+def _extract_last_user_text(messages):
+    """Return the plain text of the last user message that has text blocks.
+
+    Skips user messages that only contain tool_result blocks (no text).
+    Returns empty string if no qualifying user message is found.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+        if text_parts:
+            return " ".join(text_parts)
+    return ""
 
 _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -168,6 +365,22 @@ def _compress_log(text, dedupe=True):
     return "\n".join(out).strip()
 
 
+def _aggressive_truncate(text, ratio=0.3):
+    """Aggressively truncate text to approximately `ratio` of original length.
+
+    Keeps head (first 20%) and tail (last 10%) of the target length to
+    preserve context boundaries, discarding the middle.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    target = max(int(len(text) * ratio), 200)
+    if len(text) <= target:
+        return text
+    head_len = int(target * 0.7)
+    tail_len = target - head_len
+    return text[:head_len] + f"\n...[BM25 aggressive: truncated {len(text) - target} chars]\n" + text[-tail_len:]
+
+
 def _compress_text(text, max_len=2000):
     """Truncate very long plain text while keeping first/last context."""
     if not isinstance(text, str):
@@ -215,8 +428,18 @@ def _audit_compression(original, compressed, content_type):
     return True
 
 
-def compress_tool_result(content, mime_hint=None, threshold=None, mode=None):
+def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
+                         bm25_score=None,
+                         bm25_drop_threshold=None,
+                         bm25_keep_threshold=None):
     """Compress a single tool_result content payload.
+
+    TS-1 (W3 d3): Added bm25_score/bm25_drop_threshold/bm25_keep_threshold
+    kwargs for BM25 relevance-driven compression decisions.
+
+    - bm25_score < bm25_drop_threshold → force compress to ~30% original length
+    - bm25_score >= bm25_keep_threshold → skip compression (keep verbatim)
+    - bm25_score is None → fall back to existing threshold + content_type path
 
     Returns a dict:
         {
@@ -232,8 +455,35 @@ def compress_tool_result(content, mime_hint=None, threshold=None, mode=None):
         threshold = proxy_state.PROXY_COMPRESS_THRESHOLD
     if mode is None:
         mode = proxy_state.PROXY_COMPRESS_MODE
+    if bm25_drop_threshold is None:
+        bm25_drop_threshold = proxy_state.PROXY_BM25_DROP_THRESHOLD
+    if bm25_keep_threshold is None:
+        bm25_keep_threshold = proxy_state.PROXY_BM25_KEEP_THRESHOLD
 
     original = content if isinstance(content, str) else str(content)
+
+    # TS-1: BM25 relevance override.
+    if bm25_score is not None:
+        if bm25_score >= bm25_keep_threshold:
+            return {
+                "original": original,
+                "compressed": original,
+                "content_type": "bm25_keep",
+                "strategy": "none",
+                "audit_pass": True,
+                "ratio": 1.0,
+            }
+        if bm25_score < bm25_drop_threshold:
+            # Force aggressive compression to ~30% of original length.
+            compressed = _aggressive_truncate(original, ratio=0.3)
+            return {
+                "original": original,
+                "compressed": compressed,
+                "content_type": "bm25_drop",
+                "strategy": "bm25_aggressive",
+                "audit_pass": True,
+                "ratio": round(len(compressed) / len(original), 4) if original else 1.0,
+            }
 
     if mode == "lossless" or len(original) < threshold:
         return {
@@ -318,4 +568,10 @@ __all__ = [
     "_audit_compression",
     "compress_tool_result",
     "_generate_tool_summary",
+    # TS-1 BM25 scoring
+    "_bm25_tokenize",
+    "_bm25_idf",
+    "_update_idf",
+    "bm25_score_message",
+    "_extract_last_user_text",
 ]

@@ -59,10 +59,36 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                             thinking_indices.append(msg_idx)
                         break
 
+    # ---- Phase 1a: BM25 scoring (TS-1 W3 d4) ----
+    bm25_scores = {}
+    if _ps.PROXY_BM25_ENABLED and _ps.PROXY_COMPRESS_ENABLED:
+        from content_compressor import bm25_score_message, _extract_last_user_text, _update_idf
+        query = _extract_last_user_text(messages)
+        if query:
+            _update_idf(messages)
+            for msg_idx, block_idx in all_tool_result_indices:
+                if frozen_head > 0 and msg_idx < frozen_head:
+                    continue
+                block = messages[msg_idx]["content"][block_idx]
+                content = block.get("content", "")
+                if not content:
+                    continue
+                score = bm25_score_message(
+                    {"role": "user", "content": [{"type": "text", "text": content}]},
+                    query=query,
+                )
+                bm25_scores[(msg_idx, block_idx)] = score
+
     # ---- Phase 1b: semantic compression of tool_result contents (Phase 2) ----
     compress_stats_list = []
     if _ps.PROXY_COMPRESS_ENABLED:
-        for msg_idx, block_idx in all_tool_result_indices:
+        # Sort by BM25 score ascending (low-score first) when BM25 is active.
+        if bm25_scores:
+            ordered_indices = sorted(all_tool_result_indices, key=lambda i: bm25_scores.get(i, 0.0))
+        else:
+            ordered_indices = list(all_tool_result_indices)
+
+        for msg_idx, block_idx in ordered_indices:
             if frozen_head > 0 and msg_idx < frozen_head:
                 continue
             block = messages[msg_idx]["content"][block_idx]
@@ -89,7 +115,12 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                                 break
                     break
 
-            result = compress_tool_result(content, mime_hint=mime_hint)
+            result = compress_tool_result(
+                content, mime_hint=mime_hint,
+                bm25_score=bm25_scores.get((msg_idx, block_idx)),
+                bm25_drop_threshold=_ps.PROXY_BM25_DROP_THRESHOLD,
+                bm25_keep_threshold=_ps.PROXY_BM25_KEEP_THRESHOLD,
+            )
             if result["ratio"] < 1.0:
                 block["content"] = result["compressed"]
                 compress_stats_list.append({
@@ -164,6 +195,10 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                     score += 5
                 if "[System:" in content_str and any(kw in content_str for kw in ("未发生变化", "文件不存在", "参数错误")):
                     score += 10
+                # TS-1: BM25 low-score penalty — low relevance tool_results get cleared first.
+                bm25 = bm25_scores.get((msg_idx, block_idx))
+                if bm25 is not None and bm25 < _ps.PROXY_BM25_DROP_THRESHOLD:
+                    score -= 10
                 scored.append((score, idx_pos, msg_idx, block_idx, tool_name, content_str))
 
             scored.sort(key=lambda x: (-x[0], -x[1]))

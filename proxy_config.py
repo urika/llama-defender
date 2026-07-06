@@ -440,6 +440,42 @@ CONFIG_REGISTRY = {
         "type": "bool", "scope": "reloadable",
         "doc": "Deduplicate repeated long scalar strings within a tool_result (only in aggressive mode).",
     },
+    # TS-1: BM25 relevance-driven compression
+    "PROXY_BM25_ENABLED": {
+        "defaults": {"local": "true", "cloud": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Enable BM25 relevance scoring for tool_result compression decisions.",
+    },
+    "PROXY_BM25_K1": {
+        "defaults": {"all": "1.5"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Okapi BM25 k1 parameter (term frequency saturation).",
+    },
+    "PROXY_BM25_B": {
+        "defaults": {"all": "0.75"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Okapi BM25 b parameter (length normalization).",
+    },
+    "PROXY_BM25_KEEP_THRESHOLD": {
+        "defaults": {"all": "3.5"},
+        "type": "float", "scope": "reloadable",
+        "doc": "BM25 score >= this value: skip compression entirely (keep verbatim).",
+    },
+    "PROXY_BM25_DROP_THRESHOLD": {
+        "defaults": {"all": "0.5"},
+        "type": "float", "scope": "reloadable",
+        "doc": "BM25 score < this value: force aggressive compression to ~30% original length.",
+    },
+    "PROXY_BM25_MIN_PREFIX": {
+        "defaults": {"all": "4"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Minimum prefix length for BM25 prefix expansion (stemming heuristic).",
+    },
+    "PROXY_BM25_IDF_LRU_MAX": {
+        "defaults": {"all": "10000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Maximum entries in the BM25 IDF map before LRU pruning.",
+    },
     "PROXY_SIEVE_JSON_MAX_ITEMS": {
         "defaults": {"all": "10"},
         "type": "int", "scope": "reloadable",

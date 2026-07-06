@@ -348,6 +348,26 @@
     ],
     "defaults": {}
   },
+  "_bm25_idf": {
+    "name": "_bm25_idf",
+    "params": [
+      "token",
+      "min_prefix"
+    ],
+    "defaults": {
+      "min_prefix": 4
+    }
+  },
+  "_bm25_tokenize": {
+    "name": "_bm25_tokenize",
+    "params": [
+      "text",
+      "min_prefix"
+    ],
+    "defaults": {
+      "min_prefix": 4
+    }
+  },
   "_build_blocker_message": {
     "name": "_build_blocker_message",
     "params": [
@@ -658,6 +678,13 @@
   },
   "_extract_keywords": {
     "name": "_extract_keywords",
+    "params": [
+      "messages"
+    ],
+    "defaults": {}
+  },
+  "_extract_last_user_text": {
+    "name": "_extract_last_user_text",
     "params": [
       "messages"
     ],
@@ -1038,6 +1065,16 @@
     ],
     "defaults": {}
   },
+  "_update_idf": {
+    "name": "_update_idf",
+    "params": [
+      "messages",
+      "min_prefix"
+    ],
+    "defaults": {
+      "min_prefix": 4
+    }
+  },
   "_write_request_snapshot": {
     "name": "_write_request_snapshot",
     "params": [
@@ -1049,6 +1086,23 @@
     "defaults": {
       "after_body": null,
       "error": null
+    }
+  },
+  "bm25_score_message": {
+    "name": "bm25_score_message",
+    "params": [
+      "msg",
+      "query",
+      "idf_map",
+      "k1",
+      "b",
+      "min_prefix"
+    ],
+    "defaults": {
+      "idf_map": null,
+      "k1": 1.5,
+      "b": 0.75,
+      "min_prefix": 4
     }
   },
   "clear_old_tool_results": {
@@ -1069,12 +1123,18 @@
       "content",
       "mime_hint",
       "threshold",
-      "mode"
+      "mode",
+      "bm25_score",
+      "bm25_drop_threshold",
+      "bm25_keep_threshold"
     ],
     "defaults": {
       "mime_hint": null,
       "threshold": null,
-      "mode": null
+      "mode": null,
+      "bm25_score": null,
+      "bm25_drop_threshold": null,
+      "bm25_keep_threshold": null
     }
   },
   "convert_anthropic_messages_to_openai": {

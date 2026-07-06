@@ -138,6 +138,15 @@ PROXY_LOG_DEDUPE = os.environ.get("PROXY_LOG_DEDUPE", "true").lower() in ("1", "
 PROXY_DEDUPE_SCALARS = os.environ.get("PROXY_DEDUPE_SCALARS", "false").lower() in ("1", "true", "yes")
 PROXY_COMPRESS_AUDIT = os.environ.get("PROXY_COMPRESS_AUDIT", "true").lower() in ("1", "true", "yes")
 
+# TS-1: BM25 relevance-driven compression (W3 d3-d5)
+PROXY_BM25_ENABLED = os.environ.get("PROXY_BM25_ENABLED", _default("PROXY_BM25_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
+PROXY_BM25_K1 = float(os.environ.get("PROXY_BM25_K1", "1.5"))
+PROXY_BM25_B = float(os.environ.get("PROXY_BM25_B", "0.75"))
+PROXY_BM25_KEEP_THRESHOLD = float(os.environ.get("PROXY_BM25_KEEP_THRESHOLD", "3.5"))
+PROXY_BM25_DROP_THRESHOLD = float(os.environ.get("PROXY_BM25_DROP_THRESHOLD", "0.5"))
+PROXY_BM25_MIN_PREFIX = int(os.environ.get("PROXY_BM25_MIN_PREFIX", "4"))
+PROXY_BM25_IDF_LRU_MAX = int(os.environ.get("PROXY_BM25_IDF_LRU_MAX", "10000"))
+
 CONTENT_TOOLS_FALLBACK_ENABLED = os.environ.get("PROXY_CONTENT_TOOLS_FALLBACK", "true").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
@@ -686,6 +695,14 @@ _RELOAD_SPEC = [
     ("PROXY_DEDUPE_SCALARS", "PROXY_DEDUPE_SCALARS", "bool", "false", "false"),
     ("PROXY_LOG_DEDUPE", "PROXY_LOG_DEDUPE", "bool", "true", "true"),
     ("PROXY_COMPRESS_AUDIT", "PROXY_COMPRESS_AUDIT", "bool", "true", "true"),
+    # TS-1 BM25 relevance-driven compression
+    ("PROXY_BM25_ENABLED", "PROXY_BM25_ENABLED", "bool", "false", "true"),
+    ("PROXY_BM25_K1", "PROXY_BM25_K1", "float", "1.5", "1.5"),
+    ("PROXY_BM25_B", "PROXY_BM25_B", "float", "0.75", "0.75"),
+    ("PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_KEEP_THRESHOLD", "float", "3.5", "3.5"),
+    ("PROXY_BM25_DROP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD", "float", "0.5", "0.5"),
+    ("PROXY_BM25_MIN_PREFIX", "PROXY_BM25_MIN_PREFIX", "int", "4", "4"),
+    ("PROXY_BM25_IDF_LRU_MAX", "PROXY_BM25_IDF_LRU_MAX", "int", "10000", "10000"),
     # Context truncation
     ("PROXY_CTX_LIMIT_ENABLED", "PROXY_CTX_LIMIT_ENABLED", "bool", "false", "true"),
     ("PROXY_CTX_CHARS_LIMIT", "PROXY_CTX_CHARS_LIMIT", "int", "500000", "180000"),
@@ -847,6 +864,10 @@ __all__ = [
     "PROXY_SCRUB_ANSI", "PROXY_SIEVE_JSON_MAX_ITEMS", "PROXY_SIEVE_JSON_MAX_STR_LEN",
     "PROXY_SIEVE_JSON_MAX_DEPTH", "PROXY_LOG_DEDUPE", "PROXY_DEDUPE_SCALARS",
     "PROXY_COMPRESS_AUDIT", "CONTENT_TOOLS_FALLBACK_ENABLED",
+    # TS-1 BM25
+    "PROXY_BM25_ENABLED", "PROXY_BM25_K1", "PROXY_BM25_B",
+    "PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD",
+    "PROXY_BM25_MIN_PREFIX", "PROXY_BM25_IDF_LRU_MAX",
     # Context truncation
     "PROXY_CTX_LIMIT_ENABLED", "PROXY_CTX_CHARS_LIMIT", "PROXY_CTX_KEEP_HEAD",
     "PROXY_CTX_KEEP_TAIL", "PROXY_CTX_TRUNCATE_STRATEGY", "PROXY_CTX_KEEP_ROUNDS",
