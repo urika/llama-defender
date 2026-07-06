@@ -60,6 +60,15 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                         break
 
     # ---- Phase 1a: BM25 scoring (TS-1 W3 d4) ----
+    # TS-2 cross-segment pair protection: tool_results whose tool_use is in
+    # the frozen prefix are excluded from BM25 scoring and compression.
+    protected_tr_indices = set()
+    if frozen_head > 0:
+        protected_pairs = _protected_pair_indices(messages, frozen_head)
+        for msg_idx, block_idx in all_tool_result_indices:
+            if msg_idx in protected_pairs and msg_idx < frozen_head:
+                protected_tr_indices.add((msg_idx, block_idx))
+
     bm25_scores = {}
     if _ps.PROXY_BM25_ENABLED and _ps.PROXY_COMPRESS_ENABLED:
         from content_compressor import bm25_score_message, _extract_last_user_text, _update_idf
@@ -68,6 +77,8 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
             _update_idf(messages)
             for msg_idx, block_idx in all_tool_result_indices:
                 if frozen_head > 0 and msg_idx < frozen_head:
+                    continue
+                if (msg_idx, block_idx) in protected_tr_indices:
                     continue
                 block = messages[msg_idx]["content"][block_idx]
                 content = block.get("content", "")
@@ -90,6 +101,8 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
 
         for msg_idx, block_idx in ordered_indices:
             if frozen_head > 0 and msg_idx < frozen_head:
+                continue
+            if (msg_idx, block_idx) in protected_tr_indices:
                 continue
             block = messages[msg_idx]["content"][block_idx]
             content = block.get("content", "")
