@@ -599,7 +599,8 @@ def _compress_assistant_message(msg):
         return {**msg, "content": "[reasoning omitted]"}
     return msg
 # --- _apply_smart_truncation ---
-def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
+def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
+                           protected_pairs=None, pair_index_map=None):
     """Phase 2 改进2 (proxy-truncation-agent-scenario.md): role+content-aware
     truncation. Preserves high-value content (system, tool_result, recent
     user turns) verbatim; compresses assistant reasoning text into a fixed
@@ -614,6 +615,13 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
       4. assistant messages        — newest first; reasoning compressed
                                      if original doesn't fit, dropped if
                                      compressed form still doesn't fit
+
+    TS-2 (W1 d3-4): tool_use/tool_result 配对原子保护.
+      当 protected_pairs (set of msg idx) + pair_index_map (idx → (a, u)) 提供时,
+      drop 决策点遵守:
+        - 被保护集成员不可单边 drop; 必须整对 drop 或整对保留
+        - 若无可 drop 的非保护项 → skipped_reason="invalid_anthropic_tool_sequence"
+      未提供时 (legacy 调用路径) 退化为旧行为 + 末尾 _fix_tool_pairings 兜底.
 
     Returns (result_messages, stats_dict). The stats dict has:
       strategy='smart', truncated, dropped_messages, kept_messages,
@@ -634,6 +642,18 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
             "budget_chars": budget_chars,
         }
 
+    # TS-2: 准备配对保护集 (若调用方未提供, 自行计算).
+    if protected_pairs is None:
+        protected_pairs = _protected_pair_indices(
+            messages, _ps.PROXY_CACHE_ALIGN_HEAD)
+    if pair_index_map is None:
+        pair_index_map = _pair_index_map(messages)
+
+    # TS-2: 索引 → msg 映射, 用于按索引访问 other_msgs 中的成员.
+    # other_msgs 是 messages 减去 system + tool_result; 我们需要原始索引.
+    # Build id → original idx 映射 (用 id() 避免 dict 不可哈希问题).
+    msg_id_to_idx = {id(m): i for i, m in enumerate(messages)}
+
     # Step 1: classify. Use id-based sets to avoid relying on dict equality
     # (Anthropic SDK message dicts are not hashable, so `m in system`
     # would also be O(n²) and unreliable for nested mutations).
@@ -644,6 +664,9 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
     other_msgs = [m for m in messages
                   if id(m) not in system_ids and id(m) not in tool_result_ids]
 
+    # TS-2: 记录 tool_result 在原 messages 中的索引集合, 用于 Step 3 判断 partner 是否在 kept.
+    tool_result_orig_idxs = {msg_id_to_idx.get(id(m), -1) for m in tool_result_msgs}
+
     # Step 2: always keep system + tool_result; measure their cost.
     kept = list(system_msgs) + list(tool_result_msgs)
     kept_chars = _estimate_message_chars(kept)
@@ -653,14 +676,35 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
     # re-read loop). The caller is expected to catch this with the
     # OOM_SAFE hard ceiling before reaching here.
     if kept_chars > budget_chars:
-        return kept, {
+        # TS-2: 区分两种超预算:
+        #   (a) drop 所有非配对 other 后仍超 budget → 无有效 drop, 标 skipped_reason.
+        #   (b) drop 非配对 other 后能达标 → must_keep_exceeds_budget,
+        #       走 _fix_tool_pairings 兜底.
+        unprotected_other = [m for m in other_msgs
+                             if msg_id_to_idx.get(id(m)) not in pair_index_map]
+        unprotected_chars = _estimate_message_chars(unprotected_other)
+        if kept_chars - unprotected_chars > budget_chars:
+            # drop 所有非配对项后仍超 budget: 无有效 drop (配对保护让剩余项不可单边 drop).
+            return messages, {
+                "enabled": True,
+                "strategy": "smart",
+                "skipped": True,
+                "reason": "invalid_anthropic_tool_sequence",
+                "skipped_reason": "invalid_anthropic_tool_sequence",
+                "chars": total_input_chars,
+                "kept_chars": kept_chars,
+                "unprotected_chars": unprotected_chars,
+                "budget_chars": budget_chars,
+            }
+        result = _fix_tool_pairings(kept)
+        return result, {
             "enabled": True,
             "strategy": "smart",
             "truncated": True,
             "dropped_messages": len(other_msgs),
-            "kept_messages": len(kept),
+            "kept_messages": len(result),
             "compressed_assistants": 0,
-            "kept_chars": kept_chars,
+            "kept_chars": _estimate_message_chars(result),
             "budget_chars": budget_chars,
             "reason": "must_keep_exceeds_budget",
         }
@@ -672,7 +716,50 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
     dropped_count = 0
     # Insert in chronological order, so we prepend and reverse at the end.
     chosen = []
+    # TS-2: 跟踪被整对 drop 的索引, 避免后续误处理其配对成员.
+    dropped_idxs = set()
     for msg in reversed(other_msgs):
+        orig_idx = msg_id_to_idx.get(id(msg))
+        # TS-2: 若 msg 是被保护对成员且其配对成员尚未处理, 需检查配对状态.
+        if orig_idx is not None and orig_idx in pair_index_map:
+            a_idx, u_idx = pair_index_map[orig_idx]
+            partner_idx = u_idx if orig_idx == a_idx else a_idx
+            if partner_idx in dropped_idxs:
+                # 配对成员已被 drop, 此条也 drop (整对 drop).
+                dropped_count += 1
+                dropped_idxs.add(orig_idx)
+                continue
+            # 否则 msg 的配对成员尚未处理 (可能 system/tool_result/must_keep, 或稍后才处理).
+            # 此时 msg 单独处理: 若能 keep 就 keep, 若不能 keep 则需 partner 一起 drop.
+            msg_chars = _estimate_message_chars([msg])
+            if kept_chars + msg_chars <= budget_chars:
+                chosen.append(msg)
+                kept_chars += msg_chars
+                continue
+            # 不能 fit: 尝试压缩 (仅 assistant 走压缩).
+            if msg.get("role") == "assistant":
+                compressed = _compress_assistant_message(msg)
+                comp_chars = _estimate_message_chars([compressed])
+                if kept_chars + comp_chars <= budget_chars:
+                    chosen.append(compressed)
+                    kept_chars += comp_chars
+                    compressed_count += 1
+                    continue
+            # 既不能 keep 也不能压缩: 整对 drop. 标记 dropped_idxs, partner 后续遇到时也 drop.
+            # 但 partner 可能已在 must_keep 中 (system/tool_result),
+            # 此时不可 drop, 必须强制保留 msg (整对保留).
+            partner_in_must_keep = partner_idx in tool_result_orig_idxs or partner_idx < len(system_msgs)
+            if partner_in_must_keep:
+                # partner 强制 keep, 此条也强制 keep (即使超 budget).
+                chosen.append(msg)
+                kept_chars += msg_chars
+                continue
+            # partner 尚未处理且不在 must_keep: 整对 drop.
+            dropped_count += 1
+            dropped_idxs.add(orig_idx)
+            continue
+
+        # 非配对成员, 走原有逻辑.
         msg_chars = _estimate_message_chars([msg])
         if kept_chars + msg_chars <= budget_chars:
             chosen.append(msg)
@@ -687,6 +774,20 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
                 compressed_count += 1
                 continue
         dropped_count += 1
+
+    # TS-2: 若未发生任何 drop 且总长仍超 budget, 说明所有可 drop 项都被配对保护.
+    # 此时返回 skipped_reason, 让上层走 fallback (如 rounds / OOMSafetyFIFO).
+    if dropped_count == 0 and kept_chars > budget_chars:
+        return messages, {
+            "enabled": True,
+            "strategy": "smart",
+            "skipped": True,
+            "reason": "invalid_anthropic_tool_sequence",
+            "skipped_reason": "invalid_anthropic_tool_sequence",
+            "chars": total_input_chars,
+            "kept_chars": kept_chars,
+            "budget_chars": budget_chars,
+        }
 
     # Reverse `chosen` to restore chronological order, then assemble.
     chosen.reverse()
@@ -703,7 +804,8 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None):
         "budget_chars": budget_chars,
     }
 # --- truncate_messages_if_needed ---
-def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
+def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
+                                strategy=None, budget_chars=None):
     """
     Proxy-side message truncation with dual strategy support.
 
@@ -719,12 +821,18 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
     trigger threshold, replacing the old token-budget _ps.PROXY_CTX_TOKEN_BUDGET.
     Operates on Anthropic-format messages in-place.
     Returns (messages, stats_dict).
+
+    TS-2 (W1 d3-4): 可显式传 strategy= 覆盖 PROXY_CTX_TRUNCATE_STRATEGY;
+    budget_chars= 覆盖 PROXY_CHARS_EXPANSION (仅 smart 路径使用).
     """
-    if not _ps.PROXY_CTX_LIMIT_ENABLED and _ps.PROXY_CTX_TRUNCATE_STRATEGY != "rounds":
+    # TS-2: 显式 strategy 覆盖全局配置.
+    effective_strategy = strategy if strategy is not None else _ps.PROXY_CTX_TRUNCATE_STRATEGY
+
+    if not _ps.PROXY_CTX_LIMIT_ENABLED and effective_strategy != "rounds":
         return messages, {"enabled": False}
 
     # ---------- rounds strategy ----------
-    if _ps.PROXY_CTX_TRUNCATE_STRATEGY == "rounds":
+    if effective_strategy == "rounds":
         # keep_rounds=None: stage says skip truncation entirely
         if keep_rounds is None:
             return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "stage_skip"}
@@ -778,7 +886,7 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
         return messages, {"enabled": True, "strategy": "rounds", "skipped": True, "reason": "no_reduction"}
 
     # ---------- fifo strategy ----------
-    if _ps.PROXY_CTX_TRUNCATE_STRATEGY == "fifo":
+    if effective_strategy == "fifo":
         n = len(messages)
         keep_total = _ps.PROXY_CTX_KEEP_MESSAGES
         if n <= keep_total:
@@ -868,9 +976,10 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
     # don't fit are first attempted in compressed form (tool_use blocks
     # kept, reasoning text replaced by a stable placeholder) before being
     # dropped entirely.
-    if _ps.PROXY_CTX_TRUNCATE_STRATEGY == "smart":
+    if effective_strategy == "smart":
+        effective_budget = budget_chars if budget_chars is not None else _ps.PROXY_CHARS_EXPANSION
         return _apply_smart_truncation(
-            messages, budget_chars=_ps.PROXY_CHARS_EXPANSION, session_id=session_id,
+            messages, budget_chars=effective_budget, session_id=session_id,
         )
 
     # ---------- char strategy (and any other unhandled strategy) ----------
@@ -882,10 +991,185 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None):
     # NoneType object`.
     return messages, {
         "enabled": True,
-        "strategy": _ps.PROXY_CTX_TRUNCATE_STRATEGY,
+            "strategy": effective_strategy,
         "skipped": True,
         "reason": "char_strategy_uses_noop_fallback",
     }
+# --- _find_tool_pairs (TS-2 W1 d1-2) ---
+# Anthropic 工具配对原子单元: 事前识别 assistant tool_use → user tool_result 配对区间.
+# 设计参考 docs/02-architecture-design/tool-pair-atomicity-design-2026-07-05.md §4.
+# 与 _fix_tool_pairings (事后修复) 共存; 本函数供 truncate/clear 决策时事前参考.
+
+def _iter_tool_use_blocks(msg):
+    """Yield (tool_use_id, block) for each tool_use block in an assistant message."""
+    if not isinstance(msg, dict):
+        return
+    if msg.get("role") != "assistant":
+        return
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            tid = b.get("id", "")
+            if tid:
+                yield tid
+
+
+def _iter_tool_result_blocks(msg):
+    """Yield (tool_use_id, block) for each tool_result block in a user message."""
+    if not isinstance(msg, dict):
+        return
+    if msg.get("role") != "user":
+        return
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            tid = b.get("tool_use_id", "")
+            if tid:
+                yield tid
+
+
+def _find_tool_pairs(messages):
+    """识别 assistant tool_use → user tool_result 的配对区间 (design §4.1).
+
+    返回: List[(assistant_msg_idx, user_msg_idx)] 按 (a_idx, u_idx) 升序.
+      - 正常配对: (a_idx, u_idx)
+      - 孤儿 user tool_result (无 sender 或 sender 已被首配对占用): (-1, u_idx)
+      - 孤儿 assistant tool_use (无 result 或 result 已被首配对占用): 不出现在结果中
+      - 重复 tool_use_id (协议异常): 取首个 assistant + 首个 user 为 (a, u),
+        其余同 id 的 user 标 (-1, u_idx); 其余同 id 的 assistant 不返回.
+    """
+    # Pass 1: 收集每个 tool_use_id 的首个 assistant 索引 (按消息顺序).
+    first_assistant_for_id = {}
+    for idx, msg in enumerate(messages):
+        for tid in _iter_tool_use_blocks(msg):
+            if tid not in first_assistant_for_id:
+                first_assistant_for_id[tid] = idx
+
+    # Pass 2: 为每个 tool_use_id 配首个 user tool_result 为正式配对,
+    # 余下同 id 的 user (sender 已被首配对占用) 标孤儿 (-1, u_idx);
+    # 无 sender 的孤儿 user tool_result 不返回 (由 _fix_tool_pairings 兜底).
+    first_user_for_id = {}
+    orphan_user_indices = []
+    for idx, msg in enumerate(messages):
+        for tid in _iter_tool_result_blocks(msg):
+            if tid in first_assistant_for_id and tid not in first_user_for_id:
+                first_user_for_id[tid] = idx
+            elif tid in first_assistant_for_id and tid in first_user_for_id:
+                # 同 id 重复出现的 user tool_result: sender 已被首配对占用, 标孤儿.
+                orphan_user_indices.append((-1, idx))
+            # else: 无 sender 的孤儿 user tool_result → 不返回.
+
+    pairs = []
+    for tid, a_idx in first_assistant_for_id.items():
+        if tid in first_user_for_id:
+            pairs.append((a_idx, first_user_for_id[tid]))
+
+    pairs.extend(orphan_user_indices)
+
+    # 排序: 正常对按 (a_idx, u_idx) 升序; 孤儿 (-1, u_idx) 排在最后.
+    pairs.sort(key=lambda p: (p[0] if p[0] >= 0 else (1 << 30), p[0], p[1]))
+    return pairs
+
+
+def _protected_pair_indices(messages, protected_prefix_n):
+    """返回所有不可单边截断的消息索引集合 (design §4.2).
+
+    集合构成:
+      1. 前 protected_prefix_n 条消息 → 全部入集 (CacheAligner protected 段)
+      2. _find_tool_pairs 返回的所有 (a_idx, u_idx) 配对索引 → 全部入集
+      3. 跨段配对: 若 a_idx 或 u_idx 任一在 protected 段内, 另一个强制入集
+
+    孤儿 (-1, u_idx) 不入保护集 (孤儿由 _fix_tool_pairings 兜底).
+    """
+    n = len(messages)
+    if protected_prefix_n > n:
+        protected_prefix_n = n
+    protected = set(range(protected_prefix_n))
+
+    pairs = _find_tool_pairs(messages)
+    for a_idx, u_idx in pairs:
+        if a_idx < 0:
+            continue
+        protected.add(a_idx)
+        protected.add(u_idx)
+        # 跨段配对强制保护已在 add 中体现 (无论是否在 protected 段).
+    return protected
+
+
+def _pair_index_map(messages):
+    """返回 {msg_idx: (a_idx, u_idx) pair} 反查表,供 truncate 决策点使用.
+
+    若 msg_idx 是某对配对成员, 返回该对; 否则不在表中.
+    孤儿 (-1, u_idx) 不在此表中.
+    """
+    pairs = _find_tool_pairs(messages)
+    idx_to_pair = {}
+    for a_idx, u_idx in pairs:
+        if a_idx < 0:
+            continue
+        idx_to_pair[a_idx] = (a_idx, u_idx)
+        idx_to_pair[u_idx] = (a_idx, u_idx)
+    return idx_to_pair
+
+
+def _oom_safety_fifo(messages, max_chars=None, keep_head=None, keep_tail=None):
+    """OOMSafetyFIFO 紧急 FIFO 截断 (design §6.1 I-3).
+
+    紧急路径: 可打破 TS-2 配对保护集, 优先避免 OOM.
+    返回 (result_messages, stats_dict), stats 含:
+      skipped_reason='oom_emergency'  — 标识打破保护集
+      dropped_messages, kept_messages, iterations, chars, budget_chars
+
+    兜底由 _fix_tool_pairings 清理孤儿 (调用方应在收到 oom_emergency 后调用 _fix_tool_pairings).
+
+    参数:
+      max_chars  — 字符预算上限 (默认 PROXY_CHARS_OOM_DANGER)
+      keep_head  — 保留头部消息数 (默认 PROXY_CTX_KEEP_HEAD)
+      keep_tail  — 保留尾部消息数 (默认 PROXY_CTX_KEEP_TAIL)
+    """
+    if max_chars is None:
+        max_chars = _ps.PROXY_CHARS_OOM_DANGER
+    if keep_head is None:
+        keep_head = _ps.PROXY_CTX_KEEP_HEAD
+    if keep_tail is None:
+        keep_tail = _ps.PROXY_CTX_KEEP_TAIL
+
+    result = list(messages)
+    iteration = 0
+    min_keep = max(keep_head + keep_tail, 4)
+
+    while True:
+        est_chars = _estimate_message_chars(result)
+        if est_chars <= max_chars or len(result) <= min_keep:
+            break
+        iteration += 1
+        if len(result) > min_keep:
+            dropped = len(result) - min_keep
+            result = result[:keep_head] + result[-(min_keep - keep_head):]
+        else:
+            break
+
+    # OOM 紧急路径打破保护集, 兜底清理孤儿.
+    result = _fix_tool_pairings(result)
+
+    dropped_count = len(messages) - len(result)
+    return result, {
+        "enabled": True,
+        "strategy": "oom_safety_fifo",
+        "truncated": dropped_count > 0,
+        "dropped_messages": dropped_count,
+        "kept_messages": len(result),
+        "iterations": iteration,
+        "chars": _estimate_message_chars(result),
+        "budget_chars": max_chars,
+        "skipped_reason": "oom_emergency",
+    }
+
+
 # --- _fix_tool_pairings ---
 def _fix_tool_pairings(messages):
     """Repair orphaned tool_use/tool_result blocks after truncation.

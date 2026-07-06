@@ -1,6 +1,7 @@
 # 功能缺陷清单 (Defect List)
 
 > **生成日期**: 2026-06-06  
+> **最后更新**: 2026-07-05 (新增 DEF-109 长上下文循环根治; DEF-001/002/103/107 标记 M1.5 双路径; 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2/TS-1)
 > **数据来源**: 
 > - `logs/anthropic_proxy.log` (66 MB, 178K+ 条目)
 > - `logs/llama-server.log` (8.4 MB, rapid-mlx 后端日志)
@@ -29,6 +30,9 @@
 
 ### DEF-001: 67 个请求返回 500 错误 (22% 错误率) — 🟡 部分修复
 
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 (W1-W2)
+> M1 走 WrapperGuard 热修 (防御性清理孤儿); M1.5 TS-2 通过 `_find_tool_pairs` + 配对原子保护从源头消除孤儿 tool_use/tool_result 切断问题。
+
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/proxy_metrics.jsonl` |
@@ -43,6 +47,9 @@
 | **剩余工作** | 1) 生产环境验证 500 错误率是否降至 < 2%<br>2) 根因仍可能是 `_handle_messages` 内部逻辑错误,预截断仅为缓解措施 |
 
 ### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环 — 🟡 部分修复
+
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2
+> 截断切断配对是循环注入的诱因之一 (后端孤儿报错→模型 Defensive Read 重试)。M1.5 TS-2 消除此根因后,defensive re-read 触发率目标下降 ≥ 50%。
 
 | 项 | 内容 |
 |------|------|
@@ -118,6 +125,9 @@
 
 ### DEF-103: Cleared Compression 触发率低 (代理层收益打折) — ✅ 设计限制 (已记录)
 
+> **🔗 M1.5 替代路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-1 (W3)
+> 原 Cleared Compression 触发率不达预期;M1.5 TS-1 引入 BM25 评分驱动压缩决策,低分 tool_result 优先压,触发率目标 ≥ 60% (当前约 30%)。
+
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` |
@@ -154,6 +164,9 @@
 
 ### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高 — 🟡 已缓解
 
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 + TS-1
+> 事后 `_fix_tool_pairings` 清理孤儿导致的"额外 drop"是 high_drop_ratio 偏高主因。M1.5 TS-2 事前预防消除额外 drop;TS-1 BM25 让低相关性 tool_result 优先压缩(而非整体 drop),双管齐下目标 < 10%。
+
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/proxy_metrics.jsonl` quality_flags 统计 |
@@ -171,6 +184,22 @@
 |------|------|
 | **根因** | Pipeline 顺序错误: `clear_old_tool_results` 在 `_detect_blocker_pattern` 之前运行,清除 tool_result 内容时覆盖了错误标记 (`wasted`/`file_not_found`/`input_validation`) |
 | **修复** | 将 blocker detection 移到 tool-result clearing 之前。现在 pipeline 顺序: 1) error translation 2) **blocker detection** 3) tool-result clearing |
+
+### DEF-109: 长上下文 agentic 场景循环率过高 — 🟡 待修复
+
+> **🔗 PM 评估**: 2026-07-05 跨阶段生产数据分析 (`logs/proxy_metrics.jsonl` 5240 样本)。
+> **🔗 根治路径**: TS-1 BM25 评分 (PRD-litellm-borrow §2 TS-1) 通过降低长上下文 token 总量间接降低循环触发;DEF-002 调参 (#16a) 通过 long/very_long 阈值下调。
+> 短上下文循环已由 DEF-002 修复解决 (Phase 1 短上下文 3%);本缺陷聚焦长上下文场景。
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | `logs/proxy_metrics.jsonl` 5240 条结构化指标 (2026-06-05 ~ 07-05) |
+| **当前指标** | 按字符桶分层的 loop_injected 率: xs 0.6% / sm 11.5% / md 28.8% / lg 45.3% / xl 62.7%。<br>Phase 1 (修复后) 长上下文 ≥100K chars 仍达 39.2% (120/306); Phase 2 (动态阈值后) 57.4% (438/763)。<br>`saturation` 阶段 53%; `oom_danger` 阶段 50%。 |
+| **根因** | 1) **循环与上下文长度强正相关** (105x 倍数差), 非代理管线独立 bug <br>2) **长上下文工具调用分布**: Bash 53/120 + Read 26/120 + WebSearch 13/120, 模型本身在长程推理时倾向反复试探 <br>3) **Level 1 主导** (100/120 Phase1 长上下文循环), Level 2/3 触发不及时 <br>4) **rapid-mlx 行为特性**: 忽略 max_tokens → 生成失控 → 文本循环误报; Wasted call → Defensive Read 循环 <br>5) **统计口径失误**: `loop_injected` 打标条件 `max_run≥3` 但 `level=0` 也被打标, Phase 2 240/438 是 Level 0 假阳性 |
+| **预期缓解路径** | 1) **TS-1 BM25 压缩 (W3)**: 降低长上下文 token 总量 → 降低循环触发概率 (主路径) <br>2) **DEF-002 调参 #16a (M2)**: `PROXY_LOOP_THRESHOLD_LONG` 4→3, `VERY_LONG` 5→4 <br>3) **统计口径修复 (M2)**: `loop_injected` 改为基于 `level≥1` 而非 `max_run≥3` |
+| **验收标准** | 分场景 (不再一刀切 < 20%): <br>- 短上下文 (`xs/sm` < 50K chars): ≤ 5% (现状达) <br>- 中等 (`md` 50K-100K): ≤ 30% <br>- **长上下文 (`lg/xl` ≥ 100K): ≤ 40%** (Phase 1 39.2%, TS-1 加压缩后预期进一步降) <br>- `saturation` 阶段: ≤ 30% (现状 53%) |
+| **测试样本要求** | 验证必须覆盖 `saturation`+`expansion` lifecycle stage, 不能只跑短 session init 阶段 (Phase 3 37 条全 init 样本不足以验证) |
+| **风险预测** | 若全本地路径无 cloud 兜底, 长上下文场景循环率预计 50–65% (rapid-mlx + Metal OOM + Wasted call 三重叠加), 突破验收线 |
 
 ---
 

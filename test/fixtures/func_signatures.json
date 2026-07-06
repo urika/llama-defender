@@ -328,11 +328,15 @@
     "params": [
       "messages",
       "budget_chars",
-      "session_id"
+      "session_id",
+      "protected_pairs",
+      "pair_index_map"
     ],
     "defaults": {
       "budget_chars": null,
-      "session_id": null
+      "session_id": null,
+      "protected_pairs": null,
+      "pair_index_map": null
     }
   },
   "_audit_compression": {
@@ -1209,11 +1213,15 @@
     "params": [
       "messages",
       "session_id",
-      "keep_rounds"
+      "keep_rounds",
+      "strategy",
+      "budget_chars"
     ],
     "defaults": {
       "session_id": null,
-      "keep_rounds": null
+      "keep_rounds": null,
+      "strategy": null,
+      "budget_chars": null
     }
   }
 }

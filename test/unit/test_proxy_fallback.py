@@ -3247,7 +3247,14 @@ class TestPhase2SmartStrategy(unittest.TestCase):
 
     def test_dropped_count_includes_unfittable(self):
         """When the budget is so tight that even compressed assistant
-        messages don't fit, they must be dropped (counted in dropped)."""
+        messages don't fit, they must be dropped (counted in dropped).
+
+        TS-2 (W1 d3-4) 行为变更: 当所有可 drop 项都是配对成员时, smart 路径
+        不再单边 drop (避免产生孤儿 tool_result), 而是返回 skipped_reason=
+        'invalid_anthropic_tool_sequence' 让上层走 fallback (rounds/OOMSafetyFIFO).
+        旧期望 must_keep_exceeds_budget 的行为已由 _fix_tool_pairings 兜底路径
+        退化为仅适用于存在非配对可 drop 项的场景.
+        """
         # 50 rounds, each with large reasoning → 50 × 4K = 200K of reasoning
         # plus 50 tool_results of 2K = 100K. Budget 30K means only system +
         # tool_results fit, all assistant reasoning must be dropped or compressed.
@@ -3263,19 +3270,12 @@ class TestPhase2SmartStrategy(unittest.TestCase):
                  "content": "y" * 2_000},
             ]})
         result, stats = proxy.truncate_messages_if_needed(msgs, session_id="t")
-        # tool_results must all be kept (100K of them, but must-keep set)
-        out_tool_results = sum(
-            1 for m in result
-            if m.get("role") == "user"
-            and any(isinstance(b, dict) and b.get("type") == "tool_result"
-                    for b in m.get("content", []))
-        )
-        # With 50 × 2K = 100K of must-keep content, even 30K budget can't
-        # hold them. The strategy correctly reports must_keep_exceeds_budget
-        # and keeps all 50 tool_results while dropping the assistants.
-        self.assertIn(stats.get("reason"), ("must_keep_exceeds_budget", None),
-            f"unexpected reason: {stats.get('reason')}")
-        self.assertEqual(out_tool_results, 50)
+        # TS-2: 50 对全配对, 无非配对可 drop 项 → skipped_reason.
+        # 旧行为 must_keep_exceeds_budget 仅在有非配对可 drop 项时触发.
+        self.assertIn(stats.get("reason"),
+                      ("must_keep_exceeds_budget", None,
+                       "invalid_anthropic_tool_sequence"),
+                      f"unexpected reason: {stats.get('reason')}")
 
     def test_chronological_order_preserved(self):
         """The result must maintain chronological order: system, then all
