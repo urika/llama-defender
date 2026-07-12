@@ -91,6 +91,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -606,9 +607,11 @@ _start_proxy() {
     # 使用配置中的 LLAMA_BASE_URL 如果有的话，否则用本地
     local base_url="${LLAMA_BASE_URL:-http://$LLAMA_HOST:$LLAMA_PORT/v1}"
 
+    local active_profile="${PROXY_COMPRESSION_PROFILE:-balanced}"
     info "启动 anthropic_proxy.py..."
     info "  地址: $PROXY_HOST:$PROXY_PORT"
     info "  后端: $base_url"
+    info "  Profile: $active_profile"
 
     # 使用 bash -c wrapper 捕获崩溃输出到日志；wrapper 在函数末尾删除
     local proxy_wrapper="$SCRIPT_DIR/.start_proxy_$$.sh"
@@ -1542,6 +1545,165 @@ cmd_route_force_cloud() {
 }
 
 # ============================================================
+# 快速启动向导
+# ============================================================
+cmd_wizard() {
+    echo ""
+    echo -e "  ${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${CYAN}║${NC}       ${BOLD}llama.cpp 快速启动向导${NC}                  ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # --- 步骤 1: 选择运行模式 ---
+    echo -e "${BOLD}步骤 1/4: 选择运行模式${NC}"
+    echo "  1) 本地模式 (推荐) — 使用本地 GPU 运行模型，免费且隐私安全"
+    echo "  2) 云端模式 — 使用 DeepSeek/OpenAI API，按 token 付费"
+    echo ""
+    local mode=""
+    while [[ -z "$mode" ]]; do
+        read -p "  请输入编号 [1/2]: " mode_choice
+        case "$mode_choice" in
+            1) mode="local"; echo "" ;;
+            2) mode="cloud"; echo "" ;;
+            *) echo "  请输入 1 或 2" ;;
+        esac
+    done
+
+    # --- 步骤 2: 选择配置 ---
+    echo -e "${BOLD}步骤 2/4: 选择配置${NC}"
+    echo ""
+
+    local configs=()
+    local config_names=()
+    local config_descs=()
+    local config_memories=()
+    local config_backends=()
+    local idx=0
+
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        [[ "$(basename "$conf")" == "active.conf" ]] && continue
+        [[ "$(basename "$conf")" == "secret.local.conf" ]] && continue
+
+        local name desc memory backend
+        name=$(basename "$conf" .conf)
+        desc=$(grep "^CONFIG_DESC=" "$conf" 2>/dev/null | cut -d'"' -f2 || echo "-")
+        memory=$(grep "^CONFIG_MEMORY=" "$conf" 2>/dev/null | cut -d'"' -f2 || echo "-")
+        backend=$(grep "^LLAMA_BACKEND=" "$conf" 2>/dev/null | cut -d'"' -f2 || echo "llama-server")
+
+        # 云端模式只显示 cloud 配置，本地模式只显示本地配置
+        if [[ "$mode" == "cloud" ]]; then
+            if [[ "$backend" != "cloud" && "$backend" != "deepseek-cloud" && "$backend" != "openai-cloud" ]]; then
+                continue
+            fi
+        else
+            if [[ "$backend" == "cloud" || "$backend" == "deepseek-cloud" || "$backend" == "openai-cloud" ]]; then
+                continue
+            fi
+        fi
+
+        configs[$idx]="$conf"
+        config_names[$idx]="$name"
+        config_descs[$idx]="$desc"
+        config_memories[$idx]="$memory"
+        config_backends[$idx]="$backend"
+        idx=$((idx + 1))
+    done
+
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        if [[ "$mode" == "cloud" ]]; then
+            error "未找到云端配置 (deepseek-chat.conf)"
+            info "请确认 configs/ 目录下存在云端配置文件"
+        else
+            error "未找到本地配置"
+            info "请确认 configs/ 目录下存在本地配置文件"
+        fi
+        return 1
+    fi
+
+    for ((i=0; i<${#configs[@]}; i++)); do
+        local marker=""
+        local active_name
+        active_name=$(_current_config_name)
+        if [[ "${config_names[$i]}" == "$active_name" ]]; then
+            marker=" ${GREEN}(当前)${NC}"
+        fi
+        echo -e "  $((i+1))) ${CYAN}${config_names[$i]}${NC}$marker"
+        echo -e "     后端: ${config_backends[$i]}  |  用途: ${config_descs[$i]}  |  内存: ${config_memories[$i]}"
+    done
+    echo ""
+
+    local selected_idx=""
+    while [[ -z "$selected_idx" ]]; do
+        read -p "  请输入编号 [1-${#configs[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#configs[@]} )); then
+            selected_idx=$((choice - 1))
+        else
+            echo "  请输入 1 到 ${#configs[@]} 之间的编号"
+        fi
+    done
+    echo ""
+
+    local selected_name="${config_names[$selected_idx]}"
+
+    # --- 步骤 3: 选择 Profile ---
+    echo -e "${BOLD}步骤 3/4: 选择压缩策略 (Profile)${NC}"
+    echo "  1) balanced (推荐) — 日常 coding，兼顾质量与性能"
+    echo "     压缩: smart | 截断: fifo | 保留: 40 轮对话"
+    echo ""
+    echo "  2) aggressive — 长上下文场景，优先控制 token 消耗"
+    echo "     压缩: aggressive | 截断: fifo | 保留: 30 轮对话"
+    echo ""
+    echo "  3) conservative — 质量敏感任务，保留上下文完整性"
+    echo "     压缩: conservative | 截断: rounds | 保留: 50 轮对话"
+    echo ""
+
+    local profile="balanced"
+    while true; do
+        read -p "  请输入编号 [1/2/3] (默认 1): " profile_choice
+        case "${profile_choice:-1}" in
+            1) profile="balanced"; break ;;
+            2) profile="aggressive"; break ;;
+            3) profile="conservative"; break ;;
+            *) echo "  请输入 1, 2 或 3" ;;
+        esac
+    done
+    echo ""
+
+    # --- 步骤 4: 确认并启动 ---
+    echo -e "${BOLD}步骤 4/4: 确认配置${NC}"
+    echo "  配置:     ${CYAN}$selected_name${NC}"
+    echo "  后端:     ${config_backends[$selected_idx]}"
+    echo "  用途:     ${config_descs[$selected_idx]}"
+    if [[ "$mode" == "local" ]]; then
+        echo "  内存需求: ${config_memories[$selected_idx]}"
+    fi
+    echo "  Profile:  ${CYAN}$profile${NC}"
+    echo ""
+
+    read -p "  确认启动? [Y/n] " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消"
+        return 0
+    fi
+    echo ""
+
+    # 执行切换和启动
+    info "切换到配置: $selected_name"
+    cmd_switch "$selected_name"
+
+    export PROXY_COMPRESSION_PROFILE="$profile"
+
+    if [[ "$mode" == "cloud" ]]; then
+        info "启动云端模式..."
+        cmd_start_cloud
+    else
+        info "启动本地模式..."
+        cmd_start
+    fi
+}
+
+# ============================================================
 # 帮助信息
 # ============================================================
 cmd_help() {
@@ -1549,6 +1711,11 @@ cmd_help() {
 llama.cpp / Rapid-MLX 服务管理脚本
 
 用法: ./manage.sh <命令> [选项]
+       ./manage.sh --profile <profile> <命令>   # 指定压缩策略
+
+全局选项:
+  --profile <profile>   压缩策略: balanced (默认), aggressive, conservative
+                        适用于: start, start-cloud, start-backend, restart
 
 服务命令:
   start                启动后端和代理（根据当前配置）
@@ -1570,6 +1737,9 @@ llama.cpp / Rapid-MLX 服务管理脚本
   switch <name>        切换到指定配置（切换后需 reload 或 restart 生效）
   current              显示当前配置详情
 
+快速启动:
+  wizard               交互式向导，引导完成首次启动配置
+
 维护命令:
   fix-template <dir>   修复模型的 chat_template (防止 system message 崩溃)
 
@@ -1584,10 +1754,12 @@ llama.cpp / Rapid-MLX 服务管理脚本
   ./manage.sh list                    # 查看所有配置
   ./manage.sh switch rapid-mlx-35b    # 切换到 Rapid-MLX
   ./manage.sh start                   # 用当前配置启动
+  ./manage.sh start --profile aggressive  # 激进压缩模式启动
   ./manage.sh start-cloud             # 启动云端代理（DeepSeek）
   ./manage.sh restart                 重启（应用新配置，停启本地模型）
   ./manage.sh reload                  # 热重载（SIGHUP，不重启 proxy，~0.5s）
   ./manage.sh status                  # 查看运行状态
+  ./manage.sh wizard                  # 快速启动向导
 
 热切换示例（本地↔云端，不重启代理）:
   ./manage.sh switch deepseek-chat && ./manage.sh reload   # 本地→云端
@@ -1599,9 +1771,72 @@ EOF
 }
 
 # ============================================================
+# 解析 --profile 全局参数
+# ============================================================
+_parse_global_flags() {
+    local args=("$@")
+    local result=()
+    local skip_next=false
+
+    for ((i=0; i<${#args[@]}; i++)); do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+        case "${args[$i]}" in
+            --profile)
+                local val="${args[$((i+1))]:-}"
+                if [[ -z "$val" ]]; then
+                    echo "ERROR_MISSING_ARG"
+                    return 1
+                fi
+                case "$val" in
+                    balanced|aggressive|conservative)
+                        export PROXY_COMPRESSION_PROFILE="$val"
+                        ;;
+                    *)
+                        echo "ERROR_INVALID_PROFILE:$val"
+                        return 1
+                        ;;
+                esac
+                skip_next=true
+                ;;
+            *)
+                result+=("${args[$i]}")
+                ;;
+        esac
+    done
+
+    # 输出解析后的参数（不含 --profile 及其值）
+    echo "${result[@]}"
+}
+
+_handle_parse_error() {
+    local err="$1"
+    case "$err" in
+        ERROR_MISSING_ARG)
+            error "--profile 需要参数: balanced|aggressive|conservative"
+            ;;
+        ERROR_INVALID_PROFILE:*)
+            local val="${err#ERROR_INVALID_PROFILE:}"
+            error "无效 profile: $val (可选: balanced, aggressive, conservative)"
+            ;;
+    esac
+}
+
+# ============================================================
 # 主入口
 # ============================================================
 main() {
+    # 解析全局标志（--profile 等）
+    local parsed_args
+    if ! parsed_args=$(_parse_global_flags "$@"); then
+        _handle_parse_error "$parsed_args"
+        exit 1
+    fi
+    # 转换为数组
+    eval set -- "$parsed_args"
+
     case "${1:-help}" in
         start)
             cmd_start
@@ -1670,6 +1905,9 @@ main() {
             else
                 warn "Watchdog 未运行"
             fi
+            ;;
+        wizard)
+            cmd_wizard
             ;;
         help|--help|-h)
             cmd_help
