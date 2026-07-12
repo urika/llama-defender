@@ -29,29 +29,29 @@ def _run(cmd, timeout=3):
 def _get_system_memory():
     """Return macOS system memory stats used by routing and status page.
 
+    Uses `memory_pressure` (macOS native) instead of `vm_stat` for a more
+    accurate system-wide memory pressure reading. The "free percentage" from
+    memory_pressure accounts for page cache, purgeable pages, and compressor
+    — not just wired+active pages — giving a better signal for Metal OOM risk.
+
     Keys: total_gb, used_gb, available_gb, used_pct (string like "85.3").
     """
-    out = _run("vm_stat")
+    out = _run("memory_pressure")
     data = {}
-    page_size = 16384
     for line in out.splitlines():
-        if "Pages free:" in line:
-            data["free_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages wired down:" in line:
-            data["wired_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages active:" in line:
-            data["active_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages inactive:" in line:
-            data["inactive_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-        elif "Pages stored in compressor:" in line:
-            data["compress_gb"] = int(line.split(":")[1].strip().rstrip(".")) * page_size / (1024**3)
-    total = 48.0
-    true_used = data.get("wired_gb", 0) + data.get("active_gb", 0)
-    available = data.get("free_gb", 0) + data.get("inactive_gb", 0)
-    data["total_gb"] = total
-    data["used_gb"] = true_used
-    data["available_gb"] = available
-    data["used_pct"] = f"{true_used/total*100:.1f}"
+        if "System-wide memory free percentage:" in line:
+            free_pct = float(line.split(":")[1].strip().rstrip("%"))
+            used_pct = 100.0 - free_pct
+            total = 48.0
+            data["total_gb"] = total
+            data["used_gb"] = round(total * used_pct / 100, 1)
+            data["available_gb"] = round(total * free_pct / 100, 1)
+            data["used_pct"] = f"{used_pct:.1f}"
+            return data
+    data["total_gb"] = 48.0
+    data["used_gb"] = 0.0
+    data["available_gb"] = 48.0
+    data["used_pct"] = "0.0"
     return data
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,10 @@ _LOOP_SESSION_STATE = {}
 # Read-modify-write sequences on these dicts must acquire _state_lock.
 _SESSION_REQUEST_COUNT = {}
 
+# DEF-104: Per-session tool frequency counter for auto-promote.
+# Maps session_id → {tool_name: count}. Updated by _filter_tools after each request.
+_SESSION_TOOL_FREQ: dict[str, dict[str, int]] = {}
+
 # ---------------------------------------------------------------------------
 # Semantic content compression (Phase 2)
 # ---------------------------------------------------------------------------
@@ -137,6 +141,7 @@ PROXY_SIEVE_JSON_MAX_DEPTH = int(os.environ.get("PROXY_SIEVE_JSON_MAX_DEPTH", "4
 PROXY_LOG_DEDUPE = os.environ.get("PROXY_LOG_DEDUPE", "true").lower() in ("1", "true", "yes")
 PROXY_DEDUPE_SCALARS = os.environ.get("PROXY_DEDUPE_SCALARS", "false").lower() in ("1", "true", "yes")
 PROXY_COMPRESS_AUDIT = os.environ.get("PROXY_COMPRESS_AUDIT", "true").lower() in ("1", "true", "yes")
+PROXY_COMPRESSION_PROFILE = os.environ.get("PROXY_COMPRESSION_PROFILE", "balanced")
 
 # TS-1: BM25 relevance-driven compression (W3 d3-d5)
 PROXY_BM25_ENABLED = os.environ.get("PROXY_BM25_ENABLED", _default("PROXY_BM25_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
@@ -199,6 +204,10 @@ PROXY_PRE_TRUNCATE_CHARS = PROXY_OOM_SAFE_CHARS  # Legacy alias
 
 # P0: Hard limit on request body size
 PROXY_MAX_REQUEST_BYTES = int(os.environ.get("PROXY_MAX_REQUEST_BYTES", str(500 * 1024)))
+# Cloud path can accept larger payloads because cloud providers (DeepSeek/OpenAI)
+# handle their own OOM scheduling; this avoids rejecting requests that SmartRouter
+# would otherwise route to cloud.
+PROXY_CLOUD_MAX_REQUEST_BYTES = int(os.environ.get("PROXY_CLOUD_MAX_REQUEST_BYTES", str(2 * 1024 * 1024)))
 
 # DEF-005: estimated prompt token limit
 PROXY_OOM_SAFE_TOKENS = int(os.environ.get("PROXY_OOM_SAFE_TOKENS", "60000"))
@@ -262,6 +271,10 @@ PROXY_TEXT_LOOP_THRESHOLD = int(os.environ.get("PROXY_TEXT_LOOP_THRESHOLD", "3")
 PROXY_TEXT_LOOP_MIN_CHARS = int(os.environ.get("PROXY_TEXT_LOOP_MIN_CHARS", "100"))
 PROXY_TEXT_LOOP_SIMILARITY = float(os.environ.get("PROXY_TEXT_LOOP_SIMILARITY", "0.85"))
 
+# DEF-109: Context-size-based loop tiers
+PROXY_LOOP_CHARS_LONG = int(os.environ.get("PROXY_LOOP_CHARS_LONG", "50000"))
+PROXY_LOOP_CHARS_VERY_LONG = int(os.environ.get("PROXY_LOOP_CHARS_VERY_LONG", "100000"))
+
 # Phase 4 (建议4): Session-tier dynamic loop thresholds
 PROXY_LOOP_SESSION_SHORT_BOUND = int(os.environ.get("PROXY_LOOP_SESSION_SHORT_BOUND", "10"))
 PROXY_LOOP_SESSION_LONG_BOUND = int(os.environ.get("PROXY_LOOP_SESSION_LONG_BOUND", "25"))
@@ -321,6 +334,7 @@ _BLOCKER_ERROR_MARKERS = (
 PROXY_TOOL_FILTER_ENABLED = os.environ.get("PROXY_TOOL_FILTER_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
 PROXY_TOOL_FILTER_MAX = int(os.environ.get("PROXY_TOOL_FILTER_MAX", "20"))
 PROXY_TOOL_FILTER_RECENT = int(os.environ.get("PROXY_TOOL_FILTER_RECENT", "5"))
+PROXY_TOOL_AUTO_PROMOTE_THRESHOLD = int(os.environ.get("PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "3"))
 TOOL_ALWAYS_KEEP = (
     "Read", "Write", "Edit", "Bash", "Glob", "Grep",
     "LS", "Task", "WebFetch", "WebSearch",
@@ -724,11 +738,15 @@ _RELOAD_SPEC = [
     ("PROXY_OOM_SAFE_TOKENS", "PROXY_OOM_SAFE_TOKENS", "int", "60000", "60000"),
     ("PROXY_RETRY_AFTER_SECONDS", "PROXY_RETRY_AFTER_SECONDS", "int", "30", "30"),
     ("PROXY_MAX_REQUEST_BYTES", "PROXY_MAX_REQUEST_BYTES", "int", str(500 * 1024), str(500 * 1024)),
+    ("PROXY_CLOUD_MAX_REQUEST_BYTES", "PROXY_CLOUD_MAX_REQUEST_BYTES", "int", str(2 * 1024 * 1024), str(2 * 1024 * 1024)),
     # Loop detection
     ("PROXY_TEXT_LOOP_ENABLED", "PROXY_TEXT_LOOP_ENABLED", "bool", "true", "true"),
     ("PROXY_TEXT_LOOP_THRESHOLD", "PROXY_TEXT_LOOP_THRESHOLD", "int", "3", "3"),
     ("PROXY_TEXT_LOOP_MIN_CHARS", "PROXY_TEXT_LOOP_MIN_CHARS", "int", "100", "100"),
     ("PROXY_TEXT_LOOP_SIMILARITY", "PROXY_TEXT_LOOP_SIMILARITY", "float", "0.85", "0.85"),
+    # DEF-109 context-size-based loop tiers
+    ("PROXY_LOOP_CHARS_LONG", "PROXY_LOOP_CHARS_LONG", "int", "50000", "50000"),
+    ("PROXY_LOOP_CHARS_VERY_LONG", "PROXY_LOOP_CHARS_VERY_LONG", "int", "100000", "100000"),
     # Phase 4 dynamic loop thresholds
     ("PROXY_LOOP_SESSION_SHORT_BOUND", "PROXY_LOOP_SESSION_SHORT_BOUND", "int", "10", "10"),
     ("PROXY_LOOP_SESSION_LONG_BOUND", "PROXY_LOOP_SESSION_LONG_BOUND", "int", "25", "25"),
@@ -750,6 +768,7 @@ _RELOAD_SPEC = [
     ("PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_ENABLED", "bool", "false", "true"),
     ("PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_MAX", "int", "20", "20"),
     ("PROXY_TOOL_FILTER_RECENT", "PROXY_TOOL_FILTER_RECENT", "int", "5", "5"),
+    ("PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "int", "3", "3"),
     # History index
     ("PROXY_HISTORY_INDEX", "PROXY_HISTORY_INDEX", "str", "rule", "rule"),
     ("PROXY_HISTORY_TOP_K", "PROXY_HISTORY_TOP_K", "int", "5", "5"),
@@ -761,6 +780,7 @@ _RELOAD_SPEC = [
     ("PROXY_ROUTE_THRESHOLD_CHARS", "PROXY_ROUTE_THRESHOLD_CHARS", "int", "90000", "90000"),
     ("PROXY_CLOUD_BASE_URL", "PROXY_CLOUD_BASE_URL", "str", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1"),
     ("PROXY_CLOUD_MODEL", "PROXY_CLOUD_MODEL", "str", "deepseek-v4-flash", "deepseek-v4-flash"),
+    ("PROXY_CLOUD_API_KEY", "PROXY_CLOUD_API_KEY", "str", "", ""),
     ("PROXY_ROUTE_CLOUD_CONCURRENT", "PROXY_ROUTE_CLOUD_CONCURRENT", "int", "2", "2"),
     ("PROXY_ROUTE_MEMORY_PCT", "PROXY_ROUTE_MEMORY_PCT", "int", "90", "90"),
     ("PROXY_ROUTE_FALLBACK_ENABLED", "PROXY_ROUTE_FALLBACK_ENABLED", "bool", "true", "true"),
@@ -843,6 +863,20 @@ def _cast_config_value(value, cast):
         return str(value).lower() in ("1", "true", "yes")
     return value
 
+# Fallback: read PROXY_CLOUD_API_KEY from secret.local.conf if env var not set.
+# This ensures direct `python3 anthropic_proxy.py` also works (not just via
+# `./manage.sh` which sources the file before spawning the subprocess).
+if not PROXY_CLOUD_API_KEY:
+    _secret_path = os.path.join(_SCRIPT_DIR, "configs", "secret.local.conf")
+    _secret_env = _parse_conf_env(_secret_path)
+    if "PROXY_CLOUD_API_KEY" in _secret_env:
+        PROXY_CLOUD_API_KEY = _secret_env["PROXY_CLOUD_API_KEY"]
+
+    # Also update anthropic_proxy module if already imported
+    import sys as _sys
+    if "anthropic_proxy" in _sys.modules:
+        _sys.modules["anthropic_proxy"].PROXY_CLOUD_API_KEY = PROXY_CLOUD_API_KEY
+
 
 # ---------------------------------------------------------------------------
 # All public names exportable via `from proxy_state import *`
@@ -859,11 +893,12 @@ __all__ = [
     "PROXY_CACHE_ALIGN_ENABLED", "PROXY_CACHE_ALIGN_HEAD",
     # Shared state
     "_SESSION_LAST_MESSAGES", "_LOOP_SESSION_STATE", "_SESSION_REQUEST_COUNT",
+    "_SESSION_TOOL_FREQ",
     # Compression
     "PROXY_COMPRESS_ENABLED", "PROXY_COMPRESS_THRESHOLD", "PROXY_COMPRESS_MODE",
     "PROXY_SCRUB_ANSI", "PROXY_SIEVE_JSON_MAX_ITEMS", "PROXY_SIEVE_JSON_MAX_STR_LEN",
     "PROXY_SIEVE_JSON_MAX_DEPTH", "PROXY_LOG_DEDUPE", "PROXY_DEDUPE_SCALARS",
-    "PROXY_COMPRESS_AUDIT", "CONTENT_TOOLS_FALLBACK_ENABLED",
+    "PROXY_COMPRESS_AUDIT", "PROXY_COMPRESSION_PROFILE", "CONTENT_TOOLS_FALLBACK_ENABLED",
     # TS-1 BM25
     "PROXY_BM25_ENABLED", "PROXY_BM25_K1", "PROXY_BM25_B",
     "PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD",
@@ -878,7 +913,7 @@ __all__ = [
     # Output control
     "PROXY_MAX_TOKENS_OVERRIDE", "PROXY_OUTPUT_TOKEN_LIMIT_RATIO",
     "PROXY_BACKEND_TIMEOUT", "PROXY_OOM_SAFE_CHARS", "PROXY_PRE_TRUNCATE_CHARS",
-    "PROXY_MAX_REQUEST_BYTES", "PROXY_OOM_SAFE_TOKENS", "PROXY_RETRY_AFTER_SECONDS",
+    "PROXY_MAX_REQUEST_BYTES", "PROXY_OOM_SAFE_TOKENS", "PROXY_RETRY_AFTER_SECONDS", "PROXY_CLOUD_MAX_REQUEST_BYTES",
     # Token ratios
     "PROXY_TOKEN_RATIO_CHINESE", "PROXY_TOKEN_RATIO_ENGLISH", "PROXY_TOKEN_RATIO_CODE",
     # Memory
@@ -895,6 +930,7 @@ __all__ = [
     "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE",
     # Loop detection
     "PROXY_LOOP_THRESHOLD", "PROXY_LOOP_LEVEL2", "PROXY_LOOP_LEVEL3",
+    "PROXY_LOOP_CHARS_LONG", "PROXY_LOOP_CHARS_VERY_LONG",
     "PROXY_LOOP_SESSION_SHORT_BOUND", "PROXY_LOOP_SESSION_LONG_BOUND",
     "PROXY_LOOP_THRESHOLD_LONG", "PROXY_LOOP_THRESHOLD_VERY_LONG",
     "PROXY_TEXT_LOOP_ENABLED", "PROXY_TEXT_LOOP_THRESHOLD", "PROXY_TEXT_LOOP_MIN_CHARS",
@@ -914,6 +950,7 @@ __all__ = [
     "_BLOCKER_ERROR_MARKERS",
     # Tool filter
     "PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_RECENT",
+    "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD",
     "TOOL_ALWAYS_KEEP",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",

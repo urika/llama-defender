@@ -12,6 +12,8 @@ PIDFILE="$SCRIPT_DIR/llama-server.pid"
 LOGFILE="$SCRIPT_DIR/logs/llama-server.log"
 PROXY_PIDFILE="$SCRIPT_DIR/anthropic_proxy.pid"
 PROXY_LOGFILE="$SCRIPT_DIR/logs/anthropic_proxy.log"
+WATCHDOG_PIDFILE="$SCRIPT_DIR/watchdog.pid"
+WATCHDOG_LOGFILE="$SCRIPT_DIR/logs/watchdog.log"
 
 # 确保日志目录存在
 mkdir -p "$SCRIPT_DIR/logs"
@@ -207,11 +209,26 @@ _get_pid() {
 # ============================================================
 _check_port() {
     local port="$1"
-    if lsof -Pi ":$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
-        local pid
-        pid=$(lsof -Pi ":$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
-        error "端口 $port 已被占用 (PID: $pid)"
-        ps -p "$pid" -o pid,comm,args 2>/dev/null | tail -1
+    local pids
+    pids=$(lsof -Pi ":$port" -sTCP:LISTEN -t 2>/dev/null | tr '\n' ' ')
+    if [[ -n "$pids" ]]; then
+        # 代理端口被占用时，先检查是否是已记录的代理进程或僵尸进程
+        if [[ "$port" == "$PROXY_PORT" ]]; then
+            local proxy_pid
+            proxy_pid=$(_get_proxy_pid 2>/dev/null) || true
+            for p in $pids; do
+                if [[ -n "$proxy_pid" && "$p" == "$proxy_pid" ]] && ! kill -0 "$p" 2>/dev/null; then
+                    warn "端口 $port 被已死亡的代理 PID 文件占用，清理..."
+                    rm -f "$PROXY_PIDFILE"
+                    continue
+                fi
+            done
+            # 重新检查是否仍有其他进程占用
+            pids=$(lsof -Pi ":$port" -sTCP:LISTEN -t 2>/dev/null | tr '\n' ' ')
+            [[ -z "$pids" ]] && return 0
+        fi
+        error "端口 $port 已被占用 (PID: $pids)"
+        ps -p $pids -o pid,comm,args 2>/dev/null | tail -n +2
         return 1
     fi
     return 0
@@ -574,8 +591,14 @@ _start_mlx_vlm() {
 _start_proxy() {
     local proxy_pid
     if proxy_pid=$(_get_proxy_pid 2>/dev/null); then
-        warn "代理已在运行 (PID: $proxy_pid)"
-        return 0
+        # 已有代理进程，额外验证端口是否真的有服务响应
+        if curl -s --max-time 2 "http://$PROXY_HOST:$PROXY_PORT/v1/models" >/dev/null 2>&1; then
+            warn "代理已在运行且可连接 (PID: $proxy_pid)"
+            return 0
+        fi
+        warn "代理 PID 文件存在但端口无响应，清理旧代理..."
+        _stop_proxy || true
+        sleep 1
     fi
 
     _check_port "$PROXY_PORT" || return 1
@@ -586,6 +609,15 @@ _start_proxy() {
     info "启动 anthropic_proxy.py..."
     info "  地址: $PROXY_HOST:$PROXY_PORT"
     info "  后端: $base_url"
+
+    # 使用 bash -c wrapper 捕获崩溃输出到日志；wrapper 在函数末尾删除
+    local proxy_wrapper="$SCRIPT_DIR/.start_proxy_$$.sh"
+    cat > "$proxy_wrapper" <<EOF
+#!/usr/bin/env bash
+exec >> "$PROXY_LOGFILE" 2>&1
+exec python3 "$SCRIPT_DIR/anthropic_proxy.py"
+EOF
+    chmod +x "$proxy_wrapper"
 
     # PROXY_* env vars below follow a 3-tier priority chain (highest first):
     #   1. Active config file (configs/<active>.conf), sourced earlier
@@ -615,6 +647,7 @@ _start_proxy() {
     PROXY_SAVE_REQUESTS="${PROXY_SAVE_REQUESTS:-}" \
     PROXY_SAVE_REQUESTS_DIR="${PROXY_SAVE_REQUESTS_DIR:-/tmp/anthropic_requests}" \
     PROXY_SAVE_REQUESTS_MAX="${PROXY_SAVE_REQUESTS_MAX:-10}" \
+    PROXY_COMPRESSION_PROFILE="${PROXY_COMPRESSION_PROFILE:-balanced}" \
     PROXY_BM25_ENABLED="${PROXY_BM25_ENABLED:-true}" \
     PROXY_BM25_K1="${PROXY_BM25_K1:-1.5}" \
     PROXY_BM25_B="${PROXY_BM25_B:-0.75}" \
@@ -627,6 +660,7 @@ _start_proxy() {
     PROXY_OUTPUT_TOKEN_LIMIT_RATIO="${PROXY_OUTPUT_TOKEN_LIMIT_RATIO:-1.5}" \
     PROXY_BACKEND_TIMEOUT="${PROXY_BACKEND_TIMEOUT:-600}" \
     PROXY_MAX_REQUEST_BYTES="${PROXY_MAX_REQUEST_BYTES:-512000}" \
+    PROXY_CLOUD_MAX_REQUEST_BYTES="${PROXY_CLOUD_MAX_REQUEST_BYTES:-2097152}" \
     PROXY_OOM_SAFE_CHARS="${PROXY_OOM_SAFE_CHARS:-${PROXY_PRE_TRUNCATE_CHARS:-200000}}" \
     PROXY_SESSION_CONTINUATION_ENABLED="${PROXY_SESSION_CONTINUATION_ENABLED:-true}" \
     PROXY_SESSION_CONTINUATION_MIN_REQUESTS="${PROXY_SESSION_CONTINUATION_MIN_REQUESTS:-2}" \
@@ -650,7 +684,7 @@ _start_proxy() {
     PROXY_DYNAMIC_MAX_TOKENS_GROWTH="${PROXY_DYNAMIC_MAX_TOKENS_GROWTH:-4096}" \
     PROXY_DYNAMIC_MAX_TOKENS_SATURATION="${PROXY_DYNAMIC_MAX_TOKENS_SATURATION:-2048}" \
     PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO="${PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO:-0.8}" \
-    nohup python3 "$SCRIPT_DIR/anthropic_proxy.py" > /dev/null 2>&1 &
+    nohup "$proxy_wrapper" </dev/null >/dev/null 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PROXY_PIDFILE"
 
@@ -660,13 +694,14 @@ _start_proxy() {
     for i in {1..30}; do
         if ! kill -0 "$new_pid" 2>/dev/null; then
             error "代理进程已退出！查看日志: $PROXY_LOGFILE"
-            tail -n 20 "$PROXY_LOGFILE" 2>/dev/null
-            rm -f "$PROXY_PIDFILE"
+            tail -n 30 "$PROXY_LOGFILE" 2>/dev/null
+            rm -f "$PROXY_PIDFILE" "$proxy_wrapper"
             return 1
         fi
 
         if curl -s --max-time 2 "http://$PROXY_HOST:$PROXY_PORT/v1/models" >/dev/null 2>&1; then
             info "✅ anthropic_proxy.py 就绪 (PID: $new_pid)"
+            rm -f "$proxy_wrapper"
             return 0
         fi
 
@@ -677,6 +712,8 @@ _start_proxy() {
     done
 
     warn "代理启动超时，但进程仍在运行 (PID: $new_pid)"
+    warn "查看日志: $PROXY_LOGFILE"
+    rm -f "$proxy_wrapper"
     return 1
 }
 
@@ -720,10 +757,10 @@ cmd_start() {
 
     case "$LLAMA_BACKEND" in
         rapid-mlx|vllm-mlx)
-            _start_rapid_mlx || true
+            _start_rapid_mlx || return 1
             ;;
         mlx_vlm|mlx-vlm)
-            _start_mlx_vlm || true
+            _start_mlx_vlm || return 1
             ;;
         cloud|deepseek-cloud|openai-cloud)
             # 云模式：直接启动代理，不启动本地后端
@@ -731,11 +768,11 @@ cmd_start() {
             return $?
             ;;
         llama-server|*)
-            _start_llama_server || true
+            _start_llama_server || return 1
             ;;
     esac
 
-    # 后端就绪后启动代理（即使 wait 返回失败，只要进程还活着就尝试）
+    # 后端就绪后启动代理
     if _get_pid >/dev/null 2>&1; then
         _start_proxy
     else
@@ -821,6 +858,9 @@ cmd_start_cloud() {
 # 停止服务
 # ============================================================
 cmd_stop() {
+    # 停止 watchdog（如有）
+    cmd_stop_watchdog
+
     # 先停止代理
     _stop_proxy
 
@@ -948,7 +988,17 @@ cmd_status() {
 # ============================================================
 cmd_restart() {
     cmd_stop || true
-    sleep 2
+    # 等待端口完全释放，避免 SO_REUSEADDR 等待期间的竞争
+    local waited=0
+    while lsof -Pi ":$LLAMA_PORT" -sTCP:LISTEN -t >/dev/null 2>&1 || lsof -Pi ":$PROXY_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; do
+        if (( waited >= 5 )); then
+            warn "端口仍被占用，继续强制启动..."
+            break
+        fi
+        echo "  等待端口释放... ($waited/5s)"
+        sleep 1
+        waited=$((waited + 1))
+    done
     cmd_start
 }
 
@@ -1146,6 +1196,9 @@ cmd_start_backend() {
 # 停止本地后端（独立于代理，释放 GPU 内存）
 # ============================================================
 cmd_stop_backend() {
+    # 停止 watchdog（如有）
+    cmd_stop_watchdog
+
     local backend pid
     backend=$(_current_backend 2>/dev/null) || true
 
@@ -1348,13 +1401,38 @@ cmd_watchdog() {
 
     # 支持 daemon 模式: ./manage.sh watchdog --daemon
     if [[ "$1" == "--daemon" ]]; then
-        info "Watchdog 后台运行 (PID: $$)"
-        # 重定向日志到文件
-        exec >> "$SCRIPT_DIR/logs/watchdog.log" 2>&1
+        # Fork into background with proper daemonization
+        (
+            trap '' HUP
+            exec </dev/null
+            exec >> "$WATCHDOG_LOGFILE" 2>&1
+            echo $$ > "$WATCHDOG_PIDFILE"
+            trap 'rm -f "$WATCHDOG_PIDFILE"' EXIT
+
+            info "Watchdog 后台运行 (PID: $$)"
+            info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
+            info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
+
+            _watchdog_loop "$interval" "$threshold" "$max_fail"
+        ) &
+        disown
+        info "Watchdog 已后台启动 (PID: $!)"
+        exit 0
     fi
 
     info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
     info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
+    _watchdog_loop "$interval" "$threshold" "$max_fail"
+}
+
+_watchdog_loop() {
+    local interval="$1"
+    local threshold="$2"
+    local max_fail="$3"
+    local consecutive_fail=0
+    local restart_count=0
+    local restart_window
+    restart_window=$(date +%s)
 
     while true; do
         sleep "$interval"
@@ -1399,7 +1477,7 @@ cmd_watchdog() {
         consecutive_fail=0
 
         local metrics_line
-        metrics_line=$(grep -a "prompt_n\|predicted_n\|tok/s" "logs/llama-server.log" 2>/dev/null | tail -1)
+        metrics_line=$(grep -a "prompt_n\|predicted_n\|tok/s" "$SCRIPT_DIR/logs/llama-server.log" 2>/dev/null | tail -1)
         if [[ -n "$metrics_line" ]]; then
             local tok_s
             tok_s=$(echo "$metrics_line" | grep -oE '[0-9]+\.[0-9]+ tok/s' | grep -oE '[0-9]+\.[0-9]+' | tail -1)
@@ -1416,6 +1494,24 @@ cmd_watchdog() {
             fi
         fi
     done
+}
+
+cmd_stop_watchdog() {
+    if [[ -f "$WATCHDOG_PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null) || return 0
+        if kill -0 "$pid" 2>/dev/null; then
+            info "停止 watchdog (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            rm -f "$WATCHDOG_PIDFILE"
+            info "✅ Watchdog 已停止"
+        else
+            warn "Watchdog 未在运行，清理 PID 文件"
+            rm -f "$WATCHDOG_PIDFILE"
+        fi
+    else
+        warn "Watchdog 未在运行"
+    fi
 }
 
 # ============================================================
@@ -1463,7 +1559,9 @@ llama.cpp / Rapid-MLX 服务管理脚本
   reload               热重载代理配置（SIGHUP，不重启进程）
   start-backend        仅启动本地模型（独立于代理，用于热切换）
   stop-backend         仅停止本地模型（释放 GPU 内存）
-  watchdog             监控后端健康状态，性能衰减时自动重启
+  watchdog [--daemon]  监控后端健康状态，性能衰减时自动重启（--daemon 后台运行）
+  stop-watchdog        停止 watchdog 后台进程
+  watchdog-status      查看 watchdog 运行状态
   logs [N]             查看最后 N 行后端日志 (默认 50)
   proxy-logs [N]       查看最后 N 行代理日志 (默认 50)
 
@@ -1554,7 +1652,24 @@ main() {
             cmd_fix_template "$2" "$3"
             ;;
         watchdog)
-            cmd_watchdog
+            cmd_watchdog "$2"
+            ;;
+        stop-watchdog)
+            cmd_stop_watchdog
+            ;;
+        watchdog-status)
+            if [[ -f "$WATCHDOG_PIDFILE" ]]; then
+                local pid
+                pid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+                if kill -0 "$pid" 2>/dev/null; then
+                    info "Watchdog 运行中 (PID: $pid)"
+                else
+                    warn "Watchdog PID 文件存在但进程已死"
+                    rm -f "$WATCHDOG_PIDFILE"
+                fi
+            else
+                warn "Watchdog 未运行"
+            fi
             ;;
         help|--help|-h)
             cmd_help

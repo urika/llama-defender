@@ -1064,13 +1064,22 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
 
         file_info = f" Files: {', '.join(sorted(file_mentions)[:10])}." if file_mentions else ""
 
-        # Plan 1 (prefix-cache fix): the placeholder text MUST be byte-for-byte
-        # identical across requests. Including dropped_count / tool_count /
-        # file_mentions here changes the text every request, breaking the
-        # cache at the placeholder boundary and dropping hit rate to 0%.
-        # Dynamic info is still kept in the stats dict below (used for
-        # proxy_metrics.jsonl) — it just doesn't leak into the prompt.
-        compressed_text = "[Context folded: earlier messages omitted.]"
+        # DEF-107: when drop ratio is high, inject a structured summary
+        # instead of a bare placeholder. The summary helps the model
+        # understand what was lost without needing to re-read files.
+        # The text is still kept stable across requests sharing the same
+        # truncation boundary (prefix cache compatible).
+        drop_ratio = dropped_count / n if n > 0 else 0
+        if drop_ratio > 0.7 and (tool_count > 0 or file_mentions):
+            parts = ["[Context folded: earlier messages omitted."]
+            if tool_count > 0:
+                parts.append(f" {tool_count} tool calls were removed")
+            if file_mentions:
+                parts.append(f" referenced files: {', '.join(sorted(file_mentions)[:8])}")
+            parts.append("]")
+            compressed_text = "".join(parts)
+        else:
+            compressed_text = "[Context folded: earlier messages omitted.]"
 
         if tail and tail[0].get("role") == "user":
             tail_content = tail[0].get("content", [])

@@ -441,7 +441,7 @@ def _get_context_optimization_stats():
     recent_blocker = None
     for r in recent:
         pipeline = r.get("pipeline", {})
-        if pipeline.get("loop_detect", {}).get("max_run", 0) >= _ps.PROXY_LOOP_THRESHOLD:
+        if pipeline.get("loop_detect", {}).get("level", 0) >= 1:
             loop_count += 1
         blocker = pipeline.get("blocker_detect", {})
         if blocker.get("triggered"):
@@ -2043,6 +2043,9 @@ def _build_status_html():
   .modal-row:last-child {{ border-bottom: none; }}
   .modal-time {{ color: #888; font-family: monospace; min-width: 60px; flex-shrink: 0; }}
   .modal-msg {{ word-break: break-word; }}
+  .chart-container {{ width: 100%; height: 200px; margin-top: 8px; }}
+  .chart-row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
+  .chart-row .chart-box {{ flex: 1; min-width: 280px; }}
 </style>
 </head>
 <body>
@@ -2092,6 +2095,22 @@ def _build_status_html():
   {ctx_opt_card}
 
   {comp_card}
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>📈 Trends (24h)</h2>
+    <div class="chart-row">
+      <div class="chart-box"><canvas id="chartRequests"></canvas></div>
+      <div class="chart-box"><canvas id="chartLatency"></canvas></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-box"><canvas id="chartSuccess"></canvas></div>
+      <div class="chart-box"><canvas id="chartQuality"></canvas></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-box"><canvas id="chartChars"></canvas></div>
+      <div class="chart-box"><canvas id="chartMemory"></canvas></div>
+    </div>
+  </div>
 
   <div class="card" style="grid-column: 1 / -1;">
     <h2>🚨 Alerts (last 10m)</h2>
@@ -2156,6 +2175,102 @@ setInterval(function() {{
     location.reload();
   }}
 }}, 5000);
+
+// --- Trend charts ---
+function loadTrends() {{
+  fetch('/metrics/history')
+    .then(r => r.json())
+    .then(data => {{
+      var buckets = data.buckets || [];
+      if (buckets.length < 2) return;
+      var labels = buckets.map(b => b.ts.slice(5, 16));
+      var colors = ['rgba(46,204,113,0.7)', 'rgba(231,76,60,0.7)', 'rgba(243,156,18,0.7)', 'rgba(52,152,219,0.7)'];
+      var borderColors = ['rgba(46,204,113,1)', 'rgba(231,76,60,1)', 'rgba(243,156,18,1)', 'rgba(52,152,219,1)'];
+
+      // Requests/hour
+      new Chart(document.getElementById('chartRequests'), {{
+        type: 'bar',
+        data: {{
+          labels: labels,
+          datasets: [
+            {{ label: '200 OK', data: buckets.map(b => b.status_200), backgroundColor: colors[0], borderColor: borderColors[0], borderWidth: 1 }},
+            {{ label: '500', data: buckets.map(b => b.status_500), backgroundColor: colors[1], borderColor: borderColors[1], borderWidth: 1 }},
+            {{ label: '503', data: buckets.map(b => b.status_503), backgroundColor: colors[2], borderColor: borderColors[2], borderWidth: 1 }},
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ beginAtZero: true, ticks: {{ color: '#888' }} }} }} }}
+      }});
+
+      // Latency P50/P95
+      new Chart(document.getElementById('chartLatency'), {{
+        type: 'line',
+        data: {{
+          labels: labels,
+          datasets: [
+            {{ label: 'P50 (ms)', data: buckets.map(b => b.latency_p50_ms), borderColor: borderColors[0], backgroundColor: colors[0], fill: false, tension: 0.3 }},
+            {{ label: 'P95 (ms)', data: buckets.map(b => b.latency_p95_ms), borderColor: borderColors[1], backgroundColor: colors[1], fill: false, tension: 0.3 }},
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ beginAtZero: true, ticks: {{ color: '#888' }} }} }} }}
+      }});
+
+      // Success rate
+      new Chart(document.getElementById('chartSuccess'), {{
+        type: 'line',
+        data: {{
+          labels: labels,
+          datasets: [{{ label: 'Success Rate (%)', data: buckets.map(b => b.success_rate), borderColor: borderColors[0], backgroundColor: colors[0], fill: true, tension: 0.3 }}]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ min: 50, max: 100, ticks: {{ color: '#888' }} }} }} }}
+      }});
+
+      // Quality flags
+      new Chart(document.getElementById('chartQuality'), {{
+        type: 'bar',
+        data: {{
+          labels: labels,
+          datasets: [
+            {{ label: 'Loop', data: buckets.map(b => b.loop_injected), backgroundColor: colors[1], borderColor: borderColors[1], borderWidth: 1 }},
+            {{ label: 'Blocker', data: buckets.map(b => b.blocker_injected), backgroundColor: colors[2], borderColor: borderColors[2], borderWidth: 1 }},
+            {{ label: 'High Drop', data: buckets.map(b => b.high_drop_ratio), backgroundColor: colors[3], borderColor: borderColors[3], borderWidth: 1 }},
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ beginAtZero: true, ticks: {{ color: '#888' }} }} }} }}
+      }});
+
+      // Input/Output chars
+      new Chart(document.getElementById('chartChars'), {{
+        type: 'line',
+        data: {{
+          labels: labels,
+          datasets: [
+            {{ label: 'Avg Input (chars)', data: buckets.map(b => b.avg_input_chars), borderColor: borderColors[0], backgroundColor: colors[0], fill: false, tension: 0.3, yAxisID: 'y' }},
+            {{ label: 'Avg Output (chars)', data: buckets.map(b => b.avg_output_chars), borderColor: borderColors[1], backgroundColor: colors[1], fill: false, tension: 0.3, yAxisID: 'y' }},
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ beginAtZero: true, ticks: {{ color: '#888' }} }} }} }}
+      }});
+
+      // Memory rejection + truncation
+      new Chart(document.getElementById('chartMemory'), {{
+        type: 'bar',
+        data: {{
+          labels: labels,
+          datasets: [
+            {{ label: 'Truncation', data: buckets.map(b => b.truncation_triggered), backgroundColor: colors[2], borderColor: borderColors[2], borderWidth: 1 }},
+            {{ label: 'Memory Reject', data: buckets.map(b => b.memory_rejected), backgroundColor: colors[1], borderColor: borderColors[1], borderWidth: 1 }},
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#aaa', boxWidth: 12 }} }} }}, scales: {{ x: {{ ticks: {{ color: '#888', maxTicksLimit: 12 }} }}, y: {{ beginAtZero: true, ticks: {{ color: '#888' }} }} }} }}
+      }});
+    }})
+    .catch(function(err) {{ console.error('Trend chart error:', err); }});
+}}
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+loadTrends();
 </script>
 </body>
 </html>"""
@@ -2177,7 +2292,7 @@ def _finalize_metrics(mc):
         if budget > 0 and est_after > budget * 1.1:
             quality_flags.append("budget_overflow")
     loop = pipeline.get("loop_detect", {})
-    if loop.get("max_run", 0) >= _ps.PROXY_LOOP_THRESHOLD:
+    if loop.get("level", 0) >= 1:
         quality_flags.append("loop_injected")
     blocker = pipeline.get("blocker_detect", {})
     if blocker.get("triggered"):

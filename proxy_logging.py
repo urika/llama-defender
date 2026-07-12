@@ -49,6 +49,18 @@ def log_metrics(metrics: dict):
     line = json.dumps(metrics, ensure_ascii=False) + "\n"
     try:
         with _ps._metrics_lock:
+            # Rotate if file exceeds 10MB
+            try:
+                sz = os.path.getsize(_ps._METRICS_PATH)
+                if sz > 10 * 1024 * 1024:
+                    import shutil
+                    base = _ps._METRICS_PATH
+                    bak = base + ".1"
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                    shutil.move(base, bak)
+            except OSError:
+                pass
             with open(_ps._METRICS_PATH, "a") as f:
                 f.write(line)
     except OSError:

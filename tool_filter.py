@@ -3,7 +3,7 @@ import re
 import proxy_state as _ps
 
 # --- _filter_tools ---
-def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
+def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, session_id=""):
     if not tools or len(tools) <= _ps.PROXY_TOOL_FILTER_MAX:
         return tools, {"filtered": False, "reason": "below_max"}
 
@@ -24,6 +24,18 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
     keep_set = always_keep_set | recent_tools
     if tool_choice_name:
         keep_set.add(tool_choice_name)
+
+    # DEF-104: Auto-promote frequently used tools from session history.
+    # Tools used >= PROXY_TOOL_AUTO_PROMOTE_THRESHOLD times in this session
+    # are added to keep_set, preventing first-use filtering when Claude Code
+    # introduces new tools.
+    auto_promoted = set()
+    if _ps.PROXY_TOOL_AUTO_PROMOTE_THRESHOLD > 0 and session_id:
+        freq = _ps._SESSION_TOOL_FREQ.get(session_id, {})
+        for tool_name, count in freq.items():
+            if count >= _ps.PROXY_TOOL_AUTO_PROMOTE_THRESHOLD and tool_name not in always_keep_set:
+                auto_promoted.add(tool_name)
+                keep_set.add(tool_name)
 
     # Phase 1: sort kept tools by a stable order (always-keep first, then recent,
     # then alphabetical) so the prefix token sequence is identical across requests
@@ -47,11 +59,20 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
 
     kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
     if len(kept) < _ps.PROXY_TOOL_FILTER_MAX:
-        remaining = sorted(
-            [t for t in tools if isinstance(t, dict) and t.get("name", "") not in kept_names],
-            key=lambda t: t.get("name", "")
-        )
-        kept.extend(remaining[:_ps.PROXY_TOOL_FILTER_MAX - len(kept)])
+        # DEF-203: Use canonical filler tools from TOOL_ALWAYS_KEEP instead of
+        # client-dependent remaining tools. This ensures the tool definition
+        # sequence is identical across sessions/requests, maximizing prefix cache hits.
+        canonical_fillers = [t for t in tools if isinstance(t, dict) and t.get("name", "") in _ps.TOOL_ALWAYS_KEEP and t.get("name", "") not in kept_names]
+        canonical_fillers.sort(key=lambda t: _ps.TOOL_ALWAYS_KEEP.index(t.get("name", "")))
+        needed = _ps.PROXY_TOOL_FILTER_MAX - len(kept)
+        kept.extend(canonical_fillers[:needed])
+        # If still not enough, fall back to client tools (alphabetical)
+        if len(kept) < _ps.PROXY_TOOL_FILTER_MAX:
+            remaining = sorted(
+                [t for t in tools if isinstance(t, dict) and t.get("name", "") not in kept_names],
+                key=lambda t: t.get("name", "")
+            )
+            kept.extend(remaining[:_ps.PROXY_TOOL_FILTER_MAX - len(kept)])
         kept.sort(key=_tool_sort_key)
         kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
 
@@ -67,6 +88,7 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None):
         "recent_tools": sorted(recent_tools),
         "scanned_assistant": assistant_count,
         "filtered_out": filtered_out,
+        "auto_promoted": sorted(auto_promoted) if auto_promoted else [],
     }
 # --- _extract_keywords ---
 def _extract_keywords(messages):

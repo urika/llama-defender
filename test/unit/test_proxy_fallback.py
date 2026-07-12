@@ -1742,16 +1742,16 @@ class TestMetrics(unittest.TestCase):
                                           "est_tokens_after": 6000, "budget": 5000}}}
         proxy._finalize_metrics(mc_c)
         self.assertIn("budget_overflow", mc_c["quality_flags"])
-        # (d) loop_injected: loop_detect.max_run >= PROXY_LOOP_THRESHOLD (default 3)
+        # (d) loop_injected: loop_detect.level >= 1
         mc_d = {"pipeline": {"truncate": {"triggered": False, "dropped": 0, "kept": 0,
                                           "est_tokens_after": 0, "budget": 0},
-                             "loop_detect": {"max_run": 5}}}
+                             "loop_detect": {"max_run": 5, "level": 2}}}
         proxy._finalize_metrics(mc_d)
         self.assertIn("loop_injected", mc_d["quality_flags"])
         # (e) clean request: no flag should fire
         mc_e = {"pipeline": {"truncate": {"triggered": False, "dropped": 0, "kept": 0,
                                           "est_tokens_after": 0, "budget": 0},
-                             "loop_detect": {"max_run": 1}}}
+                             "loop_detect": {"max_run": 1, "level": 0}}}
         proxy._finalize_metrics(mc_e)
         self.assertEqual(mc_e["quality_flags"], [])
 

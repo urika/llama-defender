@@ -295,7 +295,11 @@ class InstrumentedPipeline(Pipeline):
                 continue
             executed += 1
             t0 = time.monotonic()
-            ctx = stage.process(ctx)
+            try:
+                ctx = stage.process(ctx)
+            except Exception as e:
+                log(f"  -> PIPELINE FAILURE at stage '{stage.name}': {type(e).__name__}: {e}")
+                raise RuntimeError(f"Pipeline stage '{stage.name}' failed: {type(e).__name__}: {e}") from e
             elapsed = (time.monotonic() - t0) * 1000
             total_ms += elapsed
             if elapsed > slowest_ms:
@@ -1160,7 +1164,7 @@ class TextLoopDetector(ConditionalStage):
         loop_detection = _import_loop_detection()
         tail_assistant = [m for m in ctx.messages if m.get("role") == "assistant"][-15:]
         text_loop_run, is_text_loop = loop_detection._detect_text_loop(tail_assistant, session_id=ctx.session_id)
-        eff_threshold = loop_detection._effective_text_loop_threshold(ctx.session_id)
+        eff_threshold = loop_detection._effective_text_loop_threshold(ctx.session_id, ctx.total_chars)
 
         if text_loop_run > 1:
             log(f"  -> Text loop scan: text_run={text_loop_run} (threshold={eff_threshold}, "
@@ -1251,6 +1255,7 @@ class LoopIntervention(PipelineStage):
             is_text_loop=ctx.is_text_loop,
             text_loop_run=ctx.text_loop_run,
             session_id=ctx.session_id,
+            total_chars=ctx.total_chars,
         )
 
         if loop_level >= 1:
@@ -1820,6 +1825,7 @@ class FormatConverter(PipelineStage):
                 raw_tools, ctx.messages,
                 recent_rounds=_ps.PROXY_TOOL_FILTER_RECENT,
                 tool_choice_name=tc_name,
+                session_id=ctx.session_id,
             )
             if tf_stats.get("filtered"):
                 body["tools"] = raw_tools
@@ -1827,9 +1833,19 @@ class FormatConverter(PipelineStage):
                 recent_info = f", recent_names={recent_names}" if recent_names else ""
                 filtered_out = tf_stats.get("filtered_out", [])
                 filtered_info = f", removed={filtered_out}" if filtered_out else ""
+                auto_promoted = tf_stats.get("auto_promoted", [])
+                auto_info = f", auto_promoted={auto_promoted}" if auto_promoted else ""
                 log(f"  -> Tool filter: {tf_stats['original']} -> {tf_stats['kept']} "
                     f"(always={tf_stats['always_keep']}, recent={tf_stats['recent_only']}, "
-                    f"scanned={tf_stats.get('scanned_assistant', 0)}{recent_info}{filtered_info})")
+                    f"scanned={tf_stats.get('scanned_assistant', 0)}{recent_info}{filtered_info}{auto_info})")
+
+            # DEF-104: Update session tool frequency after filtering
+            if ctx.session_id and _ps.PROXY_TOOL_AUTO_PROMOTE_THRESHOLD > 0:
+                for t in raw_tools:
+                    name = t.get("name", "") if isinstance(t, dict) else ""
+                    if name:
+                        freq = _ps._SESSION_TOOL_FREQ.setdefault(ctx.session_id, {})
+                        freq[name] = freq.get(name, 0) + 1
 
         # 6. Convert tools and tool_choice
         tools = msg_converter.convert_anthropic_tools_to_openai(body.get("tools"))
@@ -2057,7 +2073,7 @@ class BackendDispatcher(PipelineStage):
                 try:
                     with self._llama_lock:
                         self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
-                except urllib.error.URLError as ue:
+                except (urllib.error.HTTPError, urllib.error.URLError) as ue:
                     # Local backend is also down — surface the original cloud error
                     # rather than a misleading connection-refused message.
                     err_body = raw_err[:500]
@@ -2184,9 +2200,28 @@ class BackendDispatcher(PipelineStage):
 
         Caller must already hold the appropriate concurrency lock.
         """
+        # P0: enforce per-backend payload size guard just before forwarding.
+        body_bytes = json.dumps(ctx.openai_body).encode("utf-8")
+        target = getattr(ctx, '_route_target', 'local')
+        max_bytes = _ps.PROXY_CLOUD_MAX_REQUEST_BYTES if target == 'cloud' else _ps.PROXY_MAX_REQUEST_BYTES
+        if len(body_bytes) > max_bytes:
+            limit_name = "cloud" if target == 'cloud' else "local"
+            log(f"  -> Request body too large for {limit_name} backend: {len(body_bytes)} bytes > {max_bytes} limit")
+            self._handler._respond_json(
+                {"error": {
+                    "type": "payload_too_large",
+                    "message": f"Request body ({len(body_bytes)} bytes) exceeds {limit_name} backend maximum allowed size ({max_bytes} bytes).",
+                    "max_bytes": max_bytes,
+                    "received_bytes": len(body_bytes),
+                    "route_target": target,
+                }},
+                413,
+            )
+            return
+
         req = urllib.request.Request(
             f"{base_url}/chat/completions",
-            data=json.dumps(ctx.openai_body).encode("utf-8"),
+            data=body_bytes,
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",

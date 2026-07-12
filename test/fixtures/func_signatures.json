@@ -300,7 +300,8 @@
       "pattern_tool_name",
       "is_text_loop",
       "text_loop_run",
-      "session_id"
+      "session_id",
+      "total_chars"
     ],
     "defaults": {
       "threshold": null,
@@ -309,7 +310,8 @@
       "pattern_tool_name": null,
       "is_text_loop": false,
       "text_loop_run": 0,
-      "session_id": ""
+      "session_id": "",
+      "total_chars": 0
     }
   },
   "_apply_rounds_truncation": {
@@ -612,30 +614,42 @@
   "_effective_blocker_threshold": {
     "name": "_effective_blocker_threshold",
     "params": [
-      "session_id"
+      "session_id",
+      "total_chars"
     ],
-    "defaults": {}
+    "defaults": {
+      "total_chars": 0
+    }
   },
   "_effective_loop_threshold": {
     "name": "_effective_loop_threshold",
     "params": [
-      "session_id"
+      "session_id",
+      "total_chars"
     ],
-    "defaults": {}
+    "defaults": {
+      "total_chars": 0
+    }
   },
   "_effective_session_tier": {
     "name": "_effective_session_tier",
     "params": [
-      "session_id"
+      "session_id",
+      "total_chars"
     ],
-    "defaults": {}
+    "defaults": {
+      "total_chars": 0
+    }
   },
   "_effective_text_loop_threshold": {
     "name": "_effective_text_loop_threshold",
     "params": [
-      "session_id"
+      "session_id",
+      "total_chars"
     ],
-    "defaults": {}
+    "defaults": {
+      "total_chars": 0
+    }
   },
   "_empty_context_optimization_stats": {
     "name": "_empty_context_optimization_stats",
@@ -731,11 +745,13 @@
       "tools",
       "messages",
       "recent_rounds",
-      "tool_choice_name"
+      "tool_choice_name",
+      "session_id"
     ],
     "defaults": {
       "recent_rounds": 5,
-      "tool_choice_name": null
+      "tool_choice_name": null,
+      "session_id": ""
     }
   },
   "_finalize_metrics": {

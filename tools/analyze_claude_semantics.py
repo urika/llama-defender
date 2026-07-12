@@ -23,8 +23,8 @@ def parse_log(filepath):
             line = line.strip()
             if not line:
                 continue
-            # 匹配 [HH:MM:SS] [sess=xxx] 或 [HH:MM:SS] 前缀
-            m = re.match(r'\[(\d{2}:\d{2}:\d{2})\](?:\s+\[sess=([\w-]+)\])?\s+(.*)', line)
+            # 匹配 [HH:MM:SS] [LEVEL] [sess=xxx] msg 或 [HH:MM:SS] [sess=xxx] msg
+            m = re.match(r'\[(\d{2}:\d{2}:\d{2})\](?:\s+\[\w+\])?(?:\s+\[sess=([\w-]+)\])?\s+(.*)', line)
             if not m:
                 continue
             ts, sess, msg = m.group(1), m.group(2), m.group(3)

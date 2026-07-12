@@ -349,15 +349,16 @@ def test_session_continuity():
 
 def test_concurrent_serialization():
     print(f"\n{C.B}[8] Concurrent requests (PROXY_MAX_CONCURRENT=1){C.X}")
-    body = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 10,
-        "messages": [{"role": "user", "content": "Reply OK."}],
-    }
+    # Each request uses a unique body to avoid dedup (body hash match → 429).
     results_box = [None, None, None]
     times = [0, 0, 0]
 
     def worker(i):
+        body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": f"Reply OK. This is request #{i}"}],
+        }
         t0 = time.monotonic()
         code, _, resp, _ = _post("/v1/messages", body)
         times[i] = time.monotonic() - t0

@@ -414,65 +414,71 @@ class Handler(BaseHTTPRequestHandler):
             raw_sid = "cli_" + hashlib.md5(client_key.encode()).hexdigest()[:8]
         _log_ctx.session_id = raw_sid[:8]
         try:
-            if self.path != "/status":
-                log(f"GET {self.path}")
-                log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
-            if self.path == "/v1/models":
-                aliases = _ps.get_model_aliases()
-                models = []
-                for name in aliases:
-                    pref = _ps.MODEL_ROUTE_PREFERENCES.get(name, {})
-                    route = pref.get("route_bias", "auto")
-                    behavior = pref.get("behavior", "prefer")
-                    if behavior in ("force", "force_fallback") and route == "prefer_cloud":
-                        meta_route = "cloud"
-                    elif behavior in ("force", "force_fallback") and route == "prefer_local":
-                        meta_route = "local"
+            try:
+                if self.path != "/status":
+                    log(f"GET {self.path}")
+                    log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
+                if self.path == "/v1/models":
+                    aliases = _ps.get_model_aliases()
+                    models = []
+                    for name in aliases:
+                        pref = _ps.MODEL_ROUTE_PREFERENCES.get(name, {})
+                        route = pref.get("route_bias", "auto")
+                        behavior = pref.get("behavior", "prefer")
+                        if behavior in ("force", "force_fallback") and route == "prefer_cloud":
+                            meta_route = "cloud"
+                        elif behavior in ("force", "force_fallback") and route == "prefer_local":
+                            meta_route = "local"
+                        else:
+                            meta_route = "auto"
+                        models.append({
+                            "id": name,
+                            "object": "model",
+                            "created": 1677610602,
+                            "owned_by": "proxy-router",
+                            "metadata": {"route": meta_route},
+                        })
+                    self._respond_json({"object": "list", "data": models})
+                elif self.path == "/status":
+                    html = _build_status_html()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    if not getattr(self, "_request_id", None):
+                        self._request_id = f"req_{os.urandom(8).hex()}"
+                    self.send_header("request-id", self._request_id)
+                    self.end_headers()
+                    self.wfile.write(html.encode("utf-8"))
+                elif self.path == "/metrics" or self.path.startswith("/metrics?"):
+                    self._handle_metrics_endpoint()
+                elif self.path == "/metrics/history":
+                    self._handle_metrics_history_endpoint()
+                elif self.path == "/session" or self.path.startswith("/session?"):
+                    from urllib.parse import parse_qs, urlparse
+                    params = parse_qs(urlparse(self.path).query)
+                    sid = params.get("sid", [""])[0].strip()
+                    if not sid:
+                        self._respond_json({"detail": "missing sid"}, 400)
                     else:
-                        meta_route = "auto"
-                    models.append({
-                        "id": name,
-                        "object": "model",
-                        "created": 1677610602,
-                        "owned_by": "proxy-router",
-                        "metadata": {"route": meta_route},
-                    })
-                self._respond_json({"object": "list", "data": models})
-            elif self.path == "/status":
-                html = _build_status_html()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                if not getattr(self, "_request_id", None):
-                    self._request_id = f"req_{os.urandom(8).hex()}"
-                self.send_header("request-id", self._request_id)
-                self.end_headers()
-                self.wfile.write(html.encode("utf-8"))
-            elif self.path == "/metrics" or self.path.startswith("/metrics?"):
-                self._handle_metrics_endpoint()
-            elif self.path == "/session" or self.path.startswith("/session?"):
-                from urllib.parse import parse_qs, urlparse
-                params = parse_qs(urlparse(self.path).query)
-                sid = params.get("sid", [""])[0].strip()
-                if not sid:
-                    self._respond_json({"detail": "missing sid"}, 400)
+                        analysis = _analyze_session(sid)
+                        accept = self.headers.get("Accept", "")
+                        if "application/json" in accept:
+                            self._respond_json(analysis)
+                        else:
+                            html = _build_session_html(sid)
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/html; charset=utf-8")
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            if not getattr(self, "_request_id", None):
+                                self._request_id = f"req_{os.urandom(8).hex()}"
+                            self.send_header("request-id", self._request_id)
+                            self.end_headers()
+                            self.wfile.write(html.encode("utf-8"))
                 else:
-                    analysis = _analyze_session(sid)
-                    accept = self.headers.get("Accept", "")
-                    if "application/json" in accept:
-                        self._respond_json(analysis)
-                    else:
-                        html = _build_session_html(sid)
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/html; charset=utf-8")
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        if not getattr(self, "_request_id", None):
-                            self._request_id = f"req_{os.urandom(8).hex()}"
-                        self.send_header("request-id", self._request_id)
-                        self.end_headers()
-                        self.wfile.write(html.encode("utf-8"))
-            else:
-                self._respond_json({"detail": "Not found"}, 404)
+                    self._respond_json({"detail": "Not found"}, 404)
+            except Exception as e:
+                log(f"  -> GET error: {e}", level="ERROR")
+                self._respond_json({"error": {"type": "internal_error", "message": str(e)[:200]}}, 500)
         finally:
             _log_ctx.session_id = None
 
@@ -493,25 +499,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             content_len = int(self.headers.get("Content-Length", 0))
 
-            # P0: 请求体大小硬上限 — 在读取 body 前检查，防止超大请求穿透到后端
-            if content_len > PROXY_MAX_REQUEST_BYTES:
-                log(f"  -> Request body too large: {content_len} bytes > {PROXY_MAX_REQUEST_BYTES} limit, rejecting")
-                self._respond_json(
-                    {"error": {
-                        "type": "payload_too_large",
-                        "message": f"Request body ({content_len} bytes) exceeds maximum allowed size ({PROXY_MAX_REQUEST_BYTES} bytes)",
-                        "max_bytes": PROXY_MAX_REQUEST_BYTES,
-                        "received_bytes": content_len,
-                    }},
-                    413,
-                )
-                return
-
+            # Phase 1: read body and parse JSON. We intentionally do NOT reject
+            # oversized payloads here; instead we let SmartRouter decide whether
+            # the request should go to cloud (which can accept larger bodies) or
+            # local. The local size guard now lives in BackendDispatcher just
+            # before forwarding to the local backend.
             body = self.rfile.read(content_len).decode("utf-8")
             log(f"POST {self.path}")
             log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
             if _check_dedup(body):
-                log(f"  -> Duplicate request detected (body hash match within {PROXY_DEDUP_WINDOW}s), skipping")
+                log(f"  -> Duplicate request detected (body hash match within {PROXY_DEDUP_WINDOW}s), skipping", level="WARN")
                 self._respond_json(
                     {"error": {"type": "duplicate_request", "message": "Duplicate request within dedup window"}},
                     429,
@@ -523,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Extract X-Proxy-Route-To header for single-request route override
                 parsed["_x_proxy_route_to"] = self.headers.get("X-Proxy-Route-To", "")
             except json.JSONDecodeError:
-                log(f"  Body (invalid JSON): {body[:500]}")
+                log(f"  Body (invalid JSON): {body[:500]}", level="WARN")
                 self._respond_json(
                     {"error": {"type": "invalid_request_error", "message": "Invalid JSON"}},
                     400,
@@ -557,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Phase 3: memory pressure active rejection
                 mem_rejected, used_pct = _should_reject_for_memory()
                 if mem_rejected:
-                    log(f"  -> Memory pressure rejection: used_pct={used_pct:.1f}% > threshold={PROXY_MEMORY_REJECT_THRESHOLD:.1f}%")
+                    log(f"  -> Memory pressure rejection: used_pct={used_pct:.1f}% > threshold={PROXY_MEMORY_REJECT_THRESHOLD:.1f}%", level="WARN")
                     if PROXY_METRICS_ENABLED:
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
@@ -594,29 +591,29 @@ class Handler(BaseHTTPRequestHandler):
                 if early_route == "cloud":
                     log(f"  -> OOM safety pre-truncation skipped: early route decision=cloud ({total_chars:,} chars)")
                 elif total_chars > PROXY_OOM_SAFE_CHARS and msgs:
-                    log(f"  -> OOM safety pre-truncation triggered: {total_chars:,} chars > {PROXY_OOM_SAFE_CHARS:,} threshold")
-                    pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
-                    msgs_truncated, pre_stats = _apply_rounds_truncation(
-                        msgs, keep_rounds=2, session_id=pre_session_id
-                    )
-                    if pre_stats.get("truncated"):
-                        parsed = {**parsed, "messages": msgs_truncated}
-                        msgs = msgs_truncated
-                        total_chars = len(json.dumps(msgs_truncated, ensure_ascii=False))
-                        log(f"  -> Pre-truncated: dropped={pre_stats.get('dropped_msgs', 0)}, "
-                            f"kept={len(msgs_truncated)} msgs, now {total_chars:,} chars")
-                        if PROXY_METRICS_ENABLED:
-                            mc = getattr(_metrics_ctx, 'mc', None)
-                            if mc:
-                                _mc_put("pre_truncate", {
-                                    "triggered": True,
-                                    "original_chars": pre_stats.get("original_chars", 0),
-                                    "truncated_chars": total_chars,
-                                    "dropped_msgs": pre_stats.get("dropped_msgs", 0),
-                                    "kept_rounds": pre_stats.get("actual_keep_rounds", 2),
-                                })
-                    else:
-                        log(f"  -> Pre-truncation did not reduce payload, proceeding")
+                        log(f"  -> OOM safety pre-truncation triggered: {total_chars:,} chars > {PROXY_OOM_SAFE_CHARS:,} threshold", level="WARN")
+                        pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
+                        msgs_truncated, pre_stats = _apply_rounds_truncation(
+                            msgs, keep_rounds=2, session_id=pre_session_id
+                        )
+                        if pre_stats.get("truncated"):
+                            parsed = {**parsed, "messages": msgs_truncated}
+                            msgs = msgs_truncated
+                            total_chars = len(json.dumps(msgs_truncated, ensure_ascii=False))
+                            log(f"  -> Pre-truncated: dropped={pre_stats.get('dropped_msgs', 0)}, "
+                                f"kept={len(msgs_truncated)} msgs, now {total_chars:,} chars")
+                            if PROXY_METRICS_ENABLED:
+                                mc = getattr(_metrics_ctx, 'mc', None)
+                                if mc:
+                                    _mc_put("pre_truncate", {
+                                        "triggered": True,
+                                        "original_chars": pre_stats.get("original_chars", 0),
+                                        "truncated_chars": total_chars,
+                                        "dropped_msgs": pre_stats.get("dropped_msgs", 0),
+                                        "kept_rounds": pre_stats.get("actual_keep_rounds", 2),
+                                    })
+                        else:
+                            log(f"  -> Pre-truncation did not reduce payload, proceeding")
                 # Timing wrapper for structured logging
                 import time as _time
                 _t0 = _time.monotonic()
@@ -652,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                             log_metrics(mc)
                 except Exception as e:
                     _dur = (_time.monotonic() - _t0) * 1000
-                    log(f"  -> Error: {e}")
+                    log(f"  -> Error: {e}", level="ERROR")
                     _jsonl_output_map.pop(self._last_jsonl_token, None)
                     status_code, _, _ = _classify_exception(e)
                     log_request(
@@ -683,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
                     status_code, error_type, retryable = _classify_exception(e)
                     if status_code == 499:
                         # Client already disconnected, no point sending a response.
-                        log(f"  -> Client disconnected (499): {type(e).__name__}")
+                        log(f"  -> Client disconnected (499): {type(e).__name__}", level="WARN")
                     else:
                         hdrs = {"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)} if retryable else None
                         try:
@@ -700,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
                                 extra_headers=hdrs,
                             )
                         except Exception as respond_err:
-                            log(f"  -> CRITICAL: failed to send error response: {respond_err}")
+                            log(f"  -> CRITICAL: failed to send error response: {respond_err}", level="ERROR")
                     # No raise — let the connection close cleanly
                 finally:
                     # Reset OpenAI chat mode flags for this connection
@@ -716,7 +713,7 @@ class Handler(BaseHTTPRequestHandler):
                         if mc:
                             mc["snapshot_written"] = _snapshot_written
             else:
-                log(f"  -> 404 (unknown path)")
+                log(f"  -> 404 (unknown path)", level="WARN")
                 self._respond_json({"detail": "Not found"}, 404)
         finally:
             _log_ctx.session_id = None
@@ -799,7 +796,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if force_stopped:
                 choice["finish_reason"] = "length"
-                log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})")
+                log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})", level="WARN")
 
             content_summary = message.get("content", "")[:100]
             for tc in message.get("tool_calls") or []:
@@ -834,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if force_stopped:
             anthropic_resp["stop_reason"] = "max_tokens"
-            log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})")
+            log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})", level="WARN")
             for block in anthropic_resp.get("content", []):
                 if block.get("type") == "tool_use" and block.get("input") == {}:
                     tool_name = block.get("name", "")
@@ -891,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
         text_block_started = False
         tools_extractor = _StreamingToolsExtractor()
         content_tools_pending = []
+        _first_token_time = None
 
         # Output token truncation for streaming path
         max_tokens = anthropic_body.get("max_tokens", 4096)
@@ -951,6 +949,9 @@ class Handler(BaseHTTPRequestHandler):
             if output_force_stopped:
                 break
 
+            if _first_token_time is None:
+                _first_token_time = time.monotonic()
+
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
 
@@ -986,14 +987,14 @@ class Handler(BaseHTTPRequestHandler):
                         est_tokens = output_char_count * 0.4
                         if est_tokens > output_token_hard_limit:
                             tool_name = tool_calls_buffer[idx]["function"].get("name", "?")
-                            log(f"  -> !! Output token limit on tool_call: est={int(est_tokens)}, limit={output_token_hard_limit}, tool={tool_name}, forcing stop")
+                            log(f"  -> !! Output token limit on tool_call: est={int(est_tokens)}, limit={output_token_hard_limit}, tool={tool_name}, forcing stop", level="WARN")
                             output_force_stopped = True
                             break
                 continue
 
             # Check text output token limit
             if output_char_count * 0.4 > output_token_hard_limit:
-                log(f"  -> FORCE_STOPPED: output est={int(output_char_count * 0.4)} tokens, limit={output_token_hard_limit}")
+                log(f"  -> FORCE_STOPPED: output est={int(output_char_count * 0.4)} tokens, limit={output_token_hard_limit}", level="WARN")
                 output_force_stopped = True
                 break
 
@@ -1125,6 +1126,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client disconnected before stream end
+        if _first_token_time is not None:
+            mc = getattr(_metrics_ctx, 'mc', None)
+            if mc:
+                mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
@@ -1231,7 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         total = len(records)
         if total == 0:
-            self._respond_json({"schema": "v1", "total": 0})
+            self._respond_json({"schema": "v2", "total": 0})
             return
         status_counts = {}
         quality_flag_counts = {}
@@ -1242,6 +1247,8 @@ class Handler(BaseHTTPRequestHandler):
         memory_rejected = 0
         snapshot_written = 0
         dynamic_concurrent_events = 0
+        input_chars_all = []
+        ttft_all = []
         for r in records:
             s = r.get("status", "unknown")
             status_counts[s] = status_counts.get(s, 0) + 1
@@ -1263,9 +1270,46 @@ class Handler(BaseHTTPRequestHandler):
             dc = r.get("dynamic_concurrent", {})
             if isinstance(dc, dict) and dc.get("adjusted"):
                 dynamic_concurrent_events += 1
+            ic = r.get("input_chars", 0)
+            if isinstance(ic, (int, float)) and ic > 0:
+                input_chars_all.append(ic)
+            ttft = r.get("ttft_ms", 0)
+            if isinstance(ttft, (int, float)) and ttft > 0:
+                ttft_all.append(ttft)
         top_tools = sorted(tool_usage.items(), key=lambda x: -x[1])[:10]
+
+        def _percentile(vals, p):
+            if not vals:
+                return 0
+            s = sorted(vals)
+            k = (len(s) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(s) - 1)
+            if f == c:
+                return float(s[f])
+            return s[f] + (s[c] - s[f]) * (k - f)
+
+        session_size = {}
+        if input_chars_all:
+            session_size = {
+                "p50": int(_percentile(input_chars_all, 0.50)),
+                "p95": int(_percentile(input_chars_all, 0.95)),
+                "p99": int(_percentile(input_chars_all, 0.99)),
+                "max": max(input_chars_all),
+                "avg": int(sum(input_chars_all) / len(input_chars_all)),
+            }
+        ttft_stats = {}
+        if ttft_all:
+            ttft_stats = {
+                "p50_ms": round(_percentile(ttft_all, 0.50), 1),
+                "p95_ms": round(_percentile(ttft_all, 0.95), 1),
+                "p99_ms": round(_percentile(ttft_all, 0.99), 1),
+                "max_ms": round(max(ttft_all), 1),
+                "avg_ms": round(sum(ttft_all) / len(ttft_all), 1),
+            }
+
         self._respond_json({
-            "schema": "v1",
+            "schema": "v2",
             "total": total,
             "status": status_counts,
             "quality_flags": quality_flag_counts,
@@ -1276,8 +1320,112 @@ class Handler(BaseHTTPRequestHandler):
             "snapshot_written": snapshot_written,
             "dynamic_concurrent_events": dynamic_concurrent_events,
             "top_tools": [{"name": n, "count": c} for n, c in top_tools],
+            "session_size": session_size,
+            "ttft": ttft_stats,
             "last_n": last_n,
         })
+
+    def _handle_metrics_history_endpoint(self):
+        from collections import defaultdict
+        metrics_dir = os.environ.get("PROXY_METRICS_DIR", "logs")
+        metrics_path = os.path.join(metrics_dir, "proxy_metrics.jsonl")
+        records = []
+        try:
+            with open(metrics_path, "r") as f:
+                for line in f:
+                    try:
+                        records.append(json.loads(line.strip()))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+        except (FileNotFoundError, OSError):
+            pass
+        if not records:
+            self._respond_json({"schema": "v2", "buckets": []})
+            return
+
+        hourly = defaultdict(lambda: {
+            "count": 0, "status_200": 0, "status_500": 0, "status_503": 0, "status_499": 0,
+            "latencies": [], "input_chars": [], "output_chars": [],
+            "loop_injected": 0, "blocker_injected": 0, "high_drop_ratio": 0,
+            "truncation_triggered": 0, "memory_rejected": 0,
+        })
+        for r in records:
+            ts_str = r.get("ts", "")
+            if not ts_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts_str)
+                bucket = dt.strftime("%Y-%m-%d %H:00")
+            except ValueError:
+                continue
+            b = hourly[bucket]
+            b["count"] += 1
+            status = r.get("status", 0)
+            if status == 200:
+                b["status_200"] += 1
+            elif status == 500:
+                b["status_500"] += 1
+            elif status == 503:
+                b["status_503"] += 1
+            elif status == 499:
+                b["status_499"] += 1
+            dur = r.get("duration_ms", 0)
+            if isinstance(dur, (int, float)) and dur > 0:
+                b["latencies"].append(dur)
+            ic = r.get("input_chars", 0)
+            if isinstance(ic, (int, float)) and ic > 0:
+                b["input_chars"].append(ic)
+            oc = r.get("output_chars", 0)
+            if isinstance(oc, (int, float)) and oc > 0:
+                b["output_chars"].append(oc)
+            for qf in r.get("quality_flags", []):
+                if qf == "loop_injected":
+                    b["loop_injected"] += 1
+                elif qf == "blocker_injected":
+                    b["blocker_injected"] += 1
+                elif qf == "high_drop_ratio":
+                    b["high_drop_ratio"] += 1
+            pipeline = r.get("pipeline", {})
+            if pipeline.get("truncate", {}).get("triggered"):
+                b["truncation_triggered"] += 1
+            if r.get("memory_rejected"):
+                b["memory_rejected"] += 1
+
+        def _p50(vals):
+            if not vals:
+                return 0
+            s = sorted(vals)
+            return s[len(s) // 2]
+
+        def _p95(vals):
+            if not vals:
+                return 0
+            s = sorted(vals)
+            k = int(len(s) * 0.95)
+            return s[min(k, len(s) - 1)]
+
+        buckets = []
+        for bucket_key in sorted(hourly.keys()):
+            b = hourly[bucket_key]
+            buckets.append({
+                "ts": bucket_key,
+                "count": b["count"],
+                "status_200": b["status_200"],
+                "status_500": b["status_500"],
+                "status_503": b["status_503"],
+                "status_499": b["status_499"],
+                "success_rate": round(b["status_200"] / max(b["count"], 1) * 100, 1),
+                "latency_p50_ms": round(_p50(b["latencies"]), 1),
+                "latency_p95_ms": round(_p95(b["latencies"]), 1),
+                "avg_input_chars": round(sum(b["input_chars"]) / max(len(b["input_chars"]), 1), 0) if b["input_chars"] else 0,
+                "avg_output_chars": round(sum(b["output_chars"]) / max(len(b["output_chars"]), 1), 0) if b["output_chars"] else 0,
+                "loop_injected": b["loop_injected"],
+                "blocker_injected": b["blocker_injected"],
+                "high_drop_ratio": b["high_drop_ratio"],
+                "truncation_triggered": b["truncation_triggered"],
+                "memory_rejected": b["memory_rejected"],
+            })
+        self._respond_json({"schema": "v2", "buckets": buckets})
 
 
 lifecycle._get_system_memory = _get_system_memory
@@ -1316,7 +1464,10 @@ def main():
     log(f"Failure snapshots: {'enabled' if PROXY_SNAPSHOT_ENABLED else 'disabled'}")
     if IS_CLOUD:
         log(f"Cloud API mode — no local backend required")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    ReusableThreadingHTTPServer((host, port), Handler).serve_forever()
 
 if __name__ == "__main__":
     main()

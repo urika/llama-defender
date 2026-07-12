@@ -389,4 +389,122 @@ git commit --no-verify               # 绕过所有钩子
 
 ---
 
+## 11. 关键配置参数与推荐组合
+
+> 完整参数注册表见 [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`（约 100+ 参数）。
+> 以下仅列出最常用的参数及其推荐值。
+
+### 11.1 压缩 Profile 推荐组合
+
+`proxy_config.py` 定义了三种预设组合，通过 `PROXY_COMPRESSION_PROFILE` 切换：
+
+| 参数 | balanced（默认） | aggressive | conservative |
+|------|-----------------|------------|--------------|
+| `PROXY_COMPRESS_MODE` | `smart` | `aggressive` | `conservative` |
+| `PROXY_COMPRESS_MIN_CHARS` | 3000 | 1500 | 5000 |
+| `PROXY_COMPRESS_TARGET_RATIO` | 0.40 | 0.25 | 0.55 |
+| `PROXY_COMPRESS_LLM_CHUNK` | 4000 | 3000 | 6000 |
+| `PROXY_COMPRESS_LLM_ENABLED` | `true` | `true` | `false` |
+| `PROXY_COMPRESS_CLEAR_ENABLED` | `true` | `true` | `false` |
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `fifo` | `fifo` | `rounds` |
+| `PROXY_CTX_KEEP_MESSAGES` | 40 | 30 | 50 |
+| `PROXY_LOOP_THRESHOLD` | 5 | 4 | 6 |
+| `PROXY_OOM_SAFE_TOKENS` | 60000 | 50000 | 70000 |
+
+**选择建议**：
+- **balanced**: 日常 coding 任务，兼顾质量与性能
+- **aggressive**: 长上下文 agentic 场景，优先控制 token 消耗
+- **conservative**: 质量敏感任务（代码审查、文档生成），优先保留上下文完整性
+
+### 11.2 本地模式关键参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `PROXY_MAX_CONCURRENT` | `1` | `1` | 48GB Mac 上推荐 1，OOM 风险 |
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `fifo` | `fifo` | 当前生产策略，prefix cache 友好 |
+| `PROXY_CTX_KEEP_MESSAGES` | `40` | `40` | fifo 窗口大小 |
+| `PROXY_OOM_SAFE_TOKENS` | `60000` | `60000` | OOM 安全阈值，约 120K chars |
+| `PROXY_PRE_TRUNCATE_CHARS` | `400000` | `400000` | 请求体预截断阈值 |
+| `PROXY_MAX_REQUEST_BYTES` | `512000` | `512000` | 请求体硬上限（500KB） |
+| `PROXY_CLEAR_ENABLED` | `false` | `false` | 本地后端建议关闭，避免 Wasted call 循环 |
+| `PROXY_TOOL_FILTER_ENABLED` | `true` | `true` | 本地模式默认开启 |
+| `PROXY_TOOL_FILTER_MAX` | `20` | `20` | 超过此数量触发过滤 |
+| `PROXY_TOOL_AUTO_PROMOTE_THRESHOLD` | `3` | `3` | 使用 ≥3 次自动加入 keep 集 |
+| `PROXY_LOOP_THRESHOLD` | `5` | `5` | 循环检测阈值 |
+| `PROXY_LOOP_LEVEL3` | `9` | `9` | Level 3 触发阈值（移除全部工具） |
+| `PROXY_COMPRESSION_PROFILE` | `balanced` | `balanced` | 压缩策略预设组合 |
+
+### 11.3 云端模式关键参数
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+|------|--------|--------|------|
+| `PROXY_MAX_CONCURRENT` | `5` | `5` | 云端并发高，API 无 OOM 风险 |
+| `PROXY_TOOL_FILTER_ENABLED` | `false` | `false` | 云端不触发工具过滤 |
+| `PROXY_CLEAR_ENABLED` | `true` | `true` | 云端可开启 tool result 清理 |
+| `PROXY_COMPRESSION_PROFILE` | `balanced` | `aggressive` | 云端按 token 计费，建议激进压缩 |
+
+### 11.4 路由参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_ROUTE_SENSITIVE_PATTERNS` | `""` | 匹配的请求强制走本地（逗号分隔关键字） |
+| `PROXY_ROUTE_FORCE` | `""` | 强制路由模式：`local` 或 `cloud` |
+| `PROXY_CLOUD_COOLDOWN` | `300` | 云端失败后的冷却时间（秒） |
+| `PROXY_CLOUD_MAX_RETRY` | `2` | 云端重试次数 |
+
+> 完整参数列表及详细文档见 [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`。
+
+---
+
+## 12. 缺陷修复状态
+
+> 完整缺陷清单见 [`docs/DEFECT-LIST.md`](docs/DEFECT-LIST.md)。以下为截至 2026-07-12 的汇总。
+
+### 12.1 总体统计
+
+| 类别 | 数量 | 占比 |
+|------|------|------|
+| ✅ 已修复 | 27 | 90% |
+| 🟡 部分修复 | 1 | 3% |
+| ⚪ 设计限制 | 2 | 7% |
+| **合计** | **30** | **100%** |
+
+### 12.2 按严重度
+
+| 严重度 | 总数 | 已修复 |
+|--------|------|--------|
+| 🔴 P0-Critical | 7 | 7 |
+| 🟠 P1-High | 8 | 8 |
+| 🟡 P2-Medium | 10 | 8 |
+| 🔵 P3-Low | 5 | 4 |
+
+### 12.3 生产验证结果
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| 500 错误率 | 2.3% | **0%** (0/20) |
+| 503 错误率 | 4.5% | **0%** (0/20) |
+| 成功率 | 93.2% | **100%** (20/20) |
+| 单元测试 | 871 | **890** |
+| 缺陷修复率 | 70% | **90%** |
+
+### 12.4 关键修复清单
+
+| 缺陷 | 描述 | 修复要点 |
+|------|------|----------|
+| DEF-001 | 500 错误率 2.3% | `do_GET` 异常处理、pipeline stage 日志、local fallback HTTPError 捕获 |
+| DEF-002/109 | 循环检测假阳性 | `loop_injected` 统计口径从 `max_run≥3` 改为 `level≥1`；长上下文分层阈值 |
+| DEF-003 | re_read_rate 公式 bug | 修复分母为 0 处理，新增 5 个单元测试 |
+| DEF-101 | 503 错误率 4.5% | `_get_system_memory` 改用 `memory_pressure` 替代 `vm_stat` |
+| DEF-104 | 白名单自动扩展 | `_SESSION_TOOL_FREQ` 跨请求频率计数，≥3 次自动晋升 |
+| DEF-107 | high_drop_ratio 21.6% | fifo 截断时注入结构化摘要 |
+| DEF-203 | prefix cache 断裂 | 规范填充工具列表，跨 session 工具序列一致 |
+| DEF-207 | watchdog daemon | `--daemon` 参数 + PID 文件 + `disown` + `cmd_stop_watchdog` |
+| DEF-208/209 | 测试覆盖 | 新增 `test_truncation_edge.py` 19 个测试 |
+| DEF-210 | 文档同步 | fifo 策略文档、覆盖率表缺陷列、AGENTS.md 参数推荐 |
+| DEF-303 | 日志分级 | 15 处关键 `log()` 添加 ERROR/WARN 级别 |
+| DEF-304 | 可观测性仪表板 | Chart.js 趋势图、TTFT 追踪、metrics 轮转、`/metrics/history` 端点 |
+
+---
+
 > 本文件上一版本保存在 `AGENTS.md.bak`。

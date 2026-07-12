@@ -6,11 +6,17 @@ import proxy_state as _ps
 # --- Session-tier helpers (Phase 4 / 建议4) ---
 
 
-def _effective_session_tier(session_id: str) -> str:
-    """Return 'short' | 'long' | 'very_long' based on _SESSION_REQUEST_COUNT.
+def _effective_session_tier(session_id: str, total_chars: int = 0) -> str:
+    """Return 'short' | 'long' | 'very_long' based on context size and request count.
 
-    Falls back to 'short' when session_id is empty or unknown (backward compatible).
+    Priority: context size > request count. If total_chars >= 100K, session is
+    'very_long' regardless of request count (DEF-109: long context = higher loop risk).
+    Falls back to 'short' when session_id is empty or unknown.
     """
+    if total_chars >= _ps.PROXY_LOOP_CHARS_VERY_LONG:
+        return "very_long"
+    if total_chars >= _ps.PROXY_LOOP_CHARS_LONG:
+        return "long"
     if not session_id:
         return "short"
     cnt = _ps._SESSION_REQUEST_COUNT.get(session_id, 0)
@@ -21,9 +27,9 @@ def _effective_session_tier(session_id: str) -> str:
     return "very_long"
 
 
-def _effective_loop_threshold(session_id: str) -> int:
-    """Dynamic loop threshold by session tier."""
-    tier = _effective_session_tier(session_id)
+def _effective_loop_threshold(session_id: str, total_chars: int = 0) -> int:
+    """Dynamic loop threshold by session tier (considers context size)."""
+    tier = _effective_session_tier(session_id, total_chars)
     if tier == "long":
         return _ps.PROXY_LOOP_THRESHOLD_LONG
     if tier == "very_long":
@@ -31,9 +37,9 @@ def _effective_loop_threshold(session_id: str) -> int:
     return _ps.PROXY_LOOP_THRESHOLD
 
 
-def _effective_text_loop_threshold(session_id: str) -> int:
-    """Dynamic text-loop threshold by session tier."""
-    tier = _effective_session_tier(session_id)
+def _effective_text_loop_threshold(session_id: str, total_chars: int = 0) -> int:
+    """Dynamic text-loop threshold by session tier (considers context size)."""
+    tier = _effective_session_tier(session_id, total_chars)
     if tier == "long":
         return _ps.PROXY_TEXT_LOOP_THRESHOLD_LONG
     if tier == "very_long":
@@ -41,9 +47,9 @@ def _effective_text_loop_threshold(session_id: str) -> int:
     return _ps.PROXY_TEXT_LOOP_THRESHOLD
 
 
-def _effective_blocker_threshold(session_id: str) -> int:
-    """Dynamic blocker threshold by session tier."""
-    tier = _effective_session_tier(session_id)
+def _effective_blocker_threshold(session_id: str, total_chars: int = 0) -> int:
+    """Dynamic blocker threshold by session tier (considers context size)."""
+    tier = _effective_session_tier(session_id, total_chars)
     if tier == "long":
         return _ps.PROXY_BLOCKER_THRESHOLD_LONG
     if tier == "very_long":
@@ -284,11 +290,13 @@ def _apply_loop_intervention(
     threshold=None, level2_threshold=None,
     level3_threshold=None, pattern_tool_name=None,
     is_text_loop=False, text_loop_run=0, session_id="",
+    total_chars=0,
 ):
     """Escalating loop intervention (R2.1). Returns (messages, tools, level, tool_name).
 
     When session_id is provided, threshold/level2/level3 are computed dynamically
-    from the session tier (Phase 4 / 建议4).  Pass explicit values to override.
+    from the session tier (considers context size via total_chars).  Pass explicit
+    values to override.
 
     - max_run < threshold          → no-op, returns (raw_messages, raw_tools, 0, "")
     - threshold <= max_run < L2    → Level 1: append hint user message
@@ -296,7 +304,7 @@ def _apply_loop_intervention(
     - max_run >= L3                → Level 3: strip ALL tools (force plain text)
     """
     if threshold is None:
-        threshold = _effective_loop_threshold(session_id)
+        threshold = _effective_loop_threshold(session_id, total_chars)
     if level2_threshold is None:
         level2_threshold = threshold * 2  # follows existing LEVEL2 = THRESHOLD * 2 pattern
     if level3_threshold is None:

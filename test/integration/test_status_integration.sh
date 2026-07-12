@@ -118,16 +118,16 @@ for label in "Avg Prefix Ratio" "Avg Compression" "Loop Triggered" "Blocker Trig
 done
 
 # ============================================================
-# TC3: /metrics endpoint returns schema v1
+# TC3: /metrics endpoint returns valid schema (v2)
 # ============================================================
-info "TC3: verify /metrics endpoint schema v1"
+info "TC3: verify /metrics endpoint returns valid schema"
 METRICS_JSON="$LOG_DIR/metrics.json"
 if curl -sf --max-time 10 "http://127.0.0.1:$PROXY_PORT/metrics" -o "$METRICS_JSON"; then
   SCHEMA=$(python3 -c "import json,sys; d=json.load(open('$METRICS_JSON')); print(d.get('schema',''))" 2>/dev/null)
-  if [[ "$SCHEMA" == "v1" ]]; then
-    pass "TC3 /metrics schema is v1"
+  if [[ "$SCHEMA" == "v2" ]]; then
+    pass "TC3 /metrics schema is v2"
   else
-    fail "TC3 /metrics schema is '$SCHEMA', expected v1"
+    fail "TC3 /metrics schema is '$SCHEMA', expected v2"
   fi
 else
   fail "TC3 could not fetch /metrics"

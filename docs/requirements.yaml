@@ -38,7 +38,7 @@ requirements:
     desc: 超过 token 预算时主动丢弃旧消息；三策略 (rounds/fifo/char)
     priority: P0
     impl:
-      - anthropic_proxy.py:truncate_messages_if_needed
+      - truncation.py:truncate_messages_if_needed
     tests:
       - test/unit/test_proxy_fallback.py::TestFifoPlaceholderStability
 
@@ -48,8 +48,8 @@ requirements:
     desc: 被丢弃消息生成结构化摘要；三级压缩链 (LLM→规则→静态折叠)
     priority: P0
     impl:
-      - anthropic_proxy.py:_compress_middle_with_llm
-      - anthropic_proxy.py:_extract_middle_summary_rules
+      - truncation.py:_compress_middle_with_llm
+      - truncation.py:_extract_middle_summary_rules
     tests:
       - test/unit/test_proxy_fallback.py::TestCompressPromptStructure
 
@@ -59,7 +59,7 @@ requirements:
     desc: 避免每次全量重压缩；增量摘要缓存
     priority: P0
     impl:
-      - anthropic_proxy.py:_incremental_compress
+      - truncation.py:_incremental_compress
     tests:
       - test/unit/test_proxy_fallback.py::TestIncrementalCompress
 
@@ -69,8 +69,8 @@ requirements:
     desc: 保留被截断消息的关键词索引；匹配 tail 注入
     priority: P0
     impl:
-      - anthropic_proxy.py:_extract_keywords
-      - anthropic_proxy.py:_inject_keyword_context
+      - tool_filter.py:_extract_keywords
+      - tool_filter.py:_inject_keyword_context
     tests:
       - test/unit/test_proxy_fallback.py::TestKeywordIndex
 
@@ -83,7 +83,7 @@ requirements:
     desc: 三级升级：Level 1 提示 → Level 2 移除工具（注：PRD §3 提到的 Level 3 强制纯文本当前未实现）
     priority: P0
     impl:
-      - anthropic_proxy.py:_apply_loop_intervention
+      - loop_detection.py:_apply_loop_intervention
     tests:
       - test/unit/test_proxy_fallback.py::TestLoopIntervention
 
@@ -93,7 +93,7 @@ requirements:
     desc: 清除 Read 时保留 200 字符预览
     priority: P0
     impl:
-      - anthropic_proxy.py:clear_old_tool_results
+      - truncation.py:clear_old_tool_results
     tests:
       - test/unit/test_proxy_fallback.py::TestToolClearing
 
@@ -103,7 +103,7 @@ requirements:
     desc: 最近 6 个 Read 结果 +5 分语义加分
     priority: P0
     impl:
-      - anthropic_proxy.py:clear_old_tool_results
+      - truncation.py:clear_old_tool_results
     tests:
       - test/unit/test_proxy_fallback.py::TestToolClearing
 
@@ -113,8 +113,8 @@ requirements:
     desc: 连续相同错误类型 (2 次) 干预；注入 [BLOCKER] 消息
     priority: P0
     impl:
-      - anthropic_proxy.py:_detect_blocker_pattern
-      - anthropic_proxy.py:_build_blocker_message
+      - loop_detection.py:_detect_blocker_pattern
+      - loop_detection.py:_build_blocker_message
     tests:
       - test/unit/test_proxy_fallback.py::TestBlockerDetection
       - test/integration/test_blocker_integration.sh
@@ -146,7 +146,7 @@ requirements:
     desc: 44 → 15 个工具，白名单+最近使用；节省 5-8K tokens
     priority: P0
     impl:
-      - anthropic_proxy.py:_filter_tools
+      - tool_filter.py:_filter_tools
     tests:
       - test/unit/test_proxy_fallback.py::TestToolFilter
 
@@ -159,7 +159,7 @@ requirements:
     desc: Qwen 偶尔输出 XML 格式 tool_call；parse_tool_arguments 四级回退
     priority: P0
     impl:
-      - anthropic_proxy.py:parse_tool_arguments
+      - tool_parser.py:parse_tool_arguments
     tests:
       - test/unit/test_proxy_fallback.py::TestParseToolArguments
 
@@ -169,9 +169,9 @@ requirements:
     desc: 从 <tools>...</tools> 文本中提取工具调用；流式+非流式双路径
     priority: P0
     impl:
-      - anthropic_proxy.py:_extract_content_tool_calls
-      - anthropic_proxy.py:_StreamingToolsExtractor
-      - anthropic_proxy.py:convert_openai_response_to_anthropic
+      - tool_parser.py:_extract_content_tool_calls
+      - tool_parser.py:_StreamingToolsExtractor
+      - message_converter.py:convert_openai_response_to_anthropic
     tests:
       - test/unit/test_proxy_fallback.py::TestExtractContentToolCalls
       - test/unit/test_proxy_fallback.py::TestStreamingStateMachine
@@ -195,7 +195,7 @@ requirements:
     desc: 修复被截断的 tool_call arguments JSON
     priority: P0
     impl:
-      - anthropic_proxy.py:_repair_truncated_json
+      - tool_parser.py:_repair_truncated_json
     tests:
       - test/unit/test_proxy_fallback.py::TestRepairTruncatedJson
 
@@ -205,7 +205,7 @@ requirements:
     desc: 处理 Qwen reasoning_content 字段
     priority: P1
     impl:
-      - anthropic_proxy.py:convert_openai_response_to_anthropic
+      - message_converter.py:convert_openai_response_to_anthropic
       - anthropic_proxy.py:Handler._handle_streaming_response
     tests:
       - test/unit/test_proxy_fallback.py::TestReasoningExtraction
@@ -219,7 +219,7 @@ requirements:
     desc: 后端英文错误→中文自然语言提示 (3 种类型)
     priority: P1
     impl:
-      - anthropic_proxy.py:_translate_tool_result_errors
+      - tool_filter.py:_translate_tool_result_errors
     tests:
       - test/unit/test_proxy_fallback.py::TestErrorTranslation
 
@@ -229,7 +229,7 @@ requirements:
     desc: 翻译时附带解决建议 (如「用 Bash ls 确认」)
     priority: P1
     impl:
-      - anthropic_proxy.py:_translate_tool_result_errors
+      - tool_filter.py:_translate_tool_result_errors
     tests:
       - test/unit/test_proxy_fallback.py::TestErrorTranslation
 
@@ -242,8 +242,8 @@ requirements:
     desc: 每请求输出管线各步骤结构化 JSON 指标 (proxy_metrics.jsonl)
     priority: P0
     impl:
-      - anthropic_proxy.py:log_metrics
-      - anthropic_proxy.py:_mc_put
+      - proxy_logging.py:log_metrics
+      - admin_server.py:_mc_put
     tests:
       - test/unit/test_proxy_fallback.py::TestMetrics
 
@@ -253,7 +253,7 @@ requirements:
     desc: 自动标记 4 种异常模式 (high_drop_ratio / llm_compress_failed / budget_overflow / loop_injected + blocker_injected)
     priority: P1
     impl:
-      - anthropic_proxy.py:_finalize_metrics
+      - admin_server.py:_finalize_metrics
     tests:
       - test/unit/test_proxy_fallback.py::TestMetrics
 
@@ -263,7 +263,7 @@ requirements:
     desc: 记录截断前后 token 估算比 (compression_ratio 字段)
     priority: P1
     impl:
-      - anthropic_proxy.py:_finalize_metrics
+      - admin_server.py:_finalize_metrics
     tests:
       - test/unit/test_proxy_fallback.py::TestMetrics
 
@@ -276,7 +276,7 @@ requirements:
     desc: threading.Semaphore 限制同时转发请求数 (local=1, cloud=4)
     priority: P0
     impl:
-      - anthropic_proxy.py:PROXY_MAX_CONCURRENT
+      - proxy_state.py:PROXY_MAX_CONCURRENT
     tests:
       - test/e2e/test_proxy_integration.py::test_concurrent_serialization
 
@@ -286,5 +286,5 @@ requirements:
     desc: 无缝切换到云端 API 绕过本地内存限制 (BACKEND_TYPE auto-detect)
     priority: P1
     impl:
-      - anthropic_proxy.py:PROXY_MAX_CONCURRENT
+      - proxy_state.py:PROXY_MAX_CONCURRENT
     tests: []

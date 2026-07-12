@@ -58,6 +58,11 @@ def _assistant_text(text):
 class TestBM25ScoreCore(unittest.TestCase):
     """bm25_score_message 边界与匹配核心 (design §8 #1-#5)."""
 
+    def setUp(self):
+        cc._BM25_IDF_MAP.clear()
+        cc._BM25_IDF_DOC_FREQ.clear()
+        cc._BM25_IDF_TOTAL_DOCS = 0
+
     def test_01_empty_message_returns_zero(self):
         """空消息 → bm25_score_message 返回 0.0 (design §6.1 边界)."""
         self.assertEqual(cc.bm25_score_message({}, "hello"), 0.0)
@@ -99,6 +104,11 @@ class TestBM25ScoreCore(unittest.TestCase):
                  "TS-1 待 W3 d1-d2 实施 (PRD-litellm-borrow §6.2 W3)")
 class TestBM25IDF(unittest.TestCase):
     """IDF 维护与跨请求复用 (design §8 #6-#9)."""
+
+    def setUp(self):
+        cc._BM25_IDF_MAP.clear()
+        cc._BM25_IDF_DOC_FREQ.clear()
+        cc._BM25_IDF_TOTAL_DOCS = 0
 
     def test_06_long_msg_lower_score_than_short_for_same_query(self):
         """长 msg 相同 query 比短 msg 分低 (b 长度归一) (design §4.1 b 参数)."""

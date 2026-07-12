@@ -179,7 +179,7 @@ Claude Code 发送 93 条消息
 
 > **当前生产配置**: `PROXY_CTX_TRUNCATE_STRATEGY=fifo` (DEF-102)。`rounds` 策略已完整实现，
 > 但因 turn boundary 不稳定导致 prefix cache 命中率下降，暂时未启用。下文以 `rounds` 为
-> 主进行设计说明，`fifo` 策略见 § 3.4。
+> 主进行设计说明，`fifo` 策略见 § 3.5。
 
 不新增独立函数，而是**增强现有 `truncate_messages_if_needed`**，添加 `rounds` 截断策略。
 
@@ -601,32 +601,87 @@ rounds 策略下模型丢失了早期上下文，但可以**自动恢复**：
 
 **动态信息的替代方案**：被丢弃的文件名等信息虽然有用，但模型通过重新 Read 即可恢复（开销仅 1-2s），远低于 prefix cache 未命中导致的 TTFT 增加。
 
+### 3.5 FIFO 截断策略（当前生产策略）
+
+> **生产配置**: `PROXY_CTX_TRUNCATE_STRATEGY=fifo`。这是当前所有本地配置（`rapid-mlx-35b-opt.conf`、`gemma4-26b.conf` 等）的默认策略。
+
+**核心思想**：维护一个固定大小的滑动窗口，保留最近 N 条消息，丢弃更早的消息。与 `rounds` 策略不同，fifo 不按"对话轮次"边界截断，而是按消息数量。
+
+**为什么 fifo 是当前生产策略**：
+- **Prefix Cache 更稳定**：fifo 的窗口边界不随消息内容变化，每次截断后前缀完全一致
+- **实现简单**：无 token 预算计算、无自适应逻辑，纯 FIFO 队列
+- **OOM 风险更低**：固定窗口大小确保上下文长度有上限
+
+**算法**：
+
+```python
+# 伪代码：fifo 截断策略
+def _apply_fifo_truncation(messages):
+    keep_count = PROXY_CTX_KEEP_MESSAGES  # 默认 40 条
+    if len(messages) <= keep_count:
+        return messages, {"triggered": False}
+    
+    head = messages[:PROXY_CTX_KEEP_HEAD]  # 保留头部（system 等）
+    tail = messages[-(keep_count - PROXY_CTX_KEEP_HEAD):]
+    dropped = len(messages) - len(head) - len(tail)
+    
+    drop_ratio = dropped / len(messages)
+    if drop_ratio > 0.7:
+        # 注入结构化摘要（DEF-107）
+        summary = _build_drop_summary(messages)
+        result = head + [summary] + tail
+    else:
+        result = head + tail
+    
+    return result, {"triggered": True, "strategy": "fifo", "dropped": dropped}
+```
+
+**配置参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `fifo` | 截断策略：`fifo` 按消息数量滑动窗口 |
+| `PROXY_CTX_KEEP_MESSAGES` | `40` | fifo 策略下最大保留消息数 |
+| `PROXY_CTX_KEEP_HEAD` | `2` | 始终保留的头部消息数（如 system prompt） |
+
+**优缺点**：
+
+| 维度 | fifo | rounds |
+|------|------|--------|
+| Prefix Cache 稳定性 | ✅ 高（固定窗口边界） | ⚠️ 中（turn boundary 变化） |
+| 上下文保留质量 | ⚠️ 中（可能切断对话轮次） | ✅ 高（按轮次保留完整 turn） |
+| 实现复杂度 | ✅ 低 | ⚠️ 中（需 token 预算计算） |
+| OOM 风险 | ✅ 低（固定上限） | ⚠️ 中（动态预算可能超限） |
+| 生产使用 | ✅ 当前默认 | ❌ 未启用 |
+
+**何时切换回 rounds**：如果未来 Rapid-MLX 的 prefix cache 实现能容忍 turn boundary 变化，或 rounds 策略的 token 预算算法足够保守，可以切换回 rounds 以获得更好的上下文保留质量。
+
 ---
 
 ## 8. 配置参数
 
 ```bash
-# configs/rapid-mlx-35b.conf
+# configs/rapid-mlx-35b-opt.conf (当前生产配置)
 
-# 上下文截断策略：char = 按字符阈值（默认），rounds = 按对话轮数 + token 预算
-PROXY_CTX_TRUNCATE_STRATEGY=char
-PROXY_CTX_KEEP_ROUNDS=10
-PROXY_CTX_TOKEN_BUDGET=30000
-
-# 动态窗口（可选，覆盖固定轮数）
-PROXY_CTX_KEEP_ROUNDS_DYNAMIC=true
+# 上下文截断策略：fifo = 滑动窗口（当前生产默认），rounds = 按对话轮数 + token 预算
+PROXY_CTX_TRUNCATE_STRATEGY=fifo
+PROXY_CTX_KEEP_MESSAGES=40
+PROXY_CTX_KEEP_HEAD=2
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `PROXY_CTX_TRUNCATE_STRATEGY` | `char` | 截断策略：`char` 按字符阈值，`rounds` 按保留轮数 + token 预算 |
+| `PROXY_CTX_TRUNCATE_STRATEGY` | `fifo` | 截断策略：`fifo` 滑动窗口（当前生产默认），`rounds` 按保留轮数，`char` 按字符阈值 |
+| `PROXY_CTX_KEEP_MESSAGES` | `40` | fifo 策略下最大保留消息数 |
+| `PROXY_CTX_KEEP_HEAD` | `2` | fifo 策略下始终保留的头部消息数 |
 | `PROXY_CTX_KEEP_ROUNDS` | `10` | rounds 策略下最大保留最近 N 轮 assistant 回复 |
 | `PROXY_CTX_TOKEN_BUDGET` | `30000` | rounds 策略下的 prompt tokens 预算上限（动态触发） |
 | `PROXY_CTX_KEEP_ROUNDS_DYNAMIC` | `true` | 是否根据消息总数动态调整保留轮数 |
 
 **策略互斥**（review S1）：
-- `PROXY_CTX_TRUNCATE_STRATEGY=rounds` 时，现有 `PROXY_CTX_CHARS_LIMIT` 截断逻辑被跳过
-- `PROXY_CTX_TRUNCATE_STRATEGY=char` 时，保持原有行为不变
+- `PROXY_CTX_TRUNCATE_STRATEGY=fifo` 时，按消息数量滑动窗口，当前生产默认
+- `PROXY_CTX_TRUNCATE_STRATEGY=rounds` 时，按对话轮数 + token 预算截断
+- `PROXY_CTX_TRUNCATE_STRATEGY=char` 时，按字符阈值截断（旧默认）
 - `PROXY_CTX_LIMIT_ENABLED=false` 且 `STRATEGY=char` 时，完全禁用截断
 
 ---

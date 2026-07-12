@@ -225,7 +225,12 @@ CONFIG_REGISTRY = {
     "PROXY_MAX_REQUEST_BYTES": {
         "defaults": {"all": str(500 * 1024)},
         "type": "int", "scope": "reloadable",
-        "doc": "Hard limit on request body size. Returns 413 Payload Too Large before pipeline processing.",
+        "doc": "Hard limit on request body size for local backend. Returns 413 Payload Too Large before forwarding to local.",
+    },
+    "PROXY_CLOUD_MAX_REQUEST_BYTES": {
+        "defaults": {"all": str(2 * 1024 * 1024)},
+        "type": "int", "scope": "reloadable",
+        "doc": "Hard limit on request body size for cloud backend. Larger than local because cloud providers handle their own OOM scheduling.",
     },
     "PROXY_OOM_SAFE_TOKENS": {
         "defaults": {"all": "60000"},
@@ -331,6 +336,18 @@ CONFIG_REGISTRY = {
         "defaults": {"all": "9"},
         "type": "int", "scope": "reloadable",
         "doc": "Consecutive identical calls before Level 3 (force plain-text). Defaults to PROXY_LOOP_THRESHOLD * 3.",
+    },
+
+    # ---- Context-size-based loop tiers (DEF-109) ----
+    "PROXY_LOOP_CHARS_LONG": {
+        "defaults": {"all": "50000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Total chars ≥ this → long tier (stricter loop thresholds).",
+    },
+    "PROXY_LOOP_CHARS_VERY_LONG": {
+        "defaults": {"all": "100000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Total chars ≥ this → very_long tier (strictest loop thresholds).",
     },
 
     # ---- Dynamic loop thresholds (Phase 4 / 建议4) ----
@@ -520,6 +537,11 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Scan last N assistant rounds for recently used tools.",
     },
+    "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Tools used ≥ this many times in a session auto-promote to keep set (DEF-104). 0 disables.",
+    },
 
     # ---- History index ----
     "PROXY_HISTORY_INDEX": {
@@ -608,6 +630,13 @@ CONFIG_REGISTRY = {
         "doc": "Collapse repeated log lines during log-type compression.",
     },
 
+    # ---- Compression profile ----
+    "PROXY_COMPRESSION_PROFILE": {
+        "defaults": {"all": "balanced"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Preset profile: balanced (daily coding), aggressive (large logs/data), conservative (quality-critical). Individual PROXY_* vars still override profile values.",
+    },
+
     # ---- Logging ----
     "PROXY_LOG_PATH": {
         "defaults": {"all": "/tmp/anthropic_proxy.log"},
@@ -635,6 +664,11 @@ CONFIG_REGISTRY = {
         "defaults": {"all": "deepseek-v4-flash"},
         "type": "str", "scope": "reloadable",
         "doc": "Cloud model identifier used for routed requests.",
+    },
+    "PROXY_CLOUD_API_KEY": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "Cloud API key for routed requests. Must be set in configs/secret.local.conf for cloud routing to work.",
     },
     "PROXY_ROUTE_CLOUD_CONCURRENT": {
         "defaults": {"all": "2"},
@@ -746,6 +780,72 @@ __all__ = [
 # Utility: resolve canonical default for a config key
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Compression profiles — preset combinations for common scenarios.
+# Individual PROXY_* env vars still take precedence over profile values.
+# ---------------------------------------------------------------------------
+
+PROFILE_MAP = {
+    "balanced": {
+        "doc": "日常编码 — 平衡压缩与质量",
+        "PROXY_COMPRESS_ENABLED": "true",
+        "PROXY_COMPRESS_MODE": "semantic",
+        "PROXY_COMPRESS_THRESHOLD": "4096",
+        "PROXY_CLEAR_ENABLED": "false",
+        "PROXY_CTX_LIMIT_ENABLED": "true",
+        "PROXY_CTX_TRUNCATE_STRATEGY": "rounds",
+        "PROXY_CTX_KEEP_ROUNDS": "10",
+        "PROXY_CTX_TOKEN_BUDGET": "30000",
+        "PROXY_TOOL_FILTER_ENABLED": "true",
+        "PROXY_TOOL_FILTER_MAX": "20",
+        "PROXY_CACHE_ALIGN_ENABLED": "true",
+        "PROXY_CACHE_ALIGN_HEAD": "4",
+        "PROXY_BM25_ENABLED": "true",
+        "PROXY_SCRUB_ANSI": "true",
+        "PROXY_COMPRESS_AUDIT": "true",
+        "PROXY_HISTORY_INDEX": "rule",
+        "PROXY_OOM_SAFE_CHARS": "200000",
+    },
+    "aggressive": {
+        "doc": "超大日志/数据分析 — 激进压缩省上下文",
+        "PROXY_COMPRESS_ENABLED": "true",
+        "PROXY_COMPRESS_MODE": "aggressive",
+        "PROXY_COMPRESS_THRESHOLD": "2048",
+        "PROXY_CLEAR_ENABLED": "true",
+        "PROXY_CLEAR_THRESHOLD": "10000",
+        "PROXY_CTX_LIMIT_ENABLED": "true",
+        "PROXY_CTX_TRUNCATE_STRATEGY": "fifo",
+        "PROXY_CTX_KEEP_MESSAGES": "30",
+        "PROXY_TOOL_FILTER_ENABLED": "true",
+        "PROXY_TOOL_FILTER_MAX": "15",
+        "PROXY_CACHE_ALIGN_ENABLED": "true",
+        "PROXY_CACHE_ALIGN_HEAD": "2",
+        "PROXY_BM25_ENABLED": "true",
+        "PROXY_SCRUB_ANSI": "true",
+        "PROXY_COMPRESS_AUDIT": "false",
+        "PROXY_DEDUPE_SCALARS": "true",
+        "PROXY_HISTORY_INDEX": "rule",
+        "PROXY_OOM_SAFE_CHARS": "150000",
+    },
+    "conservative": {
+        "doc": "质量关键任务 — 零语义损失风险",
+        "PROXY_COMPRESS_ENABLED": "false",
+        "PROXY_CLEAR_ENABLED": "false",
+        "PROXY_CTX_LIMIT_ENABLED": "true",
+        "PROXY_CTX_TRUNCATE_STRATEGY": "char",
+        "PROXY_CTX_CHARS_LIMIT": "180000",
+        "PROXY_TOOL_FILTER_ENABLED": "false",
+        "PROXY_CACHE_ALIGN_ENABLED": "true",
+        "PROXY_CACHE_ALIGN_HEAD": "6",
+        "PROXY_BM25_ENABLED": "false",
+        "PROXY_SCRUB_ANSI": "false",
+        "PROXY_COMPRESS_AUDIT": "true",
+        "PROXY_HISTORY_INDEX": "off",
+        "PROXY_OOM_SAFE_CHARS": "250000",
+    },
+}
+
+
 def resolve_default(key, is_cloud):
     """Return the canonical default value for a config key given backend mode.
 
@@ -753,13 +853,27 @@ def resolve_default(key, is_cloud):
       - mode-specific default if present (local/cloud)
       - 'all' default as fallback
       - None if key not found
+
+    If PROXY_COMPRESSION_PROFILE is set (and not the default "balanced"),
+    profile values override the registry defaults.  Individual env vars
+    (set in config files or shell) still take precedence — this function
+    is only consulted when no env var is set.
     """
     entry = CONFIG_REGISTRY.get(key)
     if not entry:
         return None
     defaults = entry.get("defaults", {})
     mode = "cloud" if is_cloud else "local"
-    return defaults.get(mode, defaults.get("all"))
+    base = defaults.get(mode, defaults.get("all"))
+
+    # Apply profile override if the key has a profile value.
+    profile_name = os.environ.get("PROXY_COMPRESSION_PROFILE", "balanced")
+    if profile_name != "balanced":
+        profile = PROFILE_MAP.get(profile_name)
+        if profile and key in profile:
+            return profile[key]
+
+    return base
 
 # ---------------------------------------------------------------------------
 # Utility: list all vars that differ from their defaults for health/debug
