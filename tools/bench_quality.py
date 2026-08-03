@@ -4,6 +4,7 @@
 用于评估不同模型的: 代码生成、数学推理、指令遵循、格式正确性
 """
 import json
+import re
 import os
 import sys
 import time
@@ -173,7 +174,20 @@ def evaluate_response(response, test_case):
             json.loads(content)
             return {"pass": True, "reason": "有效的JSON"}
         except:
-            return {"pass": False, "reason": "无效的JSON格式"}
+            pass
+        # 容错: 模型常用 ```json 代码块包裹合法 JSON,提取后再判定
+        fence = re.search(r"```(?:json)?\s*\n?(.*?)```", content, re.DOTALL)
+        candidates = [fence.group(1).strip()] if fence else []
+        start, end = content.find('{'), content.rfind('}')
+        if start != -1 and end > start:
+            candidates.append(content[start:end + 1])
+        for candidate in candidates:
+            try:
+                json.loads(candidate)
+                return {"pass": True, "reason": "有效的JSON(代码块内)"}
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {"pass": False, "reason": "无效的JSON格式"}
     
     return {"pass": False, "reason": "未知的评估类型"}
 

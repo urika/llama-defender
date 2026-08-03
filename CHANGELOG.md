@@ -6,6 +6,58 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased] - 2026-06-21
 
+### rapid-mlx 升级 0.6.71 → 0.11.5 与 ThinkingCap DWQ 验证 (2026-08-03)
+
+将本地推理引擎 rapid-mlx 从 0.6.71 升级至 0.11.5（brew tap `raullenchai/rapid-mlx`，升级期间 tap 更新至 0.11.5），验证 DWQ 量化模型兼容性并发现 MTP 新限制。
+
+### Changed
+
+- **`rapid-mlx` 0.6.71 → 0.11.5**（brew upgrade，附带新依赖 mlx 0.32.0 / python@3.14 / numpy / openblas 等）。
+- **CLI 变更**（影响后续配置编写）:
+  - `--enable-mtp` 移除，改为 vLLM 风格 `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`；SuffixDecoding 用 `{"method":"suffix","num_speculative_tokens":8}`。
+  - 新增 `--pflash`（长 prompt prefill 压缩，Qwen3.5/3.6 默认 always）、`--kv-cache-turboquant`、`--kv-cache-dtype {bf16,int8,int4}`（int4 成默认）、`--force-hybrid/--no-hybrid` 等。
+  - gemma4-31b 服务重启后验证正常（推理 `2+3=5`），配置无需改动。
+
+### 验证（ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision-MLX, 16GB）
+
+- ✅ **DWQ 量化解析修复**: 0.6.71 下权重张量错位输出严重乱码（连 `1+1=?` 都失败）；0.11.5 下 16.2GB 权重全部正常加载（含 `qwen3_5_norm_shift` 补丁撤销假 norm shift），`1+1=?`→`2`，代码生成（快速排序）与工具调用（`get_weather("北京")` 结构化输出）全部正常。
+- ✅ **模型识别改善**: 0.6.71 识别为 hybrid（`supports_spec_decode=False`）；0.11.5 识别为 `pure attention` + `supports_spec_decode=True`，正确读取内嵌 `model-mtp.safetensors`（`Built MTP module, hidden_size=5120`）。
+- ❌ **MTP 仍无法启用**: qwen3_5 家族 MTP 注入强制要求外部 `mtp_sidecar`（如 `mlx-community/Qwen3.5-9B-MTP-4bit`），ThinkingCap 内嵌的 MTP 权重被读取但拒绝注入，`--speculative-config` 启动硬失败（`RuntimeError`）。**属上游兼容 gap**，非本模型问题。
+
+### Removed
+
+- **ThinkingCap MTP 方案暂停**: 无外部 sidecar 时 MTP 不可用；27B dense 无加速价值有限。模型保留在 `models/ThinkingCap-Qwen3.6-27B-oQ4e-DWQ-MTP-Vision-MLX/`（16GB），等待 rapid-mlx 支持内嵌 MTP 或改用标准 MTP 模型（如 `mlx-community/Qwen3.6-27B-MTP-4bit`）。
+
+---
+
+### Gemma 4 31B 配置建立与投机解码验证 (2026-08-03)
+
+新增本地量化模型 `gemma4-31b-4bit`（ModelScope `lmstudio-community/gemma-4-31B-it-MLX-4bit`, 17GB），并完成三轮 OOM 调优与两轮投机解码验证。
+
+### Added
+
+- **`configs/gemma4-31b-4bit.conf`**: Gemma 4 31B 4bit 本地配置（删除原 8bit 版 `gemma4-31b-8bit.conf`，后者 ~35GB 内存无法服务）。
+- **`tools/bench_json.py`**: JSON 格式输出专项测试（严格/宽松/语义三层判定），定位原 `format_json` 失败为评测器不兼容 markdown 代码块而非模型缺陷。
+- **`tools/bench_quality.py` 修复**: `json_valid` 评测器增加代码块/片段提取容错，避免误判。
+
+### Changed
+
+- **`gemma4-31b-4bit.conf` 内存定稿**（三轮实测，见配置文件头部注释）:
+  - ① `0.75 + cache 8192 + 8bit KV` → OOM（长 prefill）
+  - ② `0.70 + cache 4096 + 8bit KV + 并发2` → OOM（真实 agentic 负载，running=2）
+  - ③ 最终: **KV 4-bit + cache 4096 + utilization 0.60 + 并发1**，实测内存 14.1GB、cache 改善 49%、生成 14.6–16.9 tok/s、无 OOM。
+- **`tools/bench_rapidmlx.py` 修复**: 模型 ID 硬编码为 Qwen3.6 改为从 `/v1/models` 动态获取；TTFT=None 时求平均值崩溃。
+
+### Removed
+
+- **`--suffix-decoding` 从 gemma4-31b-4bit.conf 回退**（2026-08-03 实测）: 加 `--suffix-decoding --suffix-max-draft 4` 后生成速度 16→11 tok/s（降速 30%），TTFT 无收益。dense 模型 draft 接受率低，verify 开销大于命中收益。与 35B MoE 移除 `--force-spec-decode` 的经验一致。
+
+### 验证
+
+- **Qwen3.6-27B MTP 基准**（`tools/bench_mtp.py --model 27b --quick`, brew llama-server, 本地 `models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf`）: 代码生成 19.3 tok/s、推理 18.1、长代码 17.8（TTFT ~0.8s），约 1.2–1.3× 加速（符合 1.15–1.4× 预期）。**结论：MTP 有效但落地价值有限**——27B dense（~19 tok/s）仍不如已有 35B MoE（30+ tok/s），故未创建正式配置，仅存档数据 `logs/bench-mtp-results-20260803-063010.json`。`configs/qwen3.6-27b-mtp.conf` 未创建。
+
+---
+
 ### 模型评估、缓存清理与测试覆盖提升
 
 基于 deepseek-v4-flash 基线完成 5 个本地模型的系统性评估，清理低效模型与缓存，补充重构后模块的单元测试。

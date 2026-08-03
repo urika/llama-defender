@@ -72,10 +72,29 @@ def subheader(msg):
     print(f"\n  --- {msg} ---", flush=True)
 
 
+_MODEL_ID = None
+
+
+def get_model_id():
+    """从后端 /v1/models 动态获取当前加载的模型 ID(缓存)"""
+    global _MODEL_ID
+    if _MODEL_ID is None:
+        try:
+            conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=10)
+            conn.request("GET", "/v1/models",
+                         headers={"Authorization": "Bearer sk-1234"})
+            data = json.loads(conn.getresponse().read().decode("utf-8", errors="replace"))
+            conn.close()
+            _MODEL_ID = data["data"][0]["id"]
+        except Exception:
+            _MODEL_ID = "mlx-community/Qwen3.6-35B-A3B-4bit"
+    return _MODEL_ID
+
+
 def send_request(messages, max_tokens, stream=True, port=BACKEND_PORT):
     """发送请求，返回 (result_dict, ttft_ms, total_ms)"""
     body = {
-        "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+        "model": get_model_id(),
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.6,
@@ -190,9 +209,10 @@ def test_ttft(prompts, repeat=3):
                 f"prompt={resp['prompt_tokens']}tok, output={resp['completion_tokens']}tok")
             time.sleep(1)
 
-        if ttfts:
-            avg = sum(ttfts) / len(ttfts)
-            results[key] = {"avg_ttft_ms": round(avg, 1), "samples": ttfts}
+        valid_ttfts = [t for t in ttfts if t is not None]
+        if valid_ttfts:
+            avg = sum(valid_ttfts) / len(valid_ttfts)
+            results[key] = {"avg_ttft_ms": round(avg, 1), "samples": valid_ttfts}
             log(f"📊 平均 TTFT: {avg:.0f}ms")
 
     return results
