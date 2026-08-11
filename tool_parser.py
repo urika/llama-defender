@@ -98,7 +98,7 @@ def _is_truncated_json(raw: str) -> bool:
     if not s:
         return False
     # Single-char openers – clear truncation
-    if s in ("{", "[", "{"):
+    if s in ("{", "[", "]"):
         return True
     # Unclosed string
     if s.count('"') % 2 == 1:
