@@ -46,6 +46,20 @@ class TestUnescapeDoubleEscapedJson(unittest.TestCase):
         self.assertEqual(tp._unescape_double_escaped_json("hello"), "hello")
 
 
+class TestIsTruncatedJson(unittest.TestCase):
+    def test_closing_bracket(self):
+        self.assertTrue(tp._is_truncated_json("]"))
+
+    def test_opening_bracket(self):
+        self.assertTrue(tp._is_truncated_json("["))
+
+    def test_opening_brace(self):
+        self.assertTrue(tp._is_truncated_json("{"))
+
+    def test_complete_json(self):
+        self.assertFalse(tp._is_truncated_json('{"a":1}'))
+
+
 class TestParseToolArguments(unittest.TestCase):
     def test_valid_json(self):
         self.assertEqual(tp.parse_tool_arguments('{"x": 1}'), {"x": 1})
