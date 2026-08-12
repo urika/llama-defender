@@ -45,6 +45,278 @@ def _get_process_info(pattern, name, fallback_port=None):
             "elapsed": parts[3],
         }
     return {"running": False, "name": name}
+# --- _current_active_profile ---
+def _current_active_profile():
+    """Return the basename of the configs/active.conf symlink target, or 'default'."""
+    try:
+        if os.path.islink(_ps._ACTIVE_CONF_PATH):
+            target = os.readlink(_ps._ACTIVE_CONF_PATH)
+            return os.path.splitext(os.path.basename(target))[0]
+    except OSError:
+        pass
+    return "default"
+
+
+# --- _parse_conf_value ---
+def _parse_conf_value(path, key, default=""):
+    """Read a single KEY=\"value\" line from a bash-sourcable config file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    value = line[len(key) + 1:]
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    return value
+    except OSError:
+        pass
+    return default
+
+
+# --- _parse_memory_gb ---
+def _parse_memory_gb(memory_str):
+    """Extract a representative GB number from strings like '~14-18 GB' or '32GB'.
+
+    Returns None when the string does not contain a numeric GB estimate.
+    """
+    if not memory_str:
+        return None
+    # Look for ranges like 14-18 or single numbers followed by optional GB/gb
+    numbers = re.findall(r"(\d+(?:\.\d+)?)", memory_str)
+    if not numbers:
+        return None
+    try:
+        vals = [float(n) for n in numbers]
+    except ValueError:
+        return None
+    # Use the largest number as the conservative estimate for ranges.
+    return max(vals)
+
+
+# --- _build_profiles_json ---
+def _build_profiles_json():
+    """Return a list of all available profiles from configs/*.conf."""
+    configs_dir = os.path.join(_ps._SCRIPT_DIR, "configs")
+    active = _current_active_profile()
+    profiles = []
+    try:
+        entries = sorted(os.listdir(configs_dir))
+    except OSError:
+        return profiles
+
+    for name in entries:
+        if not name.endswith(".conf") or name == "active.conf" or name == "secret.local.conf":
+            continue
+        path = os.path.join(configs_dir, name)
+        if not os.path.isfile(path):
+            continue
+        profile_name = os.path.splitext(name)[0]
+        desc = _parse_conf_value(path, "CONFIG_DESC", "")
+        memory_str = _parse_conf_value(path, "CONFIG_MEMORY", "")
+        memory_gb = _parse_memory_gb(memory_str)
+        profiles.append({
+            "name": profile_name,
+            "desc": desc,
+            "memory_gb": memory_gb,
+            "active": profile_name == active,
+        })
+    return profiles
+# --- _elapsed_to_seconds ---
+def _elapsed_to_seconds(elapsed_str):
+    """Convert ps etime like '02:15' or '3-02:15:30' to seconds."""
+    if not elapsed_str:
+        return 0
+    elapsed_str = str(elapsed_str).strip()
+    days = 0
+    if "-" in elapsed_str:
+        days_part, elapsed_str = elapsed_str.split("-", 1)
+        try:
+            days = int(days_part)
+        except ValueError:
+            days = 0
+    parts = elapsed_str.split(":")
+    try:
+        if len(parts) == 3:
+            # dd-hh:mm:ss or hh:mm:ss
+            h, m, s = map(int, parts)
+        elif len(parts) == 2:
+            # mm:ss
+            h = 0
+            m, s = map(int, parts)
+        else:
+            # ss
+            h = m = 0
+            s = int(parts[0])
+    except ValueError:
+        return 0
+    return days * 86400 + h * 3600 + m * 60 + s
+# --- _probe_backend_model_name / _probe_backend_ready ---
+def _probe_backend_models():
+    """Probe the backend /v1/models endpoint and return the parsed response dict.
+
+    Returns an empty dict on any failure.
+    """
+    import urllib.request
+    import urllib.error
+
+    base = _ps.LLAMA_BASE
+    if not base:
+        return {}
+    url = base.rstrip("/") + "/models"
+    headers = {}
+    if _ps.IS_CLOUD and _ps.LLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {_ps.LLAMA_API_KEY}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status != 200:
+                return {}
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _probe_backend_model_name():
+    """Return the model name reported by the backend, or None if unavailable."""
+    data = _probe_backend_models()
+    models = data.get("data") if isinstance(data.get("data"), list) else data.get("models") if isinstance(data.get("models"), list) else []
+    if models:
+        first = models[0]
+        return first.get("id") or first.get("model") or None
+    return None
+
+
+def _probe_backend_ready():
+    """Probe whether the real backend is loaded and ready to accept inference."""
+    data = _probe_backend_models()
+    models = data.get("data") if isinstance(data.get("data"), list) else data.get("models") if isinstance(data.get("models"), list) else []
+    return len(models) > 0
+
+
+def _model_slugs_compatible(actual, expected):
+    """Return True if actual/expected model names refer to the same model family.
+
+    Different orgs or quant suffixes (e.g. mlx-community vs unsloth, -4bit vs
+    -UD-MLX-4bit) should not trigger a false-positive drift alert.  We compare
+    the alphanumeric tokens from the basename; if they share enough tokens we
+    consider them compatible.
+    """
+    if not actual or not expected:
+        return True
+    actual_short = actual.split("/")[-1]
+    expected_short = expected.split("/")[-1]
+    if actual_short == expected_short:
+        return True
+
+    def _tokens(s):
+        return set(re.findall(r"[A-Za-z0-9\.]+", s))
+
+    a_tokens = _tokens(actual_short)
+    b_tokens = _tokens(expected_short)
+    if not a_tokens or not b_tokens:
+        return False
+    intersection = a_tokens & b_tokens
+    min_len = min(len(a_tokens), len(b_tokens))
+    # Share at least 2 tokens, or at least half of the smaller token set.
+    return len(intersection) >= max(2, min_len // 2)
+# --- _build_status_json ---
+def _build_status_json():
+    """Build the structured JSON status payload for agent_go."""
+    backend_info = _get_process_info("rapid-mlx|llama-server", "Backend")
+    proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
+
+    proxy_alive = proxy_info.get("running", False)
+    backend_alive = backend_info.get("running", False)
+
+    proxy_pid = proxy_info.get("pid")
+    backend_pid = backend_info.get("pid")
+
+    proxy_uptime = _elapsed_to_seconds(proxy_info.get("elapsed", ""))
+    backend_uptime = _elapsed_to_seconds(backend_info.get("elapsed", ""))
+
+    active_profile = _current_active_profile()
+
+    backend_model_name = None
+    ready = False
+    state = "down"
+
+    if not proxy_alive:
+        state = "proxy_down"
+    elif _ps.IS_CLOUD:
+        backend_alive = True  # cloud has no local PID
+        backend_model_name = _probe_backend_model_name() or _ps.MODEL_NAME
+        ready = _probe_backend_ready()
+        state = "healthy" if ready else "backend_down"
+    else:
+        if not backend_alive:
+            state = "backend_down"
+        else:
+            backend_model_name = _probe_backend_model_name()
+            ready = _probe_backend_ready()
+            if not ready:
+                state = "starting"
+            else:
+                expected = _ps.MODEL_NAME
+                # Drift detection: tolerate org/quant suffix differences
+                if backend_model_name and expected and not _model_slugs_compatible(backend_model_name, expected):
+                    state = "model_drift"
+                else:
+                    state = "healthy"
+
+    return {
+        "api_version": _ps.PROXY_STATUS_API_VERSION,
+        "proxy": {
+            "pid": int(proxy_pid) if proxy_pid else None,
+            "uptime_sec": proxy_uptime,
+            "alive": proxy_alive,
+        },
+        "backend": {
+            "pid": int(backend_pid) if backend_pid else None,
+            "uptime_sec": backend_uptime,
+            "alive": backend_alive,
+            "model_name": backend_model_name or _ps.MODEL_NAME,
+            "backend_type": _ps.BACKEND_TYPE or ("rapid-mlx" if not _ps.IS_CLOUD else "cloud"),
+            "base_url": _ps.LLAMA_BASE,
+        },
+        "active_profile": active_profile,
+        "state": state,
+        "ready": ready,
+    }
+# --- _build_watchdog_json ---
+def _build_watchdog_json():
+    """Return structured watchdog status by reading logs/watchdog_state.json."""
+    default = {
+        "enabled": False,
+        "running": False,
+        "pid": None,
+        "last_restart_at": "",
+        "restart_count_1h": 0,
+        "last_failure_reason": "",
+    }
+    try:
+        with open(_ps._WATCHDOG_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+    pid = state.get("pid")
+    running = False
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            running = True
+        except (OSError, ValueError):
+            pass
+
+    return {
+        "enabled": bool(state.get("enabled", False)),
+        "running": running,
+        "pid": pid,
+        "last_restart_at": state.get("last_restart_at", ""),
+        "restart_count_1h": int(state.get("restart_count_1h", 0)),
+        "last_failure_reason": state.get("last_failure_reason", ""),
+    }
 # --- _get_system_memory ---
 # _get_system_memory() moved to proxy_state.py so pipeline.py can use it without
 # creating a circular import.  Keep this module-level alias for backward compat.
@@ -2361,6 +2633,11 @@ __all__ = [
     "_empty_context_optimization_stats",
     "_get_session_trace",
     "_build_status_html",
+    "_build_status_json",
+    "_build_watchdog_json",
+    "_build_profiles_json",
+    "_parse_conf_value",
+    "_parse_memory_gb",
     "_load_session_metrics",
     "_load_recent_session_ids",
     "_fallback_client_type_from_log",

@@ -379,6 +379,11 @@
     ],
     "defaults": {}
   },
+  "_build_profiles_json": {
+    "name": "_build_profiles_json",
+    "params": [],
+    "defaults": {}
+  },
   "_build_session_html": {
     "name": "_build_session_html",
     "params": [
@@ -391,11 +396,21 @@
     "params": [],
     "defaults": {}
   },
+  "_build_status_json": {
+    "name": "_build_status_json",
+    "params": [],
+    "defaults": {}
+  },
   "_build_tool_use_map": {
     "name": "_build_tool_use_map",
     "params": [
       "messages"
     ],
+    "defaults": {}
+  },
+  "_build_watchdog_json": {
+    "name": "_build_watchdog_json",
+    "params": [],
     "defaults": {}
   },
   "_cast_config_value": {
@@ -948,6 +963,24 @@
     "name": "_parse_conf_env",
     "params": [
       "path"
+    ],
+    "defaults": {}
+  },
+  "_parse_conf_value": {
+    "name": "_parse_conf_value",
+    "params": [
+      "path",
+      "key",
+      "default"
+    ],
+    "defaults": {
+      "default": ""
+    }
+  },
+  "_parse_memory_gb": {
+    "name": "_parse_memory_gb",
+    "params": [
+      "memory_str"
     ],
     "defaults": {}
   },

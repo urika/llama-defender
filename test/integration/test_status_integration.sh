@@ -134,6 +134,45 @@ else
 fi
 
 # ============================================================
+# TC4: /api/status returns structured JSON (R1/R2)
+# ============================================================
+info "TC4: verify /api/status returns structured JSON"
+STATUS_JSON="$LOG_DIR/status.json"
+STATUS_CODE=$(curl -s -o "$STATUS_JSON" -w "%{http_code}" --max-time 10 "http://127.0.0.1:$PROXY_PORT/api/status")
+if [[ "$STATUS_CODE" =~ ^(200|503)$ ]]; then
+  pass "TC4 /api/status returned HTTP $STATUS_CODE"
+  if python3 -c "import json,sys; d=json.load(open('$STATUS_JSON')); assert 'proxy' in d; assert 'backend' in d; assert 'state' in d; assert 'ready' in d; assert 'active_profile' in d" 2>/dev/null; then
+    pass "TC4 /api/status has required schema fields"
+  else
+    fail "TC4 /api/status missing required schema fields"
+  fi
+  STATE=$(python3 -c "import json,sys; print(json.load(open('$STATUS_JSON')).get('state',''))" 2>/dev/null)
+  if [[ "$STATE" =~ ^(healthy|starting|backend_down|proxy_down|model_drift|down)$ ]]; then
+    pass "TC4 /api/status state is valid ($STATE)"
+  else
+    fail "TC4 /api/status state is '$STATE', expected valid enum"
+  fi
+else
+  fail "TC4 could not fetch /api/status (HTTP $STATUS_CODE)"
+fi
+
+# ============================================================
+# TC5: /api/profiles returns profile list with active flag (R6)
+# ============================================================
+info "TC5: verify /api/profiles returns structured list"
+PROFILES_JSON="$LOG_DIR/profiles.json"
+if curl -sf --max-time 10 "http://127.0.0.1:$PROXY_PORT/api/profiles" -o "$PROFILES_JSON"; then
+  pass "TC5 /api/profiles returned JSON"
+  if python3 -c "import json,sys; d=json.load(open('$PROFILES_JSON')); assert 'profiles' in d; assert len(d['profiles']) > 0; active=[p for p in d['profiles'] if p.get('active')]; assert len(active)==1; assert 'name' in active[0]; assert 'memory_gb' in active[0]" 2>/dev/null; then
+    pass "TC5 /api/profiles schema is valid"
+  else
+    fail "TC5 /api/profiles schema invalid"
+  fi
+else
+  fail "TC5 could not fetch /api/profiles"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""

@@ -188,6 +188,54 @@ run_integration() {
       record "integration" "fail" "long-context: $lf of ${lp:-?} cases failed"
     fi
   fi
+
+  lock_out=$(bash "$SCRIPT_DIR/integration/test_manage_lock.sh" 2>&1)
+  lock_rc=$?
+  echo "$lock_out" | tail -10
+  if [[ $lock_rc -ne 0 ]]; then
+    record "integration" "fail" "test_manage_lock.sh exited $lock_rc"
+  else
+    local lock_p lock_f
+    lock_p=$(echo "$lock_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    lock_f=$(echo "$lock_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${lock_f:-0}" == "0" ]]; then
+      record "integration" "ok" "manage-lock: all ${lock_p:-?} cases passed"
+    else
+      record "integration" "fail" "manage-lock: $lock_f of ${lock_p:-?} cases failed"
+    fi
+  fi
+
+  wd_out=$(bash "$SCRIPT_DIR/integration/test_watchdog_status.sh" 2>&1)
+  wd_rc=$?
+  echo "$wd_out" | tail -10
+  if [[ $wd_rc -ne 0 ]]; then
+    record "integration" "fail" "test_watchdog_status.sh exited $wd_rc"
+  else
+    local wd_p wd_f
+    wd_p=$(echo "$wd_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    wd_f=$(echo "$wd_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${wd_f:-0}" == "0" ]]; then
+      record "integration" "ok" "watchdog-status: all ${wd_p:-?} cases passed"
+    else
+      record "integration" "fail" "watchdog-status: $wd_f of ${wd_p:-?} cases failed"
+    fi
+  fi
+
+  lc_out=$(bash "$SCRIPT_DIR/integration/test_lifecycle_integration.sh" 2>&1)
+  lc_rc=$?
+  echo "$lc_out" | tail -10
+  if [[ $lc_rc -ne 0 ]]; then
+    record "integration" "fail" "test_lifecycle_integration.sh exited $lc_rc"
+  else
+    local lc_p lc_f
+    lc_p=$(echo "$lc_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Passed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    lc_f=$(echo "$lc_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "Failed:" | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${lc_f:-0}" == "0" ]]; then
+      record "integration" "ok" "lifecycle: all ${lc_p:-?} cases passed"
+    else
+      record "integration" "fail" "lifecycle: $lc_f of ${lc_p:-?} cases failed"
+    fi
+  fi
 }
 
 # ------------------------------------------------------------

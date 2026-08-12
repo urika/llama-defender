@@ -153,6 +153,9 @@ anthropic_proxy.py (1318L)
 |--------|------|----------|-------|
 | GET | /v1/models | Model alias list + route metadata | Cloud/Local/Auto flags |
 | GET | /status | HTML status page | Real-time metrics, memory, alerts |
+| GET | /api/status | Structured health/readiness JSON | `agent_go` integration; 503 on non-healthy states |
+| GET | /api/watchdog | Watchdog state JSON | `enabled`, `last_restart_at`, `restart_count_1h`, etc. |
+| GET | /api/profiles | Available config profiles JSON | Parsed from `configs/*.conf` |
 | GET | /metrics | JSON metrics summary | Reads proxy_metrics.jsonl |
 | GET | /session | Session analysis | JSON or HTML |
 | POST | /v1/messages | Anthropic Messages API | Core: 22-stage pipeline |

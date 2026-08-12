@@ -43,3 +43,4 @@ configs/*.bak.*
 node_modules/
 package-lock.json
 .aider*
+.manage.lock

@@ -158,6 +158,123 @@ class TestBuildStatusHtml(unittest.TestCase):
             self.assertIn(label, html, f"Route card missing '{label}'")
 
 
+class TestBuildStatusJson(unittest.TestCase):
+    """Test the structured JSON status endpoint payload for agent_go."""
+
+    def test_returns_expected_schema(self):
+        status = admin_server._build_status_json()
+        self.assertIsInstance(status, dict)
+        self.assertEqual(status.get("api_version"), "1")
+        self.assertIn("proxy", status)
+        self.assertIn("backend", status)
+        self.assertIn("active_profile", status)
+        self.assertIn("state", status)
+        self.assertIn("ready", status)
+
+        proxy = status["proxy"]
+        self.assertIn("pid", proxy)
+        self.assertIn("uptime_sec", proxy)
+        self.assertIn("alive", proxy)
+
+        backend = status["backend"]
+        self.assertIn("pid", backend)
+        self.assertIn("uptime_sec", backend)
+        self.assertIn("alive", backend)
+        self.assertIn("model_name", backend)
+        self.assertIn("backend_type", backend)
+        self.assertIn("base_url", backend)
+
+    def test_state_is_valid_enum(self):
+        status = admin_server._build_status_json()
+        self.assertIn(status["state"], (
+            "healthy", "starting", "backend_down", "proxy_down", "model_drift", "down"
+        ))
+
+    def test_ready_is_boolean(self):
+        status = admin_server._build_status_json()
+        self.assertIsInstance(status["ready"], bool)
+
+    def test_elapsed_to_seconds(self):
+        self.assertEqual(admin_server._elapsed_to_seconds("30"), 30)
+        self.assertEqual(admin_server._elapsed_to_seconds("02:15"), 135)
+        self.assertEqual(admin_server._elapsed_to_seconds("1-02:00:30"), 93630)
+        self.assertEqual(admin_server._elapsed_to_seconds(""), 0)
+        self.assertEqual(admin_server._elapsed_to_seconds("not-a-time"), 0)
+
+    def test_html_status_still_works(self):
+        html = admin_server._build_status_html()
+        self.assertIsInstance(html, str)
+        self.assertIn("Local LLM Stack Status", html)
+
+
+class TestBuildProfilesJson(unittest.TestCase):
+    """Test the structured /api/profiles payload for agent_go."""
+
+    def test_returns_list_of_profiles(self):
+        profiles = admin_server._build_profiles_json()
+        self.assertIsInstance(profiles, list)
+        self.assertGreater(len(profiles), 0)
+
+    def test_active_profile_marked(self):
+        profiles = admin_server._build_profiles_json()
+        active_names = [p["name"] for p in profiles if p.get("active")]
+        self.assertEqual(len(active_names), 1)
+        self.assertEqual(active_names[0], admin_server._current_active_profile())
+
+    def test_profile_schema(self):
+        for p in admin_server._build_profiles_json():
+            self.assertIn("name", p)
+            self.assertIn("desc", p)
+            self.assertIn("memory_gb", p)
+            self.assertIn("active", p)
+            self.assertIsInstance(p["name"], str)
+            self.assertIsInstance(p["active"], bool)
+
+    def test_parse_memory_gb_range(self):
+        self.assertEqual(admin_server._parse_memory_gb("~14-18 GB"), 18.0)
+
+    def test_parse_memory_gb_single(self):
+        self.assertEqual(admin_server._parse_memory_gb("32GB"), 32.0)
+
+    def test_parse_memory_gb_non_numeric(self):
+        self.assertIsNone(admin_server._parse_memory_gb("按需付费，无本地内存限制"))
+
+    def test_parse_conf_value(self):
+        # Use one of the real config files
+        configs_dir = os.path.join(_REPO_ROOT, "configs")
+        for name in os.listdir(configs_dir):
+            if name.endswith(".conf") and name not in ("active.conf", "secret.local.conf"):
+                path = os.path.join(configs_dir, name)
+                val = admin_server._parse_conf_value(path, "CONFIG_NAME")
+                self.assertIsInstance(val, str)
+                self.assertGreater(len(val), 0)
+                break
+
+
+class TestModelSlugCompatibility(unittest.TestCase):
+
+    def test_same_name_compatible(self):
+        self.assertTrue(admin_server._model_slugs_compatible(
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-4bit"
+        ))
+
+    def test_different_org_quant_compatible(self):
+        self.assertTrue(admin_server._model_slugs_compatible(
+            "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-4bit"
+        ))
+
+    def test_different_family_incompatible(self):
+        self.assertFalse(admin_server._model_slugs_compatible(
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "mlx-community/Mistral-7B-v0.1"
+        ))
+
+    def test_empty_expected_compatible(self):
+        self.assertTrue(admin_server._model_slugs_compatible("some/model", ""))
+
+
 class TestGetRouteStats(unittest.TestCase):
     """Test the enriched _get_route_stats() returns all expected keys."""
 

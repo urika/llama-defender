@@ -449,6 +449,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("request-id", self._request_id)
                     self.end_headers()
                     self.wfile.write(html.encode("utf-8"))
+                elif self.path == "/api/status":
+                    status = _build_status_json()
+                    http_code = 200 if status["state"] in ("healthy", "starting") else 503
+                    self._respond_json(status, http_code)
+                elif self.path == "/api/watchdog":
+                    self._respond_json(_build_watchdog_json())
+                elif self.path == "/api/profiles":
+                    self._respond_json({"profiles": _build_profiles_json()})
                 elif self.path == "/metrics" or self.path.startswith("/metrics?"):
                     self._handle_metrics_endpoint()
                 elif self.path == "/metrics/history":

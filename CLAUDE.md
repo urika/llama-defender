@@ -61,6 +61,7 @@ Additional commands (see `./manage.sh help`):
 
 ```bash
 ./manage.sh watchdog [--daemon]             # Monitor backend health, auto-restart on degradation
+./manage.sh watchdog-status                 # Structured JSON status of the watchdog
 ./manage.sh route-force-local <session_id>  # Force session to local (sensitive code, privacy)
 ./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
                                       # --daemon: background process, logs to logs/watchdog.log
@@ -95,6 +96,22 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 ```
 
 Endpoints: `GET /v1/models`, `POST /v1/messages` (streaming + non-streaming), `OPTIONS`. Stateless, no third-party deps.
+
+**Structured admin APIs** (for `agent_go` / external orchestrators):
+
+| Method | Path | Purpose | Response |
+|--------|------|---------|----------|
+| GET | `/api/status` | Structured service health & readiness | JSON: `proxy`, `backend`, `active_profile`, `state`, `ready` |
+| GET | `/api/watchdog` | Watchdog state | JSON: `enabled`, `running`, `pid`, `last_restart_at`, `restart_count_1h`, `last_failure_reason` |
+| GET | `/api/profiles` | Available model configs | JSON: `profiles[]` with `name`, `desc`, `memory_gb`, `active` |
+| GET | `/status` | Human-readable HTML status page | HTML |
+| GET | `/metrics[?n=N]` | Recent request metrics | JSON |
+
+- `/api/status` returns `200` when `state` is `healthy` or `starting`, otherwise `503` with the same JSON body.
+- `ready` means the backend model is loaded and can accept inference requests (`starting` → `ready=false`).
+- `/api/profiles` reads `CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY` from `configs/*.conf`; `memory_gb` is `null` for cloud configs without a numeric estimate.
+- Watchdog auto-restart events are logged to `logs/watchdog_state.json` and surfaced by both `GET /api/watchdog` and `./manage.sh watchdog-status`.
+- Lifecycle events (`service_start`, `service_stop`, `service_restart`, `config_reload`, `profile_switch`, `watchdog_auto_restart`) are appended to `logs/lifecycle_events.jsonl` as `{ts, event, detail}`.
 
 **Dual-mode auto-detection**: `BACKEND_TYPE` is automatically inferred from
 `LLAMA_BASE_URL`:

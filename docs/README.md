@@ -103,6 +103,7 @@ docs/
 |------|------|
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3），含 5 项优化回顾、循环健康度 KPI、埋点代码实现 |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估，分析 prefix cache 命中率提升可行性 |
+| `api-and-operations-guide.md` | **对外操作与 API 手册**：面向 `agent_go` / 运维人员的命令、结构化 API、配置文件、生命周期事件速查 |
 
 ---
 
@@ -124,6 +125,7 @@ docs/
 | 场景 | 推荐路径 |
 |------|----------|
 | 新成员 onboarding | `01-requirements-product/PRD-anthropic-proxy.md` → `02-architecture-design/proxy-pipeline-reference.md` → `02-architecture-design/use-cases.md` |
+| 对外集成 / 运维操作 | `06-reference-metrics/api-and-operations-guide.md`（命令、API、配置文件、生命周期事件） |
 | 了解使用场景 | `02-architecture-design/use-cases.md`（7 个场景：日常编码 / 云端切换 / 多模型分工 / 长上下文 / 评测 / 压测 / 故障恢复） |
 | 排查线上问题 | `05-operations-changelog/` 查看近期变更 → `04-analysis-diagnostics/` 查找同类问题 |
 | 设计新功能 | `01-requirements-product/` 确认需求边界 → `02-architecture-design/` 参考现有设计模式 |

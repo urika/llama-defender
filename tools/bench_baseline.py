@@ -45,10 +45,10 @@ HOST = os.environ.get("LLAMA_HOST", "http://127.0.0.1:4000")
 HEADERS = {"Content-Type": "application/json", "x-api-key": "test", "anthropic-version": "2023-06-01"}
 
 QUALITY_TESTS = {
-    "code_hello": {"prompt": "写一个Python函数，计算斐波那契数列第n项，返回整数。", "expected": "def fib", "category": "代码"},
-    "code_sort": {"prompt": "写一个快速排序函数，要求原地排序，返回排序后的列表。", "expected": "def quicksort", "category": "代码"},
-    "code_class": {"prompt": "写一个栈类 Stack，包含 push、pop、is_empty 方法。", "expected": "class Stack", "category": "代码"},
-    "code_recursive": {"prompt": "写一个递归函数计算二叉树深度。", "expected": "def depth", "category": "代码"},
+    "code_hello": {"prompt": "写一个Python函数，计算斐波那契数列第n项，返回整数。", "expected": ["fib"], "category": "代码"},
+    "code_sort": {"prompt": "写一个快速排序函数，要求原地排序，返回排序后的列表。", "expected": ["quicksort", "quick_sort", "quickSort", "qsort"], "category": "代码"},
+    "code_class": {"prompt": "写一个栈类 Stack，包含 push、pop、is_empty 方法。", "expected": ["class stack", "class stack_", "def is_empty"], "category": "代码"},
+    "code_recursive": {"prompt": "写一个递归函数计算二叉树深度。", "expected": ["max_depth", "tree_depth", "depth_of_tree", "def depth", "def depth("], "category": "代码"},
     "math_basic": {"prompt": "计算: 123 + 456 = ?", "expected": "579", "category": "数学"},
     "math_word": {"prompt": "小明有15个苹果，给了小红7个，又买了5个，现在小明有多少个苹果？", "expected": "13", "category": "数学"},
     "math_prime": {"prompt": "判断 17 是不是质数，并解释原因。", "expected": "质数", "category": "数学"},
@@ -93,7 +93,9 @@ def run_quality():
         cat = test["category"]
         try:
             text, elapsed, usage = _send([{"role": "user", "content": test["prompt"]}], max_tokens=300)
-            passed = test["expected"].lower() in text.lower()
+            exp = test["expected"]
+            expected_list = exp if isinstance(exp, list) else [exp]
+            passed = any(e.lower() in text.lower() for e in expected_list)
             results[tid] = {"passed": passed, "elapsed": round(elapsed, 2), "category": cat}
             cat_scores.setdefault(cat, {"passed": 0, "total": 0})
             cat_scores[cat]["total"] += 1

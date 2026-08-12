@@ -393,6 +393,14 @@ _jsonl_output_map = {}
 _jsonl_counter = 0
 
 # ---------------------------------------------------------------------------
+# Status API / agent_go integration
+# ---------------------------------------------------------------------------
+PROXY_STATUS_API_VERSION = "1"
+_ACTIVE_CONF_PATH = os.path.join(_SCRIPT_DIR, "configs", "active.conf")
+_WATCHDOG_STATE_PATH = os.path.join(_LOG_DIR, "watchdog_state.json")
+_LIFECYCLE_EVENTS_PATH = os.path.join(_LOG_DIR, "lifecycle_events.jsonl")
+
+# ---------------------------------------------------------------------------
 # Intelligent model routing
 # ---------------------------------------------------------------------------
 PROXY_ROUTE_ENABLED = os.environ.get("PROXY_ROUTE_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -884,6 +892,8 @@ if not PROXY_CLOUD_API_KEY:
 __all__ = [
     # Backend
     "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD", "_strategy", "_SCRIPT_DIR",
+    # Status API / agent_go integration
+    "PROXY_STATUS_API_VERSION", "_ACTIVE_CONF_PATH", "_WATCHDOG_STATE_PATH", "_LIFECYCLE_EVENTS_PATH",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
     # Tool-result clearing

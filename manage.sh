@@ -14,6 +14,8 @@ PROXY_PIDFILE="$SCRIPT_DIR/anthropic_proxy.pid"
 PROXY_LOGFILE="$SCRIPT_DIR/logs/anthropic_proxy.log"
 WATCHDOG_PIDFILE="$SCRIPT_DIR/watchdog.pid"
 WATCHDOG_LOGFILE="$SCRIPT_DIR/logs/watchdog.log"
+WATCHDOG_STATE_PATH="$SCRIPT_DIR/logs/watchdog_state.json"
+MANAGE_LOCKFILE="$SCRIPT_DIR/.manage.lock"
 
 # 确保日志目录存在
 mkdir -p "$SCRIPT_DIR/logs"
@@ -43,6 +45,63 @@ _load_config() {
 
 # 加载当前激活配置
 _load_config
+
+# ============================================================
+# 仓库级文件锁 (R4): 变更类命令互斥, 防止 agent_go 与 watchdog 并发
+# ============================================================
+# macOS 通常没有 flock, 但自带 shlock; Linux 优先 flock 若可用。
+# 锁文件含持有者 PID, 进程崩溃后下次加锁会自动清理失效锁。
+_acquire_manage_lock() {
+    local timeout="${1:-5}"
+    local elapsed=0
+
+    # Linux: 优先使用 flock (阻塞/超时语义更干净)
+    if command -v flock >/dev/null 2>&1; then
+        local fd
+        exec {fd}>"$MANAGE_LOCKFILE"
+        if flock -w "$timeout" "$fd" 2>/dev/null; then
+            MANAGE_LOCK_FD=$fd
+            return 0
+        fi
+        exec {fd}>&- 2>/dev/null || true
+        error "无法获取 manage.sh 互斥锁 (超时 ${timeout}s); 可能有其他管理命令正在执行"
+        return 1
+    fi
+
+    # macOS / fallback: 使用 shlock 轮询
+    if ! command -v shlock >/dev/null 2>&1; then
+        warn "系统未安装 flock/shlock, 跳过管理锁 (fail-open)"
+        return 0
+    fi
+
+    while (( elapsed < timeout )); do
+        if shlock -f "$MANAGE_LOCKFILE" -p $$ 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    error "无法获取 manage.sh 互斥锁 (超时 ${timeout}s); 可能有其他管理命令正在执行"
+    return 1
+}
+
+_release_manage_lock() {
+    if [[ -n "${MANAGE_LOCK_FD:-}" ]]; then
+        flock -u "$MANAGE_LOCK_FD" 2>/dev/null || true
+        exec {MANAGE_LOCK_FD}>&- 2>/dev/null || true
+        unset MANAGE_LOCK_FD
+    fi
+    # shlock 路径: 直接删除锁文件
+    rm -f "$MANAGE_LOCKFILE"
+}
+
+_with_manage_lock() {
+    _acquire_manage_lock || return 1
+    local rc=0
+    "$@" || rc=$?
+    _release_manage_lock
+    return $rc
+}
 
 # ============================================================
 # 默认配置
@@ -97,6 +156,28 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# ============================================================
+# 生命周期事件日志 (R7): 切换/重启/自动恢复等关键事件写入 JSONL
+# ============================================================
+: "${LIFECYCLE_EVENTS_PATH:="$SCRIPT_DIR/logs/lifecycle_events.jsonl"}"
+
+_log_lifecycle_event() {
+    local event="${1:-}"
+    local detail="${2:-}"
+    if [[ -z "$event" ]]; then
+        return 0
+    fi
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p "$SCRIPT_DIR/logs"
+    # detail 中的双引号和反斜杠需要转义，使用 python3 保证合法 JSON
+    python3 - <<PY >> "$LIFECYCLE_EVENTS_PATH"
+import json, sys
+rec = {"ts": "$ts", "event": "$event", "detail": "$detail"}
+print(json.dumps(rec, ensure_ascii=False))
+PY
+}
 
 # ============================================================
 # 获取当前配置名称
@@ -778,6 +859,7 @@ cmd_start() {
     # 后端就绪后启动代理
     if _get_pid >/dev/null 2>&1; then
         _start_proxy
+        _log_lifecycle_event "service_start" "profile=$(_current_config_name) backend=$LLAMA_BACKEND"
     else
         error "后端进程未运行，跳过代理启动"
         return 1
@@ -825,6 +907,7 @@ cmd_start_cloud() {
 
     # 启动代理（不启动本地后端）
     if _start_proxy; then
+        _log_lifecycle_event "service_start" "profile=$(_current_config_name) backend=cloud base_url=$LLAMA_BASE_URL"
         # 云端 API 健康检查
         info "验证云端 API 可达性..."
         local health_url="${LLAMA_BASE_URL%/}/models"
@@ -894,6 +977,7 @@ cmd_stop() {
             if ! kill -0 "$pid" 2>/dev/null; then
                 info "✅ 后端已强制停止"
                 rm -f "$PIDFILE"
+                _log_lifecycle_event "service_stop" "profile=$(_current_config_name) backend=${backend:-unknown}"
                 return 0
             fi
 
@@ -904,6 +988,7 @@ cmd_stop() {
 
     warn "后端服务未在运行"
     rm -f "$PIDFILE"
+    _log_lifecycle_event "service_stop" "profile=$(_current_config_name)"
     return 0
 }
 
@@ -990,6 +1075,7 @@ cmd_status() {
 # 重启服务
 # ============================================================
 cmd_restart() {
+    _log_lifecycle_event "service_restart" "profile=$(_current_config_name) reason=manual"
     cmd_stop || true
     # 等待端口完全释放，避免 SO_REUSEADDR 等待期间的竞争
     local waited=0
@@ -1102,8 +1188,11 @@ cmd_switch() {
         fi
     fi
 
+    local old_profile
+    old_profile=$(_current_config_name)
     ln -sf "$target.conf" "$ACTIVE_CONF"
     info "配置已切换为: ${CYAN}$target${NC}"
+    _log_lifecycle_event "profile_switch" "from=$old_profile to=$target"
 
     _load_config
     echo ""
@@ -1140,24 +1229,50 @@ cmd_reload() {
     info "  后端: ${LLAMA_BACKEND:-llama-server}"
 
     # 发送 SIGHUP 信号，触发 proxy 的 _reload_config()
-    if kill -HUP "$proxy_pid" 2>/dev/null; then
-        info "✅ SIGHUP 已发送，代理将在下个请求间隙重载配置"
-        info "  无需重启进程，正在处理的请求不受影响"
-        info ""
-        info "重载内容:"
-        info "  - 后端路由 (LLAMA_BASE_URL, BACKEND_TYPE, MODEL_NAME)"
-        info "  - 并发控制 (PROXY_MAX_CONCURRENT + Semaphore 重建)"
-        info "  - 上下文管理 (clearing/truncation/lifecycle 阈值)"
-        info "  - 工具过滤/循环检测/blocker 等"
-        info ""
-        info "注意: 本地模型的启停需独立操作:"
-        info "  ./manage.sh start-backend   启动本地模型"
-        info "  ./manage.sh stop-backend    停止本地模型(释放 GPU 内存)"
-        info "  云端模式无需本地模型"
-    else
+    if ! kill -HUP "$proxy_pid" 2>/dev/null; then
         error "SIGHUP 发送失败 (PID: $proxy_pid)"
         return 1
     fi
+
+    _log_lifecycle_event "config_reload" "profile=$(_current_config_name) backend=${LLAMA_BACKEND:-llama-server} pid=$proxy_pid"
+
+    info "✅ SIGHUP 已发送，代理将在下个请求间隙重载配置"
+    info "  无需重启进程，正在处理的请求不受影响"
+
+    # 等待代理重载完成（最多 30 秒），优先使用 /api/status，旧版代理回退 /v1/models
+    local i ready_url="http://$PROXY_HOST:$PROXY_PORT/api/status"
+    for i in {1..30}; do
+        if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            error "代理在重载过程中退出"
+            return 1
+        fi
+        if curl -s --max-time 2 "$ready_url" >/dev/null 2>&1; then
+            info "✅ 代理热重载完成"
+            break
+        fi
+        if (( i == 5 )) && ! curl -s --max-time 2 "http://$PROXY_HOST:$PROXY_PORT/v1/models" >/dev/null 2>&1; then
+            # 旧版代理可能没有 /api/status，fallback 到 /v1/models
+            ready_url="http://$PROXY_HOST:$PROXY_PORT/v1/models"
+        fi
+        if (( i == 30 )); then
+            warn "代理重载确认超时，但进程仍在运行 (PID: $proxy_pid)"
+            warn "  请通过 ./manage.sh status 或 curl $ready_url 手动确认"
+            return 0
+        fi
+        sleep 1
+    done
+
+    info ""
+    info "重载内容:"
+    info "  - 后端路由 (LLAMA_BASE_URL, BACKEND_TYPE, MODEL_NAME)"
+    info "  - 并发控制 (PROXY_MAX_CONCURRENT + Semaphore 重建)"
+    info "  - 上下文管理 (clearing/truncation/lifecycle 阈值)"
+    info "  - 工具过滤/循环检测/blocker 等"
+    info ""
+    info "注意: 本地模型的启停需独立操作:"
+    info "  ./manage.sh start-backend   启动本地模型"
+    info "  ./manage.sh stop-backend    停止本地模型(释放 GPU 内存)"
+    info "  云端模式无需本地模型"
 }
 
 # ============================================================
@@ -1192,6 +1307,7 @@ cmd_start_backend() {
     esac
 
     info "✅ 本地后端已启动"
+    _log_lifecycle_event "service_start" "profile=$(_current_config_name) backend=$LLAMA_BACKEND component=backend"
     info "  如需代理也使用此后端，请: ./manage.sh reload"
 }
 
@@ -1225,6 +1341,7 @@ cmd_stop_backend() {
         if ! kill -0 "$pid" 2>/dev/null; then
             info "✅ 本地后端已停止 (GPU 内存已释放)"
             rm -f "$PIDFILE"
+            _log_lifecycle_event "service_stop" "profile=$(_current_config_name) backend=$backend component=backend"
             return 0
         fi
         sleep 1
@@ -1236,6 +1353,7 @@ cmd_stop_backend() {
     if ! kill -0 "$pid" 2>/dev/null; then
         info "✅ 本地后端已强制停止"
         rm -f "$PIDFILE"
+        _log_lifecycle_event "service_stop" "profile=$(_current_config_name) backend=$backend component=backend"
         return 0
     fi
 
@@ -1392,6 +1510,27 @@ cmd_fix_template() {
 }
 
 # ============================================================
+# Watchdog 状态持久化 (R5)
+# ============================================================
+_write_watchdog_state() {
+    local enabled="${1:-true}"
+    local last_restart_at="${2:-}"
+    local restart_count_1h="${3:-0}"
+    local last_failure_reason="${4:-}"
+    local pid="${5:-$$}"
+    mkdir -p "$SCRIPT_DIR/logs"
+    cat > "$WATCHDOG_STATE_PATH" <<EOF
+{
+  "enabled": $enabled,
+  "pid": $pid,
+  "last_restart_at": "$last_restart_at",
+  "restart_count_1h": $restart_count_1h,
+  "last_failure_reason": "$last_failure_reason"
+}
+EOF
+}
+
+# ============================================================
 # Watchdog: 监控后端健康，性能衰减时自动重启
 # ============================================================
 cmd_watchdog() {
@@ -1409,8 +1548,7 @@ cmd_watchdog() {
             trap '' HUP
             exec </dev/null
             exec >> "$WATCHDOG_LOGFILE" 2>&1
-            echo $$ > "$WATCHDOG_PIDFILE"
-            trap 'rm -f "$WATCHDOG_PIDFILE"' EXIT
+            trap 'rm -f "$WATCHDOG_PIDFILE"; _write_watchdog_state false "" 0 "" ""' EXIT
 
             info "Watchdog 后台运行 (PID: $$)"
             info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
@@ -1419,9 +1557,15 @@ cmd_watchdog() {
             _watchdog_loop "$interval" "$threshold" "$max_fail"
         ) &
         disown
-        info "Watchdog 已后台启动 (PID: $!)"
+        local daemon_pid=$!
+        echo "$daemon_pid" > "$WATCHDOG_PIDFILE"
+        _write_watchdog_state true "" 0 "" "$daemon_pid"
+        info "Watchdog 已后台启动 (PID: $daemon_pid)"
+        sleep 0.3
         exit 0
     fi
+
+    _write_watchdog_state true "" 0 "" $$
 
     info "Watchdog 启动 (间隔=${interval}s, 阈值=${threshold} tok/s, 连续失败=${max_fail})"
     info "  后端: ${LLAMA_BACKEND:-rapid-mlx}:${LLAMA_PORT:-8081}"
@@ -1454,7 +1598,7 @@ _watchdog_loop() {
                 break
             fi
             warn "后端未运行,尝试重启..."
-            cmd_restart
+            _watchdog_do_restart "$restart_count" "backend_down"
             restart_count=$((restart_count + 1))
             consecutive_fail=0
             continue
@@ -1471,7 +1615,7 @@ _watchdog_loop() {
                     break
                 fi
                 error "后端连续 $max_fail 次无响应,自动重启"
-                cmd_restart
+                _watchdog_do_restart "$restart_count" "backend_unresponsive"
                 restart_count=$((restart_count + 1))
                 consecutive_fail=0
             fi
@@ -1491,12 +1635,33 @@ _watchdog_loop() {
                         break
                     fi
                     warn "性能衰减: ${tok_s} tok/s < ${threshold} tok/s,重启后端..."
-                    cmd_restart
+                    _watchdog_do_restart "$restart_count" "performance_degradation"
                     restart_count=$((restart_count + 1))
                 fi
             fi
         fi
     done
+}
+
+_watchdog_do_restart() {
+    local restart_count="$1"
+    local failure_reason="$2"
+    local mypid=${BASHPID:-$$}
+
+    # 获取管理锁, 避免与 agent_go 修复操作并发重启
+    if _acquire_manage_lock 5; then
+        # 二次检查: 持锁期间状态可能已改变
+        if ! _get_pid >/dev/null 2>&1 || [[ -z "$(curl -s --max-time 5 "http://${LLAMA_HOST:-127.0.0.1}:${LLAMA_PORT:-8081}/v1/models" 2>/dev/null)" ]]; then
+            cmd_restart
+            _write_watchdog_state true "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((restart_count + 1))" "$failure_reason" "$mypid"
+            _log_lifecycle_event "watchdog_auto_restart" "profile=$(_current_config_name) reason=$failure_reason restart_count=$((restart_count + 1))"
+        else
+            info "watchdog 获取锁后发现后端已恢复, 跳过重启"
+        fi
+        _release_manage_lock
+    else
+        warn "watchdog 无法获取管理锁, 跳过本次自动重启"
+    fi
 }
 
 cmd_stop_watchdog() {
@@ -1507,14 +1672,58 @@ cmd_stop_watchdog() {
             info "停止 watchdog (PID: $pid)..."
             kill "$pid" 2>/dev/null || true
             rm -f "$WATCHDOG_PIDFILE"
+            _write_watchdog_state false "" 0 "" $$
             info "✅ Watchdog 已停止"
         else
             warn "Watchdog 未在运行，清理 PID 文件"
             rm -f "$WATCHDOG_PIDFILE"
+            _write_watchdog_state false "" 0 "" $$
         fi
     else
-        warn "Watchdog 未在运行"
+        warn "Watchdog 未运行"
+        _write_watchdog_state false "" 0 "" $$
     fi
+}
+
+# ============================================================
+# Watchdog 状态查询 (R5): 输出 JSON
+# ============================================================
+cmd_watchdog_status() {
+    python3 - <<PY
+import json, os, sys
+
+state_path = "$WATCHDOG_STATE_PATH"
+result = {
+    "enabled": False,
+    "running": False,
+    "pid": None,
+    "last_restart_at": "",
+    "restart_count_1h": 0,
+    "last_failure_reason": "",
+}
+
+try:
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+except (OSError, json.JSONDecodeError):
+    pass
+else:
+    result["enabled"] = bool(state.get("enabled", False))
+    result["pid"] = state.get("pid")
+    result["last_restart_at"] = state.get("last_restart_at", "")
+    result["restart_count_1h"] = int(state.get("restart_count_1h", 0))
+    result["last_failure_reason"] = state.get("last_failure_reason", "")
+
+pid = result["pid"]
+if pid:
+    try:
+        os.kill(int(pid), 0)
+        result["running"] = True
+    except (OSError, ValueError):
+        pass
+
+print(json.dumps(result, ensure_ascii=False))
+PY
 }
 
 # ============================================================
@@ -1728,9 +1937,15 @@ llama.cpp / Rapid-MLX 服务管理脚本
   stop-backend         仅停止本地模型（释放 GPU 内存）
   watchdog [--daemon]  监控后端健康状态，性能衰减时自动重启（--daemon 后台运行）
   stop-watchdog        停止 watchdog 后台进程
-  watchdog-status      查看 watchdog 运行状态
+  watchdog-status      查看 watchdog 运行状态 (JSON)
   logs [N]             查看最后 N 行后端日志 (默认 50)
   proxy-logs [N]       查看最后 N 行代理日志 (默认 50)
+
+调用契约:
+  所有变更命令 (start/stop/restart/start-backend/stop-backend/switch/reload)
+  在非交互模式下均不阻塞等待输入; 成功返回 0, 失败返回非 0;
+  start/start-backend/reload/switch 具有幂等性; 命令内部包含硬超时保护。
+  变更命令之间通过 .manage.lock 互斥, 防止 agent_go 与 watchdog 并发操作。
 
 配置命令:
   list                 列出所有可用配置
@@ -1839,22 +2054,22 @@ main() {
 
     case "${1:-help}" in
         start)
-            cmd_start
+            _with_manage_lock cmd_start
             ;;
         start-cloud)
-            cmd_start_cloud
+            _with_manage_lock cmd_start_cloud
             ;;
         stop)
-            cmd_stop
+            _with_manage_lock cmd_stop
             ;;
         status)
             cmd_status
             ;;
         restart)
-            cmd_restart
+            _with_manage_lock cmd_restart
             ;;
         reload)
-            cmd_reload
+            _with_manage_lock cmd_reload
             ;;
         route-force-local)
             cmd_route_force_local "$2"
@@ -1863,10 +2078,10 @@ main() {
             cmd_route_force_cloud "$2"
             ;;
         start-backend)
-            cmd_start_backend
+            _with_manage_lock cmd_start_backend
             ;;
         stop-backend)
-            cmd_stop_backend
+            _with_manage_lock cmd_stop_backend
             ;;
         logs)
             cmd_logs "${2:-50}"
@@ -1878,7 +2093,7 @@ main() {
             cmd_list
             ;;
         switch)
-            cmd_switch "$2"
+            _with_manage_lock cmd_switch "$2"
             ;;
         current)
             cmd_current
@@ -1893,18 +2108,7 @@ main() {
             cmd_stop_watchdog
             ;;
         watchdog-status)
-            if [[ -f "$WATCHDOG_PIDFILE" ]]; then
-                local pid
-                pid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
-                if kill -0 "$pid" 2>/dev/null; then
-                    info "Watchdog 运行中 (PID: $pid)"
-                else
-                    warn "Watchdog PID 文件存在但进程已死"
-                    rm -f "$WATCHDOG_PIDFILE"
-                fi
-            else
-                warn "Watchdog 未运行"
-            fi
+            cmd_watchdog_status
             ;;
         wizard)
             cmd_wizard
