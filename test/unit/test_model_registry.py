@@ -416,11 +416,30 @@ class TestProxyStateIntegration(unittest.TestCase):
 
     def test_catalog_models_present(self):
         import proxy_state
-        # Real provider facts from the agent_go integration inputs.
-        for name in ("glm-5.2", "glm-5.3", "k3", "deepseek-v4-pro", "deepseek-v4-flash"):
+        # Real provider facts, endpoint-verified 2026-08-15:
+        # kimi (Kimi Code /coding/v1) vs moonshot (开放平台 /v1) are separate
+        # systems with different model IDs.
+        for name in ("glm-5.2", "glm-5.3", "k3", "kimi-for-coding",
+                     "kimi-k3", "deepseek-v4-pro", "deepseek-v4-flash"):
             self.assertIsNotNone(
                 model_registry.get_model(name), "model %r missing from catalog" % name
             )
+
+    def test_kimi_provider_endpoints_verified(self):
+        """Kimi Code OpenAI endpoint differs from the moonshot open platform."""
+        import proxy_state
+        kimi = model_registry.get_provider_credentials(
+            "kimi", env_lookup=lambda k, d=None: {"KIMI_API_KEY": "x"}.get(k, d))
+        self.assertEqual(kimi["base_url"], "https://api.kimi.com/coding/v1")
+        self.assertEqual(kimi["anthropic_base_url"], "https://api.kimi.com/coding/")
+        moonshot = model_registry.get_provider("moonshot")
+        self.assertEqual(moonshot["base_url"], "https://api.moonshot.cn/v1")
+        self.assertFalse(moonshot["anthropic_compatible"])
+        # k3 model (1M ctx, thinking-only) lives on the kimi provider.
+        k3 = model_registry.get_model("k3")
+        self.assertEqual(k3["provider"], "kimi")
+        self.assertEqual(k3["capabilities"]["context_tokens"], 1048576)
+        self.assertEqual(k3["capabilities"]["thinking"], "only")
 
 
 if __name__ == "__main__":
