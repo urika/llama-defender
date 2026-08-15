@@ -6,6 +6,41 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ## [Unreleased] - 2026-06-21
 
+### 多云模型目录（Model Catalog）Phase A-D 全量落地 + llama-defender R8-R12 交付 (2026-08-15)
+
+新增声明式模型目录 `configs/models.json`（providers/models/routes 三段，对齐 agent_go 模型实体三层设计）与 `model_registry.py`；llama-defender 集成需求 R8-R12 全部交付（R1-R12 完整闭环）。**新增云模型 = 目录加条目 + secret 配 key + reload，零代码。** 详见 `docs/05-operations-changelog/model-catalog-multi-cloud-20260815.md`。
+
+### Added
+
+- **`model_registry.py`（563 行, stdlib only）**: 目录加载/校验（坏文件拒绝热替换）、`$env`/`$default` 引用、fallback chain、`catalog_hash`；目录缺失时合成等价目录（零行为变化部署）。
+- **`configs/models.json`**: deepseek/zhipu/kimi/local 四提供商 × 11 模型，端点/模型 ID/能力/价格全部官方文档核实+真实冒烟验证；密钥经 `key_env` 间接引用 `secret.local.conf`。
+- **多提供商分发（Phase B）**: 按模型解析 provider 凭证/分商信号量/分商熔断；`fallback_chain` 跨商降级（含云端 URLError 修复）；按模型目录价格计费 + 全局/分商预算双上限。
+- **Anthropic 协议分发（Phase D）**: provider `protocol: anthropic`（双端点双 key）经 `api.z.ai/api/anthropic` 消耗 **Z.ai Coding Plan 订阅**（SSE 透传/非流式直返+归因）；OpenAI 协议客户端自动跳过 anthropic 候选。
+- **R8-R12 端点**: `X-Proxy-Route-Target/Actual-Model/Reason/Cost` 四头 + `proxy_route` 体字段；`GET /api/route/policies`（脱敏+`catalog_hash`）；`/v1/models` 能力元数据（real_model/thinking_*/json_compliance/context_chars/price/direct_capable）；`/api/status` `route_config`；`POST /admin/reload`（幂等）；`manage.sh models`/`models-validate`。
+- **SIGHUP 增强**: 热重载现在同时重载模型目录、全部 provider key、分商信号量，并重建 `MODEL_ROUTE_PREFERENCES`（修复 import 时捕获 `PROXY_CLOUD_MODEL` 的陈旧值缺陷）。
+
+### Changed
+
+- **R8 归因头直接切换**: `X-Route-*`/`X-Actual-Model` → 契约名 `X-Proxy-Route-*`（零别名；`bench_route.py`/测试/文档同步清理）。外部消费方注意头名变更。
+- **路由决策**: `claude-opus-4-7 → glm-5.3`（Z.ai 订阅主路径，边际 ¥0）+ `deepseek-v4-pro` 链上备援；sonnet/haiku 不变。
+- **deepseek-v4-pro 价格修正** ¥2/8 → 官方正式版 ¥3/6；kimi（Kimi Code 订阅）与 glm（Z.ai 订阅）按订阅边际 0 计，按量参考价记于 note。
+- **deepseek provider** 改 `base_url_env`/`concurrent_env` 引用，保留 `PROXY_CLOUD_BASE_URL` conf 覆盖语义（中转场景）。
+- **manage.sh**: secret 以 `set -a` 导出（分商 key 启动态可见）；`models`/`models-validate` 命令。
+
+### Fixed
+
+- kimi thinking-only 模型仅接受 `temperature:1`（默认 0.7 → 云端 400）→ `force_temperature` quirk。
+- 云端 URLError（连接拒绝/超时）原先上抛 503，现进入降级链。
+- R8 头名与契约不符（agent_go fail-open 静默落空）。
+
+### 验证
+
+- 979 unit（+30）/ 10 integration / 签名+行为快照 / promptfoo 5/5 全绿。
+- 真实云调用 e2e 三家全过：deepseek（真实计费归因）、kimi k3（订阅）、Z.ai glm-5.2/5.3（非流式 usage 归因 + 流式 SSE 透传）。
+- R1-R12 逐条实测合规审计通过（临时实例 + 生产端口双验证）。
+
+---
+
 ### rapid-mlx 升级 0.6.71 → 0.11.5 与 ThinkingCap DWQ 验证 (2026-08-03)
 
 将本地推理引擎 rapid-mlx 从 0.6.71 升级至 0.11.5（brew tap `raullenchai/rapid-mlx`，升级期间 tap 更新至 0.11.5），验证 DWQ 量化模型兼容性并发现 MTP 新限制。

@@ -89,6 +89,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| `model-catalog-multi-cloud-20260815.md` | 多云模型目录 Phase A-D 全量落地变更记录（registry/多提供商分发/fallback chain/Anthropic 协议通道/R8-R12 交付/路由与成本拓扑/新增模型 SOP/遗留事项） |
 | `optimization-log-20260603.md` | 代理层优化工作日志（Context Bloat 治理 + 性能优化 Phase 1-3） |
 | `config-change-20260604-max-num-seqs.md` | 配置修改记录：将 `--max-num-seqs` 从 1 提升到 2 |
 | `config-change-20260604-rollback.md` | 配置修改记录：回滚并发上限（内存压力过高，风险大于收益） |

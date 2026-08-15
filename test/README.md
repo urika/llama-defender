@@ -9,7 +9,7 @@ are run manually before merging feature branches.
 ```
 test/
 ├── run_tests.sh                    # unified runner: --unit / --integration / --e2e / --all
-├── unit/                           # pure logic, no I/O, <1s (13 files, 548 tests)
+├── unit/                           # pure logic, no I/O, <1s (25 files, ~980 tests)
 │   ├── test_proxy_fallback.py      # content tools fallback, blocker, truncation, compression
 │   ├── test_proxy_reload.py        # SIGHUP hot-reload regression
 │   ├── test_proxy_state.py         # config invariants, __all__ coverage, RELOAD_SPEC consistency
