@@ -234,6 +234,12 @@ def convert_openai_request_to_anthropic(body):
         anthropic_body["top_p"] = body["top_p"]
     if "stream" in body:
         anthropic_body["stream"] = body["stream"]
+    # 透传 thinking / response_format（DeepSeek 推理模型 v4-pro 必须 thinking enabled；
+    # response_format json_object 用于 JSON 输出。OpenAI 请求转 Anthropic 时不丢弃）
+    if "thinking" in body:
+        anthropic_body["thinking"] = body["thinking"]
+    if "response_format" in body:
+        anthropic_body["response_format"] = body["response_format"]
     stop = body.get("stop")
     if stop is not None:
         if isinstance(stop, str):

@@ -2099,7 +2099,7 @@ main() {
             cmd_current
             ;;
         fix-template)
-            cmd_fix_template "$2" "$3"
+            cmd_fix_template "${2:-}" "${3:-}"
             ;;
         watchdog)
             cmd_watchdog "$2"

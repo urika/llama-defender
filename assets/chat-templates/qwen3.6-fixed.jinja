@@ -8,6 +8,7 @@ Fixes:
   2. |tojson → |string
   3. is sequence → is iterable
   4. developer role + raise_exception 降级
+  5. 递归收集所有 system/developer 消息并前置合并，兼容 Claude Code 的 mid-conversation system
 -#}
 
 {%- macro render_content(content, is_system_content=false) %}
@@ -36,6 +37,37 @@ Fixes:
     {%- endif %}
 {%- endmacro %}
 
+{#- 递归收集所有 system/developer 内容；Jinja2 sandbox 禁止 list.append，故用递归累加 -#}
+{%- macro collect_system(messages, idx, acc) %}
+    {%- if idx >= messages|length %}
+        {{- acc }}
+    {%- else %}
+        {%- set message = messages[idx] %}
+        {%- if message.role == 'system' or message.role == 'developer' %}
+            {%- set part = render_content(message.content, true)|trim %}
+            {%- if '<|think_off|>' in part %}
+                {%- set enable_thinking = false %}
+                {%- set part = part | replace('<|think_off|>', '') | trim %}
+            {%- elif '<|think_on|>' in part %}
+                {%- set enable_thinking = true %}
+                {%- set part = part | replace('<|think_on|>', '') | trim %}
+            {%- endif %}
+            {%- if part %}
+                {%- if acc %}
+                    {%- set new_acc = acc + '\n\n' + part %}
+                {%- else %}
+                    {%- set new_acc = part %}
+                {%- endif %}
+                {{- collect_system(messages, idx + 1, new_acc) }}
+            {%- else %}
+                {{- collect_system(messages, idx + 1, acc) }}
+            {%- endif %}
+        {%- else %}
+            {{- collect_system(messages, idx + 1, acc) }}
+        {%- endif %}
+    {%- endif %}
+{%- endmacro %}
+
 {%- set enable_thinking = true %}
 {%- set has_tools = false %}
 {%- set last_tool_failed = false %}
@@ -48,21 +80,8 @@ Fixes:
     {{- '<|im_start|>assistant\n' }}
 {%- endif %}
 
-{%- set system_content = '' %}
-{%- set has_system = false %}
-{%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
-    {%- set has_system = true %}
-    {%- set system_content = render_content(messages[0].content, true)|trim %}
-    {%- if '<|think_off|>' in system_content %}
-        {%- set enable_thinking = false %}
-        {%- set system_content = system_content | replace('<|think_off|>', '') %}
-    {%- endif %}
-    {%- if '<|think_on|>' in system_content %}
-        {%- set enable_thinking = true %}
-        {%- set system_content = system_content | replace('<|think_on|>', '') %}
-    {%- endif %}
-    {%- set system_content = system_content | trim %}
-{%- endif %}
+{%- set system_content = collect_system(messages, 0, '') %}
+{%- set has_system = system_content | length > 0 %}
 
 {%- if tools and tools is iterable and tools is not mapping %}
     {%- set has_tools = true %}
@@ -84,93 +103,92 @@ Fixes:
 {%- endif %}
 
 {%- for message in messages %}
-    {%- set is_system = (message.role == "system" or message.role == "developer") %}
-    {%- set content = render_content(message.content, is_system)|trim %}
-    {%- if '<|think_off|>' in content %}
-        {%- set enable_thinking = false %}
-        {%- set content = content | replace('<|think_off|>', '') | trim %}
-    {%- elif '<|think_on|>' in content %}
-        {%- set enable_thinking = true %}
-        {%- set content = content | replace('<|think_on|>', '') | trim %}
-    {%- endif %}
-    {%- if is_system %}
-        {%- if not loop.first and content %}
-            {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+    {%- if message.role == "system" or message.role == "developer" %}
+        {#- system/developer 已前置合并，此处跳过 -#}
+    {%- else %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if '<|think_off|>' in content %}
+            {%- set enable_thinking = false %}
+            {%- set content = content | replace('<|think_off|>', '') | trim %}
+        {%- elif '<|think_on|>' in content %}
+            {%- set enable_thinking = true %}
+            {%- set content = content | replace('<|think_on|>', '') | trim %}
         {%- endif %}
-    {%- elif message.role == "user" %}
-        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
-        {%- set last_tool_failed = false %}
-        {%- set consecutive_failures = 0 %}
-    {%- elif message.role == "assistant" %}
-        {%- set content = content | trim %}
-        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
-            {%- if '<tool_call>' in content %}
-                {%- set content = content.split('<tool_call>')[0] | trim %}
-            {%- endif %}
-        {%- endif %}
-        {%- if content %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
-        {%- else %}
-            {{- '<|im_start|>' + message.role }}
-        {%- endif %}
-        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
-            {%- for tool_call in message.tool_calls %}
-                {%- if tool_call.function is defined %}
-                    {%- set tool_call = tool_call.function %}
-                {%- endif %}
-                {{- '\n<tool_call>\n' }}
-                {{- '<function=' ~ tool_call.name ~ '>\n' }}
-                {%- if tool_call.arguments is defined and tool_call.arguments is mapping %}
-                    {%- if tool_call.arguments | length > 0 %}
-                        {%- for args_name in tool_call.arguments %}
-                            {%- set args_value = tool_call.arguments[args_name] %}
-                            {{- '<parameter=' ~ args_name ~ '>\n' }}
-                            {{- args_value | string }}
-                            {{- '\n</parameter>\n' }}
-                        {%- endfor %}
-                    {%- endif %}
-                {%- elif tool_call.arguments is defined and tool_call.arguments is string %}
-                    {%- if tool_call.arguments | trim | length > 0 %}
-                        {{- tool_call.arguments }}
-                        {{- '\n' }}
-                    {%- endif %}
-                {%- endif %}
-                {{- '</function>\n</tool_call>' }}
-            {%- endfor %}
-        {%- endif %}
-        {{- '<|im_end|>\n' }}
-    {%- elif message.role == "tool" %}
-        {%- set content_lower = content | lower %}
-        {%- if content | length < 500
-            and '$ ' not in content
-            and 'took ' not in content_lower
-            and ('"error":' in content_lower or 'error:' in content_lower or 'exception:' in content_lower or 'traceback' in content_lower or 'command not found' in content_lower or 'invalid syntax' in content_lower or 'failed to' in content_lower) %}
-            {%- set last_tool_failed = true %}
-            {%- set consecutive_failures = consecutive_failures + 1 %}
-        {%- else %}
+        {%- if message.role == "user" %}
+            {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
             {%- set last_tool_failed = false %}
             {%- set consecutive_failures = 0 %}
-        {%- endif %}
-        {%- if loop.index0 > 0 and messages[loop.index0 - 1].role != "tool" %}
-            {{- '<|im_start|>user' }}
-        {%- endif %}
-        {{- '\n<tool_response>\n' }}
-        {{- content }}
-        {%- if last_tool_failed %}
-            {%- if consecutive_failures >= 2 %}
-                {{- '\n\nSYSTEM WARNING: ' ~ consecutive_failures ~ ' consecutive tool errors detected. Your previous approach is incorrect. You MUST use a fundamentally different approach or corrected arguments.' }}
-            {%- else %}
-                {{- '\n\nSYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.' }}
+        {%- elif message.role == "assistant" %}
+            {%- set content = content | trim %}
+            {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+                {%- if '<tool_call>' in content %}
+                    {%- set content = content.split('<tool_call>')[0] | trim %}
+                {%- endif %}
             {%- endif %}
-        {%- endif %}
-        {{- '\n</tool_response>' }}
-        {%- if not loop.last and messages[loop.index0 + 1].role != "tool" %}
+            {%- if content %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role }}
+            {%- endif %}
+            {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+                {%- for tool_call in message.tool_calls %}
+                    {%- if tool_call.function is defined %}
+                        {%- set tool_call = tool_call.function %}
+                    {%- endif %}
+                    {{- '\n<tool_call>\n' }}
+                    {{- '<function=' ~ tool_call.name ~ '>\n' }}
+                    {%- if tool_call.arguments is defined and tool_call.arguments is mapping %}
+                        {%- if tool_call.arguments | length > 0 %}
+                            {%- for args_name in tool_call.arguments %}
+                                {%- set args_value = tool_call.arguments[args_name] %}
+                                {{- '<parameter=' ~ args_name ~ '>\n' }}
+                                {{- args_value | string }}
+                                {{- '\n</parameter>\n' }}
+                            {%- endfor %}
+                        {%- endif %}
+                    {%- elif tool_call.arguments is defined and tool_call.arguments is string %}
+                        {%- if tool_call.arguments | trim | length > 0 %}
+                            {{- tool_call.arguments }}
+                            {{- '\n' }}
+                        {%- endif %}
+                    {%- endif %}
+                    {{- '</function>\n</tool_call>' }}
+                {%- endfor %}
+            {%- endif %}
             {{- '<|im_end|>\n' }}
-        {%- elif loop.last %}
-            {{- '<|im_end|>\n' }}
+        {%- elif message.role == "tool" %}
+            {%- set content_lower = content | lower %}
+            {%- if content | length < 500
+                and '$ ' not in content
+                and 'took ' not in content_lower
+                and ('"error":' in content_lower or 'error:' in content_lower or 'exception:' in content_lower or 'traceback' in content_lower or 'command not found' in content_lower or 'invalid syntax' in content_lower or 'failed to' in content_lower) %}
+                {%- set last_tool_failed = true %}
+                {%- set consecutive_failures = consecutive_failures + 1 %}
+            {%- else %}
+                {%- set last_tool_failed = false %}
+                {%- set consecutive_failures = 0 %}
+            {%- endif %}
+            {%- if loop.index0 > 0 and messages[loop.index0 - 1].role != "tool" %}
+                {{- '<|im_start|>user' }}
+            {%- endif %}
+            {{- '\n<tool_response>\n' }}
+            {{- content }}
+            {%- if last_tool_failed %}
+                {%- if consecutive_failures >= 2 %}
+                    {{- '\n\nSYSTEM WARNING: ' ~ consecutive_failures ~ ' consecutive tool errors detected. Your previous approach is incorrect. You MUST use a fundamentally different approach or corrected arguments.' }}
+                {%- else %}
+                    {{- '\n\nSYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.' }}
+                {%- endif %}
+            {%- endif %}
+            {{- '\n</tool_response>' }}
+            {%- if not loop.last and messages[loop.index0 + 1].role != "tool" %}
+                {{- '<|im_end|>\n' }}
+            {%- elif loop.last %}
+                {{- '<|im_end|>\n' }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
         {%- endif %}
-    {%- else %}
-        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
     {%- endif %}
 {%- endfor %}
 {%- if add_generation_prompt %}

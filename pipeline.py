@@ -1809,6 +1809,12 @@ class FormatConverter(PipelineStage):
             openai_body["top_p"] = body["top_p"]
         if "stop_sequences" in body:
             openai_body["stop"] = body["stop_sequences"]
+        # 透传客户端 thinking / response_format（DeepSeek 推理模型 v4-pro 必须 thinking
+        # enabled 否则返回空；response_format json_object 用于 JSON 输出场景）
+        if "thinking" in body:
+            openai_body["thinking"] = body["thinking"]
+        if "response_format" in body:
+            openai_body["response_format"] = body["response_format"]
 
         # 4. DeepSeek flash: disable thinking
         if _ps.IS_CLOUD and "flash" in _ps.MODEL_NAME.lower():
