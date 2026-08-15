@@ -45,6 +45,7 @@ docs/
 | `use-cases.md` | 目标场景使用案例（7 个场景 A-G）：日常编码、本地↔云端热切换、多模型分工、长上下文分析、模型选型评测、并发压测、故障恢复 |
 | `proxy-context-window-design-review.md` | 设计审阅意见（P1-P3 需修正 + S1-S5 建议改进） |
 | `proxy-context-window-design-review-merged.md` | 审阅意见合并记录，8/8 全部采纳 |
+| `multi-cloud-model-catalog-design-20260815.md` | 多云端模型目录（Model Catalog）设计与整体架构 Review（v2）：模型管理现状梳理（8 处硬编码触点）、`configs/models.json` 声明式目录（providers/models/routes 对齐 agent_go 三层设计）、直连 vs 走代理双源真相边界（catalog_hash 漂移检测）、R8 响应头命名契约对齐（`X-Proxy-Route-*`）、多提供商分发与 fallback chain、按模型成本核算，Phase A-C 实施计划（顺带交付 llama-defender R8-R12） |
 | `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
 
 ---

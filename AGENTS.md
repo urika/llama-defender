@@ -6,7 +6,7 @@
 
 ## 1. 项目概述
 
-**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。
+**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。消费方 agent_go 项目把本服务称为 **llama-defender**（集成契约见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)：R1-R7 已交付，R8-R12 待做）。
 
 运行模式：
 
@@ -47,61 +47,65 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 
 ## 3. 代码组织与模块划分
 
-仓库根目录下一共有约 15 个核心 Python 文件和 1 个 Bash 脚本。所有业务逻辑均围绕 `anthropic_proxy.py` 的请求管线展开。
+仓库根目录下一共有约 17 个核心 Python 文件和 1 个 Bash 脚本。所有业务逻辑均围绕 `anthropic_proxy.py` → `pipeline.py` 的请求管线展开。
 
 ### 3.1 核心文件
 
 | 文件 | 用途 |
 |------|------|
-| [`manage.sh`](manage.sh) | 服务管理器：start/stop/restart/reload/switch/status/watchdog，以及本地/云端路由强制切换 |
-| [`anthropic_proxy.py`](anthropic_proxy.py) | HTTP 代理入口：`ThreadingHTTPServer` + `Handler`；8 层请求管线；工具调用 fallback；流式/非流式响应处理 |
-| [`pipeline.py`](pipeline.py) | 管线抽象：22 个可独立测试的 `PipelineStage`，把 `_handle_messages` 拆成 RequestParser、LifecycleClassifier、SmartRouter、ContentCompressor、ContextTruncator、BackendDispatcher 等阶段 |
+| [`manage.sh`](manage.sh) | 服务管理器：start/stop/restart/reload/switch/status/watchdog/wizard，以及本地/云端路由强制切换 |
+| [`anthropic_proxy.py`](anthropic_proxy.py) | HTTP 代理入口：`ThreadingHTTPServer` + `Handler`（~1480 行）；流式/非流式响应处理、双协议端点；请求处理逻辑已全部下沉到 `pipeline.py` |
+| [`pipeline.py`](pipeline.py) | 管线抽象：24 个可独立测试的 `PipelineStage`，把 `_handle_messages` 拆成 RequestParser、LifecycleClassifier、SmartRouter、ContentCompressor、ContextTruncator、BackendDispatcher 等阶段 |
 | [`proxy_state.py`](proxy_state.py) | 单一真相源：所有 `PROXY_*` / `LLAMA_*` 常量、共享可变状态、线程本地上下文、`_RELOAD_SPEC`、模型别名、路由状态 |
 | [`proxy_config.py`](proxy_config.py) | `CONFIG_REGISTRY`：每个环境变量的默认值（区分 local/cloud）、类型、作用域、文档说明 |
 | [`backend_strategy.py`](backend_strategy.py) | `BackendStrategy` / `LocalStrategy` / `CloudStrategy`：把 38+ 处 `if IS_CLOUD` 收敛为策略类 |
-| [`reload_config.py`](reload_config.py) | SIGHUP 热重载实现：重新解析 `configs/active.conf` + `configs/secret.local.conf`，更新 `proxy_state` 与主模块 |
-| [`message_converter.py`](message_converter.py) | Anthropic ↔ OpenAI 消息与工具格式双向转换，含 token 估算 |
+| [`reload_config.py`](reload_config.py) | SIGHUP 热重载实现：重新解析 `configs/active.conf` + `configs/secret.local.conf`，更新 `proxy_state` 与主模块；同时重载模型目录并重建 `MODEL_ROUTE_PREFERENCES` |
+| [`model_registry.py`](model_registry.py) | 模型目录注册表：加载/校验 `configs/models.json`（providers/models/routes 三段，对齐 agent_go 三层设计），`$env`/`$default` 引用、fallback chain、坏文件拒绝热替换、`catalog_hash`；目录文件缺失时自动合成等价目录（与旧硬编码行为一致），`MODEL_ROUTE_PREFERENCES` 与 `get_model_aliases()` 均由其派生 |
+| [`message_converter.py`](message_converter.py) | Anthropic ↔ OpenAI 消息与工具格式双向转换（含 `convert_openai_request_to_anthropic`，双协议端点入口）、token 估算 |
 | [`tool_parser.py`](tool_parser.py) | XML ↔ JSON 工具参数解析、`<tools>` 内容块 fallback、流式工具提取器 |
-| [`content_compressor.py`](content_compressor.py) | TokenSieve 语义压缩：JSON / 代码 / 日志 / 文本的分层压缩 |
-| [`truncation.py`](truncation.py) | 上下文截断：char / rounds / fifo / smart 策略、关键词索引、摘要缓存 |
+| [`content_compressor.py`](content_compressor.py) | TokenSieve 语义压缩 + BM25 相关性驱动压缩（TS-1）：JSON / 代码 / 日志 / 文本的分层压缩 |
+| [`compression_types.py`](compression_types.py) | TS-3 统一压缩结果类型契约：`CompressionResult` / `CompressionSubResult` TypedDict（JSON 可序列化，兼容 Py3.8+） |
+| [`truncation.py`](truncation.py) | 上下文截断：char / rounds / fifo / smart 策略、单遍合并压缩（L2 清除 + L4 thinking 剥离）、工具对原子保护（TS-2）、关键词索引、摘要缓存 |
 | [`lifecycle.py`](lifecycle.py) | 生命周期阶段分类（init/growth/expansion/saturation/oom_danger/pre_trunc）与动态 token 预算 |
 | [`loop_detection.py`](loop_detection.py) | 工具循环、文本输出循环、阻塞模式检测与干预 |
 | [`tool_filter.py`](tool_filter.py) | 动态工具定义过滤，降低长工具列表的 token 开销 |
-| [`admin_server.py`](admin_server.py) | `/status` 状态页、系统内存/进程信息、指标聚合、请求快照清理、并发统计 |
+| [`admin_server.py`](admin_server.py) | `/status` 状态页、`/api/*` 结构化 JSON 端点、系统内存/进程信息、指标聚合与 `/metrics/history`、请求快照清理、并发统计 |
 | [`proxy_logging.py`](proxy_logging.py) | 结构化 JSONL 日志、敏感头脱敏 |
 
 ### 3.2 数据流
 
 ```
-Client POST /v1/messages
+Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，经 convert_openai_request_to_anthropic 转换）
   → anthropic_proxy.py:Handler.do_POST()
   → _llama_lock 获取并发许可
   → Handler._handle_messages()
-  → InstrumentedPipeline 依次执行 22 个 stage
-       1. RequestParser
-       2. LifecycleClassifier
-       3. DynamicMaxTokens
-       4. SmartRouter (local/cloud 路由)
-       5. RouteNotification
-       6. ErrorTranslator
-       7. BlockerDetector
-       8. SystemNormalizer
-       9. CacheAligner
-      10. ContentCompressor
-      11. ToolLoopDetector
-      12. TextLoopDetector
-      13. SessionLoopState
-      14. LoopIntervention
-      15. RereadDetector
-      16. DateNormalizer
-      17. ContextTruncator
-      18. HighDropRatioNotice
-      19. MessageHashDebug
-      20. OOMSafetyFIFO
-      21. PrefixRatioComputer
-      22. ToolPairingRepair / FormatConverter / BackendDispatcher
-  → 转发到后端（local 后端走 OpenAI chat completions 格式；cloud 直接透传）
-  → 流式或非流式 Anthropic 格式响应返回 Client
+  → InstrumentedPipeline 依次执行 24 个 stage（编号为代码注释中的历史层号）
+       0. RequestParser
+       1. LifecycleClassifier
+       2. DynamicMaxTokens
+       2.5. SmartRouter (local/cloud 路由决策)
+       2.6. RouteNotification
+       3. ErrorTranslator
+       4. BlockerDetector
+       5. SystemNormalizer
+       6. CacheAligner
+       7. ContentCompressor
+       8. ToolLoopDetector
+       9. TextLoopDetector
+      10. SessionLoopState
+      11. LoopIntervention
+      12. RereadDetector
+      13. DateNormalizer
+      14. ContextTruncator
+      15. HighDropRatioNotice
+      16. MessageHashDebug
+      17. OOMSafetyFIFO
+      18. PrefixRatioComputer
+      19. ToolPairingRepair
+      20. FormatConverter
+      21. BackendDispatcher
+  → 转发到后端（local 后端走 OpenAI chat completions 格式；cloud 直接透传；OpenAI 端点请求 `_openai_mode` 原样返回 OpenAI 格式响应）
+  → 流式或非流式响应返回 Client
 ```
 
 ### 3.3 配置文件
@@ -110,20 +114,21 @@ Client POST /v1/messages
 
 | 文件 | 说明 |
 |------|------|
-| `configs/active.conf` | 指向当前激活配置的符号链接 |
+| `configs/active.conf` | 指向当前激活配置的符号链接（当前 → `rapid-mlx-35b-opt.conf`） |
+| `configs/rapid-mlx-35b-opt.conf` | rapid-mlx + Qwen3.6-35B-A3B-UD-MLX-4bit（**当前激活**，GPU=70%，prefix cache + KV q4 开启） |
+| `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
-| `configs/rapid-mlx-35b-opt.conf` | rapid-mlx + Qwen3.6-35B-A3B 4bit |
-| `configs/qwen3-8b.conf` | vllm-mlx + Qwen3-8B（需 `HF_HUB_OFFLINE=1`） |
-| `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点 |
-| `configs/secret.local.conf` | **git-ignored**，存放真实 API Key |
-| `configs/archived/` | 归档的历史配置 |
+| `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点（`deepseek-v4-flash`） |
+| `configs/models.json` | 模型目录（providers/models/routes），`model_registry.py` 加载、SIGHUP 热重载；**删除后自动合成等价目录**，新增云端模型只需加条目（Phase A+） |
+| `configs/secret.local.conf` | **git-ignored**，存放真实 API Key（含分提供商 `ZHIPU_API_KEY`/`KIMI_API_KEY`，由目录 `key_env` 引用） |
+| `configs/archived/` | 归档的历史配置（qwen3-8b、rapid-mlx-9b、rapid-mlx-35b、thinkingcap-…-mtp 等） |
 
 配置文件中必须包含元数据：`CONFIG_NAME`、`CONFIG_DESC`、`CONFIG_MEMORY`，供 `./manage.sh list` 读取。
 
 ### 3.4 工具与文档
 
 - `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）等。
-- `docs/`：按 6 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标）。入口 [`docs/README.md`](docs/README.md)。
+- `docs/`：按 7 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标、项目看板 `07-project-board/`）。入口 [`docs/README.md`](docs/README.md)；根级关键文档含 `llama-defender-integration-requirements.md`（agent_go 集成契约）、`DEFECT-LIST.md`、`requirement-matrix.md`。
 - `test/`：自动化测试，见下节。
 - `logs/`：运行时日志、测试日志、metrics、快照（git-ignored）。
 - `assets/chat-templates/`：Qwen chat template 修复模板。
@@ -136,7 +141,9 @@ Client POST /v1/messages
 
 ```bash
 ./manage.sh start              # 按 active.conf 启动本地后端 + 代理
+./manage.sh start --profile aggressive  # 压缩策略：balanced（默认）/ aggressive / conservative
 ./manage.sh start-cloud        # 仅启动代理，转发到云端 API
+./manage.sh start-backend / stop-backend # 单独启停本地后端（优先用 stop-backend 优雅停止，避免 Metal 死锁）
 ./manage.sh stop               # 优雅停止后端和代理
 ./manage.sh restart            # stop + start
 ./manage.sh reload             # SIGHUP 热重载代理配置（不重启 proxy 进程，约 0.5s）
@@ -144,11 +151,14 @@ Client POST /v1/messages
 ./manage.sh logs [N]           # 查看后端日志（默认 50 行）
 ./manage.sh proxy-logs [N]     # 查看代理日志（默认 50 行）
 ./manage.sh list               # 列出所有可用配置
-./manage.sh switch <name>      # 切换 active.conf 软链
+./manage.sh switch <name>      # 切换 active.conf 软链（非交互）
 ./manage.sh current            # 显示当前配置详情
+./manage.sh wizard             # 交互式快速启动向导
 ./manage.sh watchdog [--daemon] # 后端健康监控，性能衰减时自动重启
+./manage.sh watchdog-status    # watchdog 结构化 JSON 状态
 ./manage.sh route-force-local <session_id>   # 强制会话走本地
 ./manage.sh route-force-cloud <session_id>   # 强制会话走云端
+./manage.sh monitor [N]        # Metal 内存实时监控（每 N 秒刷新，默认 5）
 ./manage.sh fix-template <dir> # 修复 Qwen chat_template
 ```
 
@@ -171,7 +181,24 @@ python3 anthropic_proxy.py                              # 监听 127.0.0.1:4000
 LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 ```
 
-代理支持的端点：`GET /v1/models`、`POST /v1/messages`（流式 + 非流式）、`OPTIONS`、`GET /status` 等（部分在 `admin_server.py` 实现）。
+**双协议端点**：`POST /v1/messages`（Anthropic 格式，主端点，流式 + 非流式）**和** `POST /v1/chat/completions`（OpenAI 格式，经 `convert_openai_request_to_anthropic` 转换入管线，`_openai_mode` 下原样返回 OpenAI 格式响应）。另有 `GET /v1/models`、`OPTIONS`。
+
+**结构化 Admin API**（供 agent_go / 外部编排器使用，部分在 `admin_server.py` 实现）：
+
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| GET | `/api/status` | 结构化健康与就绪状态：`proxy`、`backend`、`active_profile`、`state`、`ready` |
+| GET | `/api/watchdog` | watchdog 状态：`enabled`、`running`、`pid`、`restart_count_1h`、`last_failure_reason` |
+| GET | `/api/profiles` | 可用模型配置列表：`name`、`desc`、`memory_gb`、`active` |
+| GET | `/metrics[?n=N]` | 最近请求指标（JSON） |
+| GET | `/metrics/history` | 历史指标（JSON） |
+| POST | `/admin/route/force-local` / `force-cloud` | 会话级路由覆盖 |
+| GET | `/status` | 人类可读 HTML 状态页 |
+
+- `/api/status` 在 `state` 为 `healthy` 或 `starting` 时返回 200，否则 503（同 JSON body）。`state` 枚举：`healthy | starting | backend_down | proxy_down | model_drift | down`。
+- `ready` 表示后端模型已加载、可接受推理请求（`starting` → `ready=false`），agent_go 的 `wait_ready` 以此字段为准。
+- 路由响应头：每个路由响应带 `X-Actual-Model`、`X-Route-Target`、`X-Route-Reason`；单请求路由覆盖用请求头 `X-Proxy-Route-To: local|cloud`（无会话粘性）。
+- **R8-R12 待做**（见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)，顺序 R8→R9→R10→R11→R12）：R8 路由归因头补 `X-Proxy-Route-Cost`、R9 `GET /api/route/policies`、R10 `/v1/models` 能力元数据、R11 `/api/status` 增 `route_config`、R12 `POST /admin/reload`（HTTP 热重载）。
 
 ### 4.4 后端类型自动检测
 
@@ -180,7 +207,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 - URL 包含 `deepseek`、`openai`、`api.` → `cloud`
 - 否则 → `local`
 
-`MODEL_NAME` 也会自动设置（local 默认 `mlx-community/Qwen3.6-35B-A3B-4bit`，cloud 默认 `deepseek-v4-pro`）。
+`MODEL_NAME` 也会自动设置（local 默认 `mlx-community/Qwen3.6-35B-A3B-4bit`，cloud 默认 `deepseek-v4-pro`；`deepseek-chat.conf` 显式设为 `deepseek-v4-flash`）。这些默认值由 `backend_strategy.py` 的 `LocalStrategy` / `CloudStrategy` 提供。
 
 ---
 
@@ -192,7 +219,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | 层级 | 命令 | 依赖 | 说明 |
 |------|------|------|------|
-| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，约 826 个用例，<1s |
+| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，24 个文件约 910 个用例，<1s |
 | 集成 | `bash test/run_tests.sh --integration` | 启动 mock backend | `test/integration/*.sh` + `mock_backend.py`，约 60s |
 | Promptfoo | `bash test/run_tests.sh --promptfoo` | 运行中的代理 | 固定 prompt 回归测试（9 个用例） |
 | E2E | `bash test/run_tests.sh --e2e` | 运行中的代理 + 后端 | `test/e2e/*` |
@@ -234,7 +261,7 @@ git commit --no-verify               # 绕过所有钩子
 
 ### 5.3 何时运行什么测试
 
-- 修改 `anthropic_proxy.py`：必须跑 `bash test/run_tests.sh --all`（特别容易破坏流式/非流式工具调用、阻塞检测、云端模式）。
+- 修改 `anthropic_proxy.py` / `pipeline.py`：必须跑 `bash test/run_tests.sh --all`（特别容易破坏流式/非流式工具调用、阻塞检测、云端模式、双协议端点）。
 - 修改 `manage.sh`：必须测试 `start`、`stop`、`restart`、`reload`、`switch <name> && reload`、本地/云端两种模式。
 - 修改 `proxy_state.py` / `proxy_config.py`：跑 `--unit` + `--trace`。
 - 修改任何模块的函数签名或行为契约：跑 `--signature` + `--snapshot`。
@@ -258,6 +285,7 @@ git commit --no-verify               # 绕过所有钩子
 - `proxy_config.py` 的 `CONFIG_REGISTRY` 是配置元数据的权威来源，CLAUDE.md / AGENTS.md / docs 应引用它而不是重复写死默认值。
 - `anthropic_proxy.py` 顶部使用 `from proxy_state import *` 导入所有常量。
 - 辅助函数多为模块级函数；只有一个 `Handler` 类处理 HTTP。
+- 新增管线阶段：继承 `PipelineStage`，保持为已抽取模块之上的薄封装（deferred import 规避 `proxy_state` 循环依赖），并在 `test/unit/test_pipeline_stages.py` 补测试。
 - 日志同时输出到 stdout 和 `/tmp/anthropic_proxy.log`。
 
 ### 6.3 配置文件
@@ -270,7 +298,7 @@ git commit --no-verify               # 绕过所有钩子
 
 ### 6.4 文档
 
-- `docs/` 下 6 类目录结构固定；新增文档按命名规范放入对应目录（见 `docs/README.md`）。
+- `docs/` 下 7 类目录结构固定；新增文档按命名规范放入对应目录（见 `docs/README.md`）。
 - 日期后缀使用 `YYYYMMDD`。
 - 修改架构约定后，必须同步更新 `CLAUDE.md` 与本文件。
 
@@ -320,13 +348,14 @@ git commit --no-verify               # 绕过所有钩子
 
 ### 8.2 vllm-mlx 启动
 
-- `vllm-mlx` v0.6.71 若无法连接 HuggingFace 会在启动时挂起。
-- 配置中必须加 `export HF_HUB_OFFLINE=1`，见 `configs/qwen3-8b.conf`。
+- `vllm-mlx` v0.6.71 若无法连接 HuggingFace 会在启动时挂起（无报错输出的 `ConnectTimeout` 重试循环）。
+- 相关配置中必须加 `export HF_HUB_OFFLINE=1`，见 `configs/archived/qwen3-8b.conf`。
 
 ### 8.3 KV-cache / prefix-cache turboquant
 
 - Rapid-MLX 如果需要跨重启保留 prefix cache，**不要**使用 `--kv-cache-turboquant`。
 - 见 `configs/rapid-mlx-35b-opt.conf` 说明。
+- Prefix cache 现状：rapid-mlx **0.11.5** 起重新启用跨请求 prefix cache（active 配置 `RAPID_MLX_ENABLE_PREFIX_CACHE=true`）；旧的 0.6.71 BatchedEngine 不支持（PagedCache 仅提供请求内 KV 管理）。KV 量化用 `RAPID_MLX_KV_QUANTIZATION=true` + 4 bits。
 
 ### 8.4 工具结果清除死亡循环
 
@@ -363,7 +392,7 @@ git commit --no-verify               # 绕过所有钩子
 在提交前，根据改动范围执行对应检查：
 
 - [ ] **如果修改 `manage.sh`**：手动测试 `start`、`stop`、`restart`、`reload`、`start-backend`、`stop-backend`、`status`、`switch <name> && reload` 在本地与云端模式下是否都正常。
-- [ ] **如果修改 `anthropic_proxy.py`**：运行 `bash test/run_tests.sh --all`；重点检查流式/非流式工具调用、阻塞检测、云端模式。
+- [ ] **如果修改 `anthropic_proxy.py` / `pipeline.py`**：运行 `bash test/run_tests.sh --all`；重点检查流式/非流式工具调用、阻塞检测、云端模式、双协议端点（`/v1/chat/completions`）。
 - [ ] **如果新增配置变量**：在 `manage.sh` 加默认值，在 `proxy_config.py` 的 `CONFIG_REGISTRY` 注册，并同步更新 `CLAUDE.md` 与本文件。
 - [ ] **如果新增后端/云服务商**：更新 `anthropic_proxy.py` 中的 `BACKEND_TYPE` 自动检测逻辑与 URL 模式文档。
 - [ ] **如果修改截断、循环检测、阻塞逻辑**：对照 `docs/DEFECT-LIST.md` 检查是否重新引入已知 P0 问题。
@@ -380,6 +409,7 @@ git commit --no-verify               # 绕过所有钩子
 | 上下文压缩策略 | [`docs/research-context-optimization/06-context-compression-strategy.md`](docs/research-context-optimization/06-context-compression-strategy.md) |
 | 上下文窗口/截断设计 | [`docs/02-architecture-design/proxy-context-window-design.md`](docs/02-architecture-design/proxy-context-window-design.md) |
 | 智能模型路由 | [`docs/02-architecture-design/intelligent-model-routing-design.md`](docs/02-architecture-design/intelligent-model-routing-design.md) |
+| agent_go 集成契约（R1-R12） | [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md) |
 | 已知缺陷列表 | [`docs/DEFECT-LIST.md`](docs/DEFECT-LIST.md) |
 | 故障记录与 workaround | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) |
 | 性能基线 | [`BENCHMARK.md`](BENCHMARK.md) |

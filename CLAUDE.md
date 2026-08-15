@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-This directory is **not** the llama.cpp C++ source — it's an orchestration layer that wraps an LLM backend and exposes an Anthropic-compatible API. Target: running Qwen-family models locally on Apple Silicon (M-series, 48 GB unified memory) **or** forwarding to cloud APIs (DeepSeek) for agentic coding with Claude Code.
+This directory is **not** the llama.cpp C++ source — it's an orchestration layer that wraps an LLM backend and exposes an Anthropic-compatible API. Target: running Qwen-family models locally on Apple Silicon (M-series, 48 GB unified memory) **or** forwarding to cloud APIs (DeepSeek) for agentic coding with Claude Code. The agent_go project calls this service "llama-defender" (see `docs/llama-defender-integration-requirements.md`).
 
 ```
 Local:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → llama-server | rapid-mlx :8081 → model
@@ -19,22 +19,28 @@ configuration directly** (no `~/.claude/settings.local.json` changes, no
 Core pieces:
 
 - **`manage.sh`** — Bash service manager. Sources `configs/active.conf`, applies defaults, starts local backend or cloud-only proxy.
-- **`anthropic_proxy.py`** — Python 3 stdlib-only HTTP proxy (port 4000). Entry point: `Handler` class (HTTP), request pipeline, truncation, `main()`. ~2891 lines (down from 5525 after Phase 0-3 refactoring, -48%).
-- **`proxy_state.py`** — Single source of truth for all PROXY_* config, shared mutable state, SIGHUP reload spec.
+- **`anthropic_proxy.py`** — Python 3 stdlib-only HTTP proxy (port 4000). Entry point: `Handler` class (HTTP), `main()`. ~1480 lines after Phase 0-4 refactoring; all message-processing logic now lives in `pipeline.py`.
+- **`pipeline.py`** — **The heart of the system**: ~24 composable, independently testable `PipelineStage` components. `Handler._handle_messages()` builds an `InstrumentedPipeline` that runs each request through: `RequestParser → LifecycleClassifier → DynamicMaxTokens → SmartRouter → RouteNotification → ErrorTranslator → BlockerDetector → SystemNormalizer → CacheAligner → ContentCompressor → ToolLoopDetector → TextLoopDetector → SessionLoopState → LoopIntervention → RereadDetector → DateNormalizer → ContextTruncator → HighDropRatioNotice → MessageHashDebug → OOMSafetyFIFO → PrefixRatioComputer → ToolPairingRepair → FormatConverter → BackendDispatcher`. Stages are thin wrappers around the extracted modules below; deferred imports avoid circular-import issues with `proxy_state` globals.
+- **`proxy_state.py`** — Single source of truth for all PROXY_* config, shared mutable state, SIGHUP reload spec (~1000 lines).
 - **`proxy_config.py`** — Canonical CONFIG_REGISTRY with per-variable defaults, types, scopes, validation.
+- **`backend_strategy.py`** — `LocalStrategy` / `CloudStrategy` classes (strategy pattern) encapsulating local vs cloud defaults and behavioral flags; replaced 38+ scattered `if IS_CLOUD` branches. Adding a new backend (Ollama, vLLM, …) only requires a new strategy class.
 
-Extracted modules (Phase 1-3):
+Extracted modules:
 
 | Module | Lines | Purpose |
 |--------|------|---------|
-| `tool_parser.py` | ~330 | XML→JSON fallback, content-tools extraction, streaming extractor |
-| `content_compressor.py` | ~320 | TokenSieve semantic compression for tool results |
-| `message_converter.py` | ~520 | Anthropic↔OpenAI bidirectional format conversion |
-| `lifecycle.py` | ~205 | Lifecycle stage classification, dynamic token budget |
-| `loop_detection.py` | ~332 | Loop/bloker detection, text similarity, intervention |
-| `tool_filter.py` | ~190 | Tool definition filtering, keyword extraction, error translation |
-| `admin_server.py` | ~980 | Status HTML dashboard, metrics, memory checks, concurrency |
-| `proxy_logging.py` | ~110 | Structured logging, JSONL requests/metrics |
+| `admin_server.py` | ~2650 | Status HTML dashboard, metrics, memory checks, concurrency, `/api/*` JSON endpoints |
+| `truncation.py` | ~1680 | Context truncation: single-pass content compression (L2 clearing + L4 thinking strip), smart truncation with tool-pair atomic protection (TS-2) |
+| `message_converter.py` | ~900 | Anthropic↔OpenAI bidirectional format conversion (incl. `convert_openai_request_to_anthropic` for the dual-protocol endpoint) |
+| `content_compressor.py` | ~560 | TokenSieve semantic compression + BM25 relevance-driven compression (TS-1) |
+| `tool_parser.py` | ~470 | XML→JSON fallback, content-tools extraction, streaming extractor |
+| `loop_detection.py` | ~410 | Loop/blocker detection, text similarity, intervention |
+| `tool_filter.py` | ~210 | Tool definition filtering, keyword extraction, error translation |
+| `lifecycle.py` | ~210 | Lifecycle stage classification, dynamic token budget |
+| `reload_config.py` | ~105 | SIGHUP hot-reload: re-read active.conf, update `proxy_state` + caller module |
+| `compression_types.py` | ~70 | TS-3 `CompressionResult` / `CompressionSubResult` TypedDicts (JSON-serializable, Py3.8+) |
+| `model_registry.py` | ~500 | Model catalog registry: loads/validates `configs/models.json` (providers/models/routes), `$env`/`$default` refs, fallback chains, hot-swap rejection, `catalog_hash`. Synthesizes a legacy-equivalent catalog when the file is absent — `MODEL_ROUTE_PREFERENCES` and `get_model_aliases()` derive from it |
+| `proxy_logging.py` | ~130 | Structured logging, JSONL requests/metrics |
 
 **`tools/extract_module.py`** — AST-based extraction tool with dual-patch test migration.
 
@@ -45,17 +51,18 @@ Extracted modules (Phase 1-3):
 ```bash
 ./manage.sh start                 # Start local backend + proxy with active.conf
 ./manage.sh start-cloud           # Start proxy only, forwarding to cloud API
+./manage.sh start --profile aggressive  # Compression strategy: balanced (default) | aggressive | conservative
 ./manage.sh stop                  # Graceful, then kill -9
 ./manage.sh status                # PID, memory, API health, current model
 ./manage.sh restart               # Stop + start
-./manage.sh logs [N]              # Tail last N lines (default 50)
-./manage.sh proxy-logs [N]        # Tail last N lines of proxy log
-./manage.sh list                  # All available configs
-./manage.sh switch <name>         # Symlink active.conf → <name>.conf
-./manage.sh current               # Current config details
+./manage.sh reload                # SIGHUP hot-reload of active.conf into the running proxy (~0.5s, idempotent)
+./manage.sh switch <name>         # Symlink active.conf → <name>.conf (non-interactive)
+./manage.sh logs [N] / proxy-logs [N]  # Tail backend / proxy log
+./manage.sh list / current        # All available configs / current config details
+./manage.sh wizard                # Interactive quick-start wizard
 ```
 
-Startup polls `http://host:port/v1/models` for up to 60 s to confirm readiness, then writes the PID file.
+Backend-only variants: `start-backend`, `stop-backend` (use graceful `stop-backend` — repeated `kill -9` can deadlock Metal; see below). Startup polls `http://host:port/v1/models` for up to 60 s to confirm readiness, then writes the PID file.
 
 Additional commands (see `./manage.sh help`):
 
@@ -64,29 +71,30 @@ Additional commands (see `./manage.sh help`):
 ./manage.sh watchdog-status                 # Structured JSON status of the watchdog
 ./manage.sh route-force-local <session_id>  # Force session to local (sensitive code, privacy)
 ./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
-                                      # --daemon: background process, logs to logs/watchdog.log
 ./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
 ./manage.sh fix-template <dir>        # Repair Qwen chat_template (DEF-007: prevents system message crashes)
 ```
 
 ## Available configurations
 
-Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` is a symlink to the currently active one.
+Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` is a symlink to the currently active one; retired configs live in `configs/archived/`; `configs/secret.local.conf` holds real API keys (gitignored, sourced by cloud configs).
 
-| Config | Backend | Model | Context | Memory | Use case |
-|--------|---------|-------|---------|--------|----------|
-| `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | (API limit) | N/A | Cloud API, no local backend |
-| `rapid-mlx-35b` | rapid-mlx | Qwen3.6-35B-A3B 4bit MLX | (model max) | ~14–18 GB | Programming, 36% faster than llama-server, **concurrency=1 required** |
-| `rapid-mlx-9b` | rapid-mlx | Qwen3.6-9B-A3B 4bit MLX | (model max) | ~8–10 GB | Lighter alternative for constrained memory |
-| `gemma4-26b` | rapid-mlx | gemma-4-26b-it | (model max) | ~26 GB | Gemma 4 26B via rapid-mlx |
+| Config | Backend | Model | Memory | Use case |
+|--------|---------|-------|--------|----------|
+| `rapid-mlx-35b-opt` (active) | rapid-mlx | Qwen3.6-35B-A3B-UD-MLX-4bit | ~14–18 GB | Default: 35B MoE dynamic quant, GPU=70%, prefix cache + KV q4 on |
+| `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative, tool clearing off |
+| `gemma4-26b` | rapid-mlx | gemma-4-26b-it | ~14–16 GB | Gemma 4 26B, concurrency=2, temp 0.2 |
+| `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | N/A | Cloud API, no local backend |
+
+Each config sets `LLAMA_*` env vars (backend, model, port, context, sampling, KV-cache type, thinking mode) plus `RAPID_MLX_*` vars (tool/reasoning parsers, prefix cache, KV quantization, extra args — e.g. `RAPID_MLX_TOOL_PARSER="qwen3_coder_xml"`, `RAPID_MLX_REASONING_PARSER="qwen3"`). Metadata fields (`CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY`) are read by `./manage.sh list`. Defaults for any unset variable are applied in `manage.sh` itself.
+
+**Model catalog** (`configs/models.json`, loaded by `model_registry.py`, hot-reloaded on SIGHUP): declarative providers (endpoints + `key_env` + concurrency, keys live in `secret.local.conf`), models (price/capabilities/quirks — glm-5.x, k3, deepseek-v4-*), and routes (alias → cloud-model binding with optional fallback chains). Deleting the file synthesizes a legacy-equivalent catalog — behavior identical to the pre-catalog hardcode. Route preferences rebuild on reload, so `$env` refs track the live `PROXY_CLOUD_MODEL`.
 
 > **⚠️ rapid-mlx OOM 防范** (48GB unified memory):
-> - `PROXY_MAX_CONCURRENT=1` — 两个 38K+ token 请求并发必然 OOM
-> - `--gpu-memory-utilization 0.60` — rapid-mlx 的 `allocation_limit` 是**软限制**，实际使用会超出 20-40%（如 limit=28GB 实际冲到 37GB）。降低 limit 让引擎更早节流
-> - 前缀缓存堆积到 6GB+ 后，再叠加一个大请求 prefill 极易触发 `[METAL] Insufficient Memory`。`--cache-memory-percent 0.30` + memory-aware cache 动态回收是必须的
-> - 实测：并发=1 + utilization=60% 后，单 38K 请求稳定运行（TTFT ~28s），无 OOM
-
-Each config sets `LLAMA_*` env vars (model, port, context, sampling, KV-cache type, thinking mode, extra args) plus optional `RAPID_MLX_*` vars. Metadata fields (`CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY`) are read by `./manage.sh list`. Defaults for any unset variable are applied in `manage.sh` itself.
+> - `PROXY_MAX_CONCURRENT=1`（gemma4 配置为 2）— 两个 38K+ token 请求并发必然 OOM
+> - `--gpu-memory-utilization 0.70` + `--max-num-seqs 1` + `--cache-memory-mb 4096` — rapid-mlx 的 `allocation_limit` 是**软限制**，实际使用会超出 20-40%。降低 limit 让引擎更早节流
+> - 前缀缓存堆积后，再叠加一个大请求 prefill 极易触发 `[METAL] Insufficient Memory`；Phase 3 memory-aware guardrails（`_should_reject_for_memory`、dynamic `max_tokens`、dynamic concurrency）是必须的
+> - 实测：并发=1 + GPU=70% 后，单 38K 请求稳定运行（TTFT ~28s），无 OOM
 
 ## Proxy
 
@@ -95,7 +103,7 @@ python3 anthropic_proxy.py                                            # listens 
 LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 ```
 
-Endpoints: `GET /v1/models`, `POST /v1/messages` (streaming + non-streaming), `OPTIONS`. Stateless, no third-party deps.
+**Dual-protocol endpoints**: `POST /v1/messages` (Anthropic format, primary) **and** `POST /v1/chat/completions` (OpenAI format, converted via `convert_openai_request_to_anthropic` then passed through). Also `GET /v1/models`, `OPTIONS`. Stateless, no third-party deps.
 
 **Structured admin APIs** (for `agent_go` / external orchestrators):
 
@@ -104,43 +112,35 @@ Endpoints: `GET /v1/models`, `POST /v1/messages` (streaming + non-streaming), `O
 | GET | `/api/status` | Structured service health & readiness | JSON: `proxy`, `backend`, `active_profile`, `state`, `ready` |
 | GET | `/api/watchdog` | Watchdog state | JSON: `enabled`, `running`, `pid`, `last_restart_at`, `restart_count_1h`, `last_failure_reason` |
 | GET | `/api/profiles` | Available model configs | JSON: `profiles[]` with `name`, `desc`, `memory_gb`, `active` |
-| GET | `/status` | Human-readable HTML status page | HTML |
 | GET | `/metrics[?n=N]` | Recent request metrics | JSON |
+| GET | `/metrics/history` | Historical metrics | JSON |
+| POST | `/admin/route/force-local` / `force-cloud` | Session-level route override | JSON |
+| GET | `/status` | Human-readable HTML status page | HTML |
 
-- `/api/status` returns `200` when `state` is `healthy` or `starting`, otherwise `503` with the same JSON body.
-- `ready` means the backend model is loaded and can accept inference requests (`starting` → `ready=false`).
-- `/api/profiles` reads `CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY` from `configs/*.conf`; `memory_gb` is `null` for cloud configs without a numeric estimate.
-- Watchdog auto-restart events are logged to `logs/watchdog_state.json` and surfaced by both `GET /api/watchdog` and `./manage.sh watchdog-status`.
-- Lifecycle events (`service_start`, `service_stop`, `service_restart`, `config_reload`, `profile_switch`, `watchdog_auto_restart`) are appended to `logs/lifecycle_events.jsonl` as `{ts, event, detail}`.
+- `/api/status` returns `200` when `state` is `healthy` or `starting`, otherwise `503` with the same JSON body. `state` enum: `healthy | starting | backend_down | proxy_down | model_drift | down`.
+- `ready` means the backend model is loaded and can accept inference requests (`starting` → `ready=false`). `agent_go`'s `wait_ready` polls this field.
+- Watchdog auto-restart events are logged to `logs/watchdog_state.json`; lifecycle events (`service_start`, `config_reload`, `profile_switch`, `watchdog_auto_restart`, …) to `logs/lifecycle_events.jsonl`.
 
-**Dual-mode auto-detection**: `BACKEND_TYPE` is automatically inferred from
-`LLAMA_BASE_URL`:
-- Contains `deepseek` / `openai` / `api.` → `cloud`
-- Otherwise → `local`
+**llama-defender integration** (`docs/llama-defender-integration-requirements.md`): R1-R7 are **delivered** (structured status, readiness semantics, manage.sh call contract, profiles/watchdog APIs). **R8-R12 are pending**, in order R8 → R9 → R10 → R11 → R12: R8 route-attribution response headers (`X-Proxy-Route-Cost` — `X-Actual-Model`/`X-Route-Target`/`X-Route-Reason` already exist), R9 `GET /api/route/policies`, R10 `/v1/models` capability metadata, R11 `/api/status` `route_config` block, R12 `POST /admin/reload` (HTTP hot-reload).
 
-`MODEL_NAME` is auto-set accordingly (local: `mlx-community/Qwen3.6-35B-A3B-4bit`,
-cloud: `deepseek-v4-pro`). Manual override via `MODEL_NAME` env var is supported
-but rarely needed.
+**Dual-mode auto-detection**: `BACKEND_TYPE` is automatically inferred from `LLAMA_BASE_URL`: contains `deepseek` / `openai` / `api.` → `cloud`, otherwise → `local`. `MODEL_NAME` auto-set accordingly; manual override via env var is rarely needed.
 
 | Mode | `LLAMA_BASE_URL` | `MODEL_NAME` (auto) | `LLAMA_API_KEY` | `PROXY_MAX_CONCURRENT` |
 |------|------------------|---------------------|-----------------|------------------------|
 | Local | `http://127.0.0.1:8081/v1` | `mlx-community/Qwen3.6-35B-A3B-4bit` | Dummy (`sk-1234`) | `1` |
-| Cloud (DeepSeek) | `https://api.deepseek.com/v1` | `deepseek-v4-pro` | **Real key** | `4` |
+| Cloud (DeepSeek) | `https://api.deepseek.com/v1` | `deepseek-v4-pro` (auto default; `deepseek-chat.conf` sets `deepseek-v4-flash`) | **Real key** | `4` |
 
-When using DeepSeek's Anthropic-compatible endpoint, `claude-opus` maps to
-`deepseek-v4-pro` and `claude-haiku`/`sonnet` map to `deepseek-v4-flash`.
+DeepSeek model mapping: `deepseek-v4-pro[1m]` ↔ `deepseek-v4-pro` (thinking), `deepseek-v4-flash` ↔ `deepseek-v4-flash`. Legacy `deepseek-chat`/`deepseek-reasoner` names were deprecated 2026-07-24.
 
-**Intelligent Model Routing** (Phase 1-3): The proxy can auto-route requests between
-local and cloud backends based on context size, memory pressure, and session state.
-- **Enable**: `PROXY_ROUTE_ENABLED=true` in config (default: `false`, backward-compatible)
+**Intelligent Model Routing** (SmartRouter stage): auto-routes requests between local and cloud backends based on context size, memory pressure, and session state.
+- **Enable**: `PROXY_ROUTE_ENABLED=true` (default `false`, backward-compatible)
 - **Threshold**: `PROXY_ROUTE_THRESHOLD_CHARS=90000` — requests above this route to cloud
 - **Cloud model**: `PROXY_CLOUD_MODEL=deepseek-v4-flash` (default), `deepseek-v4-pro` for quality
 - **API Key**: `PROXY_CLOUD_API_KEY` must be set in `secret.local.conf` for cloud routing
-- **Fallback**: `PROXY_ROUTE_FALLBACK_ENABLED=true` — cloud failure → emergency truncation → local retry
+- **Fallback**: `PROXY_ROUTE_FALLBACK_ENABLED=true` — cloud failure → emergency truncation → local retry; cloud circuit-breaker with cooldown
 - **Daily budget**: `PROXY_ROUTE_DAILY_BUDGET=5.0` — caps daily cloud cost (0 = unlimited)
-- **Cost tracking**: `/status` page shows real-time cloud cost, `/v1/models` returns stable aliases
-- **Session control**: `./manage.sh route-force-local <sid>` / `route-force-cloud <sid>`
-- **Response headers**: `X-Actual-Model`, `X-Route-Target`, `X-Route-Reason` on every response
+- **Session control**: `./manage.sh route-force-local <sid>` / `route-force-cloud <sid>`; **per-request override**: `X-Proxy-Route-To: local|cloud` request header (no session stickiness)
+- **Response headers**: `X-Actual-Model`, `X-Route-Target`, `X-Route-Reason` on every routed response
 
 Model ID → route preference mapping (preference only, safety always overrides):
 | Agent Model ID | Route Bias | Threshold | Cloud Model |
@@ -151,31 +151,22 @@ Model ID → route preference mapping (preference only, safety always overrides)
 
 ## Key implementation details
 
-- **Model loading**: `LLAMA_MODEL` starting with `/` or `./` is treated as a local path (`-m`); otherwise it's a HuggingFace ID (`-hf`).
+- **Model loading**: `LLAMA_MODEL` starting with `/` or `./` is treated as a local path (`-m`); otherwise it's a HuggingFace ID (`-hf`). Local model artifacts live in `models/` (GGUF + MLX).
 - **Thinking mode**: `LLAMA_THINKING=false|true` → `--chat-template-kwargs '{"enable_thinking":...}'`. Empty string skips the flag (use for models that don't support thinking, e.g., Qwen2.5).
-- **KV cache**: Default `q8_0` for both K and V — Unsloth's recommendation for Qwen to avoid f16 accuracy degradation.
-- **Context management defaults tied to backend type**: `PROXY_CLEAR_ENABLED`, `PROXY_TOOL_KEEP`, `PROXY_CTX_LIMIT_ENABLED`, and `PROXY_CTX_CHARS_LIMIT` all have **backend-type-aware defaults** (see `AGENTS.md` and `docs/research-context-optimization/06-context-compression-strategy.md` for the full strategy):
-  - **Cloud** (DeepSeek/OpenAI): clearing **disabled** (1M+ token context), ctx-limit **disabled**
-  - **Local** (llama-server/rapid-mlx): clearing **disabled by default** (rapid-mlx returns `Wasted call` for unchanged re-reads, causing death loops), ctx-limit **enabled** (limit=180K chars)
-  - Override via env vars if needed, but the defaults handle the common case.
-- **Concurrency caveat**: `llama-server` on Metal time-slices a single GPU; 2+ concurrent requests cause severe latency spikes. Rapid-MLX handles 2–4 concurrent requests much better. The proxy controls this via `PROXY_MAX_CONCURRENT` (default `1` for llama-server configs, `4` for Rapid-MLX configs) using a `threading.Semaphore`.
-- **Rapid-MLX `max_tokens` bug** (v0.6.30): parameter is accepted but ignored — generations can run far past the limit. Use `llama-server` when token limits matter.
-- **Rapid-MLX OOM on Apple Silicon** (48GB): `allocation_limit` is a soft target, not a hard wall. Prefill-phase activations + KV cache + prefix cache can overshoot by 20-40%. Known crash signature: `[METAL] Command buffer execution failed: Insufficient Memory`. Mitigation: `PROXY_MAX_CONCURRENT=1`, `--gpu-memory-utilization 0.75`, Phase 3 memory-aware guardrails (`_should_reject_for_memory`, dynamic `max_tokens`, dynamic concurrency), and avoid >40K token contexts when cache is already >6GB. `forced cache clear` at 30GB threshold does not prevent the crash.
-- **Error classification and retry (DEF-001)**: `_classify_exception(e)` classifies unhandled `do_POST` exceptions as 503 (OOM/connection refused, retryable), 504 (timeout, retryable), or 500 (programming error, not retryable). Retryable errors include a `Retry-After` header (default 30s via `PROXY_RETRY_AFTER_SECONDS`) and `"retryable": true` in the JSON body, allowing well-behaved clients to back off automatically. Detection uses both exception class and message-substring matching (rapid-mlx raises generic `RuntimeError`).
-- **Tool-call fallback layers**: the proxy recognises tool calls in three increasing-cost layers — structured `tool_calls` JSON (preferred; Qwen3.x, Rapid-MLX), `parse_tool_arguments` XML→JSON salvage on the args string (`<tool_call>` / `<function=…>` quirks of llama.cpp issue #21495), and `_extract_content_tool_calls` content-text fallback for `<tools>...</tools>` blocks (some Qwen models under Q4 quantisation emit these instead of populating `tool_calls`). Structured tool_calls always win when present. Gate: `PROXY_CONTENT_TOOLS_FALLBACK` (default `true`).
-- **Cloud API forwarding**: In cloud mode, the proxy skips the local backend lock
-  (`_llama_lock`) and forwards directly to the cloud API with the real
-  `LLAMA_API_KEY`. Token counting uses `usage.prompt_tokens` / `completion_tokens`
-  from the cloud response instead of `timings.*`.
-- **Cloud cost**: DeepSeek `deepseek-v4-pro` costs ~¥2–8 per million tokens.
-  A typical agentic coding task (56K tokens × 20 requests) costs approximately
-  ¥1–3. Monitor via `REQ_SUMMARY` lines in proxy logs.
-- **MTP (Multi-Token Prediction)**: Qwen3.6 supports MTP for ~1.15–1.4× faster generation. Requires MTP-specific GGUF models and a llama-server built from source with `--spec-type draft-mtp` support (Brew version lacks this). Use `--spec-type draft-mtp --spec-draft-n-max 2` in `LLAMA_EXTRA_ARGS`. Config: `qwen3.6-27b-mtp.conf`. Performance benchmark: `python3 tools/bench_mtp.py --quick`.
-- **Testing**: all tests live under `test/` with three tiers — `test/unit/` (pure logic, no I/O, runs in <1s), `test/integration/` (boots a mock backend, no LLM needed, ~5s), `test/e2e/` (requires a running proxy + backend, ~30-60s). Unified runner at `test/run_tests.sh` with `--unit`/`--integration`/`--e2e`/`--all` flags. A pre-commit hook at `.githooks/pre-commit` runs `--unit` on every commit; install via `git config core.hooksPath .githooks`. Skip with `SKIP_TESTS=1 git commit …` (or `git commit --no-verify` to bypass all hooks). When modifying `anthropic_proxy.py`, run all three tiers — tool-call paths (streaming and non-streaming), blocker detection, and cloud mode (e.g., `./manage.sh start-cloud`) are all easy to break.
-- **vllm-mlx startup requires `HF_HUB_OFFLINE=1`** (v0.6.71): backend tries to reach `huggingface.co` at startup; network failure causes `ConnectTimeout` retry loop with no error output. Add `export HF_HUB_OFFLINE=1` to the config file.
-- **Cross-request prefix cache unavailable in BatchedEngine**: rapid-mlx v0.6.71 BatchedEngine does not integrate MemoryAwarePrefixCache. Old non-batched engine (colocated with v0.6.71 binaries) had it working at 98-99% hit rate. PagedCache (block-level) only provides within-request KV management.
+- **KV cache**: Default `q8_0` for both K and V on llama-server; rapid-mlx configs use `RAPID_MLX_KV_QUANTIZATION=true` with 4 bits.
+- **Context management defaults tied to backend type** (`backend_strategy.py` is the source of these defaults): cloud = clearing disabled (1M+ context), ctx-limit disabled; local = ctx-limit enabled (180K chars), clearing configurable per config (`rapid-mlx-35b-opt` enables clearing, `qwen3.6-27b-4bit` disables it — rapid-mlx returns `Wasted call` for unchanged re-reads, which interacts with clearing to cause file-re-read death loops). See `docs/research-context-optimization/06-context-compression-strategy.md` for the full strategy.
+- **Concurrency caveat**: `llama-server` on Metal time-slices a single GPU; 2+ concurrent requests cause severe latency spikes. The proxy controls this via `PROXY_MAX_CONCURRENT` (default `1` local, `4` cloud/rapid-mlx) using a `threading.Semaphore`, plus `PROXY_DYNAMIC_CONCURRENT_*` guardrails.
+- **Rapid-MLX `max_tokens` bug** (observed on v0.6.30): parameter is accepted but ignored — generations can run far past the limit. `DynamicMaxTokens` + `PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO=1.0` mitigate; use `llama-server` when hard token limits matter.
+- **Rapid-MLX OOM on Apple Silicon** (48GB): `allocation_limit` is a soft target, not a hard wall — prefill activations + KV cache + prefix cache can overshoot 20-40%. Crash signature: `[METAL] Command buffer execution failed: Insufficient Memory`. Mitigation: `PROXY_MAX_CONCURRENT=1`, `--gpu-memory-utilization 0.70`, Phase 3 memory-aware guardrails (`_should_reject_for_memory`, dynamic `max_tokens`, dynamic concurrency). Avoid >40K token contexts when cache is already >6GB.
+- **Prefix cache**: re-enabled on rapid-mlx 0.11.5 (`RAPID_MLX_ENABLE_PREFIX_CACHE=true` in active config). Older 0.6.71 BatchedEngine lacked cross-request prefix cache (PagedCache was within-request only).
+- **HF_HUB_OFFLINE=1**: vllm-mlx tries to reach huggingface.co at startup; network failure causes a silent `ConnectTimeout` retry loop. Add `export HF_HUB_OFFLINE=1` to configs where relevant.
+- **Error classification and retry (DEF-001)**: `_classify_exception(e)` classifies unhandled `do_POST` exceptions as 503 (OOM/connection refused, retryable), 504 (timeout, retryable), or 500 (programming error, not retryable). Retryable errors include a `Retry-After` header (default 30s via `PROXY_RETRY_AFTER_SECONDS`) and `"retryable": true` in the JSON body. Rapid-mlx raises generic `RuntimeError`, so detection also matches message substrings.
+- **Tool-call fallback layers**: three increasing-cost layers — structured `tool_calls` JSON (preferred; Qwen3.x), `parse_tool_arguments` XML→JSON salvage on the args string (`<tool_call>` / `<function=…>` quirks of llama.cpp issue #21495), and `_extract_content_tool_calls` content-text fallback for `<tools>...</tools>` blocks. Structured tool_calls always win when present. Gate: `PROXY_CONTENT_TOOLS_FALLBACK` (default `true`).
+- **Cloud API forwarding**: in cloud mode the proxy skips the local backend lock and forwards directly with the real `LLAMA_API_KEY`. Token counting uses `usage.prompt_tokens` / `completion_tokens` from the cloud response instead of `timings.*`.
+- **Cloud cost**: DeepSeek `deepseek-v4-pro` costs ~¥2–8 per million tokens; a typical agentic coding task costs ~¥1–3. Monitor via `REQ_SUMMARY` lines in proxy logs.
+- **MTP (Multi-Token Prediction)**: Qwen3.6 supports MTP for ~1.15–1.4× faster generation. Requires MTP-specific GGUF models and a llama-server built with `--spec-type draft-mtp` support (Brew version lacks this). Benchmark: `python3 tools/bench_mtp.py --quick`.
 - **Metal device deadlock**: after repeated `kill -9` on the backend process, Metal initialization can hang at `MLX step thread initialized`. Requires reboot to clear. Use `./manage.sh stop-backend` for graceful shutdown.
-- **`--gpu-memory-utilization 0.80` recommended** for 48GB machines. Default 0.90 leaves only ~3.6GB headroom; production peaks at 87.6%. >0.85 triggers kernel panic risk documentation in AGENTS.md.
+- **Testing**: all tests live under `test/` — `test/unit/` (pure logic, no I/O, <1s; 24 files, ~900 tests), `test/integration/` (boots a mock backend, no LLM, ~60s; 9 suites), `test/e2e/` (requires a running proxy + backend). Unified runner `test/run_tests.sh` with `--unit`/`--integration`/`--e2e`/`--all`/`--fast` flags. Single file: `python3 -m unittest discover -s test/unit -p 'test_tool_parser.py' -v`. Pre-commit hook at `.githooks/pre-commit` runs `--unit` on every commit (`git config core.hooksPath .githooks`); skip with `SKIP_TESTS=1 git commit …`. When modifying `anthropic_proxy.py` or `pipeline.py`, run all three tiers — tool-call paths (streaming and non-streaming), blocker detection, and cloud mode are all easy to break.
 
 ## Tools
 
@@ -190,12 +181,11 @@ Model ID → route preference mapping (preference only, safety always overrides)
 | `tools/context_stress_test.py` | Context-stress test: escalating payload sizes to test OOM boundaries |
 | `tools/cache_analyzer.py` | Prefix cache efficiency analysis (hit rate, miss patterns) |
 | `tools/monitor.py` | Periodic performance monitoring + Claude semantic action analysis |
-| `tools/trace_requirements.py` | Trace which requirements (R1-R7) are exercised by live traffic |
+| `tools/trace_requirements.py` | Trace which requirements (R1-R12) are exercised by live traffic |
 | `tools/monitor_proxy_live.sh` | Live HTTP traffic monitor for the proxy |
 | `tools/analyze_claude_semantics.py` | Claude Code semantic behavior analysis from logged requests |
 | `tools/analyze_experiment.py` | A/B experiment result analyzer |
 | `tools/promptfoo_eval.sh` | Promptfoo-based regression test runner |
-| `tools/promptfoo_report_merge.py` | Merge multiple promptfoo report JSONs |
 | `tools/logview.sh` | Unified log viewer for backend and proxy logs |
 | `tools/sysmon.sh` | System monitoring (memory, CPU, disk, processes) |
 | `tools/modelmon.sh` | Model service monitoring (process, download, API health) |
@@ -204,22 +194,25 @@ Model ID → route preference mapping (preference only, safety always overrides)
 
 ## Documentation
 
-Documents are organized under `docs/` in 6 categories (see `docs/README.md` for full index):
+Documents are organized under `docs/` in 7 categories (see `docs/README.md` for full index):
 
 | Category | Subdirectory | What it contains |
 |----------|-------------|------------------|
 | Requirements | `01-requirements-product/` | PRD, system requirements analysis |
-| Architecture | `02-architecture-design/` | Pipeline design, context window design, design reviews |
+| Architecture | `02-architecture-design/` | Pipeline design (`proxy-pipeline-reference.md`), context window design, design reviews |
 | Testing | `03-experiments-testing/` | A/B experiment guides, test strategy, benchmark methodology |
 | Analysis | `04-analysis-diagnostics/` | Dead-loop analysis, cache analysis, prompt instability, message analysis |
 | Operations | `05-operations-changelog/` | Optimization logs, config change records, monitoring reports |
 | Metrics | `06-reference-metrics/` | KPI definitions, structured summary evaluation |
+| Project board | `07-project-board/` | Task tracking boards |
 
 Key reference files outside `docs/`:
 - `AGENTS.md` — Full reference for config variables, format conversion details, known issues, security notes
+- `docs/llama-defender-integration-requirements.md` — agent_go integration contract (R1-R7 delivered, R8-R12 pending)
 - `TROUBLESHOOTING.md` — Known issues and workarounds (chat template, tool calling, OOM diagnostics)
 - `BENCHMARK.md` — Performance baseline measurements (M5 Pro 48GB)
 - `CHANGELOG.md` — Release history with P0-P3 defect tracking
+- `docs/DEFECT-LIST.md` — Defect registry (DEF-001…)
 - `promptfooconfig.yaml` — Promptfoo regression test suite configuration
 
 ## Performance monitoring
@@ -230,9 +223,6 @@ The proxy logs structured metrics to `logs/proxy_metrics.jsonl` (one JSON line p
 ```
 
 Use `tools/monitor.py` to generate summary reports with p50/p90/p99 latency, truncation rates, blocker triggers, and quality flag distributions. Request payloads are logged to `logs/proxy_requests.jsonl` for post-hoc analysis (enabled via `PROXY_SAVE_REQUESTS`).
-
-All automated tests live under `test/` (see `test/README.md`); the pre-commit hook
-at `.githooks/pre-commit` runs the fast `--unit` tier on every commit.
 
 ## Building llama-server from source
 
@@ -250,5 +240,6 @@ Set `LLAMA_SERVER_BIN` env var or update `tools/bench_mtp.py`'s `LLAMA_SERVER_BI
 ## Code style
 
 - `manage.sh`: `set -euo pipefail`. Private helpers prefixed `_`, public commands prefixed `cmd_`. User-facing strings and comments are in **Chinese**.
-- `anthropic_proxy.py` + `proxy_state.py` + `proxy_config.py`: **standard library only** — no third-party deps. `proxy_state.py` is the single source of truth for config constants and shared state (imported via `from proxy_state import *`). `anthropic_proxy.py` contains the 8-layer pipeline, helpers as module-level functions, and one `Handler` class. `proxy_config.py` contains CONFIG_REGISTRY metadata + validation. Logs to stdout *and* `/tmp/anthropic_proxy.log`.
+- Python modules: **standard library only** — no third-party deps. `proxy_state.py` is the single source of truth for config constants and shared state (imported via `from proxy_state import *`). `anthropic_proxy.py` holds the `Handler` class and `main()`; request processing lives in `pipeline.py` stages. Logs to stdout *and* `/tmp/anthropic_proxy.log`.
 - Config files: bash-sourcable `KEY="value"` syntax, Chinese section headers, self-contained (no includes), include the `CONFIG_NAME`/`CONFIG_DESC`/`CONFIG_MEMORY` metadata.
+- New pipeline stages: subclass `PipelineStage`, keep them thin wrappers over the extracted modules, and add a corresponding `test/unit/test_pipeline_stages.py` case.

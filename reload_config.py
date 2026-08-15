@@ -2,6 +2,7 @@
 import sys
 import threading
 
+import model_registry
 import proxy_state
 from proxy_logging import log
 
@@ -80,6 +81,22 @@ def reload_config(signum=None, frame=None, target_module=None):
             val = proxy_state._cast_config_value(raw, cast)
             setattr(proxy_state, py_name, val)
             setattr(target_module, py_name, val)
+
+        # Reload the model catalog (configs/models.json) and rebuild route
+        # preferences. Runs AFTER the _RELOAD_SPEC loop so "$env" references
+        # resolve against the freshly applied PROXY_CLOUD_MODEL. A rejected
+        # (invalid) catalog keeps the previous one serving — logged, not fatal.
+        model_registry.reload()
+        prefs = model_registry.build_route_preferences()
+        proxy_state.MODEL_ROUTE_PREFERENCES = prefs
+        setattr(target_module, "MODEL_ROUTE_PREFERENCES", prefs)
+        err = model_registry.last_error()
+        if err:
+            log("[RELOAD] %s" % err, level="WARN")
+        else:
+            log("[RELOAD] model catalog reloaded (source=%s, hash=%s)" % (
+                "file" if model_registry.is_loaded_from_file() else "synthesized",
+                model_registry.catalog_hash()))
 
         loop_thr = int(env.get("PROXY_LOOP_THRESHOLD", getattr(target_module, "PROXY_LOOP_THRESHOLD")))
         proxy_state.PROXY_LOOP_THRESHOLD = loop_thr

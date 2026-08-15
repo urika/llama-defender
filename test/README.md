@@ -23,7 +23,9 @@ test/
 │   ├── test_message_converter.py   # Anthropic↔OpenAI tool/tool_choice conversion, token estimation
 │   ├── test_content_compressor.py  # semantic compression (json/code/log/text) + audit fallback
 │   ├── test_tool_parser.py         # tool argument parsing, <tools> content extraction
-│   └── test_proxy_logging.py       # sensitive header masking, JSONL/structured logging
+│   ├── test_proxy_logging.py       # sensitive header masking, JSONL/structured logging
+│   └── test_model_registry.py      # model catalog: synthesis equivalence, $env/$default refs,
+│                                   # fallback chains, validation, hot-swap rejection, catalog_hash
 ├── integration/                    # boots a mock backend, no real LLM, ~60s (7 suites)
 │   ├── test_blocker_integration.sh
 │   ├── test_loop_integration.sh

@@ -1,0 +1,125 @@
+{
+  "_comment": "模型目录（Model Catalog）— Phase A 初始版。providers=部署拓扑, models=模型固有属性, routes=别名绑定策略。与 multi-cloud-model-catalog-design-20260815.md 对齐。删除本文件 => registry 合成等价目录（行为与 Phase A 前完全一致）。'$env' 表示跟随 PROXY_CLOUD_MODEL（热重载生效）；'$default' 表示取 defaults.cloud_model。glm/kimi 的 price 与部分 capabilities 为占位（未确认，Phase B/C 校准）；zhipu/kimi 的 OpenAI base_url 待 Phase B 验证。",
+
+  "providers": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/v1",
+      "anthropic_base_url": "https://api.deepseek.com/anthropic",
+      "anthropic_compatible": true,
+      "key_env": "PROXY_CLOUD_API_KEY",
+      "concurrent": 2
+    },
+    "zhipu": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "anthropic_base_url": "https://open.bigmodel.cn/api/anthropic",
+      "anthropic_compatible": true,
+      "key_env": "ZHIPU_API_KEY",
+      "concurrent": 2
+    },
+    "kimi": {
+      "base_url": "https://api.moonshot.cn/v1",
+      "anthropic_base_url": "https://api.kimi.com/coding/",
+      "anthropic_compatible": true,
+      "key_env": "KIMI_API_KEY",
+      "concurrent": 2
+    },
+    "local": {
+      "base_url_env": "LLAMA_BASE_URL",
+      "key_env": "LLAMA_API_KEY",
+      "concurrent_env": "PROXY_MAX_CONCURRENT",
+      "anthropic_compatible": false
+    }
+  },
+
+  "models": {
+    "deepseek-v4-pro": {
+      "provider": "deepseek",
+      "tier": "flagship",
+      "price": {"input": 2.0, "output": 8.0, "currency": "CNY"},
+      "capabilities": {"thinking": "required", "json": "strict", "context_tokens": 1000000},
+      "request_quirks": {}
+    },
+    "deepseek-v4-flash": {
+      "provider": "deepseek",
+      "tier": "fast",
+      "price": {"input": 0.5, "output": 1.5, "currency": "CNY"},
+      "capabilities": {"thinking": "unsupported", "json": "loose", "context_tokens": 128000},
+      "request_quirks": {"force_thinking_disabled": true}
+    },
+    "glm-5.3": {
+      "provider": "zhipu",
+      "tier": "flagship",
+      "capabilities": {"thinking": "supported", "context_tokens": 1000000},
+      "request_quirks": {}
+    },
+    "glm-5.2": {
+      "provider": "zhipu",
+      "tier": "flagship",
+      "capabilities": {"thinking": "supported", "context_tokens": 1000000},
+      "request_quirks": {}
+    },
+    "glm-5.1": {
+      "provider": "zhipu",
+      "tier": "flagship",
+      "capabilities": {"thinking": "supported"},
+      "request_quirks": {}
+    },
+    "glm-4.5-air": {
+      "provider": "zhipu",
+      "tier": "fast",
+      "request_quirks": {}
+    },
+    "k3": {
+      "provider": "kimi",
+      "tier": "flagship",
+      "capabilities": {"thinking": "supported", "context_tokens": 1000000},
+      "request_quirks": {}
+    },
+    "kimi-for-coding": {
+      "provider": "kimi",
+      "tier": "flagship",
+      "request_quirks": {}
+    },
+    "kimi-for-coding-highspeed": {
+      "provider": "kimi",
+      "tier": "fast",
+      "request_quirks": {}
+    },
+    "local-default": {
+      "provider": "local",
+      "tier": "standard",
+      "price": {"input": 0, "output": 0, "currency": "CNY"},
+      "capabilities": {"thinking": "supported", "json": "loose", "context_tokens": 131072},
+      "request_quirks": {}
+    }
+  },
+
+  "routes": {
+    "claude-sonnet-4-6": {
+      "route_bias": "auto",
+      "cloud_model": "$default",
+      "behavior": "prefer",
+      "threshold_factor": 1.0,
+      "memory_bias": 0
+    },
+    "claude-opus-4-7": {
+      "route_bias": "prefer_cloud",
+      "cloud_model": "deepseek-v4-pro",
+      "behavior": "force_fallback",
+      "threshold_factor": 0.8,
+      "memory_bias": -5
+    },
+    "claude-haiku-4-5": {
+      "route_bias": "prefer_local",
+      "cloud_model": "$default",
+      "behavior": "prefer",
+      "threshold_factor": 1.33,
+      "memory_bias": 0
+    }
+  },
+
+  "defaults": {
+    "cloud_model": "$env",
+    "daily_budget": 5.0
+  }
+}

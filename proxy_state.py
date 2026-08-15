@@ -15,6 +15,8 @@ import subprocess
 import threading
 import time
 
+import model_registry
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -517,30 +519,18 @@ def _detect_client_type(user_agent: str) -> str:
     return "unknown"
 
 
-# Model ID → route preference mapping (preference only, safety always overrides)
-MODEL_ROUTE_PREFERENCES = {
-    "claude-sonnet-4-6": {
-        "route_bias": "auto",
-        "threshold_factor": 1.0,
-        "memory_bias": 0,
-        "cloud_model": PROXY_CLOUD_MODEL,
-        "behavior": "prefer",
-    },
-    "claude-opus-4-7": {
-        "route_bias": "prefer_cloud",
-        "threshold_factor": 0.8,
-        "memory_bias": -5,
-        "cloud_model": "deepseek-v4-flash",
-        "behavior": "force_fallback",
-    },
-    "claude-haiku-4-5": {
-        "route_bias": "prefer_local",
-        "threshold_factor": 1.33,
-        "memory_bias": 0,
-        "cloud_model": PROXY_CLOUD_MODEL,
-        "behavior": "prefer",
-    },
-}
+# Model ID → route preference mapping (preference only, safety always overrides).
+# Derived from the model catalog via model_registry (configs/models.json); when
+# that file is absent the registry synthesizes an equivalent catalog from the
+# env defaults above, so behavior is identical to the former hardcode.
+# Rebuilt on SIGHUP (reload_config.py) — "$env" references resolve against the
+# live PROXY_CLOUD_MODEL, fixing the legacy import-time capture staleness.
+_CATALOG_FROM_FILE = model_registry.load(
+    env_cloud_model_getter=lambda: PROXY_CLOUD_MODEL,
+    cloud_base_url=PROXY_CLOUD_BASE_URL,
+    cloud_concurrent=PROXY_ROUTE_CLOUD_CONCURRENT,
+)
+MODEL_ROUTE_PREFERENCES = model_registry.build_route_preferences()
 
 # ---------------------------------------------------------------------------
 # Structured metrics logging
@@ -638,17 +628,12 @@ def get_model_aliases():
     with _state_lock:
         if _MODEL_ALIASES_CACHE is not None:
             return _MODEL_ALIASES_CACHE
-        aliases = [
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-            "default",
-            "claude-3-5-sonnet-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-5-haiku-20241022",
-        ]
-        # Always expose claude-opus-4-7 so existing sessions never get 404.
-        # Without cloud API key the proxy falls back to local gracefully.
-        aliases.append("claude-opus-4-7")
+        # Derived from the model catalog (model_registry.get_alias_list):
+        # legacy surface (incl. always-exposed claude-opus-4-7 so existing
+        # sessions never 404; without a cloud key the proxy falls back to
+        # local gracefully) + extra route keys declared in configs/models.json.
+        # Never exposes MODEL_NAME.
+        aliases = model_registry.get_alias_list()
         _MODEL_ALIASES_CACHE = aliases
         return aliases
 
