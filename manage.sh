@@ -39,7 +39,12 @@ _load_config() {
     # cloud mode works without restarting manage.sh.
     if [[ -f "$CONFIG_DIR/secret.local.conf" ]]; then
         # shellcheck source=/dev/null
+        # set -a 使 secret 中的变量（含分提供商 KIMI_API_KEY/ZHIPU_API_KEY 等
+        # model_registry providers.key_env 引用的 key）导出给代理子进程，
+        # 启动即生效，无需依赖首次 SIGHUP 补载。
+        set -a
         source "$CONFIG_DIR/secret.local.conf"
+        set +a
     fi
 }
 
