@@ -403,7 +403,13 @@ class TestProxyStateIntegration(unittest.TestCase):
         if os.environ.get("PROXY_CLOUD_MODEL"):
             self.skipTest("PROXY_CLOUD_MODEL set in env; default-model anchor invalid")
         import proxy_state
-        self.assertEqual(proxy_state.MODEL_ROUTE_PREFERENCES, LEGACY_PREFS)
+        prefs = proxy_state.MODEL_ROUTE_PREFERENCES
+        # sonnet/haiku must stay legacy-identical; opus intentionally diverges
+        # (2026-08-15 route decision: → glm-5.3 subscription + deepseek backup).
+        self.assertEqual(prefs["claude-sonnet-4-6"], LEGACY_PREFS["claude-sonnet-4-6"])
+        self.assertEqual(prefs["claude-haiku-4-5"], LEGACY_PREFS["claude-haiku-4-5"])
+        self.assertEqual(prefs["claude-opus-4-7"]["cloud_model"], "glm-5.3")
+        self.assertEqual(prefs["claude-opus-4-7"]["fallback_models"], ["deepseek-v4-pro"])
 
     def test_catalog_file_actually_loaded(self):
         import proxy_state
@@ -500,8 +506,10 @@ class TestRoutePoliciesJson(unittest.TestCase):
         self.assertEqual(pj["models"]["k3"]["context_tokens"], 1048576)
         self.assertTrue(pj["models"]["k3"]["direct_capable"])
         self.assertFalse(pj["models"]["local-default"]["direct_capable"])
-        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"],
-                         "deepseek-v4-pro")
+        # opus routed to glm-5.3 (Z.ai subscription) with deepseek-v4-pro chain backup
+        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"], "glm-5.3")
+        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["fallback_models"],
+                         ["deepseek-v4-pro"])
 
     def test_status_json_has_route_config(self):
         """R11: /api/status carries the route_config digest."""
@@ -530,14 +538,14 @@ class TestV1ModelsMetadata(unittest.TestCase):
 
     def test_opus_metadata_from_catalog(self):
         meta = self._get_entries()["claude-opus-4-7"]
-        self.assertEqual(meta["real_model"], "deepseek-v4-pro")
-        self.assertTrue(meta["thinking_supported"])
-        self.assertTrue(meta["thinking_required"])   # thinking: required
-        self.assertEqual(meta["json_compliance"], "strict")
+        # 2026-08-15 route decision: opus → glm-5.3 (Z.ai subscription)
+        self.assertEqual(meta["real_model"], "glm-5.3")
+        self.assertTrue(meta["thinking_supported"])   # glm-5.3: thinking supported
+        self.assertFalse(meta["thinking_required"])   # (not required, unlike deepseek-v4-pro)
         self.assertEqual(meta["context_chars"], 1000000)
-        self.assertEqual(meta["price"]["input"], 3.0)   # 官方正式版价
-        self.assertEqual(meta["price"]["output"], 6.0)
-        self.assertTrue(meta["direct_capable"])       # deepseek has an Anthropic endpoint
+        self.assertEqual(meta["price"]["input"], 0)   # subscription marginal cost
+        self.assertEqual(meta["fallback_models"], ["deepseek-v4-pro"])
+        self.assertTrue(meta["direct_capable"])       # zhipu has an Anthropic endpoint
 
     def test_sonnet_flash_metadata(self):
         meta = self._get_entries()["claude-sonnet-4-6"]
