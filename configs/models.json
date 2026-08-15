@@ -3,11 +3,11 @@
 
   "providers": {
     "deepseek": {
-      "base_url": "https://api.deepseek.com/v1",
+      "base_url_env": "PROXY_CLOUD_BASE_URL",
       "anthropic_base_url": "https://api.deepseek.com/anthropic",
       "anthropic_compatible": true,
       "key_env": "PROXY_CLOUD_API_KEY",
-      "concurrent": 2
+      "concurrent_env": "PROXY_ROUTE_CLOUD_CONCURRENT"
     },
     "zhipu": {
       "base_url": "https://open.bigmodel.cn/api/paas/v4",

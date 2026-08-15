@@ -410,6 +410,29 @@ def get_provider_for_model(model_name):
     return get_provider(m.get("provider", ""))
 
 
+def get_model_credentials(model_name, env_lookup=None):
+    """Concrete dispatch credentials for a model, or None when unknown.
+
+    The returned dict is get_provider_credentials()' shape for the model's
+    provider; callers fall back to PROXY_CLOUD_* globals when None.
+    """
+    m = _catalog()["models"].get(model_name)
+    if not m:
+        return None
+    return get_provider_credentials(m.get("provider", ""), env_lookup=env_lookup)
+
+
+def list_providers():
+    return sorted(_catalog()["providers"].keys())
+
+
+def get_provider_budget(provider):
+    """Per-provider daily budget cap from defaults.per_provider_budget (None=uncapped)."""
+    ppb = _catalog().get("defaults", {}).get("per_provider_budget") or {}
+    v = ppb.get(provider)
+    return float(v) if _is_num(v) and v >= 0 else None
+
+
 def get_provider_credentials(provider_name, env_lookup=None):
     """Resolve a provider to concrete (base_url, api_key, concurrent).
 

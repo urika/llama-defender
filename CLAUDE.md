@@ -137,10 +137,10 @@ DeepSeek model mapping: `deepseek-v4-pro[1m]` ↔ `deepseek-v4-pro` (thinking), 
 - **Threshold**: `PROXY_ROUTE_THRESHOLD_CHARS=90000` — requests above this route to cloud
 - **Cloud model**: `PROXY_CLOUD_MODEL=deepseek-v4-flash` (default), `deepseek-v4-pro` for quality
 - **API Key**: `PROXY_CLOUD_API_KEY` must be set in `secret.local.conf` for cloud routing
-- **Fallback**: `PROXY_ROUTE_FALLBACK_ENABLED=true` — cloud failure → emergency truncation → local retry; cloud circuit-breaker with cooldown
-- **Daily budget**: `PROXY_ROUTE_DAILY_BUDGET=5.0` — caps daily cloud cost (0 = unlimited)
+- **Fallback**: `PROXY_ROUTE_FALLBACK_ENABLED=true` — cloud failure walks the catalog `fallback_chain` (cross-provider, skipping providers in cooldown or without a key) → emergency truncation → local retry; per-provider circuit breakers (fail counter + cooldown) are independent per provider
+- **Daily budget**: `PROXY_ROUTE_DAILY_BUDGET=5.0` caps global daily cloud cost (0 = unlimited); catalog `defaults.per_provider_budget` adds per-provider caps. Costs use per-model catalog pricing (models without a price fall back to `PROXY_CLOUD_PRICE_*`)
 - **Session control**: `./manage.sh route-force-local <sid>` / `route-force-cloud <sid>`; **per-request override**: `X-Proxy-Route-To: local|cloud` request header (no session stickiness)
-- **Response headers**: `X-Actual-Model`, `X-Route-Target`, `X-Route-Reason` on every routed response
+- **Response headers (R8 contract)**: `X-Proxy-Route-Target` (`cloud|local|local_forced`), `X-Proxy-Route-Actual-Model`, `X-Proxy-Route-Reason`, `X-Proxy-Route-Cost` on every routed response; OpenAI-protocol non-streaming responses also carry a `proxy_route` body field with actual usage-based cost
 
 Model ID → route preference mapping (preference only, safety always overrides):
 | Agent Model ID | Route Bias | Threshold | Cloud Model |

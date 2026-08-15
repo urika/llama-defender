@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Optional
 
 import proxy_state as _ps
+import model_registry
 from proxy_logging import log
 
 
@@ -203,6 +204,8 @@ class PipelineContext:
     _route_model_bias: str = ""           # model force direction ("prefer_cloud"/"prefer_local"/"")
     _route_actual_cost: float = 0.0       # actual cloud cost (post-request)
     _route_cloud_model: str = ""          # selected cloud model name
+    _route_fallback_models: list = field(default_factory=list)  # catalog fallback chain
+    _route_provider: str = ""             # provider name of the dispatched model
     _emergency_fallback: bool = False     # emergency fallback mode flag
     _agent_model_tier: str = "sonnet"     # Agent-selected tier ("opus"/"sonnet"/"haiku")
 
@@ -573,6 +576,8 @@ class SmartRouter(PipelineStage):
         )
         effective_memory_pct = _ps.PROXY_ROUTE_MEMORY_PCT + pref.get("memory_bias", 0)
         ctx._route_cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
+        # Phase B: catalog fallback chain (cross-provider degradation order)
+        ctx._route_fallback_models = list(pref.get("fallback_models", []))
         ctx._agent_model_tier = _classify_tier(requested_model)
 
         # Store model force direction in ctx, don't return yet.
@@ -702,6 +707,17 @@ class SmartRouter(PipelineStage):
             today = time.strftime("%Y-%m-%d")
             if daily_date == today and daily_cost >= _ps.PROXY_ROUTE_DAILY_BUDGET:
                 return "local", f"daily_budget_exceeded(¥{daily_cost:.2f}/¥{_ps.PROXY_ROUTE_DAILY_BUDGET:.0f})"
+
+        # Priority 3.6: per-provider daily budget cap (catalog defaults.per_provider_budget)
+        _pb_model = getattr(ctx, '_route_cloud_model', '')
+        _pb_creds = model_registry.get_model_credentials(_pb_model, env_lookup=_ps._env_lookup) if _pb_model else None
+        _pb_name = (_pb_creds or {}).get("name", "")
+        if _pb_name and _ps._provider_budget_exceeded(_pb_name):
+            _pb_spent = 0.0
+            with _ps._state_lock:
+                _pb_spent = _ps._route_provider_cost.get(_pb_name, 0.0)
+            _pb_cap = model_registry.get_provider_budget(_pb_name) or 0
+            return "local", f"provider_budget_exceeded({_pb_name} ¥{_pb_spent:.2f}/¥{_pb_cap:.2f})"
 
         # Priority 6: Memory pressure
         try:
@@ -1816,8 +1832,14 @@ class FormatConverter(PipelineStage):
         if "response_format" in body:
             openai_body["response_format"] = body["response_format"]
 
-        # 4. DeepSeek flash: disable thinking
-        if _ps.IS_CLOUD and "flash" in _ps.MODEL_NAME.lower():
+        # 4. Model request quirks from the catalog (e.g. deepseek-v4-flash
+        #    force-disables thinking — request_quirks.force_thinking_disabled).
+        #    Legacy substring heuristic kept for models absent from the catalog.
+        sel_model = openai_body.get("model", "")
+        sel_entry = model_registry.get_model(sel_model)
+        if (sel_entry or {}).get("request_quirks", {}).get("force_thinking_disabled"):
+            openai_body["thinking"] = {"type": "disabled"}
+        elif sel_entry is None and _ps.IS_CLOUD and "flash" in sel_model.lower():
             openai_body["thinking"] = {"type": "disabled"}
 
         # 5. Tool filtering
@@ -1935,6 +1957,97 @@ class BackendDispatcher(PipelineStage):
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
 
+    # ------------------------------------------------------------------
+    # Phase B: catalog-driven cloud target resolution
+    # ------------------------------------------------------------------
+    def _resolve_cloud_target(self, model_name):
+        """Resolve a cloud model to {model, provider, base_url, api_key, key_env, lock}.
+
+        Catalog providers win; unknown models (or providers without a base_url)
+        fall back to the PROXY_CLOUD_* globals so pre-catalog deployments keep
+        working. Provider lock falls back to the constructor cloud_lock.
+        """
+        creds = model_registry.get_model_credentials(model_name, env_lookup=_ps._env_lookup)
+        if creds and creds.get("base_url"):
+            lock = _ps._provider_locks.get(creds["name"]) or self._cloud_lock
+            return {
+                "model": model_name,
+                "provider": creds["name"],
+                "base_url": creds["base_url"],
+                "api_key": creds.get("api_key", ""),
+                "key_env": creds.get("key_env", ""),
+                "lock": lock,
+            }
+        return {
+            "model": model_name,
+            "provider": "default",
+            "base_url": _ps.PROXY_CLOUD_BASE_URL,
+            "api_key": _ps.PROXY_CLOUD_API_KEY,
+            "key_env": "PROXY_CLOUD_API_KEY",
+            "lock": self._cloud_lock,
+        }
+
+    def _cloud_candidates(self, ctx):
+        """Primary cloud model + catalog fallback chain, deduped, resolved."""
+        primary = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+        names = [primary] + [
+            m for m in getattr(ctx, '_route_fallback_models', [])
+            if m and m != primary
+        ]
+        seen, out = set(), []
+        for n in names:
+            if n in seen:
+                continue
+            seen.add(n)
+            out.append(self._resolve_cloud_target(n))
+        return out
+
+    def _model_prices(self, model):
+        """(input, output) ¥/M-token price for a model; global pair as fallback."""
+        price = (model_registry.get_model(model) or {}).get("price") or {}
+        pin = price.get("input", _ps.PROXY_CLOUD_PRICE_INPUT)
+        pout = price.get("output", _ps.PROXY_CLOUD_PRICE_OUTPUT)
+        if not isinstance(pin, (int, float)) or isinstance(pin, bool):
+            pin = _ps.PROXY_CLOUD_PRICE_INPUT
+        if not isinstance(pout, (int, float)) or isinstance(pout, bool):
+            pout = _ps.PROXY_CLOUD_PRICE_OUTPUT
+        return pin, pout
+
+    def _route_cost_estimate(self, ctx):
+        """Pre-dispatch cost estimate (char-ratio input, price-ratio output)."""
+        model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+        pin, pout = self._model_prices(model)
+        est_in = max(1, int(ctx.total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1)))
+        est_input_cost = est_in * pin / 1_000_000
+        est_output_cost = est_input_cost * (pout / pin) if pin else 0.0
+        return est_input_cost + est_output_cost
+
+    def _set_route_headers(self, ctx):
+        """R8 route-attribution response headers (contract names X-Proxy-Route-*).
+
+        Target display value: cloud | local | local_forced (forced-by-session
+        or -header local, and the emergency cloud→local fallback path).
+        Cost is a pre-dispatch estimate for streaming compatibility; the
+        actual usage-based cost lands in metrics and the OpenAI-mode body.
+        """
+        target = getattr(ctx, '_route_target', 'local')
+        reason = getattr(ctx, '_route_reason', '')
+        if target == 'cloud':
+            actual = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
+            cost = self._route_cost_estimate(ctx)
+        else:
+            actual = _ps.MODEL_NAME
+            cost = 0.0
+        display = target
+        if target == 'local' and reason in ('session_force_local', 'header_override'):
+            display = 'local_forced'
+        self._handler._route_response_headers = {
+            "X-Proxy-Route-Target": display,
+            "X-Proxy-Route-Actual-Model": actual,
+            "X-Proxy-Route-Reason": reason,
+            "X-Proxy-Route-Cost": "%.6f" % cost,
+        }
+
     def process(self, ctx: PipelineContext) -> PipelineContext:
         target = getattr(ctx, '_route_target', 'local')
         self._route_fallback = False
@@ -1945,18 +2058,27 @@ class BackendDispatcher(PipelineStage):
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
 
-        # Validate cloud API key — force mode: error; force_fallback/prefer: fallback to local
-        if target == 'cloud' and not _ps.PROXY_CLOUD_API_KEY:
+        # Resolve catalog-driven cloud candidates (primary + fallback chain).
+        candidates = self._cloud_candidates(ctx) if target == 'cloud' else []
+
+        # Validate cloud API key availability across candidates — force mode:
+        # error; force_fallback/prefer: fall back to local. Cooldown-active
+        # providers don't count as usable here.
+        if target == 'cloud' and not any(
+            c["api_key"] and not _ps._provider_cooldown_active(c["provider"])
+            for c in candidates
+        ):
             route_reason = getattr(ctx, '_route_reason', '')
             if route_reason and route_reason.startswith("model_forced_") \
                     and not route_reason.startswith("model_forced_fallback_"):
+                key_env = candidates[0]["key_env"] if candidates else "PROXY_CLOUD_API_KEY"
                 log("  -> [ERROR] Force mode but no cloud API key configured — returning 503")
                 self._handler._respond_json({
                     "error": {
                         "type": "cloud_unavailable",
                         "message": (
                             f"Cloud API key not configured for force-routed model. "
-                            f"Set PROXY_CLOUD_API_KEY in your config, or switch to a "
+                            f"Set {key_env} in configs/secret.local.conf, or switch to a "
                             f"prefer-routed model via `/model claude-sonnet-4-6`."
                         ),
                     }
@@ -1971,35 +2093,58 @@ class BackendDispatcher(PipelineStage):
             if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
                 ctx.openai_body["model"] = _ps.MODEL_NAME
 
-        # Set X-* route response headers for client awareness
-        route_headers = {}
-        if target == 'cloud':
-            actual_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
-        else:
-            actual_model = _ps.MODEL_NAME
-        route_headers["X-Actual-Model"] = actual_model
-        route_headers["X-Route-Target"] = target
-        if ctx._route_reason:
-            route_headers["X-Route-Reason"] = ctx._route_reason
-        self._handler._route_response_headers = route_headers
+        # R8 route-attribution response headers (X-Proxy-Route-* contract names)
+        self._set_route_headers(ctx)
 
         if target == 'cloud':
-            base_url = _ps.PROXY_CLOUD_BASE_URL
-            api_key = _ps.PROXY_CLOUD_API_KEY
-            model_name = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
-            log(f"  -> Forwarding to {base_url}/chat/completions (cloud, model={model_name})")
-            try:
-                with self._cloud_lock:
-                    self._do_dispatch(ctx, base_url, api_key)
-            except urllib.error.HTTPError as e:
-                # Cloud failed — attempt fallback
-                raw_err = e.read().decode("utf-8")
-                err = raw_err[:500]
-                self._backend_status = e.code
-                self._fallback_reason = str(e.code)
-                log(f"  <- Cloud API failed ({e.code}), checking fallback...")
-                _log_cloud_error(ctx, e.code, raw_err)
+            # Iterate the catalog candidates: primary model first, then the
+            # fallback chain. Skips providers in cooldown or without a key.
+            dispatch_exc = None
+            dispatch_raw_err = ""
+            idx = 0
+            while idx < len(candidates):
+                cand = candidates[idx]
+                idx += 1
+                if _ps._provider_cooldown_active(cand["provider"]):
+                    log(f"  -> Skip {cand['model']} — provider '{cand['provider']}' in cooldown")
+                    continue
+                if not cand["api_key"]:
+                    log(f"  -> Skip {cand['model']} — no API key ({cand['key_env']})")
+                    continue
+                ctx._route_cloud_model = cand["model"]
+                ctx._route_provider = cand["provider"]
+                if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                    ctx.openai_body["model"] = cand["model"]
+                self._set_route_headers(ctx)
+                log(f"  -> Forwarding to {cand['base_url']}/chat/completions "
+                    f"(cloud, provider={cand['provider']}, model={cand['model']})")
+                try:
+                    with cand["lock"]:
+                        self._do_dispatch(ctx, cand["base_url"], cand["api_key"])
+                    _ps._record_provider_success(cand["provider"])
+                    return ctx
+                except urllib.error.HTTPError as e:
+                    raw_err = e.read().decode("utf-8")
+                    dispatch_exc, dispatch_raw_err = e, raw_err
+                    self._backend_status = e.code
+                    self._fallback_reason = str(e.code)
+                    log(f"  <- Cloud API failed ({e.code}), checking fallback...")
+                    _log_cloud_error(ctx, e.code, raw_err)
+                    _ps._record_provider_failure(
+                        cand["provider"],
+                        retryable=e.code in (408, 429, 500, 502, 503, 504),
+                    )
+                except urllib.error.URLError as ue:
+                    # Connection-level failure (refused/timeout) — also feeds
+                    # the chain and the local fallback.
+                    dispatch_exc, dispatch_raw_err = ue, str(ue)
+                    self._backend_status = 503
+                    self._fallback_reason = str(ue)
+                    log(f"  <- Cloud API unreachable ({ue}), checking fallback...")
+                    _log_cloud_error(ctx, 503, str(ue))
+                    _ps._record_provider_failure(cand["provider"], retryable=True)
 
+                # Gates below end the request regardless of remaining chain.
                 # Force mode: do NOT fallback (model_forced_cloud) unless force_fallback
                 route_reason = getattr(ctx, '_route_reason', '')
                 if route_reason and route_reason.startswith("model_forced_") \
@@ -2022,10 +2167,11 @@ class BackendDispatcher(PipelineStage):
 
                 if not _ps.PROXY_ROUTE_FALLBACK_ENABLED:
                     log(f"  -> Fallback disabled — returning 503")
+                    status = getattr(dispatch_exc, "code", 503)
                     self._handler._respond_json({
                         "error": {
                             "type": "cloud_unavailable",
-                            "message": f"Cloud API failed with status {e.code} and fallback is disabled.",
+                            "message": f"Cloud API failed with status {status} and fallback is disabled.",
                         }
                     }, 503)
                     return ctx
@@ -2041,56 +2187,68 @@ class BackendDispatcher(PipelineStage):
                     }, 403)
                     return ctx
 
-                # Attempt one in-place message repair + cloud retry for
-                # repairable 400 format errors before falling back to local.
-                if self._is_repairable_format_error(e.code, raw_err):
+                # Attempt one in-place message repair + same-provider retry for
+                # repairable 400 format errors before moving down the chain.
+                if isinstance(dispatch_exc, urllib.error.HTTPError) and \
+                        self._is_repairable_format_error(dispatch_exc.code, dispatch_raw_err):
                     log(f"  -> Detected repairable format error, attempting message repair + cloud retry")
                     if self._repair_openai_messages(ctx):
                         try:
-                            with self._cloud_lock:
-                                self._do_dispatch(ctx, base_url, api_key)
+                            with cand["lock"]:
+                                self._do_dispatch(ctx, cand["base_url"], cand["api_key"])
                             log(f"  <- Cloud retry succeeded after message repair")
+                            _ps._record_provider_success(cand["provider"])
                             return ctx
                         except urllib.error.HTTPError as e2:
                             raw_err2 = e2.read().decode("utf-8")
-                            err2 = raw_err2[:500]
-                            log(f"  <- Cloud retry failed ({e2.code}: {err2}), proceeding to fallback...")
+                            log(f"  <- Cloud retry failed ({e2.code}: {raw_err2[:200]}), trying next candidate...")
                             _log_cloud_error(ctx, e2.code, raw_err2, exc_info="retry_after_repair")
+                            dispatch_exc, dispatch_raw_err = e2, raw_err2
+                            _ps._record_provider_failure(
+                                cand["provider"],
+                                retryable=e2.code in (408, 429, 500, 502, 503, 504),
+                            )
                         except urllib.error.URLError as ue2:
-                            log(f"  <- Cloud retry failed ({ue2}), proceeding to fallback...")
+                            log(f"  <- Cloud retry failed ({ue2}), trying next candidate...")
+                            dispatch_exc, dispatch_raw_err = ue2, str(ue2)
+                            _ps._record_provider_failure(cand["provider"], retryable=True)
                     else:
-                        log(f"  -> No message repair possible, proceeding to fallback...")
+                        log(f"  -> No message repair possible, trying next candidate...")
+                # next chain candidate
 
-                # Record failure and manage cooldown
-                self._record_cloud_failure(ctx, e)
-                self._route_fallback = True
+            # Chain exhausted — record session failure and fall back to local.
+            # Record failure and manage cooldown
+            self._record_cloud_failure(ctx, dispatch_exc)
+            self._route_fallback = True
 
-                # Emergency truncation before retrying on local
-                self._emergency_truncate(ctx)
-                ctx._emergency_fallback = True
-                ctx._route_target = 'local_forced'
+            # Emergency truncation before retrying on local
+            self._emergency_truncate(ctx)
+            ctx._emergency_fallback = True
+            ctx._route_target = 'local_forced'
+            self._set_route_headers(ctx)
 
-                # Retry with local backend
-                log(f"  -> Fallback to local backend")
-                # openai_body.model still holds the cloud model name from
-                # FormatConverter; re-point to local MODEL_NAME for the retry.
-                if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
-                    ctx.openai_body["model"] = _ps.MODEL_NAME
-                try:
-                    with self._llama_lock:
-                        self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
-                except (urllib.error.HTTPError, urllib.error.URLError) as ue:
-                    # Local backend is also down — surface the original cloud error
-                    # rather than a misleading connection-refused message.
-                    err_body = raw_err[:500]
-                    log(f"  <- Local fallback unavailable ({ue}); returning original cloud error {e.code}")
-                    self._handler._respond_json({
-                        "error": {
-                            "type": "cloud_unavailable",
-                            "message": f"Cloud API failed ({e.code}: {err_body}); local backend also unavailable.",
-                        }
-                    }, e.code)
-                    return ctx
+            # Retry with local backend
+            log(f"  -> Fallback to local backend")
+            # openai_body.model still holds the cloud model name from
+            # FormatConverter; re-point to local MODEL_NAME for the retry.
+            if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                ctx.openai_body["model"] = _ps.MODEL_NAME
+            try:
+                with self._llama_lock:
+                    self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
+            except (urllib.error.HTTPError, urllib.error.URLError) as ue:
+                # Local backend is also down — surface the original cloud error
+                # rather than a misleading connection-refused message.
+                err_code = getattr(dispatch_exc, "code", None) or 503
+                err_body = dispatch_raw_err[:500] if dispatch_raw_err else ""
+                log(f"  <- Local fallback unavailable ({ue}); returning original cloud error {err_code}")
+                self._handler._respond_json({
+                    "error": {
+                        "type": "cloud_unavailable",
+                        "message": f"Cloud API failed ({err_code}: {err_body}); local backend also unavailable.",
+                    }
+                }, err_code)
+                return ctx
         else:
             base_url = _ps.LLAMA_BASE
             api_key = _ps.LLAMA_API_KEY
@@ -2138,16 +2296,25 @@ class BackendDispatcher(PipelineStage):
                 ctx._route_target = 'cloud'
                 ctx._route_reason = 'local_failure_fallback'
 
-                # Retry with cloud backend
-                cloud_url = _ps.PROXY_CLOUD_BASE_URL
-                cloud_key = _ps.PROXY_CLOUD_API_KEY
-                cloud_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
-                log(f"  -> Fallback to cloud backend ({cloud_model})")
+                # Retry with cloud backend — resolve via the catalog so the
+                # correct provider endpoint/key/lock is used.
+                cloud_cand = None
+                for _c in candidates or self._cloud_candidates(ctx):
+                    if _c["api_key"] and not _ps._provider_cooldown_active(_c["provider"]):
+                        cloud_cand = _c
+                        break
+                if cloud_cand is None:
+                    cloud_cand = self._resolve_cloud_target(
+                        getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL)
+                ctx._route_cloud_model = cloud_cand["model"]
+                ctx._route_provider = cloud_cand["provider"]
+                log(f"  -> Fallback to cloud backend (provider={cloud_cand['provider']}, {cloud_cand['model']})")
                 if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
-                    ctx.openai_body["model"] = cloud_model
+                    ctx.openai_body["model"] = cloud_cand["model"]
+                self._set_route_headers(ctx)
                 try:
-                    with self._cloud_lock:
-                        self._do_dispatch(ctx, cloud_url, cloud_key)
+                    with cloud_cand["lock"]:
+                        self._do_dispatch(ctx, cloud_cand["base_url"], cloud_cand["api_key"])
                 except Exception as e2:
                     log(f"  <- Cloud fallback also failed: {e2}")
                     self._handler._respond_json({
@@ -2255,6 +2422,22 @@ class BackendDispatcher(PipelineStage):
                 usage = openai_resp.get("usage") or {}
                 self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                 self._output_tokens = usage.get("completion_tokens", self._output_tokens)
+                # R8 (非流式): usage-based actual cost + proxy_route body field
+                # on OpenAI-protocol responses (Anthropic-format responses carry
+                # attribution via headers — body field would be dropped by the
+                # converter anyway).
+                if getattr(ctx, '_route_target', 'local') == 'cloud':
+                    pin, pout = self._model_prices(getattr(ctx, '_route_cloud_model', ''))
+                    ctx._route_actual_cost = round(
+                        (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
+                    if getattr(self._handler, '_openai_mode', False):
+                        openai_resp["proxy_route"] = {
+                            "target": "cloud",
+                            "actual_model": getattr(ctx, '_route_cloud_model', ''),
+                            "reason": getattr(ctx, '_route_reason', ''),
+                            "cost": ctx._route_actual_cost,
+                        }
+                        body_bytes = json.dumps(openai_resp).encode("utf-8")
             except Exception:
                 pass
             wrapped = _BytesIOResponse(resp.status, body_bytes)
@@ -2355,11 +2538,16 @@ class BackendDispatcher(PipelineStage):
             self._emergency_fallback = True
 
     def _accumulate_daily_cost(self, ctx):
-        """Accumulate daily cloud API cost (best-effort estimation)."""
+        """Accumulate daily cloud API cost (best-effort estimation).
+
+        Phase B: per-model catalog pricing and per-provider totals.
+        """
         try:
             total = _ps._accumulate_route_daily_cost(
                 input_tokens=self._input_tokens,
                 output_tokens=self._output_tokens,
+                model=getattr(ctx, '_route_cloud_model', ''),
+                provider=getattr(ctx, '_route_provider', ''),
             )
             log(f"  -> [route_cost] daily cost now ¥{total:.4f}")
         except Exception:
@@ -2372,6 +2560,7 @@ class BackendDispatcher(PipelineStage):
             "route_target": getattr(ctx, '_route_target', 'local'),
             "route_reason": getattr(ctx, '_route_reason', ''),
             "route_cloud_model": getattr(ctx, '_route_cloud_model', ''),
+            "route_provider": getattr(ctx, '_route_provider', ''),
             "route_fallback": self._route_fallback,
             "emergency_fallback": self._emergency_fallback,
             "fallback_reason": self._fallback_reason,

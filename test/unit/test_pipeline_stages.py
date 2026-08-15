@@ -893,6 +893,17 @@ class TestBackendDispatcher(unittest.TestCase):
             p.stop()
         _ps._cloud_fail_count.clear()
         _ps._cloud_cooldown_start.clear()
+        # Phase B: per-provider breaker state must not leak between tests
+        # (a tripped provider cooldown makes the cloud key-gate short-circuit
+        #  every later test in this class into the local fallback path).
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
+
+    def tearDown(self):
+        # Also clear on exit: leftover breaker state leaks into later test
+        # MODULES in the same discover process (e.g. test_payload_limit).
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
         _ps._SESSION_ROUTE_MAP.clear()
 
     def _make_ctx(self, target="local", is_stream=False, total_chars=5000, session_id="s1"):
@@ -1129,10 +1140,28 @@ class TestBackendDispatcher(unittest.TestCase):
             stage.process(ctx)
         headers = self._mock_handler._route_response_headers
         self.assertIsNotNone(headers)
-        self.assertEqual(headers["X-Route-Target"], "cloud")
-        self.assertEqual(headers["X-Route-Reason"], "chars_exceed_threshold")
-        self.assertIn("X-Actual-Model", headers)
+        # R8 contract names (llama-defender-integration-requirements.md §R8)
+        self.assertEqual(headers["X-Proxy-Route-Target"], "cloud")
+        self.assertEqual(headers["X-Proxy-Route-Reason"], "chars_exceed_threshold")
+        self.assertIn("X-Proxy-Route-Actual-Model", headers)
+        self.assertIn("X-Proxy-Route-Cost", headers)
+        # Old pre-contract names must be gone (direct switch, no aliases).
+        self.assertNotIn("X-Route-Target", headers)
+        self.assertNotIn("X-Actual-Model", headers)
 
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-key")
+    def test_route_headers_local_forced_display(self):
+        """Forced-local reasons map the display target to local_forced (R8)."""
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="local")
+        ctx._route_reason = "session_force_local"
+        with patch("pipeline.urllib.request.urlopen", return_value=self._mock_urlopen(200)):
+            stage.process(ctx)
+        headers = self._mock_handler._route_response_headers
+        self.assertEqual(headers["X-Proxy-Route-Target"], "local_forced")
+        self.assertEqual(headers["X-Proxy-Route-Cost"], "0.000000")
+
+    @patch.dict(_ps._provider_locks, clear=True)
     @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
     def test_cloud_concurrency_lock_held_during_dispatch(self):
         """Verify cloud backend dispatch holds concurrency lock.
@@ -1337,3 +1366,226 @@ class TestBytesIOResponse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ===========================================================================
+# Phase B: multi-provider dispatch (model catalog)
+# ===========================================================================
+
+class TestMultiProviderDispatch(unittest.TestCase):
+    """Catalog-driven dispatch: per-provider credentials/locks, fallback
+    chains, isolated circuit breakers, cloud URLError fallback, R8 cost."""
+
+    CATALOG = {
+        "providers": {
+            "p1": {"base_url": "https://p1.example/v1", "key_env": "P1_KEY", "concurrent": 1},
+            "p2": {"base_url": "https://p2.example/v1", "key_env": "P2_KEY", "concurrent": 1},
+            "local": {"base_url_env": "LLAMA_BASE_URL", "key_env": "LLAMA_API_KEY",
+                      "concurrent_env": "PROXY_MAX_CONCURRENT"},
+        },
+        "models": {
+            "m1": {"provider": "p1", "tier": "flagship",
+                   "price": {"input": 1.0, "output": 2.0}},
+            "m2": {"provider": "p2", "tier": "flagship",
+                   "price": {"input": 3.0, "output": 6.0}},
+            "local-default": {"provider": "local", "tier": "standard"},
+        },
+        "routes": {
+            "claude-sonnet-4-6": {
+                "route_bias": "auto", "cloud_model": ["m1", "m2"],
+                "behavior": "prefer", "threshold_factor": 1.0, "memory_bias": 0,
+            },
+        },
+        "defaults": {"cloud_model": "m1"},
+    }
+
+    def setUp(self):
+        import os
+        import tempfile
+        import model_registry
+
+        self._model_registry = model_registry
+        self._tmp = tempfile.TemporaryDirectory()
+        path = os.path.join(self._tmp.name, "models.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.CATALOG, f)
+        model_registry._reset()
+        assert model_registry.load(
+            path=path, env_cloud_model_getter=lambda: "m1")
+
+        self._patches = [
+            patch.object(_ps, "P1_KEY", "sk-p1", create=True),
+            patch.object(_ps, "P2_KEY", "sk-p2", create=True),
+            patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._restore)
+
+        self._mock_handler = MagicMock()
+        self._mock_handler._handle_streaming_response = MagicMock()
+        self._mock_handler._handle_non_streaming_response = MagicMock()
+        self._mock_handler._respond_json = MagicMock()
+        self._mock_handler._route_response_headers = None
+        _ps._cloud_fail_count.clear()
+        _ps._cloud_cooldown_start.clear()
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
+
+    def _restore(self):
+        """Restore the real catalog + clean breaker state for later tests."""
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
+        self._tmp.cleanup()
+        self._model_registry._reset()
+        self._model_registry.load(
+            env_cloud_model_getter=lambda: _ps.PROXY_CLOUD_MODEL)
+
+    def _make_ctx(self, target="cloud", model="m1", fallbacks=None):
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6", "max_tokens": 4096},
+            is_stream=False,
+            total_chars=5000,
+            session_id="s_multi",
+            openai_body={"model": model, "messages": []},
+        )
+        ctx._route_target = target
+        ctx._route_cloud_model = model
+        ctx._route_fallback_models = list(fallbacks or [])
+        return ctx
+
+    def _mock_urlopen(self, status=200,
+                      body=b'{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20}}'):
+        mock_resp = MagicMock()
+        mock_resp.status = status
+        mock_resp.read.return_value = body
+        return mock_resp
+
+    def _stage(self):
+        return BackendDispatcher(llama_lock=MagicMock(), cloud_lock=MagicMock(),
+                                 handler=self._mock_handler)
+
+    def test_provider_credentials_resolved_per_model(self):
+        """Dispatch URL follows the model's catalog provider, not globals."""
+        stage = self._stage()
+        ctx = self._make_ctx(model="m2")
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)) as mo:
+            stage.process(ctx)
+        url = str(mo.call_args[0][0].full_url)
+        self.assertIn("p2.example", url)
+        self.assertEqual(ctx._route_provider, "p2")
+
+    def test_chain_falls_back_to_second_provider(self):
+        """Primary provider 500 → next chain entry on another provider serves."""
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1", fallbacks=["m2"])
+
+        def side_effect(req, timeout=None):
+            if "p1.example" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 500, "boom", {}, io.BytesIO(b"{}"))
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect) as mo:
+            stage.process(ctx)
+        urls = [str(c[0][0].full_url) for c in mo.call_args_list]
+        self.assertTrue(any("p1.example" in u for u in urls))
+        self.assertTrue(any("p2.example" in u for u in urls))
+        self.assertEqual(ctx._route_cloud_model, "m2")
+        self.assertEqual(ctx._route_provider, "p2")
+        # Chain success is still a cloud success — no local route_fallback.
+        self.assertFalse(stage._route_fallback)
+        # Provider breaker counted the p1 failure (1 < MAX, not tripped).
+        self.assertEqual(_ps._PROVIDER_FAIL_COUNT.get("p1", 0), 1)
+        with _ps._state_lock:
+            self.assertNotIn("p1", _ps._PROVIDER_COOLDOWN_START)
+
+    def test_cooldown_provider_is_skipped(self):
+        """A provider in cooldown is skipped in favour of the chain fallback."""
+        import time
+        stage = self._stage()
+        with _ps._state_lock:
+            _ps._PROVIDER_COOLDOWN_START["p1"] = time.monotonic()
+        ctx = self._make_ctx(model="m1", fallbacks=["m2"])
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)) as mo:
+            stage.process(ctx)
+        urls = [str(c[0][0].full_url) for c in mo.call_args_list]
+        self.assertFalse([u for u in urls if "p1.example" in u])
+        self.assertEqual(ctx._route_provider, "p2")
+
+    def test_keyless_provider_is_skipped(self):
+        """Missing provider key skips that chain entry instead of failing."""
+        self._patches.append(patch.object(_ps, "P1_KEY", "", create=True))
+        self._patches[-1].start()
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1", fallbacks=["m2"])
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)) as mo:
+            stage.process(ctx)
+        urls = [str(c[0][0].full_url) for c in mo.call_args_list]
+        self.assertFalse([u for u in urls if "p1.example" in u])
+        self.assertEqual(ctx._route_provider, "p2")
+
+    def test_all_providers_unusable_falls_to_local(self):
+        """Every candidate keyless → gate falls back to local (no 503 for prefer)."""
+        self._patches.append(patch.object(_ps, "P1_KEY", "", create=True))
+        self._patches.append(patch.object(_ps, "P2_KEY", "", create=True))
+        for p in self._patches[-2:]:
+            p.start()
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1", fallbacks=["m2"])
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)):
+            stage.process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "cloud_no_api_key")
+
+    def test_cloud_urlerror_falls_back_to_local(self):
+        """Connection-level cloud failure (URLError) triggers local fallback."""
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1")
+
+        def side_effect(req, timeout=None):
+            if "p1.example" in req.full_url:
+                raise urllib.error.URLError("connection refused")
+            return self._mock_urlopen(200)
+
+        with patch("pipeline.urllib.request.urlopen", side_effect=side_effect):
+            stage.process(ctx)
+        self.assertEqual(ctx._route_target, "local_forced")
+        self.assertTrue(stage._route_fallback)
+        # ctx flag is set on every emergency fallback; the stage flag only
+        # when truncation actually dropped messages (5K chars → nothing to drop).
+        self.assertTrue(ctx._emergency_fallback)
+        headers = self._mock_handler._route_response_headers
+        self.assertEqual(headers["X-Proxy-Route-Target"], "local_forced")
+
+    def test_r8_cost_header_present_for_cloud(self):
+        """Cloud responses carry a positive estimated X-Proxy-Route-Cost."""
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1")
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)):
+            stage.process(ctx)
+        headers = self._mock_handler._route_response_headers
+        self.assertGreater(float(headers["X-Proxy-Route-Cost"]), 0.0)
+        self.assertEqual(headers["X-Proxy-Route-Actual-Model"], "m1")
+
+    def test_provider_breaker_trips_after_max_failures(self):
+        """MAX_CLOUD_FAILS provider failures trip only that provider's cooldown."""
+        import time
+        stage = self._stage()
+        for _ in range(_ps.PROXY_ROUTE_MAX_CLOUD_FAILS):
+            ctx = self._make_ctx(model="m1", fallbacks=[])
+            def _raise_503(req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.full_url, 503, "down", {}, io.BytesIO(b"{}"))
+            with patch("pipeline.urllib.request.urlopen", side_effect=_raise_503):
+                with patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", False):
+                    stage.process(ctx)
+        with _ps._state_lock:
+            self.assertIn("p1", _ps._PROVIDER_COOLDOWN_START)
+            self.assertNotIn("p2", _ps._PROVIDER_COOLDOWN_START)

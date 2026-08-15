@@ -425,3 +425,34 @@ class TestProxyStateIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProviderAccessors(ModelRegistryTestBase):
+    def test_list_providers(self):
+        path = self._write_catalog(_minimal_catalog())
+        model_registry.load(path=path)
+        self.assertEqual(model_registry.list_providers(), ["local", "p1"])
+
+    def test_get_model_credentials(self):
+        path = self._write_catalog(_minimal_catalog())
+        model_registry.load(path=path)
+        env = {"P1_KEY": "sk-p1"}
+        creds = model_registry.get_model_credentials(
+            "m1", env_lookup=lambda k, d=None: env.get(k, d))
+        self.assertEqual(creds["base_url"], "https://p1.example/v1")
+        self.assertEqual(creds["api_key"], "sk-p1")
+        self.assertEqual(creds["key_env"], "P1_KEY")
+
+    def test_get_model_credentials_unknown_model(self):
+        path = self._write_catalog(_minimal_catalog())
+        model_registry.load(path=path)
+        self.assertIsNone(model_registry.get_model_credentials("ghost"))
+
+    def test_get_provider_budget(self):
+        cat = _minimal_catalog()
+        cat["defaults"]["per_provider_budget"] = {"p1": 1.5}
+        path = self._write_catalog(cat)
+        model_registry.load(path=path)
+        self.assertEqual(model_registry.get_provider_budget("p1"), 1.5)
+        self.assertIsNone(model_registry.get_provider_budget("local"))
+        self.assertIsNone(model_registry.get_provider_budget("ghost"))

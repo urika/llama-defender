@@ -2,6 +2,7 @@
 
 > 状态：设计稿 v2（2026-08-15：并入需求稿 v2 的「定位澄清」——直连 vs 走代理分流、R8 响应头命名契约、双源真相边界）
 > **Phase A 已实施（2026-08-15）**：`model_registry.py`（503 行）+ `configs/models.json`（deepseek/zhipu/kimi/local 四提供商，9 模型）+ proxy_state/reload_config 集成 + 39 个单测；949 unit / 10 integration 全绿，删除目录文件行为与 Phase A 前完全一致（兼容合成）。SIGHUP 重建 preferences，陈旧捕获缺陷已修复。
+> **Phase B 已实施（2026-08-15）**：多提供商分发（按模型解析凭证/分商信号量）+ fallback_chain 跨商降级 + 分商熔断互不影响 + 按模型目录价格计费（分商预算双上限）+ R8 契约头四件套直接切换（`X-Proxy-Route-*`，旧名已清理）+ flash quirks 迁入目录（保留未知模型旧启发式兜底）；deepseek provider 改 `base_url_env`/`concurrent_env` 引用以保留 `PROXY_CLOUD_BASE_URL` 覆盖语义（中转场景）。965 unit / 10 integration 全绿。
 > 背景：未来需新增云端模型选择（glm5.2 / glm5.3 / K3 / deepseek-v4-pro 等），当前架构围绕单一云提供商（DeepSeek）硬编码，扩展需要改动多处代码。
 > 关联：[llama-defender-integration-requirements.md](../llama-defender-integration-requirements.md)（v2，R8-R12）、[intelligent-model-routing-design.md](intelligent-model-routing-design.md)、agent_go 侧模型实体三层设计（① 模型固有 / ② 角色绑定 / ③ 部署拓扑）
 > 目标：**新增一个云端模型 = 改一个声明式配置文件 + 配一个 API Key，零代码改动，SIGHUP 热生效。**

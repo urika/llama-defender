@@ -144,6 +144,8 @@
       "_route_model_bias",
       "_route_actual_cost",
       "_route_cloud_model",
+      "_route_fallback_models",
+      "_route_provider",
       "_emergency_fallback",
       "_agent_model_tier"
     ],
@@ -187,6 +189,8 @@
       "_route_model_bias": "",
       "_route_actual_cost": 0.0,
       "_route_cloud_model": "",
+      "_route_fallback_models": "<factory>",
+      "_route_provider": "",
       "_emergency_fallback": false,
       "_agent_model_tier": "sonnet"
     }
@@ -261,11 +265,15 @@
     "name": "_accumulate_route_daily_cost",
     "params": [
       "input_tokens",
-      "output_tokens"
+      "output_tokens",
+      "model",
+      "provider"
     ],
     "defaults": {
       "input_tokens": 0,
-      "output_tokens": 0
+      "output_tokens": 0,
+      "model": "",
+      "provider": ""
     }
   },
   "_adjust_concurrency": {

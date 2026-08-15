@@ -330,6 +330,50 @@ class TestRouteCost(unittest.TestCase):
         total = _accumulate_route_daily_cost(input_tokens=1000, output_tokens=0)
         self.assertAlmostEqual(total, 1000 * 0.5 / 1_000_000, places=6)
 
+    def test_accumulate_per_model_catalog_price(self):
+        """Catalog price (deepseek-v4-pro 2.0/8.0) overrides the global pair;
+        provider totals accumulate alongside the global total (Phase B)."""
+        import time as _time
+        from proxy_state import _accumulate_route_daily_cost
+        with proxy_state._state_lock:
+            proxy_state._route_daily_cost = 0.0
+            proxy_state._route_daily_date = _time.strftime("%Y-%m-%d")
+            proxy_state._route_provider_cost.clear()
+        t_in = _accumulate_route_daily_cost(
+            input_tokens=1_000_000, output_tokens=0,
+            model="deepseek-v4-pro", provider="deepseek")
+        self.assertAlmostEqual(t_in, 2.0, places=6)
+        t_out = _accumulate_route_daily_cost(
+            input_tokens=0, output_tokens=1_000_000,
+            model="deepseek-v4-pro", provider="deepseek")
+        self.assertAlmostEqual(t_out - t_in, 8.0, places=6)
+        with proxy_state._state_lock:
+            self.assertAlmostEqual(
+                proxy_state._route_provider_cost.get("deepseek", 0.0), 10.0, places=6)
+
+    def test_accumulate_unknown_model_uses_global_price(self):
+        from proxy_state import _accumulate_route_daily_cost
+        with proxy_state._state_lock:
+            proxy_state._route_daily_cost = 0.0
+            proxy_state._route_daily_date = ""
+        total = _accumulate_route_daily_cost(
+            input_tokens=1_000_000, output_tokens=0, model="ghost-model")
+        self.assertAlmostEqual(total, 0.5, places=6)
+
+    def test_provider_budget_gate(self):
+        from proxy_state import _provider_budget_exceeded
+        # No per_provider_budget in the committed catalog → never exceeded.
+        self.assertFalse(_provider_budget_exceeded("deepseek"))
+        import time as _time
+        with patch.object(proxy_state.model_registry, "get_provider_budget",
+                          return_value=1.0):
+            with proxy_state._state_lock:
+                proxy_state._route_daily_date = _time.strftime("%Y-%m-%d")
+                proxy_state._route_provider_cost["p1"] = 2.0
+            self.assertTrue(_provider_budget_exceeded("p1"))
+        with proxy_state._state_lock:
+            proxy_state._route_provider_cost.clear()
+
 
 class TestReloadSpecDefaultsConsistency(unittest.TestCase):
     """Verify _RELOAD_SPEC defaults match CONFIG_REGISTRY canonical defaults.

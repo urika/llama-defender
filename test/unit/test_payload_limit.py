@@ -91,8 +91,14 @@ class TestPayloadSizeLimit(unittest.TestCase):
     @patch.object(proxy_state, "PROXY_ROUTE_THRESHOLD_CHARS", 1)
     @patch.object(proxy_state, "PROXY_CLOUD_BASE_URL", "https://cloud.example.com/v1")
     @patch.object(proxy_state, "PROXY_CLOUD_API_KEY", "sk-cloud")
+    @patch.object(proxy_state, "PROXY_ROUTE_FALLBACK_ENABLED", False)
     def test_oversized_cloud_request_uses_cloud_limit(self):
-        """Cloud-routed request between local and cloud limits is not rejected."""
+        """Cloud-routed request between local and cloud limits is not rejected.
+
+        Fallback disabled so an unreachable cloud endpoint (URLError in the
+        test sandbox) returns 503 instead of falling back to the local backend,
+        whose smaller limit would 413 and mask the assertion target.
+        """
         # Body size between LOCAL_LIMIT and CLOUD_LIMIT.
         body = _build_body(self.LOCAL_LIMIT + 500)
         h = self._make_handler(body)

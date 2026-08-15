@@ -197,7 +197,8 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 - `/api/status` 在 `state` 为 `healthy` 或 `starting` 时返回 200，否则 503（同 JSON body）。`state` 枚举：`healthy | starting | backend_down | proxy_down | model_drift | down`。
 - `ready` 表示后端模型已加载、可接受推理请求（`starting` → `ready=false`），agent_go 的 `wait_ready` 以此字段为准。
-- 路由响应头：每个路由响应带 `X-Actual-Model`、`X-Route-Target`、`X-Route-Reason`；单请求路由覆盖用请求头 `X-Proxy-Route-To: local|cloud`（无会话粘性）。
+- 路由响应头（R8 契约名）：每个路由响应带 `X-Proxy-Route-Target`（`cloud|local|local_forced`）、`X-Proxy-Route-Actual-Model`、`X-Proxy-Route-Reason`、`X-Proxy-Route-Cost`（预估费用，本地为 0）；OpenAI 协议非流式响应体另带 `proxy_route` 字段（实际 usage 计费）。单请求路由覆盖用请求头 `X-Proxy-Route-To: local|cloud`（无会话粘性）。
+- 多提供商分发（Phase B）：按模型解析目录 provider 凭证/并发锁；路由 `fallback_chain` 跨商降级（跳过冷却中/无 key 的提供商）；分商熔断互不影响；按模型目录价格计费 + 全局/分商预算双上限。
 - **R8-R12 待做**（见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)，顺序 R8→R9→R10→R11→R12）：R8 路由归因头补 `X-Proxy-Route-Cost`、R9 `GET /api/route/policies`、R10 `/v1/models` 能力元数据、R11 `/api/status` 增 `route_config`、R12 `POST /admin/reload`（HTTP 热重载）。
 
 ### 4.4 后端类型自动检测
@@ -219,7 +220,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | 层级 | 命令 | 依赖 | 说明 |
 |------|------|------|------|
-| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，24 个文件约 910 个用例，<1s |
+| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，25 个文件约 965 个用例，<1s |
 | 集成 | `bash test/run_tests.sh --integration` | 启动 mock backend | `test/integration/*.sh` + `mock_backend.py`，约 60s |
 | Promptfoo | `bash test/run_tests.sh --promptfoo` | 运行中的代理 | 固定 prompt 回归测试（9 个用例） |
 | E2E | `bash test/run_tests.sh --e2e` | 运行中的代理 + 后端 | `test/e2e/*` |

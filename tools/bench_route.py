@@ -50,12 +50,12 @@ def main():
     # TC1: Short → local
     print("\n[TC1] Short context (local expected)")
     s, h, r, e = send(build_short())
-    print(f"  route={h.get('X-Route-Target','?')} model={h.get('X-Actual-Model','?')} {r.get('content',[{}])[0].get('text','')[:50]} ({e:.0f}ms)")
+    print(f"  route={h.get('X-Proxy-Route-Target','?')} model={h.get('X-Proxy-Route-Actual-Model','?')} {r.get('content',[{}])[0].get('text','')[:50]} ({e:.0f}ms)")
 
     # TC2: Long → cloud
     print(f"\n[TC2] Long context {args.size} (cloud expected)")
     s, h, r, e = send(build_long_context(target))
-    print(f"  route={h.get('X-Route-Target','?')} model={h.get('X-Actual-Model','?')} {r.get('content',[{}])[0].get('text','')[:80]} ({e:.0f}ms)")
+    print(f"  route={h.get('X-Proxy-Route-Target','?')} model={h.get('X-Proxy-Route-Actual-Model','?')} {r.get('content',[{}])[0].get('text','')[:80]} ({e:.0f}ms)")
 
     # TC3: TTFT comparison (with delays to avoid dedup)
     print(f"\n[TC3] TTFT comparison (3 samples each)")
@@ -75,13 +75,13 @@ def main():
     print(f"\n[TC4] Session lifecycle: new→cloud→stay→new→local")
     sid = "bench-lifecycle"
     s, h, _, _ = send(build_short(), {"X-Claude-Code-Session-Id": sid})
-    r1 = h.get('X-Route-Target','?')
+    r1 = h.get('X-Proxy-Route-Target','?')
     s, h, _, _ = send(build_long_context(target), {"X-Claude-Code-Session-Id": sid})
-    r2 = h.get('X-Route-Target','?')
+    r2 = h.get('X-Proxy-Route-Target','?')
     s, h, _, _ = send(build_short(), {"X-Claude-Code-Session-Id": sid})
-    r3 = h.get('X-Route-Target','?')
+    r3 = h.get('X-Proxy-Route-Target','?')
     s, h, _, _ = send(build_short(), {"X-Claude-Code-Session-Id": "bench-new-session"})
-    r4 = h.get('X-Route-Target','?')
+    r4 = h.get('X-Proxy-Route-Target','?')
     print(f"  {r1} → {r2} → {r3} → {r4} (new session)")
 
     print(f"\n=== Done ===")

@@ -90,6 +90,19 @@ def reload_config(signum=None, frame=None, target_module=None):
         prefs = model_registry.build_route_preferences()
         proxy_state.MODEL_ROUTE_PREFERENCES = prefs
         setattr(target_module, "MODEL_ROUTE_PREFERENCES", prefs)
+
+        # Apply every catalog provider key_env found in the parsed conf env
+        # (e.g. ZHIPU_API_KEY / KIMI_API_KEY from secret.local.conf) so provider
+        # keys rotate on SIGHUP without per-provider _RELOAD_SPEC entries.
+        for _pname in model_registry.list_providers():
+            _ke = (model_registry.get_provider(_pname) or {}).get("key_env", "")
+            if _ke and _ke != "LLAMA_API_KEY" and _ke in env:
+                setattr(proxy_state, _ke, env[_ke])
+                setattr(target_module, _ke, env[_ke])
+
+        # Rebuild per-provider semaphores (catalog `concurrent` may have changed).
+        proxy_state.rebuild_provider_locks()
+
         err = model_registry.last_error()
         if err:
             log("[RELOAD] %s" % err, level="WARN")

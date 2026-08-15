@@ -532,6 +532,99 @@ _CATALOG_FROM_FILE = model_registry.load(
 )
 MODEL_ROUTE_PREFERENCES = model_registry.build_route_preferences()
 
+
+# ---------------------------------------------------------------------------
+# Multi-provider cloud state (Phase B model catalog)
+# ---------------------------------------------------------------------------
+def _env_lookup(key, default=None):
+    """Provider env resolver: hot-reloaded proxy_state attrs win over os.environ.
+
+    Provider keys (ZHIPU_API_KEY / KIMI_API_KEY / ...) live either as proxy_state
+    attrs (applied by reload_config from secret.local.conf on SIGHUP) or in the
+    process environment (exported by manage.sh at startup).
+    """
+    v = globals().get(key)
+    if isinstance(v, str) and v:
+        return v
+    v = os.environ.get(key)
+    return v if v else default
+
+
+def rebuild_provider_locks():
+    """(Re)build per-provider semaphores from the catalog's `concurrent` fields.
+
+    Rebuilt at startup and on SIGHUP. Dispatch looks up the selected model's
+    provider; providers without a lock (or unknown models) fall back to the
+    global _cloud_lock, preserving pre-catalog behavior.
+    """
+    global _provider_locks
+    new_locks = {}
+    for pname in model_registry.list_providers():
+        if pname == "local":
+            continue
+        creds = model_registry.get_provider_credentials(pname, env_lookup=_env_lookup)
+        if creds:
+            new_locks[pname] = threading.Semaphore(max(1, creds["concurrent"]))
+    _provider_locks = new_locks
+
+
+_provider_locks = {}
+rebuild_provider_locks()
+
+# Per-provider circuit breaker + cost (all access under _state_lock)
+_PROVIDER_FAIL_COUNT = {}       # provider → consecutive failure count
+_PROVIDER_COOLDOWN_START = {}   # provider → monotonic timestamp
+_route_provider_cost = {}       # provider → daily cost (¥, same date key as _route_daily_date)
+
+
+def _provider_cooldown_active(pname):
+    """True while provider cooldown window is open; clears it once expired."""
+    if not pname:
+        return False
+    with _state_lock:
+        ts = _PROVIDER_COOLDOWN_START.get(pname)
+    if not ts:
+        return False
+    if time.monotonic() - ts < PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS:
+        return True
+    with _state_lock:
+        _PROVIDER_COOLDOWN_START.pop(pname, None)
+    return False
+
+
+def _record_provider_failure(pname, retryable=True):
+    """Count a provider failure; trip the cooldown after MAX_CLOUD_FAILS."""
+    if not pname or not retryable:
+        return
+    with _state_lock:
+        _PROVIDER_FAIL_COUNT[pname] = _PROVIDER_FAIL_COUNT.get(pname, 0) + 1
+        n = _PROVIDER_FAIL_COUNT[pname]
+        if n >= PROXY_ROUTE_MAX_CLOUD_FAILS:
+            _PROVIDER_COOLDOWN_START[pname] = time.monotonic()
+            _PROVIDER_FAIL_COUNT[pname] = 0
+
+
+def _record_provider_success(pname):
+    if not pname:
+        return
+    with _state_lock:
+        _PROVIDER_FAIL_COUNT.pop(pname, None)
+
+
+def _provider_budget_exceeded(pname):
+    """True when the provider's per-provider daily budget cap is reached."""
+    if not pname:
+        return False
+    budget = model_registry.get_provider_budget(pname)
+    if budget is None or budget <= 0:
+        return False
+    today = time.strftime("%Y-%m-%d")
+    with _state_lock:
+        if _route_daily_date != today:
+            return False
+        spent = _route_provider_cost.get(pname, 0.0)
+    return spent >= budget
+
 # ---------------------------------------------------------------------------
 # Structured metrics logging
 # ---------------------------------------------------------------------------
@@ -556,21 +649,40 @@ _route_daily_cost: float = 0.0
 _route_daily_date: str = ""   # YYYY-MM-DD, cross-day auto-reset
 
 
-def _accumulate_route_daily_cost(input_tokens: int = 0, output_tokens: int = 0) -> float:
+def _accumulate_route_daily_cost(input_tokens: int = 0, output_tokens: int = 0,
+                                 model: str = "", provider: str = "") -> float:
     """Atomically add estimated cloud API cost and return new daily total.
 
     Tokens are estimated; output_tokens may be max_tokens upper-bound for streaming.
     Cost is in CNY. Cross-day reset is handled automatically.
+
+    Phase B: per-model pricing from the catalog (models.<name>.price); models
+    without a catalog price fall back to the global PROXY_CLOUD_PRICE_* pair.
+    Per-provider totals accumulate alongside the global total for
+    per_provider_budget caps (defaults.per_provider_budget).
     """
     global _route_daily_cost, _route_daily_date
+    price_in, price_out = PROXY_CLOUD_PRICE_INPUT, PROXY_CLOUD_PRICE_OUTPUT
+    if model:
+        entry = model_registry.get_model(model)
+        price = (entry or {}).get("price") or {}
+        pi = price.get("input")
+        po = price.get("output")
+        if isinstance(pi, (int, float)) and not isinstance(pi, bool) and pi >= 0:
+            price_in = pi
+        if isinstance(po, (int, float)) and not isinstance(po, bool) and po >= 0:
+            price_out = po
     today = time.strftime("%Y-%m-%d")
     with _state_lock:
         if _route_daily_date != today:
             _route_daily_date = today
             _route_daily_cost = 0.0
-        input_cost = input_tokens * PROXY_CLOUD_PRICE_INPUT / 1_000_000
-        output_cost = output_tokens * PROXY_CLOUD_PRICE_OUTPUT / 1_000_000
+            _route_provider_cost.clear()
+        input_cost = input_tokens * price_in / 1_000_000
+        output_cost = output_tokens * price_out / 1_000_000
         _route_daily_cost += input_cost + output_cost
+        if provider:
+            _route_provider_cost[provider] = _route_provider_cost.get(provider, 0.0) + input_cost + output_cost
         return _route_daily_cost
 
 
