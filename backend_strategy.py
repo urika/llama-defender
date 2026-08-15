@@ -15,6 +15,8 @@ class BackendStrategy:
 
     @classmethod
     def get_default(cls, key, fallback=None):
+        # DEPRECATED（配置统一阶段一）：新代码请使用 proxy_config.get_default()，
+        # 默认值唯一权威为 proxy_config.CONFIG_REGISTRY。此方法仅为向后兼容保留。
         return cls.DEFAULTS.get(key, fallback)
 
     @staticmethod
@@ -25,6 +27,9 @@ class BackendStrategy:
 class LocalStrategy(BackendStrategy):
     """Local backend (llama-server, rapid-mlx) — 48GB Apple Silicon defaults."""
 
+    # NOTE: DEFAULTS below are DEPRECATED.  New variables should be added to
+    # proxy_config.CONFIG_REGISTRY only.  proxy_state.py reads defaults via
+    # proxy_config.get_default(), which checks CONFIG_REGISTRY first.
     DEFAULTS = {
         "PROXY_MAX_CONCURRENT": "1",
         "MODEL_NAME": "mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -81,6 +86,9 @@ class LocalStrategy(BackendStrategy):
 class CloudStrategy(BackendStrategy):
     """Cloud API (DeepSeek, OpenAI) — 1M+ token context defaults."""
 
+    # NOTE: DEFAULTS below are DEPRECATED.  New variables should be added to
+    # proxy_config.CONFIG_REGISTRY only.  proxy_state.py reads defaults via
+    # proxy_config.get_default(), which checks CONFIG_REGISTRY first.
     DEFAULTS = {
         "PROXY_MAX_CONCURRENT": "4",
         "MODEL_NAME": "deepseek-v4-pro",

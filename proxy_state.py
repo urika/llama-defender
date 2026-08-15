@@ -17,6 +17,10 @@ import time
 
 import model_registry
 
+# 配置统一阶段一：默认值唯一权威是 proxy_config.CONFIG_REGISTRY。
+# proxy_config 对共享状态采用惰性 __getattr__ 转发，此处 import 不会形成循环依赖。
+from proxy_config import get_default
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -79,6 +83,7 @@ _strategy = BackendStrategy.create(IS_CLOUD)
 # ---------------------------------------------------------------------------
 
 # Config default resolution: reads canonical defaults from proxy_config
+# 注：保留用于向后兼容；新代码请直接使用顶部导入的 get_default()。
 def _default(env_key, cloud_val, local_val):
     """Return the canonical default for env_key, falling back to hardcoded.
     Uses backend_strategy for IS_CLOUD-dependent defaults."""
@@ -172,15 +177,10 @@ PROXY_CTX_TOKEN_RATIO = float(os.environ.get("PROXY_CTX_TOKEN_RATIO", "2.0"))
 # ---------------------------------------------------------------------------
 # Unified char-based lifecycle stage thresholds
 # ---------------------------------------------------------------------------
-PROXY_CHARS_GROWTH = int(os.environ.get(
-    "PROXY_CHARS_GROWTH", "80000" if IS_CLOUD else "40000"))
-PROXY_CHARS_EXPANSION = int(os.environ.get(
-    "PROXY_CHARS_EXPANSION", "200000" if IS_CLOUD else "90000"))
-PROXY_CHARS_SATURATION = int(os.environ.get(
-    "PROXY_CHARS_SATURATION",
-    os.environ.get("PROXY_CTX_CHARS_LIMIT", _default("PROXY_CTX_CHARS_LIMIT", "500000", "180000"))))
-PROXY_CHARS_OOM_DANGER = int(os.environ.get(
-    "PROXY_CHARS_OOM_DANGER", "1000000" if IS_CLOUD else "350000"))
+PROXY_CHARS_GROWTH = int(os.environ.get("PROXY_CHARS_GROWTH", get_default("PROXY_CHARS_GROWTH")))
+PROXY_CHARS_EXPANSION = int(os.environ.get("PROXY_CHARS_EXPANSION", get_default("PROXY_CHARS_EXPANSION")))
+PROXY_CHARS_SATURATION = int(os.environ.get("PROXY_CHARS_SATURATION", get_default("PROXY_CHARS_SATURATION")))
+PROXY_CHARS_OOM_DANGER = int(os.environ.get("PROXY_CHARS_OOM_DANGER", get_default("PROXY_CHARS_OOM_DANGER")))
 
 # ---------------------------------------------------------------------------
 # Output token control
@@ -193,7 +193,7 @@ PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "600"))
 # Cloud backends (DeepSeek/OpenAI) support 1M+ tokens, so pre_truncate is
 # effectively disabled (10M chars threshold). Local backends cap at 200K
 # to prevent Metal OOM.
-_default_oom = _strategy.get_default("PROXY_OOM_SAFE_CHARS", "200000")
+_default_oom = get_default("PROXY_OOM_SAFE_CHARS")
 # Treat empty string like unset (manage.sh may pass PROXY_OOM_SAFE_CHARS=""
 # when neither PROXY_OOM_SAFE_CHARS nor PROXY_PRE_TRUNCATE_CHARS is defined).
 # `int("")` raises ValueError, so use `or` to fall through to the default.
@@ -228,7 +228,7 @@ PROXY_TOKEN_RATIO_CODE = float(os.environ.get("PROXY_TOKEN_RATIO_CODE", "3.0"))
 # Phase 3: memory pressure active rejection
 # ---------------------------------------------------------------------------
 PROXY_MEMORY_REJECT_THRESHOLD = float(os.environ.get(
-    "PROXY_MEMORY_REJECT_THRESHOLD", "95" if IS_CLOUD else "90"))
+    "PROXY_MEMORY_REJECT_THRESHOLD", get_default("PROXY_MEMORY_REJECT_THRESHOLD")))
 
 # ---------------------------------------------------------------------------
 # Phase 3: dynamic max_tokens
@@ -251,14 +251,28 @@ PROXY_SNAPSHOT_MAX_FILES = int(os.environ.get("PROXY_SNAPSHOT_MAX_FILES", "50"))
 # Phase 3: dynamic concurrency control
 # ---------------------------------------------------------------------------
 PROXY_DYNAMIC_CONCURRENT_ENABLED = os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_ENABLED", "false" if IS_CLOUD else "true").lower() in ("1", "true", "yes")
+    "PROXY_DYNAMIC_CONCURRENT_ENABLED", get_default("PROXY_DYNAMIC_CONCURRENT_ENABLED")).lower() in ("1", "true", "yes")
 PROXY_DYNAMIC_CONCURRENT_MIN = int(os.environ.get("PROXY_DYNAMIC_CONCURRENT_MIN", "1"))
 PROXY_DYNAMIC_CONCURRENT_MAX = int(os.environ.get(
-    "PROXY_DYNAMIC_CONCURRENT_MAX", "8" if IS_CLOUD else "4"))
+    "PROXY_DYNAMIC_CONCURRENT_MAX", get_default("PROXY_DYNAMIC_CONCURRENT_MAX")))
 PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS = float(os.environ.get(
     "PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS", "30000"))
 PROXY_DYNAMIC_CONCURRENT_ERROR_RATE = float(os.environ.get(
     "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE", "0.2"))
+
+# ---------------------------------------------------------------------------
+# 请求优先级队列（Phase 1：默认关闭，叠加在 _llama_lock 之上，不替代它）
+# ---------------------------------------------------------------------------
+PROXY_QUEUE_ENABLED = os.environ.get(
+    "PROXY_QUEUE_ENABLED", get_default("PROXY_QUEUE_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_QUEUE_TIMEOUT_SECONDS = int(os.environ.get(
+    "PROXY_QUEUE_TIMEOUT_SECONDS", get_default("PROXY_QUEUE_TIMEOUT_SECONDS")))
+PROXY_QUEUE_LARGE_THRESHOLD_CHARS = int(os.environ.get(
+    "PROXY_QUEUE_LARGE_THRESHOLD_CHARS", get_default("PROXY_QUEUE_LARGE_THRESHOLD_CHARS")))
+PROXY_QUEUE_HUGE_THRESHOLD_CHARS = int(os.environ.get(
+    "PROXY_QUEUE_HUGE_THRESHOLD_CHARS", get_default("PROXY_QUEUE_HUGE_THRESHOLD_CHARS")))
+PROXY_QUEUE_HUGE_ACTION = os.environ.get(
+    "PROXY_QUEUE_HUGE_ACTION", get_default("PROXY_QUEUE_HUGE_ACTION"))
 
 # ---------------------------------------------------------------------------
 # Loop detection
@@ -634,6 +648,28 @@ _METRICS_PATH = os.path.join(_SCRIPT_DIR, PROXY_METRICS_DIR, "proxy_metrics.json
 _metrics_lock = threading.Lock()
 _state_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# 请求优先级队列：全局单例（惰性构建，worker 数 = 构建时的 PROXY_MAX_CONCURRENT）
+# 注意：SIGHUP 热重载 PROXY_MAX_CONCURRENT / 阈值不会重建已存在的管理器实例；
+# 分桶阈值在调用方（Handler）按当前值实时计算，不受此限制。
+# ---------------------------------------------------------------------------
+_QUEUE_MANAGER = None
+
+
+def get_queue_manager():
+    """返回全局 RequestQueueManager（双重检查锁惰性构建）。"""
+    global _QUEUE_MANAGER
+    if _QUEUE_MANAGER is None:
+        with _state_lock:
+            if _QUEUE_MANAGER is None:
+                import queue_manager
+                _QUEUE_MANAGER = queue_manager.RequestQueueManager(
+                    max_workers=PROXY_MAX_CONCURRENT,
+                    large_threshold=PROXY_QUEUE_LARGE_THRESHOLD_CHARS,
+                    huge_threshold=PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
+                )
+    return _QUEUE_MANAGER
+
 # Cloud concurrency lock (rebuilt on SIGHUP if PROXY_ROUTE_CLOUD_CONCURRENT changes)
 _cloud_lock = threading.Semaphore(PROXY_ROUTE_CLOUD_CONCURRENT)
 
@@ -907,6 +943,12 @@ _RELOAD_SPEC = [
     ("PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "int", "4096", "4096"),
     ("PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "int", "2048", "2048"),
     ("PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "float", "0.8", "0.8"),
+    # 请求优先级队列（Phase 1，默认关闭）
+    ("PROXY_QUEUE_ENABLED", "PROXY_QUEUE_ENABLED", "bool", "false", "false"),
+    ("PROXY_QUEUE_TIMEOUT_SECONDS", "PROXY_QUEUE_TIMEOUT_SECONDS", "int", "300", "300"),
+    ("PROXY_QUEUE_LARGE_THRESHOLD_CHARS", "PROXY_QUEUE_LARGE_THRESHOLD_CHARS", "int", "80000", "80000"),
+    ("PROXY_QUEUE_HUGE_THRESHOLD_CHARS", "PROXY_QUEUE_HUGE_THRESHOLD_CHARS", "int", "200000", "200000"),
+    ("PROXY_QUEUE_HUGE_ACTION", "PROXY_QUEUE_HUGE_ACTION", "str", "cloud", "cloud"),
 ]
 
 
@@ -1095,4 +1137,8 @@ __all__ = [
     "_detect_client_type",
     "_accumulate_route_daily_cost",
     "_parse_budget_alert_tiers", "_get_budget_alert_level",
+    # 请求优先级队列
+    "PROXY_QUEUE_ENABLED", "PROXY_QUEUE_TIMEOUT_SECONDS",
+    "PROXY_QUEUE_LARGE_THRESHOLD_CHARS", "PROXY_QUEUE_HUGE_THRESHOLD_CHARS",
+    "PROXY_QUEUE_HUGE_ACTION", "get_queue_manager",
 ]

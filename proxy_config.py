@@ -745,27 +745,166 @@ CONFIG_REGISTRY = {
         "type": "float", "scope": "reloadable",
         "doc": "Non-sticky: ratio of effective_threshold below which a cloud request counts as 'below' for return counter (0.7 = below 70% of threshold).",
     },
+
+    # ---- 请求优先级队列（Phase 1：默认关闭，向后兼容）----
+    "PROXY_QUEUE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Enable priority request queue. Default false = legacy semaphore behavior.",
+    },
+    "PROXY_QUEUE_TIMEOUT_SECONDS": {
+        "defaults": {"all": "300"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max seconds a request may wait in the priority queue before 503.",
+    },
+    "PROXY_QUEUE_LARGE_THRESHOLD_CHARS": {
+        "defaults": {"all": "80000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Char threshold for 'large' queue bucket.",
+    },
+    "PROXY_QUEUE_HUGE_THRESHOLD_CHARS": {
+        "defaults": {"all": "200000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Char threshold for 'huge' bucket: routed to cloud or rejected instead of queueing locally.",
+    },
+    "PROXY_QUEUE_HUGE_ACTION": {
+        "defaults": {"all": "cloud"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Action for huge bucket: cloud (route via SmartRouter if enabled) | reject (413).",
+    },
+
+    # ---- 后端启动参数（由 manage.sh 消费，代理运行时不读取，scope=module）----
+    "LLAMA_BACKEND": {
+        "defaults": {"all": "llama-server"},
+        "type": "str", "scope": "module",
+        "doc": "Backend binary kind: llama-server | rapid-mlx | vllm-mlx. Consumed by manage.sh.",
+    },
+    "LLAMA_MODEL": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "module",
+        "doc": "Model id/path passed to the backend binary (-hf or -m). Consumed by manage.sh.",
+    },
+    "LLAMA_SERVER_BIN": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "module",
+        "doc": "Explicit path to the backend binary (e.g. .venv-rapidmlx/bin/rapid-mlx). Empty = PATH lookup.",
+    },
+    "LLAMA_THREADS": {
+        "defaults": {"all": "8"},
+        "type": "int", "scope": "module",
+        "doc": "CPU threads for the backend binary.",
+    },
+    "LLAMA_TEMP": {
+        "defaults": {"all": "0.7"},
+        "type": "float", "scope": "module",
+        "doc": "Sampling temperature passed to the backend.",
+    },
+    "LLAMA_TOP_P": {
+        "defaults": {"all": "0.8"},
+        "type": "float", "scope": "module",
+        "doc": "Top-p sampling passed to the backend.",
+    },
+    "LLAMA_TOP_K": {
+        "defaults": {"all": "20"},
+        "type": "int", "scope": "module",
+        "doc": "Top-k sampling passed to the backend.",
+    },
+    "LLAMA_MIN_P": {
+        "defaults": {"all": "0.0"},
+        "type": "float", "scope": "module",
+        "doc": "Min-p sampling passed to the backend.",
+    },
+    "LLAMA_PRESENCE_PENALTY": {
+        "defaults": {"all": "0.0"},
+        "type": "float", "scope": "module",
+        "doc": "Presence penalty passed to the backend.",
+    },
+    "LLAMA_THINKING": {
+        "defaults": {"all": "false"},
+        "type": "str", "scope": "module",
+        "doc": "Thinking mode flag: true|false|'' (empty = omit flag, for models without thinking support).",
+    },
+    "RAPID_MLX_TOOL_PARSER": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "module",
+        "doc": "rapid-mlx tool parser name (e.g. hermes, qwen3_coder_xml). Consumed by manage.sh.",
+    },
+    "RAPID_MLX_REASONING_PARSER": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "module",
+        "doc": "rapid-mlx reasoning parser name (e.g. qwen3). Consumed by manage.sh.",
+    },
+    "RAPID_MLX_ENABLE_PREFIX_CACHE": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "module",
+        "doc": "Enable rapid-mlx cross-request prefix cache (>= 0.11.5). Consumed by manage.sh.",
+    },
+    "RAPID_MLX_KV_QUANTIZATION": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "module",
+        "doc": "Enable rapid-mlx KV cache quantization. Consumed by manage.sh.",
+    },
+    "RAPID_MLX_KV_QUANT_BITS": {
+        "defaults": {"all": "4"},
+        "type": "int", "scope": "module",
+        "doc": "rapid-mlx KV cache quantization bits. Consumed by manage.sh.",
+    },
+    "RAPID_MLX_EXTRA_ARGS": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "module",
+        "doc": "Extra CLI args appended to the rapid-mlx command line. Consumed by manage.sh.",
+    },
 }
 
+# 非代理配置变量白名单：允许出现在 conf/env 中，但不要求注册进 CONFIG_REGISTRY。
+# - CONFIG_*：configs/*.conf 的元数据，由 manage.sh list 消费。
+# - HF_HUB_OFFLINE：环境开关，由后端进程读取。
+# - *_API_KEY：models.json 中 provider key_env 引用的密钥变量，存放在 secret.local.conf。
+NON_PROXY_VARS = frozenset({
+    "CONFIG_NAME",
+    "CONFIG_DESC",
+    "CONFIG_MEMORY",
+    "HF_HUB_OFFLINE",
+})
+NON_PROXY_SUFFIXES = ("_API_KEY",)
+
 # ---------------------------------------------------------------------------
-# Thread lock and shared state: imported from proxy_state (single source of
-# truth for all module-level config constants and mutable shared state).
-# Previously defined here to avoid circular imports — now resolved by
-# extracting state into its own dependency-free module.
+# Thread lock and shared state: lazily re-exported from proxy_state (single
+# source of truth for all module-level config constants and mutable shared
+# state).
+#
+# 配置统一阶段一：proxy_state 顶部需要 `from proxy_config import get_default`，
+# 若此处仍保留模块级 `from proxy_state import ...` 会形成循环 import。改为
+# PEP 562 惰性 __getattr__ 转发，属性访问行为不变（proxy_config._state_lock
+# 等仍可正常使用，且与 proxy_state 中是同一对象）。
 # ---------------------------------------------------------------------------
 
-from proxy_state import (
-    _state_lock,
-    _SESSION_REQUEST_COUNT,
-    _SESSION_LAST_MESSAGES,
-    _DEDUP_CACHE,
-    _LATENCY_WINDOW,
-    _ERROR_WINDOW,
-)
+_LAZY_STATE_NAMES = frozenset({
+    "_state_lock",
+    "_SESSION_REQUEST_COUNT",
+    "_SESSION_LAST_MESSAGES",
+    "_DEDUP_CACHE",
+    "_LATENCY_WINDOW",
+    "_ERROR_WINDOW",
+})
+
+
+def __getattr__(name):
+    # PEP 562：访问时才 import proxy_state，打破模块加载期的循环依赖。
+    if name in _LAZY_STATE_NAMES:
+        import proxy_state
+        return getattr(proxy_state, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "CONFIG_REGISTRY",
     "resolve_default",
+    "get_default",
+    "get_registry_entry",
+    "is_reloadable",
+    "list_unregistered_env_vars",
+    "validate_startup",
+    "write_defaults_sh",
     "diff_from_defaults",
     "validate",
     "_state_lock",
@@ -946,3 +1085,140 @@ def validate(module=None):
 # Boot-time: AUTO_DETECT_CLOUD will be set after proxy loads its module-level
 # vars. Callers should invoke validate() after the proxy's module-level code
 # has run, not here (circular dependency).
+
+
+# ---------------------------------------------------------------------------
+# 配置统一阶段一：CONFIG_REGISTRY 作为唯一默认值权威
+# ---------------------------------------------------------------------------
+
+def get_default(key, backend_type=None):
+    """Return the canonical default for key, resolved for backend_type ('local'/'cloud').
+
+    backend_type: if None, inferred from LLAMA_BASE_URL.
+    Returns the raw default string from CONFIG_REGISTRY.
+    """
+    if backend_type is None:
+        base_url = os.environ.get("LLAMA_BASE_URL", "")
+        backend_type = "cloud" if any(x in base_url.lower() for x in ("deepseek", "openai", "api.")) else "local"
+    is_cloud = (backend_type == "cloud")
+    resolved = resolve_default(key, is_cloud)
+    return resolved if resolved is not None else ""
+
+
+def get_registry_entry(key):
+    """Return the full registry entry dict for key, or None."""
+    return CONFIG_REGISTRY.get(key)
+
+
+def is_reloadable(key):
+    """Return True if key has scope == 'reloadable'."""
+    entry = CONFIG_REGISTRY.get(key)
+    return entry and entry.get("scope") == "reloadable"
+
+
+def _is_non_proxy_var(key):
+    """白名单判定：conf 元数据 / 环境开关 / provider 密钥变量不算未注册。"""
+    if key in NON_PROXY_VARS:
+        return True
+    return any(key.endswith(suffix) for suffix in NON_PROXY_SUFFIXES)
+
+
+def list_unregistered_env_vars(env=None):
+    """Return sorted list of PROXY_*/LLAMA_*/RAPID_MLX_* env vars not in CONFIG_REGISTRY."""
+    if env is None:
+        env = os.environ
+    prefixes = ("PROXY_", "LLAMA_", "RAPID_MLX_")
+    return sorted(
+        k for k in env
+        if k.startswith(prefixes) and k not in CONFIG_REGISTRY and not _is_non_proxy_var(k)
+    )
+
+
+def validate_startup(env=None, active_conf_path=None, backend_type=None, strict=False):
+    """Validate startup configuration. Returns list of error strings.
+
+    strict=False: returns errors but does not exit.
+    strict=True: raises SystemExit with error summary.
+
+    Checks:
+    1. All PROXY_*/LLAMA_*/RAPID_MLX_* env vars are registered in CONFIG_REGISTRY.
+    2. Values match declared types (int/float/bool).
+    3. backend_type is 'local' or 'cloud'.
+    4. If active_conf_path is given, all KEY=value vars in the file are registered.
+    """
+    if env is None:
+        env = os.environ
+    errors = []
+
+    # 1. 未注册的环境变量
+    unregistered = list_unregistered_env_vars(env)
+    for k in unregistered:
+        errors.append(f"Unregistered env var: {k} (add to CONFIG_REGISTRY or remove)")
+
+    # 2. 类型校验
+    for key, entry in CONFIG_REGISTRY.items():
+        raw = env.get(key)
+        if raw is None or raw == "":
+            continue
+        entry_type = entry.get("type", "str")
+        if entry_type == "int":
+            try:
+                int(raw)
+            except ValueError:
+                errors.append(f"{key} should be int, got '{raw}'")
+        elif entry_type == "float":
+            try:
+                float(raw)
+            except ValueError:
+                errors.append(f"{key} should be float, got '{raw}'")
+        elif entry_type == "bool":
+            if raw.lower() not in ("1", "true", "yes", "0", "false", "no"):
+                errors.append(f"{key} should be bool, got '{raw}'")
+
+    # 3. backend_type 合法性
+    bt = env.get("BACKEND_TYPE", backend_type or "")
+    if bt and bt not in ("local", "cloud"):
+        errors.append(f"BACKEND_TYPE should be 'local' or 'cloud', got '{bt}'")
+
+    # 4. active.conf 中的未注册变量
+    if active_conf_path and os.path.exists(active_conf_path):
+        with open(active_conf_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key = line.split("=", 1)[0].strip()
+                # conf 文件里允许 export KEY=... 写法
+                if key.startswith("export "):
+                    key = key[len("export "):].strip()
+                if (
+                    key.startswith(("PROXY_", "LLAMA_", "RAPID_MLX_"))
+                    and key not in CONFIG_REGISTRY
+                    and not _is_non_proxy_var(key)
+                ):
+                    errors.append(f"Unregistered config var in {active_conf_path}: {key}")
+
+    if strict and errors:
+        summary = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        raise SystemExit(summary)
+    return errors
+
+
+def write_defaults_sh(backend_type, path):
+    """Write unset CONFIG_REGISTRY variables to a Bash file at path.
+
+    Only writes variables that are NOT already set in os.environ.
+    Format: export KEY="value"
+    """
+    lines = []
+    for key, entry in sorted(CONFIG_REGISTRY.items()):
+        if key in os.environ:
+            continue
+        val = get_default(key, backend_type)
+        if val == "":
+            continue
+        lines.append(f'export {key}="{val}"')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")

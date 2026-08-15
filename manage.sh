@@ -715,6 +715,42 @@ EOF
     # This is the Phase 2 cleanup of the original "manage.sh default=char vs
     # conf sets fifo/rounds" priority ambiguity. The alias LLAMA_CTX_STRATEGY
     # is supported as a more semantic name for the same env var.
+    #
+    # 配置统一阶段一：先从 CONFIG_REGISTRY 生成未显式设置的默认值并 source，
+    # 使 registry 成为默认值唯一权威（下方 :- 硬编码回退逐步退化为兼容兜底）。
+    # 注意：conf 文件是 source（未 export），python 子进程看不到这些 shell
+    # 变量，因此把已设置的变量名通过 _PROXY_SET_VAR_NAMES 传给子进程做
+    # "已设置" 判定，避免 registry 默认值覆盖配置文件中的显式值。
+    # 收集全部 shell 变量名（而非仅 PROXY_/LLAMA_/RAPID_MLX_ 前缀），
+    # 由子进程按 CONFIG_REGISTRY 成员过滤——MODEL_NAME/PORT/HOST 等
+    # 不带前缀的注册变量也必须被识别为"已设置"。
+    local _defaults_tmp _set_var_names _bt
+    _defaults_tmp="$(mktemp)"
+    _set_var_names="$(compgen -A variable | tr '\n' ' ')"
+    _bt="${BACKEND_TYPE:-}"
+    if [[ -z "$_bt" ]]; then
+        # 与 proxy_state.py 的自动检测规则保持一致
+        case "${LLAMA_BASE_URL:-}" in
+            *deepseek*|*openai*|*api.*) _bt="cloud" ;;
+            *) _bt="local" ;;
+        esac
+    fi
+    if _PROXY_SET_VAR_NAMES="$_set_var_names" python3 -c "
+import os, sys
+sys.path.insert(0, '$SCRIPT_DIR')
+import proxy_config
+for _k in os.environ.pop('_PROXY_SET_VAR_NAMES', '').split():
+    if _k in proxy_config.CONFIG_REGISTRY:
+        os.environ.setdefault(_k, '')
+proxy_config.write_defaults_sh('$_bt', '$_defaults_tmp')
+" 2>/dev/null; then
+        # shellcheck source=/dev/null
+        source "$_defaults_tmp"
+    else
+        warn "CONFIG_REGISTRY 默认值生成失败，回退到内置默认值"
+    fi
+    rm -f "$_defaults_tmp"
+
     LLAMA_BASE_URL="$base_url" \
     LLAMA_API_KEY="${LLAMA_API_KEY:-sk-1234}" \
     MODEL_NAME="${MODEL_NAME:-$LLAMA_MODEL}" \
@@ -1252,6 +1288,32 @@ else:
     print(f"✓ configs/models.json 校验通过 (hash={model_registry.catalog_hash()})")
 sys.exit(0)
 PYEOF
+}
+
+# ============================================================
+# 配置校验（CONFIG_REGISTRY lint）
+# ============================================================
+cmd_config_lint() {
+    local conf_file="${1:-$ACTIVE_CONF}"
+    python3 - "$SCRIPT_DIR" "$conf_file" <<'EOF'
+import sys, os
+
+sys.path.insert(0, sys.argv[1])
+import proxy_config
+
+path = sys.argv[2]
+backend_type = os.environ.get("BACKEND_TYPE", "local")
+errors = proxy_config.validate_startup(
+    env=os.environ,
+    active_conf_path=path,
+    backend_type=backend_type,
+)
+if errors:
+    for e in errors:
+        print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+print(f"OK: {path} 通过配置校验")
+EOF
 }
 
 # ============================================================
@@ -2058,6 +2120,7 @@ llama.cpp / Rapid-MLX 服务管理脚本
   list                 列出所有可用配置
   switch <name>        切换到指定配置（切换后需 reload 或 restart 生效）
   current              显示当前配置详情
+  config-lint [file]   校验配置文件与 CONFIG_REGISTRY 的一致性（默认校验 active.conf）
 
 模型目录:
   models               显示模型目录（providers/models/routes、key 就绪状态、hash）
@@ -2208,6 +2271,9 @@ main() {
             ;;
         models-validate)
             cmd_models_validate
+            ;;
+        config-lint)
+            cmd_config_lint "${2:-}"
             ;;
         switch)
             _with_manage_lock cmd_switch "$2"
