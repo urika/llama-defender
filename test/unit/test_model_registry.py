@@ -535,7 +535,8 @@ class TestV1ModelsMetadata(unittest.TestCase):
         self.assertTrue(meta["thinking_required"])   # thinking: required
         self.assertEqual(meta["json_compliance"], "strict")
         self.assertEqual(meta["context_chars"], 1000000)
-        self.assertEqual(meta["price"], {"input": 2.0, "output": 8.0, "currency": "CNY"})
+        self.assertEqual(meta["price"]["input"], 3.0)   # 官方正式版价
+        self.assertEqual(meta["price"]["output"], 6.0)
         self.assertTrue(meta["direct_capable"])       # deepseek has an Anthropic endpoint
 
     def test_sonnet_flash_metadata(self):

@@ -342,14 +342,14 @@ class TestRouteCost(unittest.TestCase):
         t_in = _accumulate_route_daily_cost(
             input_tokens=1_000_000, output_tokens=0,
             model="deepseek-v4-pro", provider="deepseek")
-        self.assertAlmostEqual(t_in, 2.0, places=6)
+        self.assertAlmostEqual(t_in, 3.0, places=6)   # catalog price ¥3/M in
         t_out = _accumulate_route_daily_cost(
             input_tokens=0, output_tokens=1_000_000,
             model="deepseek-v4-pro", provider="deepseek")
-        self.assertAlmostEqual(t_out - t_in, 8.0, places=6)
+        self.assertAlmostEqual(t_out - t_in, 6.0, places=6)  # ¥6/M out
         with proxy_state._state_lock:
             self.assertAlmostEqual(
-                proxy_state._route_provider_cost.get("deepseek", 0.0), 10.0, places=6)
+                proxy_state._route_provider_cost.get("deepseek", 0.0), 9.0, places=6)
 
     def test_accumulate_unknown_model_uses_global_price(self):
         from proxy_state import _accumulate_route_daily_cost
