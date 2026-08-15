@@ -1195,13 +1195,19 @@ print()
 print("提供商 (providers)")
 for name in model_registry.list_providers():
     p = model_registry.get_provider(name) or {}
-    url = p.get("base_url") or ("$" + p.get("base_url_env", "?"))
+    proto = p.get("protocol", "openai")
+    if proto == "anthropic":
+        url = p.get("base_url") or p.get("anthropic_base_url") or "-"
+        keff = p.get("anthropic_key_env") or p.get("key_env", "")
+    else:
+        url = p.get("base_url") or ("$" + p.get("base_url_env", "?"))
+        keff = p.get("key_env", "")
     cc = p.get("concurrent") or ("$" + p.get("concurrent_env", "?"))
-    ks = key_set(p.get("key_env", ""))
-    proto = (" [" + p["protocol"] + "]") if p.get("protocol", "openai") != "openai" else ""
-    print(f"  {name:10} key={'✓' if ks else '✗'}({p.get('key_env','')}) concurrent={cc}{proto}")
+    ks = key_set(keff)
+    ptag = (" [" + proto + "]") if proto != "openai" else ""
+    print(f"  {name:10} key={'✓' if ks else '✗'}({keff}) concurrent={cc}{ptag}")
     print(f"             {url}")
-    if p.get("anthropic_base_url"):
+    if p.get("anthropic_base_url") and proto != "anthropic":
         print(f"             anthropic: {p['anthropic_base_url']}")
 print()
 

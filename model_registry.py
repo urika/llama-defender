@@ -170,10 +170,22 @@ def _validate(catalog):
             continue
         has_url = isinstance(p.get("base_url"), str) and p["base_url"]
         has_url_env = isinstance(p.get("base_url_env"), str) and p["base_url_env"]
-        if not has_url and not has_url_env:
+        has_anthropic = (p.get("protocol") == "anthropic"
+                         and isinstance(p.get("anthropic_base_url"), str)
+                         and p["anthropic_base_url"])
+        if not has_url and not has_url_env and not has_anthropic:
+            errors.append(
+                "provider %r needs base_url/base_url_env"
+                " (or anthropic_base_url when protocol=anthropic)" % pname)
+        if p.get("protocol") != "anthropic" and not (has_url or has_url_env):
             errors.append("provider %r needs base_url or base_url_env" % pname)
-        if not (isinstance(p.get("key_env"), str) and p["key_env"]):
-            errors.append("provider %r needs key_env" % pname)
+        has_key = (isinstance(p.get("key_env"), str) and p["key_env"]) or (
+            p.get("protocol") == "anthropic"
+            and isinstance(p.get("anthropic_key_env"), str) and p["anthropic_key_env"])
+        if not has_key:
+            errors.append(
+                "provider %r needs key_env"
+                " (or anthropic_key_env when protocol=anthropic)" % pname)
         if "concurrent" in p and not (_is_num(p["concurrent"]) and p["concurrent"] > 0):
             errors.append("provider %r concurrent must be a positive number" % pname)
         if "concurrent_env" in p and not (

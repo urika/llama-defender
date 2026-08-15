@@ -237,13 +237,20 @@ def _build_route_policies_json():
     providers = {}
     for pname in model_registry.list_providers():
         p = model_registry.get_provider(pname) or {}
+        # Dispatch-effective key: anthropic-protocol providers authenticate
+        # with anthropic_key_env (may differ from the archived openai key_env).
+        if p.get("protocol") == "anthropic":
+            eff_key_env = p.get("anthropic_key_env") or p.get("key_env", "")
+        else:
+            eff_key_env = p.get("key_env", "")
         providers[pname] = {
             "base_url": p.get("base_url", ""),
             "base_url_env": p.get("base_url_env", ""),
+            "protocol": p.get("protocol", "openai"),
             "anthropic_base_url": p.get("anthropic_base_url", ""),
             "anthropic_compatible": bool(p.get("anthropic_compatible", False)),
-            "key_env": p.get("key_env", ""),
-            "key_set": _key_set(p.get("key_env", "")),
+            "key_env": eff_key_env,
+            "key_set": _key_set(eff_key_env),
             "concurrent": p.get("concurrent"),
             "concurrent_env": p.get("concurrent_env", ""),
         }
