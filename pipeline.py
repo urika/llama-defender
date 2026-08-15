@@ -778,6 +778,22 @@ class SmartRouter(PipelineStage):
 # Stage 2.6: RouteNotification — log route-switch events (Phase 1: log only)
 # ============================================================================
 
+def _catalog_model_prices(model):
+    """(input, output) ¥/M-token price for a model; global pair as fallback.
+
+    Shared by BackendDispatcher (cost accounting) and RouteNotification
+    (notice wording) so both stay consistent with the catalog — subscription
+    models (price 0/0) read as "no per-token charge".
+    """
+    price = (model_registry.get_model(model) or {}).get("price") or {}
+    pin = price.get("input", _ps.PROXY_CLOUD_PRICE_INPUT)
+    pout = price.get("output", _ps.PROXY_CLOUD_PRICE_OUTPUT)
+    if not isinstance(pin, (int, float)) or isinstance(pin, bool):
+        pin = _ps.PROXY_CLOUD_PRICE_INPUT
+    if not isinstance(pout, (int, float)) or isinstance(pout, bool):
+        pout = _ps.PROXY_CLOUD_PRICE_OUTPUT
+    return pin, pout
+
 class RouteNotification(PipelineStage):
     """Stage 2.6: Inject route-switch notification when target changes.
 
@@ -826,20 +842,41 @@ class RouteNotification(PipelineStage):
                        if ctx.stage_config else ctx.total_chars)
         threshold = _ps.PROXY_ROUTE_THRESHOLD_CHARS
         model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
-        # Dynamic cost estimation based on actual config
-        price_in = _ps.PROXY_CLOUD_PRICE_INPUT
-        price_out = _ps.PROXY_CLOUD_PRICE_OUTPUT
-        est_input_cost = total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1) * price_in / 1_000_000
-        est_output_cost = est_input_cost * (price_out / price_in) if price_in else 0
-        est_total = est_input_cost + est_output_cost
+        reason = getattr(ctx, '_route_reason', '')
+        why = self._reason_phrase(ctx, reason, total_chars, threshold)
+        # Cost wording follows the catalog price of the SELECTED model —
+        # subscription models (0/0) are "no per-token charge", pay-per-use
+        # models get a char-ratio estimate at their own price.
+        price_in, price_out = _catalog_model_prices(model)
+        if price_in == 0 and price_out == 0:
+            cost_clause = "Subscription quota — no per-token charge."
+        else:
+            est_input = total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1) * price_in / 1_000_000
+            est_out = est_input * (price_out / price_in) if price_in else 0.0
+            cost_clause = (f"Estimated cost ~¥{est_input + est_out:.4f}/request "
+                           f"(input ¥{price_in:.2f}/M, output ¥{price_out:.2f}/M).")
         return (
-            f"[System: Switched to cloud model — context {total_chars:,} chars "
-            f"exceeds local {threshold:,} limit. Using {model}. "
-            f"Estimated cost ~¥{est_total:.4f}/request "
-            f"(input ¥{price_in:.2f}/M, output ¥{price_out:.2f}/M). "
+            f"[System: Switched to cloud model — {why}. Using {model}. "
+            f"{cost_clause} "
             f"Session will stay on cloud. New sessions return to local. "
             f"To force local: `./manage.sh route-force-local {ctx.session_id or 'SESSION_ID'}`.]"
         )
+
+    @staticmethod
+    def _reason_phrase(ctx, reason, total_chars, threshold):
+        """Human phrasing for the route reason (was hardcoded "exceeds limit")."""
+        if reason.startswith("chars_exceed") or reason.startswith("lifecycle_stage"):
+            return f"context {total_chars:,} chars exceeds local {threshold:,} limit"
+        if reason == "header_override":
+            return "per-request route override (X-Proxy-Route-To header)"
+        if reason.startswith("model_forced"):
+            req = ctx.body.get("model", "") if hasattr(ctx, "body") else ""
+            return f"model preference ({req}) routes this session to cloud"
+        if reason.startswith("memory_pressure"):
+            return f"local memory pressure ({reason})"
+        if reason.startswith("session_"):
+            return f"session routing state ({reason})"
+        return f"routing policy ({reason})" if reason else "routing policy decision"
 
     def _build_emergency_notice(self, ctx):
         total_chars = (ctx.stage_config.get("total_chars", 0)
@@ -2011,14 +2048,7 @@ class BackendDispatcher(PipelineStage):
 
     def _model_prices(self, model):
         """(input, output) ¥/M-token price for a model; global pair as fallback."""
-        price = (model_registry.get_model(model) or {}).get("price") or {}
-        pin = price.get("input", _ps.PROXY_CLOUD_PRICE_INPUT)
-        pout = price.get("output", _ps.PROXY_CLOUD_PRICE_OUTPUT)
-        if not isinstance(pin, (int, float)) or isinstance(pin, bool):
-            pin = _ps.PROXY_CLOUD_PRICE_INPUT
-        if not isinstance(pout, (int, float)) or isinstance(pout, bool):
-            pout = _ps.PROXY_CLOUD_PRICE_OUTPUT
-        return pin, pout
+        return _catalog_model_prices(model)
 
     def _route_cost_estimate(self, ctx):
         """Pre-dispatch cost estimate (char-ratio input, price-ratio output)."""

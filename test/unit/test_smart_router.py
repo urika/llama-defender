@@ -1108,3 +1108,50 @@ class TestGetModelAliasesThreadSafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRouteNotificationWording(unittest.TestCase):
+    """Phase D+ 文案修正: reason-aware wording + catalog/subscription pricing."""
+
+    def setUp(self):
+        self._original_notified = set(_ps._ROUTE_NOTIFIED_SESSIONS)
+
+    def tearDown(self):
+        _ps._ROUTE_NOTIFIED_SESSIONS.clear()
+        _ps._ROUTE_NOTIFIED_SESSIONS.update(self._original_notified)
+
+    def _notice(self, reason, model, total_chars=2000):
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6"},
+            session_id="sess_wording",
+        )
+        ctx._route_target = "cloud"
+        ctx._route_reason = reason
+        ctx._route_cloud_model = model
+        ctx.stage_config = {"total_chars": total_chars, "stage": "growth"}
+        result = RouteNotification().process(ctx)
+        return result.messages[-1]["content"][0]["text"]
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    def test_threshold_reason_keeps_exceeds_wording(self):
+        notice = self._notice("chars_exceed_threshold", "deepseek-v4-flash",
+                              total_chars=127843)
+        self.assertIn("chars exceeds local", notice)
+        self.assertIn("Estimated cost", notice)          # pay-per-use: estimate
+        self.assertIn("deepseek-v4-flash", notice)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    def test_header_override_reason_not_exceeds(self):
+        """Override-triggered switch must not claim 'context exceeds limit'."""
+        notice = self._notice("header_override", "glm-5.3", total_chars=22)
+        self.assertIn("route override", notice)
+        self.assertNotIn("exceeds local", notice)
+
+    @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
+    def test_subscription_model_no_per_token_charge(self):
+        """Subscription models (catalog price 0/0) — no per-token estimate."""
+        notice = self._notice("model_forced_fallback_cloud(claude-opus-4-7->glm-5.3)",
+                              "glm-5.3", total_chars=5000)
+        self.assertIn("no per-token charge", notice)
+        self.assertNotIn("input ¥", notice)
+        self.assertIn("model preference", notice)

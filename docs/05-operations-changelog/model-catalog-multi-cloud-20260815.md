@@ -60,7 +60,7 @@ curl -X POST :4000/admin/reload -H "Content-Length: 0"   # HTTP 热重载（远�
 
 1. ~~zhipu bigmodel 充值~~ **已决策归档（2026-08-15）**：bigmodel 按量路径不启用——目录 provider 移除 `base_url`/`key_env`（仅存 Z.ai 订阅通道），`ZHIPU_API_KEY` 在 secret 中注释归档；恢复方法记录于 provider `note`（加回字段+充值+切 protocol）。校验规则同步放宽：`protocol=anthropic` 的 provider 允许仅有 `anthropic_base_url`+`anthropic_key_env`
 2. **token 轮换**：三枚 key（zhipu bigmodel 已归档 / kimi / z.ai）均出现在聊天记录，建议轮换后更新 `secret.local.conf`
-3. RouteNotification 文案：header_override 触发的切云通知沿用"超限"话术 + 估价用全局价（纯文案，不影响契约字段）
+3. ~~RouteNotification 文案~~ **已修复（2026-08-15）**：通知按 `route_reason` 生成原因话术（超限/覆盖/模型偏好/内存压力），估价改用所选模型的目录价格（订阅模型显示 "no per-token charge"，不再误用全局价）
 4. Kimi K3 开放平台 `reasoning_effort` 参数（low/high/max）未接入——kimi provider 走订阅通道暂无需要
 5. DeepSeek 2026-08-17 分时调价生效后，如需精确核算更新目录两个数字即可
 
