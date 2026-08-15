@@ -1765,3 +1765,60 @@ class TestAnthropicProtocolDispatch(unittest.TestCase):
             stage.process(ctx)
         self._mock_handler._handle_anthropic_stream_passthrough.assert_called_once()
         self._mock_handler._handle_anthropic_response.assert_not_called()
+
+
+class TestReasoningEffortPassthrough(unittest.TestCase):
+    """Effort 贯通: output_config.effort → 按模型 levels 映射 → openai_body.reasoning_effort."""
+
+    def _ctx(self, body_extra, cloud_model="k3"):
+        body = {"model": "claude-sonnet-4-6", "max_tokens": 64}
+        body.update(body_extra)
+        ctx = PipelineContext(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            body=body, is_stream=False)
+        ctx._route_target = "cloud"
+        ctx._route_cloud_model = cloud_model
+        return ctx
+
+    def test_map_effort_exact_and_step_up(self):
+        from pipeline import _map_effort_to_levels
+        kimi = ["low", "high", "max"]
+        self.assertEqual(_map_effort_to_levels("low", kimi), "low")
+        self.assertEqual(_map_effort_to_levels("high", kimi), "high")
+        self.assertEqual(_map_effort_to_levels("max", kimi), "max")
+        # medium/xhigh 不在 kimi 集合 → 就近向上取（质量保守）
+        self.assertEqual(_map_effort_to_levels("medium", kimi), "high")
+        self.assertEqual(_map_effort_to_levels("xhigh", kimi), "max")
+        # 向下回退（后端只有更低档时）
+        self.assertEqual(_map_effort_to_levels("xhigh", ["low", "medium"]), "medium")
+        self.assertIsNone(_map_effort_to_levels("bogus", kimi))
+        self.assertIsNone(_map_effort_to_levels("high", []))
+
+    def test_kimi_model_gets_mapped_effort(self):
+        ctx = FormatConverter().process(
+            self._ctx({"output_config": {"effort": "xhigh"}}, cloud_model="k3"))
+        self.assertEqual(ctx.openai_body["reasoning_effort"], "max")  # kimi: xhigh→max
+
+    def test_openai_reasoning_effort_normalized(self):
+        """OpenAI 协议顶层 reasoning_effort（经入口归一为 output_config）同样生效。"""
+        ctx = FormatConverter().process(
+            self._ctx({"reasoning_effort": "low"}, cloud_model="kimi-for-coding"))
+        self.assertEqual(ctx.openai_body["reasoning_effort"], "low")
+
+    def test_backend_without_levels_gets_nothing(self):
+        ctx = FormatConverter().process(
+            self._ctx({"output_config": {"effort": "high"}},
+                      cloud_model="deepseek-v4-flash"))
+        self.assertNotIn("reasoning_effort", ctx.openai_body)
+
+    def test_no_client_value_no_injection(self):
+        ctx = FormatConverter().process(self._ctx({}, cloud_model="k3"))
+        self.assertNotIn("reasoning_effort", ctx.openai_body)
+
+    def test_converter_openai_to_anthropic_effort_nested(self):
+        from message_converter import convert_openai_request_to_anthropic
+        out = convert_openai_request_to_anthropic(
+            {"model": "k3", "max_tokens": 8, "reasoning_effort": "low",
+             "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(out.get("output_config", {}).get("effort"), "low")
+        self.assertNotIn("reasoning_effort", out)  # 顶层杂键不得进入 Anthropic 载荷

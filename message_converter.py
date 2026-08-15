@@ -240,6 +240,10 @@ def convert_openai_request_to_anthropic(body):
         anthropic_body["thinking"] = body["thinking"]
     if "response_format" in body:
         anthropic_body["response_format"] = body["response_format"]
+    # reasoning_effort（OpenAI 顶层）→ output_config.effort（Anthropic 嵌套形态）。
+    # FormatConverter 消费后会按目标模型的 reasoning_effort_levels 重新映射。
+    if isinstance(body.get("reasoning_effort"), str) and body["reasoning_effort"]:
+        anthropic_body.setdefault("output_config", {})["effort"] = body["reasoning_effort"]
     stop = body.get("stop")
     if stop is not None:
         if isinstance(stop, str):

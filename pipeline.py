@@ -794,6 +794,50 @@ def _catalog_model_prices(model):
         pout = _ps.PROXY_CLOUD_PRICE_OUTPUT
     return pin, pout
 
+
+# Effort ladder used to map between the Anthropic five-level scale
+# (output_config.effort) and backend-specific reasoning_effort sets.
+_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
+
+
+def _map_effort_to_levels(value, levels):
+    """Map an Anthropic effort level onto the levels a backend accepts.
+
+    Exact match wins; otherwise step toward the nearest accepted level,
+    rounding UP when possible (quality-preserving: a client asking for
+    `medium` depth gets `high` on a low/high/max backend, not `low`)
+    and falling back to the highest accepted level below otherwise.
+    """
+    if not levels or value not in _EFFORT_ORDER:
+        return None
+    if value in levels:
+        return value
+    idx = _EFFORT_ORDER.index(value)
+    for up in range(idx + 1, len(_EFFORT_ORDER)):
+        if _EFFORT_ORDER[up] in levels:
+            return _EFFORT_ORDER[up]
+    for down in range(idx - 1, -1, -1):
+        if _EFFORT_ORDER[down] in levels:
+            return _EFFORT_ORDER[down]
+    return None
+
+
+def _effective_effort(ctx, quirks):
+    """Resolve the requested reasoning effort, Anthropic scale.
+
+    Priority: client `output_config.effort` (Anthropic protocol) or
+    `reasoning_effort` (OpenAI-protocol entry, normalized by
+    convert_openai_request_to_anthropic) > catalog quirk default > None.
+    """
+    body = ctx.body if hasattr(ctx, "body") else {}
+    oc = body.get("output_config") if isinstance(body, dict) else None
+    if isinstance(oc, dict) and oc.get("effort"):
+        return str(oc["effort"])
+    if isinstance(body, dict) and body.get("reasoning_effort"):
+        return str(body["reasoning_effort"])
+    d = quirks.get("reasoning_effort_default")
+    return str(d) if d else None
+
 class RouteNotification(PipelineStage):
     """Stage 2.6: Inject route-switch notification when target changes.
 
@@ -1883,6 +1927,16 @@ class FormatConverter(PipelineStage):
         # ("invalid temperature: only 1 is allowed for this model").
         if "force_temperature" in quirks:
             openai_body["temperature"] = quirks["force_temperature"]
+        # Reasoning-effort passthrough: map the client's Anthropic-scale
+        # output_config.effort (or OpenAI reasoning_effort, or the catalog's
+        # reasoning_effort_default quirk) onto the backend's accepted levels.
+        # Backends without reasoning_effort_levels (deepseek) get nothing.
+        levels = ((sel_entry or {}).get("capabilities") or {}).get("reasoning_effort_levels")
+        if levels:
+            effort = _effective_effort(ctx, quirks)
+            mapped = _map_effort_to_levels(effort, levels) if effort else None
+            if mapped:
+                openai_body["reasoning_effort"] = mapped
 
         # 5. Tool filtering
         raw_tools = body.get("tools")
