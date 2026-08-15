@@ -1589,3 +1589,31 @@ class TestMultiProviderDispatch(unittest.TestCase):
         with _ps._state_lock:
             self.assertIn("p1", _ps._PROVIDER_COOLDOWN_START)
             self.assertNotIn("p2", _ps._PROVIDER_COOLDOWN_START)
+
+
+class TestCatalogRequestQuirks(unittest.TestCase):
+    """Catalog request_quirks applied by FormatConverter (Phase B/C)."""
+
+    def _ctx(self, target, cloud_model):
+        ctx = PipelineContext(
+            messages=[{"role": "user", "content": "hi"}],
+            body={"max_tokens": 64, "temperature": 0.7},
+            is_stream=False)
+        ctx._route_target = target
+        ctx._route_cloud_model = cloud_model
+        return ctx
+
+    def test_kimi_thinking_only_forces_temperature_1(self):
+        """kimi thinking-only models reject temperature != 1 (live 400 found)."""
+        ctx = FormatConverter().process(self._ctx("cloud", "k3"))
+        self.assertEqual(ctx.openai_body["model"], "k3")
+        self.assertEqual(ctx.openai_body["temperature"], 1)
+
+    def test_temperature_override_beats_client_value(self):
+        ctx = FormatConverter().process(self._ctx("cloud", "kimi-for-coding"))
+        self.assertEqual(ctx.openai_body["temperature"], 1)
+
+    def test_non_quirk_model_keeps_temperature(self):
+        ctx = FormatConverter().process(self._ctx("cloud", "deepseek-v4-flash"))
+        self.assertEqual(ctx.openai_body["temperature"], 0.7)
+        self.assertEqual(ctx.openai_body["thinking"], {"type": "disabled"})

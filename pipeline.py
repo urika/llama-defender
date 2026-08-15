@@ -1837,10 +1837,15 @@ class FormatConverter(PipelineStage):
         #    Legacy substring heuristic kept for models absent from the catalog.
         sel_model = openai_body.get("model", "")
         sel_entry = model_registry.get_model(sel_model)
-        if (sel_entry or {}).get("request_quirks", {}).get("force_thinking_disabled"):
+        quirks = (sel_entry or {}).get("request_quirks", {})
+        if quirks.get("force_thinking_disabled"):
             openai_body["thinking"] = {"type": "disabled"}
         elif sel_entry is None and _ps.IS_CLOUD and "flash" in sel_model.lower():
             openai_body["thinking"] = {"type": "disabled"}
+        # Kimi thinking-only models reject any temperature != 1
+        # ("invalid temperature: only 1 is allowed for this model").
+        if "force_temperature" in quirks:
+            openai_body["temperature"] = quirks["force_temperature"]
 
         # 5. Tool filtering
         raw_tools = body.get("tools")
