@@ -541,7 +541,8 @@ class TestV1ModelsMetadata(unittest.TestCase):
         # 2026-08-15 route decision: opus → glm-5.3 (Z.ai subscription)
         self.assertEqual(meta["real_model"], "glm-5.3")
         self.assertTrue(meta["thinking_supported"])   # glm-5.3: thinking supported
-        self.assertFalse(meta["thinking_required"])   # (not required, unlike deepseek-v4-pro)
+        self.assertTrue(meta["thinking_required"])    # thinking "only": z.ai ignores the
+                                                      # thinking param and always thinks (F1)
         self.assertEqual(meta["context_chars"], 1000000)
         self.assertEqual(meta["price"]["input"], 0)   # subscription marginal cost
         self.assertEqual(meta["fallback_models"], ["deepseek-v4-pro"])

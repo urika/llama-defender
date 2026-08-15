@@ -1822,3 +1822,28 @@ class TestReasoningEffortPassthrough(unittest.TestCase):
              "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(out.get("output_config", {}).get("effort"), "low")
         self.assertNotIn("reasoning_effort", out)  # 顶层杂键不得进入 Anthropic 载荷
+
+
+class TestMinMaxTokensFloor(unittest.TestCase):
+    """F1: thinking-only 模型 max_tokens 下限（GLM 空响应修复）."""
+
+    def _convert(self, max_tokens, model="glm-5.2"):
+        body = {"model": "claude-opus-4-7", "max_tokens": max_tokens}
+        ctx = PipelineContext(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            body=body, is_stream=False)
+        ctx._route_target = "cloud"
+        ctx._route_cloud_model = model
+        return FormatConverter().process(ctx)
+
+    def test_small_max_tokens_floored(self):
+        ctx = self._convert(1000)
+        self.assertEqual(ctx.openai_body["max_tokens"], 8192)
+
+    def test_large_max_tokens_untouched(self):
+        ctx = self._convert(32000)
+        self.assertEqual(ctx.openai_body["max_tokens"], 32000)
+
+    def test_model_without_quirk_untouched(self):
+        ctx = self._convert(1000, model="deepseek-v4-flash")
+        self.assertEqual(ctx.openai_body["max_tokens"], 1000)

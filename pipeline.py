@@ -1927,6 +1927,16 @@ class FormatConverter(PipelineStage):
         # ("invalid temperature: only 1 is allowed for this model").
         if "force_temperature" in quirks:
             openai_body["temperature"] = quirks["force_temperature"]
+        # Thinking-only models (glm on z.ai ignores the thinking param entirely
+        # and always thinks; kimi likewise) can burn the whole output budget on
+        # reasoning and return no text block. Floor max_tokens so text always
+        # has room (catalog quirk `min_max_tokens`, e.g. 8192).
+        floor = quirks.get("min_max_tokens")
+        if floor and isinstance(openai_body.get("max_tokens"), int):
+            if openai_body["max_tokens"] < floor:
+                log(f"  -> [quirk] max_tokens {openai_body['max_tokens']} -> {floor} "
+                    f"(thinking-only model: reserve room for text after reasoning)")
+                openai_body["max_tokens"] = floor
         # Reasoning-effort passthrough: map the client's Anthropic-scale
         # output_config.effort (or OpenAI reasoning_effort, or the catalog's
         # reasoning_effort_default quirk) onto the backend's accepted levels.

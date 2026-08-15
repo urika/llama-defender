@@ -1,5 +1,5 @@
 {
-  "_comment": "模型目录（Model Catalog）— Phase A/B。providers=部署拓扑, models=模型固有属性, routes=别名绑定策略。与 multi-cloud-model-catalog-design-20260815.md 对齐。删除本文件 => registry 合成等价目录（行为与引入前完全一致）。'$env' 跟随 PROXY_CLOUD_MODEL（热重载生效）；'$default' 取 defaults.cloud_model。端点校验(2026-08-15, 官方文档+真实冒烟)：zhipu bigmodel.cn 按量路径已归档不启用(2026-08-15 决策, 恢复方法见 provider note); zhipu 直连=api.z.ai/api/anthropic Coding Plan 订阅(2026-08-15 实测 200, 订阅仅覆盖 Anthropic 端点, OpenAI paas/v4 不覆盖——代理已支持 Anthropic 协议分发(Phase D, zhipu provider protocol=anthropic 走 api.z.ai 订阅; OpenAI 协议客户端请求会跳过 anthropic 候选)；kimi=api.kimi.com/coding/v1（Kimi Code 会员订阅体系，key 验证 200；api.moonshot.cn 开放平台是另一套独立体系/计费，经决策不纳入目录——需要时加 provider 条目即可）。kimi 能力元数据取自 /coding/v1/models 实测（k3=1048576 ctx, thinking only, vision）。effort 贯通(2026-08-15 实测): 客户端 output_config.effort(Anthropic 五档)按模型 reasoning_effort_levels 就近映射——OpenAI 通道(kimi)顶层 reasoning_effort(实测 low 使 reasoning_tokens 15→2)、Anthropic 通道(z.ai)嵌套 output_config.effort(实测 200)；quirk reasoning_effort_default 可设无客户端值时的默认。quirk 备注：zhipu temperature 区间 (0,1) 不支持 0；kimi thinking-only 模型仅接受 temperature=1(force_temperature quirk, 实测 400 修复)。价格已按官方口径补录(2026-08-15)：glm-5.x/4.5-air=经订阅分发边际0(按量参考价 10/31 与 0.8/2 记于各模型 note, 切回 protocol=openai 按量端点时应改回)；kimi(Kimi Code)=会员订阅额度内边际 0(开放平台 kimi-k3 参考价 20 入/2 cached/100 出)；deepseek-v4-pro 修正为官方正式版价 3/6(flash 沿用 0.5/1.5)。input_cached 为元数据，成本核算按未命中价(保守)。 路由决策(2026-08-15): claude-opus-4-7 → glm-5.3(Z.ai 订阅, anthropic 协议) 主路径, deepseek-v4-pro 为链上备援(订阅 429 时兜底)。",
+  "_comment": "模型目录（Model Catalog）— Phase A/B。providers=部署拓扑, models=模型固有属性, routes=别名绑定策略。与 multi-cloud-model-catalog-design-20260815.md 对齐。删除本文件 => registry 合成等价目录（行为与引入前完全一致）。'$env' 跟随 PROXY_CLOUD_MODEL（热重载生效）；'$default' 取 defaults.cloud_model。端点校验(2026-08-15, 官方文档+真实冒烟)：zhipu bigmodel.cn 按量路径已归档不启用(2026-08-15 决策, 恢复方法见 provider note); zhipu 直连=api.z.ai/api/anthropic Coding Plan 订阅(2026-08-15 实测 200, 订阅仅覆盖 Anthropic 端点, OpenAI paas/v4 不覆盖——代理已支持 Anthropic 协议分发(Phase D, zhipu provider protocol=anthropic 走 api.z.ai 订阅; OpenAI 协议客户端请求会跳过 anthropic 候选)；kimi=api.kimi.com/coding/v1（Kimi Code 会员订阅体系，key 验证 200；api.moonshot.cn 开放平台是另一套独立体系/计费，经决策不纳入目录——需要时加 provider 条目即可）。kimi 能力元数据取自 /coding/v1/models 实测（k3=1048576 ctx, thinking only, vision）。effort 贯通(2026-08-15 实测): 客户端 output_config.effort(Anthropic 五档)按模型 reasoning_effort_levels 就近映射——OpenAI 通道(kimi)顶层 reasoning_effort(实测 low 使 reasoning_tokens 15→2)、Anthropic 通道(z.ai)嵌套 output_config.effort(实测 200)；quirk reasoning_effort_default 可设无客户端值时的默认。GLM 空响应修复(2026-08-15 实测): z.ai GLM 无视 thinking 参数(disabled/adaptive/enabled/无参四形态行为一致, 始终思考), 小 max_tokens 被思考吃光→无 text 块——thinking-only 模型(glm/kimi)设 min_max_tokens=8192 下限, FormatConverter 取 max(客户端值, 下限)。quirk 备注：zhipu temperature 区间 (0,1) 不支持 0；kimi thinking-only 模型仅接受 temperature=1(force_temperature quirk, 实测 400 修复)。价格已按官方口径补录(2026-08-15)：glm-5.x/4.5-air=经订阅分发边际0(按量参考价 10/31 与 0.8/2 记于各模型 note, 切回 protocol=openai 按量端点时应改回)；kimi(Kimi Code)=会员订阅额度内边际 0(开放平台 kimi-k3 参考价 20 入/2 cached/100 出)；deepseek-v4-pro 修正为官方正式版价 3/6(flash 沿用 0.5/1.5)。input_cached 为元数据，成本核算按未命中价(保守)。 路由决策(2026-08-15): claude-opus-4-7 → glm-5.3(Z.ai 订阅, anthropic 协议) 主路径, deepseek-v4-pro 为链上备援(订阅 429 时兜底)。",
   "providers": {
     "deepseek": {
       "base_url_env": "PROXY_CLOUD_BASE_URL",
@@ -69,7 +69,7 @@
       "provider": "zhipu",
       "tier": "flagship",
       "capabilities": {
-        "thinking": "supported",
+        "thinking": "only",
         "context_tokens": 1000000,
         "reasoning_effort_levels": [
           "low",
@@ -79,7 +79,9 @@
           "max"
         ]
       },
-      "request_quirks": {},
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
       "price": {
         "input": 0,
         "output": 0,
@@ -91,7 +93,7 @@
       "provider": "zhipu",
       "tier": "flagship",
       "capabilities": {
-        "thinking": "supported",
+        "thinking": "only",
         "context_tokens": 1000000,
         "reasoning_effort_levels": [
           "low",
@@ -101,7 +103,9 @@
           "max"
         ]
       },
-      "request_quirks": {},
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
       "price": {
         "input": 0,
         "output": 0,
@@ -113,7 +117,7 @@
       "provider": "zhipu",
       "tier": "flagship",
       "capabilities": {
-        "thinking": "supported",
+        "thinking": "only",
         "reasoning_effort_levels": [
           "low",
           "medium",
@@ -122,7 +126,9 @@
           "max"
         ]
       },
-      "request_quirks": {},
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
       "price": {
         "input": 0,
         "output": 0,
@@ -133,12 +139,17 @@
     "glm-4.5-air": {
       "provider": "zhipu",
       "tier": "fast",
-      "request_quirks": {},
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
       "price": {
         "input": 0,
         "output": 0,
         "currency": "CNY",
         "note": "经 Z.ai Coding Plan 订阅分发(Phase D protocol=anthropic), 额度内边际0; 按量参考价 0.8/2 = GLM-4.5 官方价(air 应更低, 此为保守上界)"
+      },
+      "capabilities": {
+        "thinking": "only"
       }
     },
     "k3": {
@@ -155,7 +166,8 @@
         ]
       },
       "request_quirks": {
-        "force_temperature": 1
+        "force_temperature": 1,
+        "min_max_tokens": 8192
       },
       "price": {
         "input": 0,
@@ -178,7 +190,8 @@
         ]
       },
       "request_quirks": {
-        "force_temperature": 1
+        "force_temperature": 1,
+        "min_max_tokens": 8192
       },
       "price": {
         "input": 0,
@@ -201,7 +214,8 @@
         ]
       },
       "request_quirks": {
-        "force_temperature": 1
+        "force_temperature": 1,
+        "min_max_tokens": 8192
       },
       "price": {
         "input": 0,
@@ -224,7 +238,8 @@
         ]
       },
       "request_quirks": {
-        "force_temperature": 1
+        "force_temperature": 1,
+        "min_max_tokens": 8192
       },
       "price": {
         "input": 0,
