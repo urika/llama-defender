@@ -44,6 +44,8 @@ signal.signal(signal.SIGHUP, _reload_config)
 import loop_detection
 from loop_detection import *
 
+import model_registry
+
 # ---------------------------------------------------------------------------
 # Pipeline abstraction: refactored _handle_messages processing stages.
 # ---------------------------------------------------------------------------
@@ -431,12 +433,37 @@ class Handler(BaseHTTPRequestHandler):
                             meta_route = "local"
                         else:
                             meta_route = "auto"
+                        # R10: capability metadata from the model catalog —
+                        # agent_go's registry syncs from this instead of manual entry.
+                        meta = {"route": meta_route}
+                        real = pref.get("cloud_model")
+                        if real:
+                            meta["real_model"] = real
+                            entry = model_registry.get_model(real)
+                            if entry:
+                                caps = entry.get("capabilities") or {}
+                                thinking = caps.get("thinking")
+                                meta["thinking_supported"] = (
+                                    thinking in ("supported", "required", "only")
+                                    if thinking is not None else None
+                                )
+                                meta["thinking_required"] = (
+                                    thinking in ("required", "only")
+                                    if thinking is not None else None
+                                )
+                                meta["json_compliance"] = caps.get("json")
+                                meta["context_chars"] = caps.get("context_tokens")
+                                meta["price"] = entry.get("price")
+                                prov = model_registry.get_provider(entry.get("provider", "")) or {}
+                                meta["direct_capable"] = bool(prov.get("anthropic_compatible", False))
+                            if pref.get("fallback_models"):
+                                meta["fallback_models"] = pref["fallback_models"]
                         models.append({
                             "id": name,
                             "object": "model",
                             "created": 1677610602,
                             "owned_by": "proxy-router",
-                            "metadata": {"route": meta_route},
+                            "metadata": meta,
                         })
                     self._respond_json({"object": "list", "data": models})
                 elif self.path == "/status":
@@ -457,6 +484,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._respond_json(_build_watchdog_json())
                 elif self.path == "/api/profiles":
                     self._respond_json({"profiles": _build_profiles_json()})
+                elif self.path == "/api/route/policies":
+                    # R9: sanitized routing policies + catalog (no key material)
+                    self._respond_json(_build_route_policies_json())
                 elif self.path == "/metrics" or self.path.startswith("/metrics?"):
                     self._handle_metrics_endpoint()
                 elif self.path == "/metrics/history":
@@ -515,6 +545,11 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_len).decode("utf-8")
             log(f"POST {self.path}")
             log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
+            # Admin: HTTP hot-reload (R12) — checked before JSON parsing so an
+            # empty-body POST is valid. Idempotent, serialized by _RELOAD_LOCK.
+            if self.path == "/admin/reload":
+                self._handle_admin_reload()
+                return
             if _check_dedup(body):
                 log(f"  -> Duplicate request detected (body hash match within {PROXY_DEDUP_WINDOW}s), skipping", level="WARN")
                 self._respond_json(
@@ -1190,6 +1225,28 @@ class Handler(BaseHTTPRequestHandler):
             _ps._cloud_fail_count.pop(session_id, None)
         log(f"  -> [admin] Session {session_id} route forced to {target} (user_manual)")
         self._respond_json({"ok": True, "session_id": session_id, "route_target": target})
+
+    def _handle_admin_reload(self):
+        """R12: POST /admin/reload — HTTP equivalent of `manage.sh reload` (SIGHUP).
+
+        Idempotent; serialized against SIGHUP by the same _RELOAD_LOCK inside
+        reload_config. Also reloads the model catalog (configs/models.json).
+        """
+        log("  -> [admin/reload] HTTP hot-reload triggered")
+        ok, err = True, ""
+        try:
+            _reload_config()
+        except Exception as e:
+            ok, err = False, str(e)
+            log(f"  <- [admin/reload] failed: {e}", level="ERROR")
+        payload = {
+            "api_version": PROXY_STATUS_API_VERSION,
+            "reloaded": ok,
+            "active_profile": _current_active_profile(),
+        }
+        if err:
+            payload["error"] = err
+        self._respond_json(payload, 200 if ok else 500)
 
     def _respond_json(self, data, status=200, extra_headers=None):
         # When serving an OpenAI-format client, shape error responses in the

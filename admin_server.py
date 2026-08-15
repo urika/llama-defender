@@ -8,6 +8,7 @@ import json
 import os, re, subprocess, time, threading
 from datetime import datetime, timedelta
 import proxy_state as _ps
+import model_registry
 from backend_strategy import BackendStrategy
 _strategy = BackendStrategy.create(_ps.IS_CLOUD)
 from message_converter import _classify_content_for_ratio
@@ -220,6 +221,74 @@ def _model_slugs_compatible(actual, expected):
     min_len = min(len(a_tokens), len(b_tokens))
     # Share at least 2 tokens, or at least half of the smaller token set.
     return len(intersection) >= max(2, min_len // 2)
+# --- _build_route_policies_json ---
+def _build_route_policies_json():
+    """R9: sanitized routing policies + model catalog for agent_go.
+
+    NEVER returns key material — provider keys surface as `key_set` bool only.
+    `catalog_hash` lets agent_go detect drift between its own provider config
+    (direct-connect path) and this proxy's catalog (via-proxy path).
+    """
+    def _key_set(key_env):
+        if not key_env:
+            return False
+        return bool(_ps._env_lookup(key_env, ""))
+
+    providers = {}
+    for pname in model_registry.list_providers():
+        p = model_registry.get_provider(pname) or {}
+        providers[pname] = {
+            "base_url": p.get("base_url", ""),
+            "base_url_env": p.get("base_url_env", ""),
+            "anthropic_base_url": p.get("anthropic_base_url", ""),
+            "anthropic_compatible": bool(p.get("anthropic_compatible", False)),
+            "key_env": p.get("key_env", ""),
+            "key_set": _key_set(p.get("key_env", "")),
+            "concurrent": p.get("concurrent"),
+            "concurrent_env": p.get("concurrent_env", ""),
+        }
+
+    models = {}
+    for mname in model_registry.list_models():
+        m = model_registry.get_model(mname) or {}
+        caps = m.get("capabilities") or {}
+        prov = model_registry.get_provider(m.get("provider", "")) or {}
+        models[mname] = {
+            "provider": m.get("provider", ""),
+            "tier": m.get("tier", ""),
+            "price": m.get("price"),
+            "thinking": caps.get("thinking"),
+            "json_compliance": caps.get("json"),
+            "context_tokens": caps.get("context_tokens"),
+            "vision": bool(caps.get("vision", False)),
+            "direct_capable": bool(prov.get("anthropic_compatible", False)),
+        }
+
+    defaults_raw = model_registry._catalog().get("defaults", {})
+    defaults = {
+        "cloud_model": defaults_raw.get("cloud_model", ""),
+        "daily_budget": defaults_raw.get("daily_budget"),
+    }
+    if "per_provider_budget" in defaults_raw:
+        defaults["per_provider_budget"] = defaults_raw["per_provider_budget"]
+
+    return {
+        "api_version": _ps.PROXY_STATUS_API_VERSION,
+        "catalog_hash": model_registry.catalog_hash(),
+        "catalog_source": "file" if model_registry.is_loaded_from_file() else "synthesized",
+        "catalog_error": model_registry.last_error(),
+        "route_enabled": _ps.PROXY_ROUTE_ENABLED,
+        "threshold_chars": _ps.PROXY_ROUTE_THRESHOLD_CHARS,
+        "cloud_model": _ps.PROXY_CLOUD_MODEL,
+        "cloud_key_set": _key_set("PROXY_CLOUD_API_KEY"),
+        "providers": providers,
+        "models": models,
+        # Contract field (需求稿 §R9): alias → {route_bias, behavior, cloud_model, ...}
+        "preferences": _ps.MODEL_ROUTE_PREFERENCES,
+        "defaults": defaults,
+    }
+
+
 # --- _build_status_json ---
 def _build_status_json():
     """Build the structured JSON status payload for agent_go."""
@@ -282,6 +351,14 @@ def _build_status_json():
         "active_profile": active_profile,
         "state": state,
         "ready": ready,
+        # R11: routing config summary — complements /api/route/policies (R9:
+        # full catalog there, current-state digest here).
+        "route_config": {
+            "route_enabled": _ps.PROXY_ROUTE_ENABLED,
+            "cloud_model": _ps.PROXY_CLOUD_MODEL,
+            "cloud_key_set": bool(_ps.PROXY_CLOUD_API_KEY),
+            "cloud_concurrent": _ps.PROXY_ROUTE_CLOUD_CONCURRENT,
+        },
     }
 # --- _build_watchdog_json ---
 def _build_watchdog_json():
@@ -2636,6 +2713,8 @@ __all__ = [
     "_build_status_json",
     "_build_watchdog_json",
     "_build_profiles_json",
+    "_build_route_policies_json",
+    "_current_active_profile",
     "_parse_conf_value",
     "_parse_memory_gb",
     "_load_session_metrics",

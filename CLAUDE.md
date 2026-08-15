@@ -71,6 +71,8 @@ Additional commands (see `./manage.sh help`):
 ./manage.sh watchdog-status                 # Structured JSON status of the watchdog
 ./manage.sh route-force-local <session_id>  # Force session to local (sensitive code, privacy)
 ./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
+./manage.sh models                          # Model catalog overview (providers/models/routes, key readiness, hash)
+./manage.sh models-validate                 # Validate configs/models.json (non-zero exit on bad file)
 ./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
 ./manage.sh fix-template <dir>        # Repair Qwen chat_template (DEF-007: prevents system message crashes)
 ```
@@ -109,19 +111,21 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | Method | Path | Purpose | Response |
 |--------|------|---------|----------|
-| GET | `/api/status` | Structured service health & readiness | JSON: `proxy`, `backend`, `active_profile`, `state`, `ready` |
+| GET | `/api/status` | Structured service health & readiness | JSON: `proxy`, `backend`, `active_profile`, `state`, `ready`, `route_config` |
+| GET | `/api/route/policies` | Sanitized routing policies + model catalog (R9) | JSON: `providers` (keys as `key_set` bool only), `models`, `preferences`, `defaults`, `catalog_hash`, `api_version` |
 | GET | `/api/watchdog` | Watchdog state | JSON: `enabled`, `running`, `pid`, `last_restart_at`, `restart_count_1h`, `last_failure_reason` |
 | GET | `/api/profiles` | Available model configs | JSON: `profiles[]` with `name`, `desc`, `memory_gb`, `active` |
 | GET | `/metrics[?n=N]` | Recent request metrics | JSON |
 | GET | `/metrics/history` | Historical metrics | JSON |
 | POST | `/admin/route/force-local` / `force-cloud` | Session-level route override | JSON |
+| POST | `/admin/reload` | HTTP hot-reload, equivalent to `manage.sh reload` (R12) | JSON: `reloaded`, `active_profile`, `api_version` |
 | GET | `/status` | Human-readable HTML status page | HTML |
 
 - `/api/status` returns `200` when `state` is `healthy` or `starting`, otherwise `503` with the same JSON body. `state` enum: `healthy | starting | backend_down | proxy_down | model_drift | down`.
 - `ready` means the backend model is loaded and can accept inference requests (`starting` → `ready=false`). `agent_go`'s `wait_ready` polls this field.
 - Watchdog auto-restart events are logged to `logs/watchdog_state.json`; lifecycle events (`service_start`, `config_reload`, `profile_switch`, `watchdog_auto_restart`, …) to `logs/lifecycle_events.jsonl`.
 
-**llama-defender integration** (`docs/llama-defender-integration-requirements.md`): R1-R7 are **delivered** (structured status, readiness semantics, manage.sh call contract, profiles/watchdog APIs). **R8-R12 are pending**, in order R8 → R9 → R10 → R11 → R12: R8 route-attribution response headers (`X-Proxy-Route-Cost` — `X-Actual-Model`/`X-Route-Target`/`X-Route-Reason` already exist), R9 `GET /api/route/policies`, R10 `/v1/models` capability metadata, R11 `/api/status` `route_config` block, R12 `POST /admin/reload` (HTTP hot-reload).
+**llama-defender integration** (`docs/llama-defender-integration-requirements.md`): R1-R12 **all delivered**. R1-R7: structured status, readiness semantics, manage.sh call contract, profiles/watchdog APIs. R8: `X-Proxy-Route-Target/Actual-Model/Reason/Cost` attribution headers + OpenAI-mode `proxy_route` body field. R9: `GET /api/route/policies` (sanitized catalog + `catalog_hash` for agent_go drift detection). R10: `/v1/models` capability metadata (`real_model`/`thinking_*`/`json_compliance`/`context_chars`/`price`/`direct_capable`). R11: `/api/status` `route_config` digest. R12: `POST /admin/reload`.
 
 **Dual-mode auto-detection**: `BACKEND_TYPE` is automatically inferred from `LLAMA_BASE_URL`: contains `deepseek` / `openai` / `api.` → `cloud`, otherwise → `local`. `MODEL_NAME` auto-set accordingly; manual override via env var is rarely needed.
 

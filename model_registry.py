@@ -483,7 +483,9 @@ def _resolve_cloud_model(value, getter):
 def _getter():
     with _lock:
         g = (_state or {}).get("params", {}).get("env_cloud_model_getter")
-    return g
+    # Standalone CLI usage (manage.sh models) has no proxy_state getter —
+    # fall back to reading PROXY_CLOUD_MODEL from the environment directly.
+    return g or _default_env_cloud_model
 
 
 def get_route(alias):

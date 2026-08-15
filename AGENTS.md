@@ -6,7 +6,7 @@
 
 ## 1. 项目概述
 
-**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。消费方 agent_go 项目把本服务称为 **llama-defender**（集成契约见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)：R1-R7 已交付，R8-R12 待做）。
+**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。消费方 agent_go 项目把本服务称为 **llama-defender**（集成契约见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)：R1-R12 已全部交付）。
 
 运行模式：
 
@@ -159,6 +159,8 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 ./manage.sh route-force-local <session_id>   # 强制会话走本地
 ./manage.sh route-force-cloud <session_id>   # 强制会话走云端
 ./manage.sh monitor [N]        # Metal 内存实时监控（每 N 秒刷新，默认 5）
+./manage.sh models             # 模型目录总览（providers/models/routes、key 就绪状态、hash）
+./manage.sh models-validate    # 校验 configs/models.json（坏文件非零退出）
 ./manage.sh fix-template <dir> # 修复 Qwen chat_template
 ```
 
@@ -187,19 +189,21 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
-| GET | `/api/status` | 结构化健康与就绪状态：`proxy`、`backend`、`active_profile`、`state`、`ready` |
+| GET | `/api/status` | 结构化健康与就绪状态：`proxy`、`backend`、`active_profile`、`state`、`ready`、`route_config`（R11 路由配置摘要） |
+| GET | `/api/route/policies` | 脱敏路由策略 + 模型目录（R9）：providers（key 只回 `key_set` 布尔）、models、preferences、defaults、`catalog_hash`（agent_go 漂移检测） |
 | GET | `/api/watchdog` | watchdog 状态：`enabled`、`running`、`pid`、`restart_count_1h`、`last_failure_reason` |
 | GET | `/api/profiles` | 可用模型配置列表：`name`、`desc`、`memory_gb`、`active` |
 | GET | `/metrics[?n=N]` | 最近请求指标（JSON） |
 | GET | `/metrics/history` | 历史指标（JSON） |
 | POST | `/admin/route/force-local` / `force-cloud` | 会话级路由覆盖 |
+| POST | `/admin/reload` | HTTP 热重载（R12，等效 `manage.sh reload`，含模型目录重载） |
 | GET | `/status` | 人类可读 HTML 状态页 |
 
 - `/api/status` 在 `state` 为 `healthy` 或 `starting` 时返回 200，否则 503（同 JSON body）。`state` 枚举：`healthy | starting | backend_down | proxy_down | model_drift | down`。
 - `ready` 表示后端模型已加载、可接受推理请求（`starting` → `ready=false`），agent_go 的 `wait_ready` 以此字段为准。
 - 路由响应头（R8 契约名）：每个路由响应带 `X-Proxy-Route-Target`（`cloud|local|local_forced`）、`X-Proxy-Route-Actual-Model`、`X-Proxy-Route-Reason`、`X-Proxy-Route-Cost`（预估费用，本地为 0）；OpenAI 协议非流式响应体另带 `proxy_route` 字段（实际 usage 计费）。单请求路由覆盖用请求头 `X-Proxy-Route-To: local|cloud`（无会话粘性）。
 - 多提供商分发（Phase B）：按模型解析目录 provider 凭证/并发锁；路由 `fallback_chain` 跨商降级（跳过冷却中/无 key 的提供商）；分商熔断互不影响；按模型目录价格计费 + 全局/分商预算双上限。
-- **R8-R12 待做**（见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)，顺序 R8→R9→R10→R11→R12）：R8 路由归因头补 `X-Proxy-Route-Cost`、R9 `GET /api/route/policies`、R10 `/v1/models` 能力元数据、R11 `/api/status` 增 `route_config`、R12 `POST /admin/reload`（HTTP 热重载）。
+- **R8-R12 已全部交付（2026-08-15）**：R8 归因头四件套 `X-Proxy-Route-*`（含 Cost 与 local_forced）+ OpenAI 协议非流式 `proxy_route` 体字段；R9 `GET /api/route/policies`（脱敏目录 + `catalog_hash`）；R10 `/v1/models` 能力元数据（`real_model`/`thinking_*`/`json_compliance`/`context_chars`/`price`/`direct_capable`）；R11 `/api/status` `route_config` 段；R12 `POST /admin/reload`。CLI 侧配套 `./manage.sh models` / `models-validate`。
 
 ### 4.4 后端类型自动检测
 

@@ -22,6 +22,14 @@
 
 ### 0.2 待做（R8-R12，按优先级与四层闭环支撑映射）
 
+> **2026-08-15 更新：R8-R12 已全部交付**（模型目录 Phase B/C，commit b35b608/后续）。实现说明：
+> - **R8** ✅ 四头 `X-Proxy-Route-Target(cloud|local|local_forced)/Actual-Model/Reason/Cost`（Cost 为预估，OpenAI 协议非流式响应体另带 `proxy_route` 实际 usage 计费字段）
+> - **R9** ✅ `GET /api/route/policies`：providers（key 只回 `key_set` 布尔）+ models（tier/price/capabilities/direct_capable）+ preferences + defaults + `catalog_hash`（漂移检测）+ `api_version`
+> - **R10** ✅ `/v1/models` metadata 增 `real_model/thinking_supported/thinking_required/json_compliance/context_chars/price/direct_capable/fallback_models`
+> - **R11** ✅ `/api/status` 增 `route_config{route_enabled,cloud_model,cloud_key_set,cloud_concurrent}`
+> - **R12** ✅ `POST /admin/reload`（幂等，等效 SIGHUP，含 configs/models.json 目录重载）
+> - CLI 配套：`./manage.sh models` / `models-validate`
+
 | 优先级 | 需求 | 支撑层 | 解决的 Gap |
 |--------|------|--------|-----------|
 | **P0 R8** | 路由归因返回（`X-Proxy-Route-Target/Actual-Model/Reason/Cost` 响应头） | **④ 观测归因** | metering 按 URL 标 is_local，force_fallback ~36% 回退本地导致归因全错（bench 成本/归因最大误差源） |
@@ -34,7 +42,7 @@
 
 ### 0.3 实施顺序
 
-`R8 → R9 → R10 → R11 → R12`（P0 先行，R8 是归因可信度的前提）
+`R8 → R9 → R10 → R11 → R12`（P0 先行，R8 是归因可信度的前提）— 已按此顺序全部完成
 
 ## 1. 需求场景
 

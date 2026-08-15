@@ -1148,6 +1148,101 @@ cmd_list() {
 }
 
 # ============================================================
+# 模型目录（configs/models.json）查看与校验
+# ============================================================
+cmd_models() {
+    python3 - <<'PYEOF'
+import json, os, re, sys
+
+sys.path.insert(0, os.getcwd())
+import model_registry
+
+# Key readiness: os.environ (manage.sh exports) + secret/active conf parsing.
+_CONF_KEYS = {}
+for _path in ("configs/secret.local.conf", "configs/active.conf"):
+    try:
+        for _line in open(_path, encoding="utf-8"):
+            m = re.match(r'^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)="([^"]*)"', _line)
+            if m:
+                _CONF_KEYS.setdefault(m.group(1), m.group(2))
+    except OSError:
+        pass
+
+def key_set(key_env):
+    if not key_env:
+        return False
+    return bool(os.environ.get(key_env) or _CONF_KEYS.get(key_env))
+
+from_file = model_registry.load()
+err = model_registry.last_error()
+hash_ = model_registry.catalog_hash()
+
+print("模型目录 (Model Catalog)")
+print("=" * 60)
+if err:
+    print(f"  ⚠ 目录错误: {err}")
+    print(f"  来源: {'synthesized(兼容合成)' if not from_file else 'file'}")
+else:
+    print(f"  来源: {'file (configs/models.json)' if from_file else 'synthesized (无目录文件, 兼容合成)'}")
+print(f"  hash: {hash_}")
+print()
+
+print("提供商 (providers)")
+for name in model_registry.list_providers():
+    p = model_registry.get_provider(name) or {}
+    url = p.get("base_url") or ("$" + p.get("base_url_env", "?"))
+    cc = p.get("concurrent") or ("$" + p.get("concurrent_env", "?"))
+    ks = key_set(p.get("key_env", ""))
+    print(f"  {name:10} key={'✓' if ks else '✗'}({p.get('key_env','')}) concurrent={cc}")
+    print(f"             {url}")
+    if p.get("anthropic_base_url"):
+        print(f"             anthropic: {p['anthropic_base_url']}")
+print()
+
+print("模型 (models)")
+for name in model_registry.list_models():
+    m = model_registry.get_model(name) or {}
+    caps = m.get("capabilities") or {}
+    price = m.get("price")
+    price_s = f"¥{price['input']}/{price['output']}" if price else "-"
+    print(f"  {name:28} {m.get('provider',''):9} {m.get('tier',''):9} "
+          f"ctx={caps.get('context_tokens') or '-':>8} think={caps.get('thinking') or '-':10} {price_s}")
+print()
+
+print("路由 (routes: 别名 → 云端模型)")
+for alias, r in model_registry.build_route_preferences().items():
+    chain = " → ".join([r["cloud_model"]] + r.get("fallback_models", []))
+    print(f"  {alias:22} {r['route_bias']:13} {r['behavior']:15} {chain}")
+print()
+
+d = model_registry._catalog().get("defaults", {})
+print(f"defaults: cloud_model={d.get('cloud_model')} daily_budget={d.get('daily_budget')}")
+PYEOF
+}
+
+cmd_models_validate() {
+    python3 - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.getcwd())
+import model_registry
+
+model_registry._reset()
+from_file = model_registry.load()
+err = model_registry.last_error()
+if err:
+    print(f"✗ 目录校验失败: {err}")
+    if not from_file:
+        print("  (当前以兼容合成目录运行；请修复 configs/models.json 后重试)")
+    sys.exit(1)
+if not from_file:
+    print("⚠ configs/models.json 不存在 — 将使用兼容合成目录（行为等价，但无法配置多云模型）")
+else:
+    print(f"✓ configs/models.json 校验通过 (hash={model_registry.catalog_hash()})")
+sys.exit(0)
+PYEOF
+}
+
+# ============================================================
 # 切换配置
 # ============================================================
 cmd_switch() {
@@ -1952,6 +2047,10 @@ llama.cpp / Rapid-MLX 服务管理脚本
   switch <name>        切换到指定配置（切换后需 reload 或 restart 生效）
   current              显示当前配置详情
 
+模型目录:
+  models               显示模型目录（providers/models/routes、key 就绪状态、hash）
+  models-validate      校验 configs/models.json（坏文件非零退出）
+
 快速启动:
   wizard               交互式向导，引导完成首次启动配置
 
@@ -2091,6 +2190,12 @@ main() {
             ;;
         list|configs)
             cmd_list
+            ;;
+        models)
+            cmd_models
+            ;;
+        models-validate)
+            cmd_models_validate
             ;;
         switch)
             _with_manage_lock cmd_switch "$2"

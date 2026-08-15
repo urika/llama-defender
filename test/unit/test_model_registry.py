@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -474,3 +475,112 @@ class TestProviderAccessors(ModelRegistryTestBase):
         self.assertEqual(model_registry.get_provider_budget("p1"), 1.5)
         self.assertIsNone(model_registry.get_provider_budget("local"))
         self.assertIsNone(model_registry.get_provider_budget("ghost"))
+
+
+class TestRoutePoliciesJson(unittest.TestCase):
+    """R9: sanitized /api/route/policies payload (no key material)."""
+
+    def test_payload_sanitized_and_complete(self):
+        import admin_server
+        pj = admin_server._build_route_policies_json()
+        # Contract fields
+        for k in ("api_version", "catalog_hash", "route_enabled", "threshold_chars",
+                  "cloud_model", "cloud_key_set", "providers", "models",
+                  "preferences", "defaults"):
+            self.assertIn(k, pj)
+        # Sanitization: booleans only, never key values.
+        s = json.dumps(pj)
+        self.assertNotIn("sk-kimi", s)
+        self.assertNotIn("sk-1234", s)
+        for pname, p in pj["providers"].items():
+            self.assertIsInstance(p["key_set"], bool)
+            self.assertNotIn("api_key", p)
+        # Catalog facts
+        self.assertIn("kimi", pj["providers"])
+        self.assertEqual(pj["models"]["k3"]["context_tokens"], 1048576)
+        self.assertTrue(pj["models"]["k3"]["direct_capable"])
+        self.assertFalse(pj["models"]["local-default"]["direct_capable"])
+        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"],
+                         "deepseek-v4-pro")
+
+    def test_status_json_has_route_config(self):
+        """R11: /api/status carries the route_config digest."""
+        import admin_server
+        sj = admin_server._build_status_json()
+        rc = sj["route_config"]
+        for k in ("route_enabled", "cloud_model", "cloud_key_set", "cloud_concurrent"):
+            self.assertIn(k, rc)
+        self.assertIsInstance(rc["cloud_key_set"], bool)
+
+
+class TestV1ModelsMetadata(unittest.TestCase):
+    """R10: /v1/models capability metadata sourced from the catalog."""
+
+    def _get_entries(self):
+        import anthropic_proxy as proxy
+        h = proxy.Handler.__new__(proxy.Handler)
+        h.path = "/v1/models"
+        h.headers = {}
+        h._responses = []
+        h._respond_json = lambda d, s=200, e=None: h._responses.append(
+            {"data": d, "status": s})
+        proxy.Handler.do_GET(h)
+        self.assertEqual(h._responses[0]["status"], 200)
+        return {m["id"]: m["metadata"] for m in h._responses[0]["data"]["data"]}
+
+    def test_opus_metadata_from_catalog(self):
+        meta = self._get_entries()["claude-opus-4-7"]
+        self.assertEqual(meta["real_model"], "deepseek-v4-pro")
+        self.assertTrue(meta["thinking_supported"])
+        self.assertTrue(meta["thinking_required"])   # thinking: required
+        self.assertEqual(meta["json_compliance"], "strict")
+        self.assertEqual(meta["context_chars"], 1000000)
+        self.assertEqual(meta["price"], {"input": 2.0, "output": 8.0, "currency": "CNY"})
+        self.assertTrue(meta["direct_capable"])       # deepseek has an Anthropic endpoint
+
+    def test_sonnet_flash_metadata(self):
+        meta = self._get_entries()["claude-sonnet-4-6"]
+        self.assertEqual(meta["real_model"], "deepseek-v4-flash")
+        self.assertFalse(meta["thinking_supported"])  # thinking: unsupported
+        self.assertFalse(meta["thinking_required"])
+
+    def test_legacy_alias_minimal_metadata(self):
+        meta = self._get_entries()["claude-3-5-sonnet-20241022"]
+        self.assertEqual(meta, {"route": "auto"})
+
+
+class TestAdminReload(unittest.TestCase):
+    """R12: POST /admin/reload handler."""
+
+    def _make_handler(self):
+        import anthropic_proxy as proxy
+        h = proxy.Handler.__new__(proxy.Handler)
+        h._responses = []
+        h._respond_json = lambda d, s=200, e=None: h._responses.append(
+            {"data": d, "status": s})
+        return h
+
+    def test_reloaded_ok(self):
+        import anthropic_proxy as proxy
+        h = self._make_handler()
+        with patch.object(proxy, "_reload_config", lambda: None):
+            h._handle_admin_reload()
+        data, status = h._responses[0]["data"], h._responses[0]["status"]
+        self.assertEqual(status, 200)
+        self.assertTrue(data["reloaded"])
+        self.assertEqual(data["api_version"], "1")
+        self.assertIn("active_profile", data)
+
+    def test_reloaded_failure_500(self):
+        import anthropic_proxy as proxy
+        h = self._make_handler()
+
+        def _boom():
+            raise RuntimeError("conf parse failed")
+
+        with patch.object(proxy, "_reload_config", _boom):
+            h._handle_admin_reload()
+        data, status = h._responses[0]["data"], h._responses[0]["status"]
+        self.assertEqual(status, 500)
+        self.assertFalse(data["reloaded"])
+        self.assertIn("conf parse failed", data["error"])
