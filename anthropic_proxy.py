@@ -1248,6 +1248,55 @@ class Handler(BaseHTTPRequestHandler):
             payload["error"] = err
         self._respond_json(payload, 200 if ok else 500)
 
+    def _send_common_headers(self, content_type):
+        """Shared response header block: CORS + request-id + R8 route headers."""
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_request_id", None):
+            self._request_id = f"req_{os.urandom(8).hex()}"
+        self.send_header("request-id", self._request_id)
+        route_headers = getattr(self, '_route_response_headers', None) or {}
+        for hk, hv in route_headers.items():
+            self.send_header(hk, str(hv))
+        self._route_response_headers = None
+
+    def _handle_anthropic_stream_passthrough(self, resp, anthropic_body):
+        """Relay an Anthropic-protocol SSE stream to the client unchanged (Phase D).
+
+        The upstream (anthropic-protocol cloud backend) already emits the exact
+        event protocol the client speaks — no conversion, just relay + TTFT.
+        """
+        self.send_response(200)
+        self.send_header("Cache-Control", "no-cache")
+        self._send_common_headers("text/event-stream")
+        self.end_headers()
+        _first_token_time = None
+        try:
+            for raw in resp:
+                if not isinstance(raw, bytes):
+                    raw = raw.encode("utf-8")
+                if _first_token_time is None and raw.strip() and not raw.startswith(b":"):
+                    _first_token_time = time.monotonic()
+                self.wfile.write(raw)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected
+        if _first_token_time is not None:
+            mc = getattr(_metrics_ctx, 'mc', None)
+            if mc:
+                mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
+
+    def _handle_anthropic_response(self, status, body_bytes, ctx):
+        """Return a non-streaming Anthropic-protocol response unchanged (Phase D)."""
+        self.send_response(status)
+        self._send_common_headers("application/json")
+        self.end_headers()
+        try:
+            self.wfile.write(body_bytes if isinstance(body_bytes, bytes)
+                             else body_bytes.encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _respond_json(self, data, status=200, extra_headers=None):
         # When serving an OpenAI-format client, shape error responses in the
         # OpenAI style {error: {message, type, param, code}}.

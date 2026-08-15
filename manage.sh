@@ -1198,7 +1198,8 @@ for name in model_registry.list_providers():
     url = p.get("base_url") or ("$" + p.get("base_url_env", "?"))
     cc = p.get("concurrent") or ("$" + p.get("concurrent_env", "?"))
     ks = key_set(p.get("key_env", ""))
-    print(f"  {name:10} key={'✓' if ks else '✗'}({p.get('key_env','')}) concurrent={cc}")
+    proto = (" [" + p["protocol"] + "]") if p.get("protocol", "openai") != "openai" else ""
+    print(f"  {name:10} key={'✓' if ks else '✗'}({p.get('key_env','')}) concurrent={cc}{proto}")
     print(f"             {url}")
     if p.get("anthropic_base_url"):
         print(f"             anthropic: {p['anthropic_base_url']}")

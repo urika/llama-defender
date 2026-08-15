@@ -1978,6 +1978,7 @@ class BackendDispatcher(PipelineStage):
             return {
                 "model": model_name,
                 "provider": creds["name"],
+                "protocol": creds.get("protocol", "openai"),
                 "base_url": creds["base_url"],
                 "api_key": creds.get("api_key", ""),
                 "key_env": creds.get("key_env", ""),
@@ -1986,6 +1987,7 @@ class BackendDispatcher(PipelineStage):
         return {
             "model": model_name,
             "provider": "default",
+            "protocol": "openai",
             "base_url": _ps.PROXY_CLOUD_BASE_URL,
             "api_key": _ps.PROXY_CLOUD_API_KEY,
             "key_env": "PROXY_CLOUD_API_KEY",
@@ -2065,14 +2067,21 @@ class BackendDispatcher(PipelineStage):
 
         # Resolve catalog-driven cloud candidates (primary + fallback chain).
         candidates = self._cloud_candidates(ctx) if target == 'cloud' else []
+        # OpenAI-protocol clients can't be served by anthropic-protocol
+        # backends (response shape mismatch) — such candidates are unusable.
+        _oai_client = bool(getattr(self._handler, '_openai_mode', False))
+
+        def _usable(c):
+            return (
+                c["api_key"]
+                and not _ps._provider_cooldown_active(c["provider"])
+                and not (_oai_client and c.get("protocol") == "anthropic")
+            )
 
         # Validate cloud API key availability across candidates — force mode:
         # error; force_fallback/prefer: fall back to local. Cooldown-active
         # providers don't count as usable here.
-        if target == 'cloud' and not any(
-            c["api_key"] and not _ps._provider_cooldown_active(c["provider"])
-            for c in candidates
-        ):
+        if target == 'cloud' and not any(_usable(c) for c in candidates):
             route_reason = getattr(ctx, '_route_reason', '')
             if route_reason and route_reason.startswith("model_forced_") \
                     and not route_reason.startswith("model_forced_fallback_"):
@@ -2116,16 +2125,27 @@ class BackendDispatcher(PipelineStage):
                 if not cand["api_key"]:
                     log(f"  -> Skip {cand['model']} — no API key ({cand['key_env']})")
                     continue
+                if _oai_client and cand.get("protocol") == "anthropic":
+                    log(f"  -> Skip {cand['model']} — anthropic-protocol backend "
+                        f"cannot serve an OpenAI-protocol client")
+                    continue
                 ctx._route_cloud_model = cand["model"]
                 ctx._route_provider = cand["provider"]
                 if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
                     ctx.openai_body["model"] = cand["model"]
                 self._set_route_headers(ctx)
-                log(f"  -> Forwarding to {cand['base_url']}/chat/completions "
-                    f"(cloud, provider={cand['provider']}, model={cand['model']})")
                 try:
-                    with cand["lock"]:
-                        self._do_dispatch(ctx, cand["base_url"], cand["api_key"])
+                    if cand.get("protocol") == "anthropic":
+                        log(f"  -> Forwarding to {cand['base_url']}/v1/messages "
+                            f"(cloud, anthropic protocol, provider={cand['provider']}, "
+                            f"model={cand['model']})")
+                        with cand["lock"]:
+                            self._do_dispatch_anthropic(ctx, cand)
+                    else:
+                        log(f"  -> Forwarding to {cand['base_url']}/chat/completions "
+                            f"(cloud, provider={cand['provider']}, model={cand['model']})")
+                        with cand["lock"]:
+                            self._do_dispatch(ctx, cand["base_url"], cand["api_key"])
                     _ps._record_provider_success(cand["provider"])
                     return ctx
                 except urllib.error.HTTPError as e:
@@ -2464,6 +2484,95 @@ class BackendDispatcher(PipelineStage):
             pass
 
         # Accumulate daily route cost if cloud succeeded
+        if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
+            self._accumulate_daily_cost(ctx)
+
+    def _do_dispatch_anthropic(self, ctx, cand):
+        """Send the Anthropic-format body to an anthropic-protocol endpoint (Phase D).
+
+        Reuses the pipeline's openai_body (all stage adjustments — compression,
+        tool filtering, quirks — already applied) and converts it back via
+        convert_openai_request_to_anthropic, the same round-trip the
+        /v1/chat/completions entry uses. Response is relayed to the client
+        unchanged (SSE passthrough / raw JSON + proxy_route attribution).
+        Caller must already hold the provider concurrency lock.
+        """
+        msg_converter = _import_message_converter()
+        try:
+            anthropic_req = msg_converter.convert_openai_request_to_anthropic(ctx.openai_body)
+        except Exception as e:
+            log(f"  -> Anthropic body conversion failed ({e}); falling back to raw messages", level="WARN")
+            anthropic_req = {
+                "model": cand["model"],
+                "max_tokens": ctx.body.get("max_tokens", 4096),
+                "messages": ctx.messages,
+            }
+        anthropic_req["model"] = cand["model"]
+        anthropic_req["stream"] = bool(ctx.is_stream)
+        anthropic_req.pop("_x_proxy_route_to", None)
+        body_bytes = json.dumps(anthropic_req).encode("utf-8")
+
+        if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
+            log(f"  -> Request body too large for anthropic backend: "
+                f"{len(body_bytes)} > {_ps.PROXY_CLOUD_MAX_REQUEST_BYTES}")
+            self._handler._respond_json(
+                {"error": {
+                    "type": "payload_too_large",
+                    "message": f"Request body ({len(body_bytes)} bytes) exceeds anthropic "
+                               f"backend maximum ({_ps.PROXY_CLOUD_MAX_REQUEST_BYTES} bytes).",
+                }}, 413)
+            return
+
+        req = urllib.request.Request(
+            f"{cand['base_url']}/v1/messages",
+            data=body_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": cand["api_key"],
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        _dispatch_t0 = time.monotonic()
+        resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
+        self._backend_status = resp.status
+        log(f"  <- backend status: {resp.status} (anthropic)")
+
+        self._input_tokens = max(1, int(ctx.total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1)))
+        self._output_tokens = int(ctx.body.get("max_tokens", 4096))
+
+        if ctx.is_stream:
+            self._handler._handle_anthropic_stream_passthrough(resp, ctx.body)
+        else:
+            resp_bytes = resp.read()
+            try:
+                anth_resp = json.loads(resp_bytes.decode("utf-8"))
+                usage = anth_resp.get("usage") or {}
+                self._input_tokens = usage.get("input_tokens", self._input_tokens)
+                self._output_tokens = usage.get("output_tokens", self._output_tokens)
+                pin, pout = self._model_prices(cand["model"])
+                ctx._route_actual_cost = round(
+                    (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
+                # R8 (非流式): proxy_route attribution in the response body.
+                anth_resp["proxy_route"] = {
+                    "target": "cloud",
+                    "actual_model": cand["model"],
+                    "reason": getattr(ctx, '_route_reason', ''),
+                    "cost": ctx._route_actual_cost,
+                }
+                resp_bytes = json.dumps(anth_resp, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
+            self._handler._handle_anthropic_response(resp.status, resp_bytes, ctx)
+
+        dispatch_ms = (time.monotonic() - _dispatch_t0) * 1000
+        self._dispatch_latency_ms = dispatch_ms
+        try:
+            if not self._route_fallback:
+                _ps._LATENCY_BY_TARGET.setdefault(
+                    "cloud", collections.deque(maxlen=100)).append(dispatch_ms)
+        except Exception:
+            pass
         if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
             self._accumulate_daily_cost(ctx)
 

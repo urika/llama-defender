@@ -1617,3 +1617,151 @@ class TestCatalogRequestQuirks(unittest.TestCase):
         ctx = FormatConverter().process(self._ctx("cloud", "deepseek-v4-flash"))
         self.assertEqual(ctx.openai_body["temperature"], 0.7)
         self.assertEqual(ctx.openai_body["thinking"], {"type": "disabled"})
+
+
+# ===========================================================================
+# Phase D: anthropic-protocol cloud dispatch
+# ===========================================================================
+
+class TestAnthropicProtocolDispatch(unittest.TestCase):
+    """provider.protocol=anthropic dispatch: URL/headers/body + client-protocol skip."""
+
+    CATALOG = {
+        "providers": {
+            "zai": {
+                "protocol": "anthropic",
+                "base_url": "https://open.example/v4",          # openai pay-per-use (unused)
+                "anthropic_base_url": "https://zai.example/api/anthropic",
+                "anthropic_key_env": "ZAI_KEY",
+                "key_env": "ZHIPU_KEY",                          # different key per system
+                "anthropic_compatible": True,
+                "concurrent": 1,
+            },
+            "p2": {"base_url": "https://p2.example/v1", "key_env": "P2_KEY", "concurrent": 1},
+            "local": {"base_url_env": "LLAMA_BASE_URL", "key_env": "LLAMA_API_KEY",
+                      "concurrent_env": "PROXY_MAX_CONCURRENT"},
+        },
+        "models": {
+            "glm-x": {"provider": "zai", "tier": "flagship"},
+            "m2": {"provider": "p2", "tier": "flagship"},
+            "local-default": {"provider": "local", "tier": "standard"},
+        },
+        "routes": {
+            "claude-sonnet-4-6": {"route_bias": "auto", "cloud_model": "glm-x",
+                                  "behavior": "prefer", "threshold_factor": 1.0,
+                                  "memory_bias": 0},
+        },
+        "defaults": {"cloud_model": "glm-x"},
+    }
+
+    def setUp(self):
+        import os
+        import tempfile
+        import model_registry
+        self._model_registry = model_registry
+        self._tmp = tempfile.TemporaryDirectory()
+        path = os.path.join(self._tmp.name, "models.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.CATALOG, f)
+        model_registry._reset()
+        assert model_registry.load(path=path, env_cloud_model_getter=lambda: "glm-x")
+        self._patches = [
+            patch.object(_ps, "ZAI_KEY", "sk-zai", create=True),
+            patch.object(_ps, "P2_KEY", "sk-p2", create=True),
+            patch.object(_ps, "PROXY_ROUTE_FALLBACK_ENABLED", True),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._restore)
+        self._mock_handler = MagicMock()
+        self._mock_handler._handle_streaming_response = MagicMock()
+        self._mock_handler._handle_non_streaming_response = MagicMock()
+        self._mock_handler._handle_anthropic_stream_passthrough = MagicMock()
+        self._mock_handler._handle_anthropic_response = MagicMock()
+        self._mock_handler._respond_json = MagicMock()
+        self._mock_handler._route_response_headers = None
+        self._mock_handler._openai_mode = False
+        _ps._cloud_fail_count.clear()
+        _ps._cloud_cooldown_start.clear()
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
+
+    def _restore(self):
+        _ps._PROVIDER_FAIL_COUNT.clear()
+        _ps._PROVIDER_COOLDOWN_START.clear()
+        self._tmp.cleanup()
+        self._model_registry._reset()
+        self._model_registry.load(
+            env_cloud_model_getter=lambda: _ps.PROXY_CLOUD_MODEL)
+
+    def _make_ctx(self, target="cloud", model="glm-x", fallbacks=None, stream=False):
+        ctx = PipelineContext(
+            body={"model": "claude-sonnet-4-6", "max_tokens": 64,
+                  "messages": [{"role": "user", "content": "hi"}]},
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            is_stream=stream, total_chars=100, session_id="s_anthropic",
+            openai_body={"model": model, "messages": [{"role": "user", "content": "hi"}],
+                         "max_tokens": 64, "stream": stream},
+        )
+        ctx._route_target = target
+        ctx._route_cloud_model = model
+        ctx._route_fallback_models = list(fallbacks or [])
+        return ctx
+
+    def _mock_urlopen(self):
+        m = MagicMock()
+        m.status = 200
+        m.read.return_value = json.dumps({
+            "id": "msg_x", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }).encode("utf-8")
+        return m
+
+    def test_anthropic_dispatch_url_headers_body(self):
+        stage = BackendDispatcher(llama_lock=MagicMock(), cloud_lock=MagicMock(),
+                                  handler=self._mock_handler)
+        ctx = self._make_ctx()
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen()) as mo:
+            stage.process(ctx)
+        req = mo.call_args[0][0]
+        self.assertTrue(str(req.full_url).endswith("/v1/messages"), req.full_url)
+        self.assertIn("zai.example", str(req.full_url))
+        # urllib normalizes header names via .capitalize() → "X-api-key"
+        self.assertEqual(req.headers.get("X-api-key"), "sk-zai")  # subscription key, not ZHIPU_KEY
+        self.assertEqual(req.headers.get("Anthropic-version"), "2023-06-01")
+        sent = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(sent["model"], "glm-x")
+        # Anthropic-format messages (content blocks), produced via the tested
+        # convert_openai_request_to_anthropic round-trip.
+        self.assertEqual(sent["messages"][0]["role"], "user")
+        self._mock_handler._handle_anthropic_response.assert_called_once()
+        # proxy_route attribution injected into the relayed body
+        relayed = json.loads(
+            self._mock_handler._handle_anthropic_response.call_args[0][1])
+        self.assertEqual(relayed["proxy_route"]["actual_model"], "glm-x")
+        self.assertEqual(ctx._route_provider, "zai")
+
+    def test_openai_mode_client_skips_anthropic_candidate(self):
+        """OpenAI-protocol clients can't consume anthropic backends — chain falls through."""
+        self._mock_handler._openai_mode = True
+        stage = BackendDispatcher(llama_lock=MagicMock(), cloud_lock=MagicMock(),
+                                  handler=self._mock_handler)
+        ctx = self._make_ctx(model="glm-x", fallbacks=["m2"])
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen()) as mo:
+            stage.process(ctx)
+        url = str(mo.call_args[0][0].full_url)
+        self.assertIn("p2.example/v1/chat/completions", url)   # openai fallback served
+        self.assertEqual(ctx._route_provider, "p2")
+
+    def test_anthropic_stream_uses_passthrough(self):
+        stage = BackendDispatcher(llama_lock=MagicMock(), cloud_lock=MagicMock(),
+                                  handler=self._mock_handler)
+        ctx = self._make_ctx(stream=True)
+        with patch("pipeline.urllib.request.urlopen", return_value=self._mock_urlopen()):
+            stage.process(ctx)
+        self._mock_handler._handle_anthropic_stream_passthrough.assert_called_once()
+        self._mock_handler._handle_anthropic_response.assert_not_called()

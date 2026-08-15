@@ -182,6 +182,12 @@ def _validate(catalog):
             errors.append("provider %r concurrent_env must be a name" % pname)
         if "anthropic_compatible" in p and not isinstance(p["anthropic_compatible"], bool):
             errors.append("provider %r anthropic_compatible must be bool" % pname)
+        if "protocol" in p and p["protocol"] not in ("openai", "anthropic"):
+            errors.append("provider %r protocol must be openai|anthropic" % pname)
+        if "anthropic_key_env" in p and not (
+            isinstance(p["anthropic_key_env"], str) and p["anthropic_key_env"]
+        ):
+            errors.append("provider %r anthropic_key_env must be a name" % pname)
 
     for mname, m in models.items():
         if not isinstance(mname, str) or not mname:
@@ -444,10 +450,18 @@ def get_provider_credentials(provider_name, env_lookup=None):
         return None
     env_get = env_lookup or (lambda k, d=None: os.environ.get(k, d))
 
-    if p.get("base_url"):
-        base_url = p["base_url"]
+    protocol = p.get("protocol", "openai")
+    if protocol == "anthropic":
+        # Phase D: dispatch through the Anthropic-protocol endpoint (e.g.
+        # Z.ai Coding Plan subscription); key may differ from the OpenAI one.
+        base_url = p.get("anthropic_base_url", "")
+        key_env = p.get("anthropic_key_env") or p.get("key_env", "")
     else:
-        base_url = env_get(p.get("base_url_env", ""), "") or ""
+        if p.get("base_url"):
+            base_url = p["base_url"]
+        else:
+            base_url = env_get(p.get("base_url_env", ""), "") or ""
+        key_env = p.get("key_env", "")
 
     if "concurrent" in p:
         concurrent = int(p["concurrent"])
@@ -457,13 +471,14 @@ def get_provider_credentials(provider_name, env_lookup=None):
         except (TypeError, ValueError):
             concurrent = 1
 
-    api_key = env_get(p.get("key_env", ""), "") or ""
+    api_key = env_get(key_env, "") or ""
     return {
         "name": provider_name,
+        "protocol": protocol,
         "base_url": base_url,
         "api_key": api_key,
         "concurrent": concurrent,
-        "key_env": p.get("key_env", ""),
+        "key_env": key_env,
         "anthropic_base_url": p.get("anthropic_base_url", ""),
         "anthropic_compatible": bool(p.get("anthropic_compatible", False)),
     }

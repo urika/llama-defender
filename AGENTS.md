@@ -203,6 +203,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 - `ready` 表示后端模型已加载、可接受推理请求（`starting` → `ready=false`），agent_go 的 `wait_ready` 以此字段为准。
 - 路由响应头（R8 契约名）：每个路由响应带 `X-Proxy-Route-Target`（`cloud|local|local_forced`）、`X-Proxy-Route-Actual-Model`、`X-Proxy-Route-Reason`、`X-Proxy-Route-Cost`（预估费用，本地为 0）；OpenAI 协议非流式响应体另带 `proxy_route` 字段（实际 usage 计费）。单请求路由覆盖用请求头 `X-Proxy-Route-To: local|cloud`（无会话粘性）。
 - 多提供商分发（Phase B）：按模型解析目录 provider 凭证/并发锁；路由 `fallback_chain` 跨商降级（跳过冷却中/无 key 的提供商）；分商熔断互不影响；按模型目录价格计费 + 全局/分商预算双上限。
+- Anthropic 协议分发（Phase D）：provider 可声明 `protocol: anthropic`（双端点双 key：`anthropic_base_url` + `anthropic_key_env`）——该 provider 的模型走 `{anthropic_base_url}/v1/messages`（Anthropic 协议，如 Z.ai Coding Plan 订阅），SSE 原样透传、非流式直返 + `proxy_route` 归因；OpenAI 协议客户端自动跳过 anthropic 候选并沿链降级。当前 zhipu=protocol anthropic（订阅路径，glm 边际成本 0）。
 - **R8-R12 已全部交付（2026-08-15）**：R8 归因头四件套 `X-Proxy-Route-*`（含 Cost 与 local_forced）+ OpenAI 协议非流式 `proxy_route` 体字段；R9 `GET /api/route/policies`（脱敏目录 + `catalog_hash`）；R10 `/v1/models` 能力元数据（`real_model`/`thinking_*`/`json_compliance`/`context_chars`/`price`/`direct_capable`）；R11 `/api/status` `route_config` 段；R12 `POST /admin/reload`。CLI 侧配套 `./manage.sh models` / `models-validate`。
 
 ### 4.4 后端类型自动检测
