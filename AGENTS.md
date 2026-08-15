@@ -57,7 +57,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`anthropic_proxy.py`](anthropic_proxy.py) | HTTP 代理入口：`ThreadingHTTPServer` + `Handler`（~1480 行）；流式/非流式响应处理、双协议端点；请求处理逻辑已全部下沉到 `pipeline.py` |
 | [`pipeline.py`](pipeline.py) | 管线抽象：24 个可独立测试的 `PipelineStage`，把 `_handle_messages` 拆成 RequestParser、LifecycleClassifier、SmartRouter、ContentCompressor、ContextTruncator、BackendDispatcher 等阶段 |
 | [`proxy_state.py`](proxy_state.py) | 单一真相源：所有 `PROXY_*` / `LLAMA_*` 常量、共享可变状态、线程本地上下文、`_RELOAD_SPEC`、模型别名、路由状态 |
-| [`proxy_config.py`](proxy_config.py) | `CONFIG_REGISTRY`：每个环境变量的默认值（区分 local/cloud）、类型、作用域、文档说明 |
+| [`proxy_config.py`](proxy_config.py) | `CONFIG_REGISTRY`：每个环境变量的默认值（区分 local/cloud）、类型、作用域、文档说明；配置统一阶段一起为默认值唯一权威（`get_default()` / `validate_startup()` / `write_defaults_sh()`） |
 | [`backend_strategy.py`](backend_strategy.py) | `BackendStrategy` / `LocalStrategy` / `CloudStrategy`：把 38+ 处 `if IS_CLOUD` 收敛为策略类 |
 | [`reload_config.py`](reload_config.py) | SIGHUP 热重载实现：重新解析 `configs/active.conf` + `configs/secret.local.conf`，更新 `proxy_state` 与主模块；同时重载模型目录并重建 `MODEL_ROUTE_PREFERENCES` |
 | [`model_registry.py`](model_registry.py) | 模型目录注册表：加载/校验 `configs/models.json`（providers/models/routes 三段，对齐 agent_go 三层设计），`$env`/`$default` 引用、fallback chain、坏文件拒绝热替换、`catalog_hash`；目录文件缺失时自动合成等价目录（与旧硬编码行为一致），`MODEL_ROUTE_PREFERENCES` 与 `get_model_aliases()` 均由其派生 |
@@ -161,6 +161,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 ./manage.sh monitor [N]        # Metal 内存实时监控（每 N 秒刷新，默认 5）
 ./manage.sh models             # 模型目录总览（providers/models/routes、key 就绪状态、hash）
 ./manage.sh models-validate    # 校验 configs/models.json（坏文件非零退出）
+./manage.sh config-lint [file] # 校验配置文件与 CONFIG_REGISTRY 一致性（默认 active.conf）
 ./manage.sh fix-template <dir> # 修复 Qwen chat_template
 ```
 
@@ -192,6 +193,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/status` | 结构化健康与就绪状态：`proxy`、`backend`、`active_profile`、`state`、`ready`、`route_config`（R11 路由配置摘要） |
 | GET | `/api/route/policies` | 脱敏路由策略 + 模型目录（R9）：providers（key 只回 `key_set` 布尔）、models、preferences、defaults、`catalog_hash`（agent_go 漂移检测） |
 | GET | `/api/watchdog` | watchdog 状态：`enabled`、`running`、`pid`、`restart_count_1h`、`last_failure_reason` |
+| GET | `/api/queue` | 请求优先级队列状态（Phase 1 默认关闭）：`enabled`、`workers`、`waiting`、`by_bucket`、`oldest_wait_ms` |
 | GET | `/api/profiles` | 可用模型配置列表：`name`、`desc`、`memory_gb`、`active` |
 | GET | `/metrics[?n=N]` | 最近请求指标（JSON） |
 | GET | `/metrics/history` | 历史指标（JSON） |
@@ -487,6 +489,18 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_ROUTE_FORCE` | `""` | 强制路由模式：`local` 或 `cloud` |
 | `PROXY_CLOUD_COOLDOWN` | `300` | 云端失败后的冷却时间（秒） |
 | `PROXY_CLOUD_MAX_RETRY` | `2` | 云端重试次数 |
+
+### 11.5 请求队列参数（Phase 1）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_QUEUE_ENABLED` | `false` | 启用优先级请求队列；默认关闭 = 原信号量行为（当前 `qwen3.8-27b-4bit` 灰度开启） |
+| `PROXY_QUEUE_TIMEOUT_SECONDS` | `300` | 排队超时，超时返回 503 + `Retry-After` |
+| `PROXY_QUEUE_LARGE_THRESHOLD_CHARS` | `80000` | large bucket 阈值（低优先级排队） |
+| `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理 |
+| `PROXY_QUEUE_HUGE_ACTION` | `cloud` | huge 处理：`cloud`（强制路由云端，需 `PROXY_ROUTE_ENABLED=true`）/ `reject`（413） |
+
+队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 
 > 完整参数列表及详细文档见 [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`。
 

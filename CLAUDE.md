@@ -114,6 +114,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/status` | Structured service health & readiness | JSON: `proxy`, `backend`, `active_profile`, `state`, `ready`, `route_config` |
 | GET | `/api/route/policies` | Sanitized routing policies + model catalog (R9) | JSON: `providers` (keys as `key_set` bool only), `models`, `preferences`, `defaults`, `catalog_hash`, `api_version` |
 | GET | `/api/watchdog` | Watchdog state | JSON: `enabled`, `running`, `pid`, `last_restart_at`, `restart_count_1h`, `last_failure_reason` |
+| GET | `/api/queue` | Priority request queue state (Phase 1, default off) | JSON: `enabled`, `workers`, `waiting`, `by_bucket`, `oldest_wait_ms` |
 | GET | `/api/profiles` | Available model configs | JSON: `profiles[]` with `name`, `desc`, `memory_gb`, `active` |
 | GET | `/metrics[?n=N]` | Recent request metrics | JSON |
 | GET | `/metrics/history` | Historical metrics | JSON |

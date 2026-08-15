@@ -401,6 +401,27 @@ def _build_watchdog_json():
         "restart_count_1h": int(state.get("restart_count_1h", 0)),
         "last_failure_reason": state.get("last_failure_reason", ""),
     }
+
+
+def _build_queue_json():
+    """请求优先级队列状态（GET /api/queue）。
+
+    队列未启用（PROXY_QUEUE_ENABLED=false，默认）时返回 enabled=false + 静态字段，
+    不触发队列管理器的惰性构建。
+    """
+    if not getattr(_ps, "PROXY_QUEUE_ENABLED", False):
+        return {
+            "enabled": False,
+            "workers": _ps.PROXY_MAX_CONCURRENT,
+            "waiting": 0,
+            "by_bucket": {"interactive": 0, "standard": 0, "large": 0},
+            "oldest_wait_ms": 0,
+        }
+    try:
+        stats = _ps.get_queue_manager().stats()
+    except Exception as e:
+        return {"enabled": True, "error": f"queue_unavailable: {e}"}
+    return {"enabled": True, **stats}
 # --- _get_system_memory ---
 # _get_system_memory() moved to proxy_state.py so pipeline.py can use it without
 # creating a circular import.  Keep this module-level alias for backward compat.
@@ -2719,6 +2740,7 @@ __all__ = [
     "_build_status_html",
     "_build_status_json",
     "_build_watchdog_json",
+    "_build_queue_json",
     "_build_profiles_json",
     "_build_route_policies_json",
     "_current_active_profile",

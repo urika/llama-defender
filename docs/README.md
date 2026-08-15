@@ -46,6 +46,7 @@ docs/
 | `proxy-context-window-design-review.md` | 设计审阅意见（P1-P3 需修正 + S1-S5 建议改进） |
 | `proxy-context-window-design-review-merged.md` | 审阅意见合并记录，8/8 全部采纳 |
 | `multi-cloud-model-catalog-design-20260815.md` | 多云端模型目录（Model Catalog）设计与整体架构 Review（v2）：模型管理现状梳理（8 处硬编码触点）、`configs/models.json` 声明式目录（providers/models/routes 对齐 agent_go 三层设计）、直连 vs 走代理双源真相边界（catalog_hash 漂移检测）、R8 响应头命名契约对齐（`X-Proxy-Route-*`）、多提供商分发与 fallback chain、按模型成本核算，Phase A-C 实施计划（顺带交付 llama-defender R8-R12） |
+| `config-unification-and-request-queue-design-20260815.md` | 配置统一与请求队列设计方案：解决配置默认值分散四处导致的漂移风险（如 qwen3.8 MODEL_NAME 缺失），以及单信号量下大请求阻塞小请求的公平性问题；含 CONFIG_REGISTRY 单一事实源、启动校验、请求四级分桶、准入控制、优先级队列、超时取消、与 SmartRouter 集成、迁移与测试计划 |
 | `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
 
 ---

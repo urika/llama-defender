@@ -44,6 +44,8 @@ signal.signal(signal.SIGHUP, _reload_config)
 import loop_detection
 from loop_detection import *
 
+import queue_manager
+
 import model_registry
 
 # ---------------------------------------------------------------------------
@@ -482,6 +484,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._respond_json(status, http_code)
                 elif self.path == "/api/watchdog":
                     self._respond_json(_build_watchdog_json())
+                elif self.path == "/api/queue":
+                    self._respond_json(_build_queue_json())
                 elif self.path == "/api/profiles":
                     self._respond_json({"profiles": _build_profiles_json()})
                 elif self.path == "/api/route/policies":
@@ -623,6 +627,76 @@ class Handler(BaseHTTPRequestHandler):
                 total_chars = len(json.dumps(msgs, ensure_ascii=False)) if msgs else 0
                 tools = parsed.get("tools", [])
                 log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
+
+                # 请求优先级队列（Phase 1，PROXY_QUEUE_ENABLED=false 时完全跳过）：
+                # 1) 准入控制：huge bucket 强制路由云端或 413 拒绝
+                # 2) 非 huge：入队并在 _handle_messages 前等待 worker 名额
+                _queue_ticket = None       # 非 None 表示需要在 finally 中 release
+                _queue_bucket = ""
+                if PROXY_QUEUE_ENABLED:
+                    _qm = _ps.get_queue_manager()
+                    _queue_bucket = queue_manager.classify_bucket(
+                        total_chars,
+                        _ps.PROXY_QUEUE_LARGE_THRESHOLD_CHARS,
+                        _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
+                    )
+                    if _queue_bucket == "huge":
+                        # huge 不入本地队列。客户端显式 X-Proxy-Route-To: local 时
+                        # 尊重客户端选择（不走云端），按 reject 处理。
+                        _client_route = parsed.get("_x_proxy_route_to", "")
+                        if PROXY_QUEUE_HUGE_ACTION == "cloud" and PROXY_ROUTE_ENABLED \
+                                and _client_route != "local":
+                            # 复用 X-Proxy-Route-To 内部标记，SmartRouter 会强制走云端；
+                            # _early_route_decision 也会因此跳过 OOM 预截断。
+                            parsed["_x_proxy_route_to"] = "cloud"
+                            self._queue_response_headers = {"X-Queue-Bucket": "huge"}
+                            log(f"  -> [queue] huge bucket ({total_chars:,} chars >= "
+                                f"{_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}): force route to cloud", level="WARN")
+                        else:
+                            log(f"  -> [queue] huge bucket rejected ({total_chars:,} chars, "
+                                f"action={PROXY_QUEUE_HUGE_ACTION}, route_enabled={PROXY_ROUTE_ENABLED})", level="WARN")
+                            if PROXY_METRICS_ENABLED:
+                                mc = getattr(_metrics_ctx, 'mc', None)
+                                if mc:
+                                    mc["queue_bucket"] = "huge"
+                                    mc["queue_rejected"] = "huge_context_not_supported_locally"
+                                    _finalize_metrics(mc)
+                                    log_metrics(mc)
+                            self._respond_json(
+                                {
+                                    "error": {
+                                        "type": "huge_context_not_supported_locally",
+                                        "message": (f"Prompt of {total_chars:,} chars exceeds the local queue "
+                                                    f"huge threshold ({_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}). "
+                                                    "Enable routing (PROXY_ROUTE_ENABLED) to auto-route such requests to cloud."),
+                                        "chars": total_chars,
+                                        "threshold": _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
+                                        "retryable": False,
+                                    }
+                                },
+                                413,
+                            )
+                            return
+                    else:
+                        _queue_ticket = _qm.enqueue({
+                            "request_id": getattr(self, "_request_id", "") or "",
+                            "total_chars": total_chars,
+                            "stream": bool(parsed.get("stream")),
+                            "bucket": _queue_bucket,
+                        })
+                        self._queue_response_headers = {
+                            "X-Queue-Bucket": _queue_bucket,
+                            "X-Queue-Position": str(_qm.position(_queue_ticket)),
+                            "X-Queue-Estimated-Wait-Ms": str(_qm.estimated_wait_ms(_queue_bucket)),
+                        }
+                        log(f"  -> [queue] enqueued bucket={_queue_bucket} "
+                            f"pos={self._queue_response_headers['X-Queue-Position']} "
+                            f"est_wait={self._queue_response_headers['X-Queue-Estimated-Wait-Ms']}ms")
+                        if PROXY_METRICS_ENABLED:
+                            mc = getattr(_metrics_ctx, 'mc', None)
+                            if mc:
+                                mc["queue_bucket"] = _queue_bucket
+
                 # DEF-001 fix: pre-truncate very large payloads to prevent rapid-mlx
                 # OOM and 500 errors. Evidence: 65/67 of v0.5.0-baseline 500s came
                 # from input_chars > 400K (session a309b181). Force rounds truncation
@@ -669,6 +743,43 @@ class Handler(BaseHTTPRequestHandler):
                 # Phase 3: request failure snapshot — save original body before processing
                 _write_request_snapshot(_req_id, parsed)
                 _snapshot_written = False
+                # 请求队列：等待 worker 名额（超时返回 False 并已自动出队）
+                _queue_acquired = False
+                if _queue_ticket is not None:
+                    _queue_acquired = _qm.acquire(_queue_ticket, timeout=PROXY_QUEUE_TIMEOUT_SECONDS)
+                    _queue_wait_ms = _queue_ticket.elapsed_wait_ms()
+                    if not _queue_acquired:
+                        log(f"  -> [queue] timeout after {_queue_wait_ms}ms "
+                            f"(bucket={_queue_bucket}, limit={PROXY_QUEUE_TIMEOUT_SECONDS}s)", level="WARN")
+                        if PROXY_METRICS_ENABLED:
+                            mc = getattr(_metrics_ctx, 'mc', None)
+                            if mc:
+                                mc["queue_wait_ms"] = _queue_wait_ms
+                                mc["queue_rejected"] = "queue_timeout"
+                                _finalize_metrics(mc)
+                                log_metrics(mc)
+                        self._respond_json(
+                            {
+                                "error": {
+                                    "type": "queue_timeout",
+                                    "message": (f"Request waited {_queue_wait_ms}ms in queue "
+                                                f"(bucket={_queue_bucket}), exceeding the "
+                                                f"{PROXY_QUEUE_TIMEOUT_SECONDS}s limit. Retry later."),
+                                    "request_id": _req_id,
+                                    "retryable": True,
+                                }
+                            },
+                            503,
+                            extra_headers={"Retry-After": str(PROXY_RETRY_AFTER_SECONDS)},
+                        )
+                        return
+                    if self._queue_response_headers is not None:
+                        self._queue_response_headers["X-Queue-Wait-Ms"] = str(_queue_wait_ms)
+                    if PROXY_METRICS_ENABLED:
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["queue_wait_ms"] = _queue_wait_ms
+                    log(f"  -> [queue] acquired worker after {_queue_wait_ms}ms (bucket={_queue_bucket})")
                 try:
                     self._handle_messages(parsed)
                     _dur = (_time.monotonic() - _t0) * 1000
@@ -743,6 +854,13 @@ class Handler(BaseHTTPRequestHandler):
                             log(f"  -> CRITICAL: failed to send error response: {respond_err}", level="ERROR")
                     # No raise — let the connection close cleanly
                 finally:
+                    # 请求队列：释放 worker 名额并记录占用耗时（供等待时间估计）
+                    if _queue_acquired:
+                        try:
+                            _qm.release(_queue_ticket,
+                                        occupied_ms=(_time.monotonic() - _t0) * 1000)
+                        except Exception:
+                            pass
                     # Reset OpenAI chat mode flags for this connection
                     self._openai_mode = False
                     self._openai_model = None
@@ -920,6 +1038,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in route_headers.items():
             self.send_header(hk, str(hv))
         self._route_response_headers = None
+        # 请求队列响应头（X-Queue-*），与 route headers 同机制
+        queue_headers = getattr(self, '_queue_response_headers', None) or {}
+        for hk, hv in queue_headers.items():
+            self.send_header(hk, str(hv))
+        self._queue_response_headers = None
         self.end_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
@@ -1189,6 +1312,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in route_headers.items():
             self.send_header(hk, str(hv))
         self._route_response_headers = None
+        # 请求队列响应头（X-Queue-*），与 route headers 同机制
+        queue_headers = getattr(self, '_queue_response_headers', None) or {}
+        for hk, hv in queue_headers.items():
+            self.send_header(hk, str(hv))
+        self._queue_response_headers = None
         self.end_headers()
 
         total_text = ""
@@ -1259,6 +1387,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in route_headers.items():
             self.send_header(hk, str(hv))
         self._route_response_headers = None
+        # 请求队列响应头（X-Queue-*），与 route headers 同机制
+        queue_headers = getattr(self, '_queue_response_headers', None) or {}
+        for hk, hv in queue_headers.items():
+            self.send_header(hk, str(hv))
+        self._queue_response_headers = None
 
     def _handle_anthropic_stream_passthrough(self, resp, anthropic_body):
         """Relay an Anthropic-protocol SSE stream to the client unchanged (Phase D).
@@ -1323,6 +1456,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in route_headers.items():
             self.send_header(hk, str(hv))
         self._route_response_headers = None
+        # 请求队列响应头（X-Queue-*），与 route headers 同机制
+        queue_headers = getattr(self, '_queue_response_headers', None) or {}
+        for hk, hv in queue_headers.items():
+            self.send_header(hk, str(hv))
+        self._queue_response_headers = None
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, str(v))
@@ -1578,6 +1716,18 @@ def main():
     log(f"Failure snapshots: {'enabled' if PROXY_SNAPSHOT_ENABLED else 'disabled'}")
     if IS_CLOUD:
         log(f"Cloud API mode — no local backend required")
+
+    # 配置启动校验（配置统一阶段一：仅警告，不退出）
+    config_errors = proxy_config.validate_startup(
+        env=os.environ,
+        active_conf_path=getattr(_ps, "RELOAD_CONFIG_PATH", "configs/active.conf"),
+        backend_type="cloud" if IS_CLOUD else "local",
+        strict=False,
+    )
+    if config_errors:
+        for err in config_errors:
+            log(f"[CONFIG WARNING] {err}")
+
     class ReusableThreadingHTTPServer(ThreadingHTTPServer):
         allow_reuse_address = True
 
