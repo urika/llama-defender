@@ -51,6 +51,24 @@ def classify_bucket(total_chars, large_threshold, huge_threshold):
     return "standard"
 
 
+def decide_huge_action(total_chars, client_route, huge_action,
+                       route_enabled, ctx_chars_limit):
+    """huge bucket 准入决策（纯函数，Handler do_POST 调用）。
+
+    huge 请求不入本地队列，处理取决于客户端显式路由头：
+
+    返回 dict，含 action + 附加信息:
+    - {"action": "cloud"}                    # 强制路由云端（无 local 头 + 路由开启）
+    - {"action": "local"}                    # 显式 X-Proxy-Route-To: local 且未超本地上限 → 放行本地
+    - {"action": "reject"}                   # 其余：413 拒绝（路由关闭 / 超本地上限 / action≠cloud）
+    """
+    if client_route == "local" and (ctx_chars_limit <= 0 or total_chars <= ctx_chars_limit):
+        return {"action": "local"}
+    if huge_action == "cloud" and route_enabled and client_route != "local":
+        return {"action": "cloud"}
+    return {"action": "reject"}
+
+
 class QueueTicket:
     """入队凭证。Handler 持有它等待 worker、查询位置、取消排队。"""
 

@@ -14,7 +14,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import queue_manager
-from queue_manager import RequestQueueManager, classify_bucket
+from queue_manager import RequestQueueManager, classify_bucket, decide_huge_action
 
 
 class TestClassifyBucket(unittest.TestCase):
@@ -33,6 +33,46 @@ class TestClassifyBucket(unittest.TestCase):
     def test_custom_thresholds(self):
         self.assertEqual(classify_bucket(50000, 40000, 100000), "large")
         self.assertEqual(classify_bucket(100000, 40000, 100000), "huge")
+
+
+class TestDecideHugeAction(unittest.TestCase):
+    """huge bucket 准入决策（Handler do_POST 调用）。
+
+    覆盖：显式 local 未超本地上限 → 放行本地；显式 local 超上限 → reject；
+    无 local 头 + 路由开启 → cloud；路由关闭 → reject。
+    """
+
+    def test_explicit_local_within_limit_forwards_local(self):
+        r = decide_huge_action(220000, "local", "cloud", True, 400000)
+        self.assertEqual(r["action"], "local")
+
+    def test_explicit_local_at_limit_boundary(self):
+        self.assertEqual(decide_huge_action(400000, "local", "cloud", True, 400000)["action"], "local")
+        self.assertEqual(decide_huge_action(400001, "local", "cloud", True, 400000)["action"], "reject")
+
+    def test_explicit_local_over_limit_rejected(self):
+        r = decide_huge_action(500000, "local", "cloud", True, 400000)
+        self.assertEqual(r["action"], "reject")
+
+    def test_no_header_routes_cloud(self):
+        r = decide_huge_action(220000, "", "cloud", True, 400000)
+        self.assertEqual(r["action"], "cloud")
+
+    def test_cloud_header_routes_cloud(self):
+        r = decide_huge_action(220000, "cloud", "cloud", True, 400000)
+        self.assertEqual(r["action"], "cloud")
+
+    def test_routing_disabled_rejects(self):
+        r = decide_huge_action(220000, "", "cloud", False, 400000)
+        self.assertEqual(r["action"], "reject")
+
+    def test_huge_action_not_cloud_rejects(self):
+        r = decide_huge_action(220000, "", "reject", True, 400000)
+        self.assertEqual(r["action"], "reject")
+
+    def test_zero_limit_treats_as_unbounded_for_local(self):
+        r = decide_huge_action(999999, "local", "cloud", True, 0)
+        self.assertEqual(r["action"], "local")
 
 
 def _ctx(request_id, total_chars, stream=False, bucket=None):

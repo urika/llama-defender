@@ -641,11 +641,27 @@ class Handler(BaseHTTPRequestHandler):
                         _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
                     )
                     if _queue_bucket == "huge":
-                        # huge 不入本地队列。客户端显式 X-Proxy-Route-To: local 时
-                        # 尊重客户端选择（不走云端），按 reject 处理。
+                        # huge 不入本地队列。准入决策由 decide_huge_action 决定：
+                        # - local（显式 X-Proxy-Route-To: local 且未超本地上限）→ 放行本地，
+                        #   由管线 OOM 保护 / ContextTruncator 兜底；
+                        # - cloud（无 local 头 + 路由开启）→ 强制云端；
+                        # - reject → 413 拒绝（本地确实无法承载 / 路由关闭）。
                         _client_route = parsed.get("_x_proxy_route_to", "")
-                        if PROXY_QUEUE_HUGE_ACTION == "cloud" and PROXY_ROUTE_ENABLED \
-                                and _client_route != "local":
+                        _huge_action = queue_manager.decide_huge_action(
+                            total_chars,
+                            _client_route,
+                            _ps.PROXY_QUEUE_HUGE_ACTION,
+                            PROXY_ROUTE_ENABLED,
+                            _ps.PROXY_CTX_CHARS_LIMIT,
+                        )
+                        if _huge_action["action"] == "local":
+                            # 放行本地：保持 local 标记，SmartRouter / _early_route_decision 均走本地；
+                            # 不入队（huge 语义），由 _llama_lock 串行化。
+                            self._queue_response_headers = {"X-Queue-Bucket": "huge"}
+                            log(f"  -> [queue] huge bucket ({total_chars:,} chars): explicit "
+                                f"X-Proxy-Route-To: local, forwarding locally "
+                                f"(ctx_limit={_ps.PROXY_CTX_CHARS_LIMIT:,})", level="WARN")
+                        elif _huge_action["action"] == "cloud":
                             # 复用 X-Proxy-Route-To 内部标记，SmartRouter 会强制走云端；
                             # _early_route_decision 也会因此跳过 OOM 预截断。
                             parsed["_x_proxy_route_to"] = "cloud"
