@@ -20,6 +20,9 @@ configs/*.local.conf
 __pycache__/
 *.pyc
 
+# Local Python venvs (e.g. .venv-rapidmlx, pinned backend versions)
+.venv*/
+
 # Editor
 .vscode/
 .idea/

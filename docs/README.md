@@ -62,6 +62,7 @@ docs/
 | `ab-test-task-log-system.md` | A/B 测试任务：为代理添加结构化日志系统（M1 结构化日志 + M2 状态页统计） |
 | `test-strategy.md` | 测试策略与覆盖矩阵，审计发现自动化测试覆盖 7/23 = 30%，列出补齐优先级 |
 | `refactor-test-strategy.md` | 重构测试策略与回归保障方案，覆盖模块拆分等价性校验、Cache Aligner/结构化压缩效果评估、云端模式硬化、84+ 新增测试案例 |
+| `swe-bench-pro-eval.md` | SWE-bench Pro 测评接口层说明：独立项目 `~/APP/swe-eval` 的用法、代理接口约定（路由强制/会话隔离）、两阶段计划与口径声明 |
 
 ---
 

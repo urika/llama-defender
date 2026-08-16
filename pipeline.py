@@ -2493,7 +2493,7 @@ class BackendDispatcher(PipelineStage):
         Caller must already hold the appropriate concurrency lock.
         """
         # P0: enforce per-backend payload size guard just before forwarding.
-        body_bytes = json.dumps(ctx.openai_body).encode("utf-8")
+        body_bytes = json.dumps(ctx.openai_body, ensure_ascii=False).encode("utf-8")
         target = getattr(ctx, '_route_target', 'local')
         max_bytes = _ps.PROXY_CLOUD_MAX_REQUEST_BYTES if target == 'cloud' else _ps.PROXY_MAX_REQUEST_BYTES
         if len(body_bytes) > max_bytes:
@@ -2604,7 +2604,7 @@ class BackendDispatcher(PipelineStage):
         anthropic_req["model"] = cand["model"]
         anthropic_req["stream"] = bool(ctx.is_stream)
         anthropic_req.pop("_x_proxy_route_to", None)
-        body_bytes = json.dumps(anthropic_req).encode("utf-8")
+        body_bytes = json.dumps(anthropic_req, ensure_ascii=False).encode("utf-8")
 
         if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
             log(f"  -> Request body too large for anthropic backend: "
