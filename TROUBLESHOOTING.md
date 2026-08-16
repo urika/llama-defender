@@ -220,3 +220,76 @@ LLAMA_CHAT_TEMPLATE="assets/chat-templates/qwen-fixed-chat-template.jinja"
           resp = urllib.request.urlopen(...)
   ```
 - **修复:** 移除内层 `with _llama_lock`，保留外层即可
+
+---
+
+## MTP 投机解码（Qwen3.8-27B）配置与源码修改记录
+
+> 日期: 2026-08-16 · 状态: **已生效**（含 temp>0 放宽，代理流量可触发）
+
+### 一、MTP 生效的配置要求
+
+**前提（缺一不可）：**
+
+1. **sidecar checkpoint**：Qwen3.8-27B-4bit 主模型**不含 MTP head 权重**，必须提供外部 sidecar。
+   - 正确版本：`mlx-community/Qwen3.8-27B-MTP-4bit`（239MB，4-bit group_size=64 affine，31 keys 含全部 bias，hidden=5120）
+   - ⚠️ **`mlx-community/Qwen3.8-27B-MTP-mxfp4` 无效**：`mlx_vlm.convert` 转换丢弃了 8 个 `*.biases` 张量，rapid-mlx 的 coverage check（`qwen3_5_inject.py:625-639`）会拒绝注入。
+   - ⚠️ `mlx-community/Qwen3.5-9B-MTP-4bit` 维度不匹配（hidden=1024 vs 5120），报 `fc out-dim mismatch`。
+   - 本地路径：`~/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-MTP-4bit/snapshots/draft-sidecar/`
+
+2. **配置**（`configs/qwen3.8-27b-4bit.conf` 的 `RAPID_MLX_EXTRA_ARGS`）：
+   ```bash
+   --speculative-config {"method":"mtp","model":"<sidecar路径>","num_speculative_tokens":2}
+   ```
+   - ⚠️ **JSON 不能带单引号**：manage.sh 用 `read -ra` 按空白拆分，外层单引号会原样传入导致 `json.loads` 失败。裸 JSON + 转义双引号。
+   - ⚠️ `--mtp-sidecar` 与 `--speculative-config` **互斥**，sidecar 必须走 JSON 的 `model` 字段。
+
+3. **采样参数**：MTP 与 logits processors 冲突。若配置了 `--default-presence-penalty`，MTP gate 强制 fall-through（不触发）。**已从配置移除 `--default-presence-penalty 1.5`**。repetition penalty 1.0 无影响。
+
+### 二、启动验证日志（成功时应有）
+
+```
+Built MTP module (1 layer(s), hidden_size=5120).
+Quantized MTP: 4-bit, group_size=64.
+Loaded 31/31 expected MTP weight tensors.
+Patched TextModel with MTP surfaces.
+dispatch_mtp_inject succeeded.
+[MTP-vendored] installed on GenerationBatch._step
+MTP: enabled via --speculative-config, max_k=2
+```
+
+### 三、K 上限被钳制为 1（hybrid 限制）
+
+Qwen3.8-27B 是 hybrid GatedDeltaNet，SSM cache（`ArraysCache`）只有单快照 rollback，不支持 chain-of-K：
+```
+[MTP-chain-of-K] SSM cache detected — clamping max_k from 2 to 1
+```
+`num_speculative_tokens=2` 实际只 draft 1 个 token。chain-of-K（K≥2）需要 per-position 快照，rapid-mlx 未接线。
+
+### 四、源码修改：让 temp>0 请求触发 MTP（方案 A）
+
+> ⚠️ **修改在 `.venv-rapidmlx` 内，升级 rapid-mlx 会丢失，需重打 patch。**
+
+文件：`.venv-rapidmlx/lib/python3.14/site-packages/vllm_mlx/scheduler.py`
+
+**原状**：`_is_greedy_for_uid` 要求 `temperature == 0.0`，且 generator 构造硬编码 `temp=0.0`。代理转发请求默认 temp=0.7（`pipeline.py:1902`），故不触发 MTP。
+
+**改动 1**：`_is_greedy_for_uid` → 新增 `_mtp_sampling_for_uid(uid)` 返回采样参数字典（temp/top_p/top_k/min_p），gate 改为 `return _mtp_sampling_for_uid(uid) is not None`（保留 metadata fail-closed）。
+
+**改动 2**：generator 构造点 `temp=0.0` 改为透传 `_mtp_sampling_for_uid(uid)` 的 temp/top_p/top_k/min_p。
+
+**lossless 依据**：`generator.py` 的 temp>0 路径实现了标准残差采样协议（`residual = max(p_target - p_draft, 0)` + `categorical` 重采样，`log_accept = v_at - d_at`），拒绝时从残差分布重采样，token 分布与纯解码一致。generator 复用 mlx-lm 同源 `apply_top_p`/`categorical_sampling`，与 `_orig_step` 采样器分布一致。
+
+### 五、实测效果
+
+| 场景 | 修改前 | 修改后 | 提升 |
+|------|--------|--------|------|
+| temp=0.7（代理流量） | 17.0 tok/s | **20.9 tok/s** | +23% |
+| greedy（temp=0.0） | 21.8 tok/s | 21.7 tok/s | 持平 |
+
+- 代理端到端（4000 端口）确认触发 MTP（attempts 768，accept 率 ~79%）。
+- metrics 端点：`GET /metrics` → `rapid_mlx_spec_decode_attempts_total` / `_accepts_total`。
+
+### 六、工具
+
+- A/B 对比测试脚本（临时，未入库）：对比 temp=0.0 vs temp=0.7 的 tok/s 与 MTP 计数增量。
