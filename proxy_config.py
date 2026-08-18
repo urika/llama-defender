@@ -768,9 +768,12 @@ CONFIG_REGISTRY = {
         "doc": "Char threshold for 'large' queue bucket.",
     },
     "PROXY_QUEUE_HUGE_THRESHOLD_CHARS": {
-        "defaults": {"all": "200000"},
+        "defaults": {"all": "350000"},
         "type": "int", "scope": "reloadable",
-        "doc": "Char threshold for 'huge' bucket: routed to cloud or rejected instead of queueing locally.",
+        "doc": "Char threshold for 'huge' bucket: routed to cloud or rejected instead of queueing locally. "
+        "2026-08-18: 200000 -> 350000, 对齐后端 pflash 96K token 阈值 (350K chars ~ 80-100K tokens): "
+        "墙内走前缀缓存, 过 96K tokens 由 pflash 兜底; auto-route 90K chars 阈值不受影响, "
+        "非强制路由的大会话仍在 huge 之前送云。",
     },
     "PROXY_QUEUE_HUGE_ACTION": {
         "defaults": {"all": "cloud"},

@@ -289,7 +289,8 @@ class TestProxyStateIntegration(unittest.TestCase):
         self.assertFalse(proxy_state.PROXY_QUEUE_ENABLED)  # 默认关闭
         self.assertEqual(proxy_state.PROXY_QUEUE_TIMEOUT_SECONDS, 300)
         self.assertEqual(proxy_state.PROXY_QUEUE_LARGE_THRESHOLD_CHARS, 80000)
-        self.assertEqual(proxy_state.PROXY_QUEUE_HUGE_THRESHOLD_CHARS, 200000)
+        # 2026-08-18: 200000 -> 350000 (CONFIG_REGISTRY 权威默认,对齐 pflash 96K 阈值)
+        self.assertEqual(proxy_state.PROXY_QUEUE_HUGE_THRESHOLD_CHARS, 350000)
         self.assertEqual(proxy_state.PROXY_QUEUE_HUGE_ACTION, "cloud")
 
     def test_reload_spec_entries(self):
