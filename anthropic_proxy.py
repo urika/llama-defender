@@ -800,21 +800,24 @@ class Handler(BaseHTTPRequestHandler):
                     self._handle_messages(parsed)
                     _dur = (_time.monotonic() - _t0) * 1000
                     _out_chars = _jsonl_output_map.pop(self._last_jsonl_token, 0)
+                    # TS-4: 客户端中途断连 (BrokenPipe 已在 backend_dispatcher 捕获)
+                    # 按 499 (client closed request) 记账,不计入 5xx 错误率。
+                    _status = 499 if getattr(self, "_client_disconnected", False) else 200
                     log_request(
                         model=parsed.get("model", "unknown"),
                         input_chars=total_chars,
                         output_chars=_out_chars,
-                        status=200,
+                        status=_status,
                         duration_ms=_dur,
                         start_time=_req_start_time,
                     )
-                    _record_request_for_concurrency(_dur, 200)
+                    _record_request_for_concurrency(_dur, _status)
                     if PROXY_METRICS_ENABLED:
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
                             mc["output_chars"] = _out_chars
                             mc["duration_ms"] = round(_dur, 1)
-                            mc["status"] = 200
+                            mc["status"] = _status
                             _finalize_metrics(mc)
                             log_metrics(mc)
                 except Exception as e:

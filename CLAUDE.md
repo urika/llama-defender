@@ -32,7 +32,7 @@ Extracted modules:
 | `admin_server.py` | ~2650 | Status HTML dashboard, metrics, memory checks, concurrency, `/api/*` JSON endpoints |
 | `truncation.py` | ~1680 | Context truncation: single-pass content compression (L2 clearing + L4 thinking strip), smart truncation with tool-pair atomic protection (TS-2) |
 | `message_converter.py` | ~900 | Anthropic↔OpenAI bidirectional format conversion (incl. `convert_openai_request_to_anthropic` for the dual-protocol endpoint) |
-| `content_compressor.py` | ~560 | TokenSieve semantic compression + BM25 relevance-driven compression (TS-1) |
+| `content_compressor.py` | ~680 | TokenSieve semantic compression + BM25 relevance-driven compression (TS-1) + TS-4 结构化 drop 分支 (`_structured_compress`, BM25 低分先保结构压缩再按 `PROXY_BM25_DROP_TARGET_RATIO` 封顶) |
 | `tool_parser.py` | ~470 | XML→JSON fallback, content-tools extraction, streaming extractor |
 | `loop_detection.py` | ~410 | Loop/blocker detection, text similarity, intervention |
 | `tool_filter.py` | ~210 | Tool definition filtering, keyword extraction, error translation |

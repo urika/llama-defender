@@ -155,7 +155,12 @@ PROXY_BM25_ENABLED = os.environ.get("PROXY_BM25_ENABLED", _default("PROXY_BM25_E
 PROXY_BM25_K1 = float(os.environ.get("PROXY_BM25_K1", "1.5"))
 PROXY_BM25_B = float(os.environ.get("PROXY_BM25_B", "0.75"))
 PROXY_BM25_KEEP_THRESHOLD = float(os.environ.get("PROXY_BM25_KEEP_THRESHOLD", "3.5"))
-PROXY_BM25_DROP_THRESHOLD = float(os.environ.get("PROXY_BM25_DROP_THRESHOLD", "0.5"))
+# TS-4 (2026-08-18 日志分析): 全史 bm25_scores 中位数 0.00/p90 0.18,旧默认 0.5
+# 使几乎所有 tool_result 落入 drop 分支被 30% 截断;降至 0.1 收窄误伤面
+# (drop 分支同时已改为类型感知结构化压缩,见 content_compressor._structured_compress)。
+PROXY_BM25_DROP_THRESHOLD = float(os.environ.get("PROXY_BM25_DROP_THRESHOLD", "0.1"))
+# TS-4: BM25 drop 分支结构化压缩后的封顶比例 (相对原文长度)。
+PROXY_BM25_DROP_TARGET_RATIO = float(os.environ.get("PROXY_BM25_DROP_TARGET_RATIO", "0.45"))
 PROXY_BM25_MIN_PREFIX = int(os.environ.get("PROXY_BM25_MIN_PREFIX", "4"))
 PROXY_BM25_IDF_LRU_MAX = int(os.environ.get("PROXY_BM25_IDF_LRU_MAX", "10000"))
 
@@ -855,7 +860,8 @@ _RELOAD_SPEC = [
     ("PROXY_BM25_K1", "PROXY_BM25_K1", "float", "1.5", "1.5"),
     ("PROXY_BM25_B", "PROXY_BM25_B", "float", "0.75", "0.75"),
     ("PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_KEEP_THRESHOLD", "float", "3.5", "3.5"),
-    ("PROXY_BM25_DROP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD", "float", "0.5", "0.5"),
+    ("PROXY_BM25_DROP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD", "float", "0.1", "0.1"),
+    ("PROXY_BM25_DROP_TARGET_RATIO", "PROXY_BM25_DROP_TARGET_RATIO", "float", "0.45", "0.45"),
     ("PROXY_BM25_MIN_PREFIX", "PROXY_BM25_MIN_PREFIX", "int", "4", "4"),
     ("PROXY_BM25_IDF_LRU_MAX", "PROXY_BM25_IDF_LRU_MAX", "int", "10000", "10000"),
     # Context truncation
@@ -1050,7 +1056,7 @@ __all__ = [
     "PROXY_COMPRESS_AUDIT", "PROXY_COMPRESSION_PROFILE", "CONTENT_TOOLS_FALLBACK_ENABLED",
     # TS-1 BM25
     "PROXY_BM25_ENABLED", "PROXY_BM25_K1", "PROXY_BM25_B",
-    "PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD",
+    "PROXY_BM25_KEEP_THRESHOLD", "PROXY_BM25_DROP_THRESHOLD", "PROXY_BM25_DROP_TARGET_RATIO",
     "PROXY_BM25_MIN_PREFIX", "PROXY_BM25_IDF_LRU_MAX",
     # Context truncation
     "PROXY_CTX_LIMIT_ENABLED", "PROXY_CTX_CHARS_LIMIT", "PROXY_CTX_KEEP_HEAD",

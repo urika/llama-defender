@@ -21,6 +21,21 @@ _BM25_IDF_DOC_FREQ = {}
 _BM25_IDF_TOTAL_DOCS = 0
 
 
+def _text_str(value):
+    """Defensive text normalization.
+
+    2026-08-17 实测: 部分消息 content 块的 "text" 字段是 list 形态
+    (上游/转换器的特定消息形态),直接进 str.join 会崩
+    (TypeError: sequence item 0: expected str instance, list found),
+    代理 500 导致本地臂批跑整任务死亡(swe38-sy 会话实测)。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(str(x) for x in value)
+    return str(value)
+
+
 def _bm25_tokenize(text, min_prefix=4):
     """Tokenize text for BM25 scoring.
 
@@ -30,6 +45,7 @@ def _bm25_tokenize(text, min_prefix=4):
     Prefix expansion: for each English token >= min_prefix chars, also emit
     its first min_prefix characters as a variant matching key.
     """
+    text = _text_str(text)  # 防 list 型 text 块(2026-08-17 实测)
     tokens = []
     for m in _BM25_TOKEN_RE.finditer(text):
         token = m.group(0)
@@ -145,13 +161,13 @@ def bm25_score_message(msg, query, idf_map=None, k1=1.5, b=0.75, min_prefix=4):
     for block in content:
         if isinstance(block, dict):
             if block.get("type") == "text":
-                doc_text_parts.append(block.get("text", ""))
+                doc_text_parts.append(_text_str(block.get("text", "")))
             elif block.get("type") == "tool_result":
                 tc = block.get("content", "")
                 if isinstance(tc, list):
                     for sub in tc:
                         if isinstance(sub, dict) and sub.get("type") == "text":
-                            doc_text_parts.append(sub.get("text", ""))
+                            doc_text_parts.append(_text_str(sub.get("text", "")))
                 elif isinstance(tc, str):
                     doc_text_parts.append(tc)
     doc_text = " ".join(doc_text_parts)
@@ -200,7 +216,7 @@ def _extract_last_user_text(messages):
         text_parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
+                text_parts.append(_text_str(block.get("text", "")))
         if text_parts:
             return " ".join(text_parts)
     return ""
@@ -428,6 +444,50 @@ def _audit_compression(original, compressed, content_type):
     return True
 
 
+def _structured_compress(original, mime_hint=None, mode=None):
+    """Type-aware structured compression: scrub → detect → route → audit.
+
+    Extracted from compress_tool_result (TS-4) so the BM25 drop path can
+    reuse the layered compressors (json_sieve / code_compress / log_compress)
+    instead of blind head/tail truncation.
+
+    Returns (compressed, content_type, strategy, audit_pass). The caller is
+    responsible for the length-threshold guard; this helper always compresses.
+    """
+    if mode is None:
+        mode = proxy_state.PROXY_COMPRESS_MODE
+    scrubbed = _scrub_ansi(original) if proxy_state.PROXY_SCRUB_ANSI else original
+    content_type = _detect_content_type(scrubbed, mime_hint=mime_hint)
+
+    if content_type == "json":
+        try:
+            parsed = json.loads(scrubbed)
+            enable_dedupe = proxy_state.PROXY_DEDUPE_SCALARS and mode == "aggressive"
+            compressed_obj = _sieve_json(parsed, enable_dedupe=enable_dedupe)
+            if proxy_state.PROXY_DEDUPE_SCALARS and mode == "aggressive":
+                compressed_obj = _dedupe_scalars(compressed_obj)
+            compressed = json.dumps(compressed_obj, ensure_ascii=False, separators=(',', ':'))
+            strategy = "json_sieve"
+        except Exception:
+            compressed = scrubbed
+            strategy = "json_passthrough"
+    elif content_type == "code":
+        compressed = _compress_code(scrubbed)
+        strategy = "code_compress"
+    elif content_type == "log":
+        compressed = _compress_log(scrubbed, dedupe=proxy_state.PROXY_LOG_DEDUPE)
+        strategy = "log_compress"
+    else:
+        compressed = _compress_text(scrubbed)
+        strategy = "text_truncate"
+
+    audit_pass = _audit_compression(scrubbed, compressed, content_type)
+    if not audit_pass:
+        compressed = scrubbed
+        strategy = "audit_fallback"
+    return compressed, content_type, strategy, audit_pass
+
+
 def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
                          bm25_score=None,
                          bm25_drop_threshold=None,
@@ -482,47 +542,26 @@ def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
         if bm25_score >= bm25_keep_threshold:
             return _result(original, "bm25_keep", "none", True, 1.0)
         if bm25_score < bm25_drop_threshold:
-            compressed = _aggressive_truncate(original, ratio=0.3)
-            r = len(compressed) / original_len if original_len else 1.0
-            return _result(compressed, "bm25_drop", "bm25_aggressive", True, r)
+            # TS-4 (2026-08-18 日志分析落地): 全史 89.9% 的压缩命中此分支,
+            # 旧实现直接 30% 头尾截断,json/log 分层压缩器成为死路径。现在先做
+            # 类型感知的结构化压缩;结果仍高于目标比例(且原文超过 threshold)
+            # 时再叠加头尾截断封顶,保证尺寸上限语义不回退。
+            structured, ctype, strategy, audit_pass = _structured_compress(
+                original, mime_hint=mime_hint, mode=mode)
+            target_len = original_len * proxy_state.PROXY_BM25_DROP_TARGET_RATIO
+            if original_len >= threshold and len(structured) > target_len:
+                cap_ratio = target_len / len(structured)
+                structured = _aggressive_truncate(structured, ratio=cap_ratio)
+                strategy += "+cap"
+            r = len(structured) / original_len if original_len else 1.0
+            return _result(structured, ctype, f"bm25_{strategy}", audit_pass, r)
 
     if mode == "lossless" or original_len < threshold:
         return _result(original, "short", "none", True, 1.0)
 
-    # Stage 1: scrub ANSI
-    scrubbed = _scrub_ansi(original) if proxy_state.PROXY_SCRUB_ANSI else original
-
-    # Stage 2: detect content type
-    content_type = _detect_content_type(scrubbed, mime_hint=mime_hint)
-
-    # Stage 3: route to compressor
-    if content_type == "json":
-        try:
-            parsed = json.loads(scrubbed)
-            enable_dedupe = proxy_state.PROXY_DEDUPE_SCALARS and mode == "aggressive"
-            compressed_obj = _sieve_json(parsed, enable_dedupe=enable_dedupe)
-            if proxy_state.PROXY_DEDUPE_SCALARS and mode == "aggressive":
-                compressed_obj = _dedupe_scalars(compressed_obj)
-            compressed = json.dumps(compressed_obj, ensure_ascii=False, separators=(',', ':'))
-            strategy = "json_sieve"
-        except Exception:
-            compressed = scrubbed
-            strategy = "json_passthrough"
-    elif content_type == "code":
-        compressed = _compress_code(scrubbed)
-        strategy = "code_compress"
-    elif content_type == "log":
-        compressed = _compress_log(scrubbed, dedupe=proxy_state.PROXY_LOG_DEDUPE)
-        strategy = "log_compress"
-    else:
-        compressed = _compress_text(scrubbed)
-        strategy = "text_truncate"
-
-    # Stage 4: audit
-    audit_pass = _audit_compression(scrubbed, compressed, content_type)
-    if not audit_pass:
-        compressed = scrubbed
-        strategy = "audit_fallback"
+    # Stages 1-4 (TS-4): shared structured compression path.
+    compressed, content_type, strategy, audit_pass = _structured_compress(
+        original, mime_hint=mime_hint, mode=mode)
 
     ratio = len(compressed) / original_len if original_len else 1.0
     return _result(compressed, content_type, strategy, audit_pass, ratio)
@@ -553,6 +592,7 @@ __all__ = [
     "_compress_text",
     "_dedupe_scalars",
     "_audit_compression",
+    "_structured_compress",
     "compress_tool_result",
     "_generate_tool_summary",
     # TS-1 BM25 scoring

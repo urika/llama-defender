@@ -1090,6 +1090,9 @@ class ContentCompressor(ConditionalStage):
         cache_dynamic = ctx._cache_dynamic
         compress_stats = {"clear": {"enabled": False}, "think": {"enabled": False}}
 
+        # TS-4 指标修复: 记录压缩前整个上下文的字符量,用于 context_before/after
+        ctx._compress_ctx_before = truncation._estimate_message_chars(ctx.messages)
+
         if cache_dynamic:
             dynamic_stage_config = dict(ctx.stage_config) if ctx.stage_config else {}
             dynamic_stage_config["frozen_head"] = 0  # prefix already protected
@@ -1103,6 +1106,7 @@ class ContentCompressor(ConditionalStage):
         ctx._cache_dynamic = cache_dynamic
         ctx.messages = ctx._cache_prefix + ctx._cache_dynamic
         ctx.compress_stats = compress_stats
+        ctx._compress_ctx_after = truncation._estimate_message_chars(ctx.messages)
 
         # Extract sub-stats
         clear_stats = compress_stats.get("clear", {})
@@ -1167,6 +1171,10 @@ class ContentCompressor(ConditionalStage):
                 "think_stripped": think_stats.get("stripped_count", 0),
                 "semantic_compressed": semantic.get("compressed_count", 0),
                 "semantic_saved_chars": semantic.get("saved_chars", 0),
+                # TS-4 指标修复: 压缩阶段前后整个上下文的字符量
+                # (semantic_saved_chars 只统计 tool_result 本体,不含消息壳开销)
+                "context_before_chars": getattr(ctx, '_compress_ctx_before', 0),
+                "context_after_chars": getattr(ctx, '_compress_ctx_after', 0),
             }
         }
 
@@ -1615,6 +1623,10 @@ class ContextTruncator(ConditionalStage):
                     "budget_chars": budget_chars,
                 }
             }
+            # TS-4 指标修复: 透传 fifo/char 路径的前后字符数,使压缩率可核算
+            if trunc_stats.get("chars_before") is not None:
+                result["compression"]["chars_before"] = trunc_stats["chars_before"]
+                result["compression"]["chars_after"] = trunc_stats.get("chars_after")
             if strategy == "rounds":
                 result["compression"]["compression_type"] = trunc_stats.get("compression", "folded")
                 result["compression"]["rounds"] = trunc_stats.get("actual_keep_rounds", "?")
@@ -1770,9 +1782,11 @@ class MessageHashDebug(PipelineStage):
         if messages:
 
             def _msg_hash(m):
+                import content_compressor  # 局部导入,与管线懒加载风格一致
                 c = m.get("content", "")
                 if isinstance(c, list):
-                    c = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+                    c = "".join(content_compressor._text_str(b.get("text", ""))
+                                for b in c if b.get("type") == "text")
                 elif not isinstance(c, str):
                     c = str(c)
                 return hashlib.md5((m.get("role", "") + ":" + c).encode()).hexdigest()[:8]
@@ -2059,6 +2073,7 @@ class BackendDispatcher(PipelineStage):
         self._emergency_fallback = False
         self._fallback_reason = ""
         self._sensitive_blocked = False
+        self._client_disconnected = False
         self._input_tokens = 0
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
@@ -2530,37 +2545,46 @@ class BackendDispatcher(PipelineStage):
         self._input_tokens = max(1, int(ctx.total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1)))
         self._output_tokens = int(ctx.body.get("max_tokens", 4096))
 
-        if ctx.is_stream:
-            self._handler._handle_streaming_response(resp, ctx.body)
-        else:
-            # Pre-read non-streaming body so we can extract actual usage for
-            # accurate cost tracking, then hand a BytesIO wrapper to the handler.
-            body_bytes = resp.read()
-            try:
-                openai_resp = json.loads(body_bytes.decode("utf-8"))
-                usage = openai_resp.get("usage") or {}
-                self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
-                self._output_tokens = usage.get("completion_tokens", self._output_tokens)
-                # R8 (非流式): usage-based actual cost + proxy_route body field
-                # on OpenAI-protocol responses (Anthropic-format responses carry
-                # attribution via headers — body field would be dropped by the
-                # converter anyway).
-                if getattr(ctx, '_route_target', 'local') == 'cloud':
-                    pin, pout = self._model_prices(getattr(ctx, '_route_cloud_model', ''))
-                    ctx._route_actual_cost = round(
-                        (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
-                    if getattr(self._handler, '_openai_mode', False):
-                        openai_resp["proxy_route"] = {
-                            "target": "cloud",
-                            "actual_model": getattr(ctx, '_route_cloud_model', ''),
-                            "reason": getattr(ctx, '_route_reason', ''),
-                            "cost": ctx._route_actual_cost,
-                        }
-                        body_bytes = json.dumps(openai_resp).encode("utf-8")
-            except Exception:
-                pass
-            wrapped = _BytesIOResponse(resp.status, body_bytes)
-            self._handler._handle_non_streaming_response(wrapped, ctx.body)
+        # TS-4 (2026-08-18 日志分析): 客户端中途断连 (claude-cli 取消/超时) 时
+        # wfile.write 抛 BrokenPipeError,旧路径沿管线逃逸成 RuntimeError → 500,
+        # 既污染错误率又可能触发无意义的降级链。归类为客户端取消,不视为后端错误。
+        try:
+            if ctx.is_stream:
+                self._handler._handle_streaming_response(resp, ctx.body)
+            else:
+                # Pre-read non-streaming body so we can extract actual usage for
+                # accurate cost tracking, then hand a BytesIO wrapper to the handler.
+                body_bytes = resp.read()
+                try:
+                    openai_resp = json.loads(body_bytes.decode("utf-8"))
+                    usage = openai_resp.get("usage") or {}
+                    self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
+                    self._output_tokens = usage.get("completion_tokens", self._output_tokens)
+                    # R8 (非流式): usage-based actual cost + proxy_route body field
+                    # on OpenAI-protocol responses (Anthropic-format responses carry
+                    # attribution via headers — body field would be dropped by the
+                    # converter anyway).
+                    if getattr(ctx, '_route_target', 'local') == 'cloud':
+                        pin, pout = self._model_prices(getattr(ctx, '_route_cloud_model', ''))
+                        ctx._route_actual_cost = round(
+                            (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
+                        if getattr(self._handler, '_openai_mode', False):
+                            openai_resp["proxy_route"] = {
+                                "target": "cloud",
+                                "actual_model": getattr(ctx, '_route_cloud_model', ''),
+                                "reason": getattr(ctx, '_route_reason', ''),
+                                "cost": ctx._route_actual_cost,
+                            }
+                            body_bytes = json.dumps(openai_resp).encode("utf-8")
+                except Exception:
+                    pass
+                wrapped = _BytesIOResponse(resp.status, body_bytes)
+                self._handler._handle_non_streaming_response(wrapped, ctx.body)
+        except (BrokenPipeError, ConnectionResetError):
+            self._client_disconnected = True
+            self._handler._client_disconnected = True
+            log("  <- Client disconnected mid-response (broken pipe) — relay aborted", level="WARN")
+            return
 
         # Phase 3+ (建议3): record backend-only dispatch latency so cloud vs
         # long-tail comparison is decoupled from proxy-side pipeline overhead.
@@ -2635,29 +2659,36 @@ class BackendDispatcher(PipelineStage):
         self._input_tokens = max(1, int(ctx.total_chars / max(_ps.PROXY_CTX_TOKEN_RATIO, 0.1)))
         self._output_tokens = int(ctx.body.get("max_tokens", 4096))
 
-        if ctx.is_stream:
-            self._handler._handle_anthropic_stream_passthrough(resp, ctx.body)
-        else:
-            resp_bytes = resp.read()
-            try:
-                anth_resp = json.loads(resp_bytes.decode("utf-8"))
-                usage = anth_resp.get("usage") or {}
-                self._input_tokens = usage.get("input_tokens", self._input_tokens)
-                self._output_tokens = usage.get("output_tokens", self._output_tokens)
-                pin, pout = self._model_prices(cand["model"])
-                ctx._route_actual_cost = round(
-                    (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
-                # R8 (非流式): proxy_route attribution in the response body.
-                anth_resp["proxy_route"] = {
-                    "target": "cloud",
-                    "actual_model": cand["model"],
-                    "reason": getattr(ctx, '_route_reason', ''),
-                    "cost": ctx._route_actual_cost,
-                }
-                resp_bytes = json.dumps(anth_resp, ensure_ascii=False).encode("utf-8")
-            except Exception:
-                pass
-            self._handler._handle_anthropic_response(resp.status, resp_bytes, ctx)
+        # TS-4: 客户端断连同 _do_dispatch 的处理 (见上),不视为云端/provider 失败。
+        try:
+            if ctx.is_stream:
+                self._handler._handle_anthropic_stream_passthrough(resp, ctx.body)
+            else:
+                resp_bytes = resp.read()
+                try:
+                    anth_resp = json.loads(resp_bytes.decode("utf-8"))
+                    usage = anth_resp.get("usage") or {}
+                    self._input_tokens = usage.get("input_tokens", self._input_tokens)
+                    self._output_tokens = usage.get("output_tokens", self._output_tokens)
+                    pin, pout = self._model_prices(cand["model"])
+                    ctx._route_actual_cost = round(
+                        (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
+                    # R8 (非流式): proxy_route attribution in the response body.
+                    anth_resp["proxy_route"] = {
+                        "target": "cloud",
+                        "actual_model": cand["model"],
+                        "reason": getattr(ctx, '_route_reason', ''),
+                        "cost": ctx._route_actual_cost,
+                    }
+                    resp_bytes = json.dumps(anth_resp, ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    pass
+                self._handler._handle_anthropic_response(resp.status, resp_bytes, ctx)
+        except (BrokenPipeError, ConnectionResetError):
+            self._client_disconnected = True
+            self._handler._client_disconnected = True
+            log("  <- Client disconnected mid-response (broken pipe) — anthropic relay aborted", level="WARN")
+            return
 
         dispatch_ms = (time.monotonic() - _dispatch_t0) * 1000
         self._dispatch_latency_ms = dispatch_ms

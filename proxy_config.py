@@ -479,9 +479,14 @@ CONFIG_REGISTRY = {
         "doc": "BM25 score >= this value: skip compression entirely (keep verbatim).",
     },
     "PROXY_BM25_DROP_THRESHOLD": {
-        "defaults": {"all": "0.5"},
+        "defaults": {"all": "0.1"},
         "type": "float", "scope": "reloadable",
-        "doc": "BM25 score < this value: force aggressive compression to ~30% original length.",
+        "doc": "BM25 score < this value: force aggressive compression. 2026-08-18 lowered 0.5->0.1 (measured score median 0.00/p90 0.18; old default put nearly all tool_results in the drop path).",
+    },
+    "PROXY_BM25_DROP_TARGET_RATIO": {
+        "defaults": {"all": "0.45"},
+        "type": "float", "scope": "reloadable",
+        "doc": "TS-4: BM25 drop branch cap ratio (relative to original). Structured compression runs first; head/tail truncation is applied on top only if the structured result still exceeds this ratio.",
     },
     "PROXY_BM25_MIN_PREFIX": {
         "defaults": {"all": "4"},

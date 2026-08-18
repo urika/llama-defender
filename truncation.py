@@ -3,7 +3,7 @@ import json
 import re
 import urllib.request
 import proxy_state as _ps
-from content_compressor import compress_tool_result, _generate_tool_summary
+from content_compressor import compress_tool_result, _generate_tool_summary, _text_str
 from lifecycle import _classify_lifecycle_stage
 from loop_detection import _build_tool_use_map
 from message_converter import _estimate_message_chars, _strip_thinking_from_msg
@@ -516,7 +516,7 @@ def _compress_middle_with_llm(messages, timeout=30):
                 for b in content:
                     if isinstance(b, dict):
                         if b.get("type") == "text":
-                            parts.append(b.get("text", "")[:300])
+                            parts.append(_text_str(b.get("text", ""))[:300])
                         elif b.get("type") == "tool_use":
                             name = b.get("name", "")
                             inp = b.get("input", {})
@@ -1095,6 +1095,10 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
 
         result = _fix_tool_pairings(result)
 
+        # TS-4 指标修复: fifo 路径此前不回报 compression_ratio,管线指标恒为 1.0。
+        chars_before = _estimate_message_chars(messages)
+        chars_after = _estimate_message_chars(result)
+
         return result, {
             "enabled": True,
             "strategy": "fifo",
@@ -1106,7 +1110,10 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
             "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
             "dropped_indices": list(range(_ps.PROXY_CTX_KEEP_HEAD, n - tail_count)),
             "compressed_assistants": 0,
-            "kept_chars": _estimate_message_chars(result),
+            "kept_chars": chars_after,
+            "chars_before": chars_before,
+            "chars_after": chars_after,
+            "compression_ratio": round(chars_after / chars_before, 4) if chars_before else 1.0,
             "budget_chars": _ps.PROXY_CHARS_EXPANSION,
         }
 
