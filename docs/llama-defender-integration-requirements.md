@@ -1,6 +1,6 @@
 # llama-defender 集成需求（agent_go → 服务方）
 
-> 状态：需求稿 v2（2026-08-15 更新：并入模型实体三层设计的接口契约，补充 R8-R12）
+> 状态：需求稿 v2（2026-08-15 更新：并入模型实体三层设计的接口契约，补充 R8-R12；2026-08-19 补充 R13-R16 上下文工程诊断数据面，R8-R12 已全部交付）
 > 关联：[local-model-management-design.md](local-model-management-design.md)（agent_go 侧设计）、[model-entity-config-design.md](model-entity-config-design.md)（模型实体三层配置设计）
 > 目标项目：`/Users/jinsongwang/APP/llama.cpp`（llama-defender）
 > 背景：agent_go 将本地模型纳入管理（启停/切换/状态监控/保活分工）。按「谁拥有进程谁保活」原则，agent_go 作为消费方只负责就绪检查与一次性修复触发；本文档列出需要 llama-defender（服务方）提供或增强的接口与功能契约。
@@ -19,30 +19,21 @@
 | SmartRouter 智能路由 | 模型偏好（MODEL_ROUTE_PREFERENCES 三模式）+ 阈值/内存/会话/sticky + 云端熔断冷却回退 |
 | manage.sh 生命周期 | `start/stop/status/restart/reload/switch/watchdog`（pidfile + 日志 + 热重载 SIGHUP） |
 | 基础接口 | `GET /v1/models`、`GET /status`(HTML)、`GET /api/status`(JSON)、`GET /metrics`、`GET /api/profiles`、`GET /api/watchdog`、`POST /admin/route/force-local`、`POST /admin/route/force-cloud` |
+| **R8-R12 路由归因与部署可视** | **2026-08-15 全部交付**（模型目录 Phase B/C，commit b35b608/后续）。**R8** ✅ 四头 `X-Proxy-Route-Target(cloud\|local\|local_forced)/Actual-Model/Reason/Cost`（Cost 为预估，OpenAI 协议非流式响应体另带 `proxy_route` 实际 usage 计费字段）；**R9** ✅ `GET /api/route/policies`：providers（key 只回 `key_set` 布尔）+ models（tier/price/capabilities/direct_capable）+ preferences + defaults + `catalog_hash`（漂移检测）+ `api_version`；**R10** ✅ `/v1/models` metadata 增 `real_model/thinking_supported/thinking_required/json_compliance/context_chars/price/direct_capable/fallback_models`；**R11** ✅ `/api/status` 增 `route_config{route_enabled,cloud_model,cloud_key_set,cloud_concurrent}`；**R12** ✅ `POST /admin/reload`（幂等，等效 SIGHUP，含 configs/models.json 目录重载）；CLI 配套：`./manage.sh models` / `models-validate` |
 
-### 0.2 待做（R8-R12，按优先级与四层闭环支撑映射）
+### 0.2 待做（R13-R16，按优先级与四层闭环支撑映射）
 
-> **2026-08-15 更新：R8-R12 已全部交付**（模型目录 Phase B/C，commit b35b608/后续）。实现说明：
-> - **R8** ✅ 四头 `X-Proxy-Route-Target(cloud|local|local_forced)/Actual-Model/Reason/Cost`（Cost 为预估，OpenAI 协议非流式响应体另带 `proxy_route` 实际 usage 计费字段）
-> - **R9** ✅ `GET /api/route/policies`：providers（key 只回 `key_set` 布尔）+ models（tier/price/capabilities/direct_capable）+ preferences + defaults + `catalog_hash`（漂移检测）+ `api_version`
-> - **R10** ✅ `/v1/models` metadata 增 `real_model/thinking_supported/thinking_required/json_compliance/context_chars/price/direct_capable/fallback_models`
-> - **R11** ✅ `/api/status` 增 `route_config{route_enabled,cloud_model,cloud_key_set,cloud_concurrent}`
-> - **R12** ✅ `POST /admin/reload`（幂等，等效 SIGHUP，含 configs/models.json 目录重载）
-> - CLI 配套：`./manage.sh models` / `models-validate`
+> **2026-08-19 增补**：来自 [llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md)（上下文工程设计的数据面缺口），详尽定义以该文档为准。
 
 | 优先级 | 需求 | 支撑层 | 解决的 Gap |
 |--------|------|--------|-----------|
-| **P0 R8** | 路由归因返回（`X-Proxy-Route-Target/Actual-Model/Reason/Cost` 响应头） | **④ 观测归因** | metering 按 URL 标 is_local，force_fallback ~36% 回退本地导致归因全错（bench 成本/归因最大误差源） |
-| **P0 R9** | `GET /api/route/policies`（MODEL_ROUTE_PREFERENCES + 云端配置脱敏） | ③ 部署拓扑可视 | 部署拓扑对 agent_go 不可见（G3） |
-| **P1 R10** | `/v1/models` 能力元数据（route/real_model/thinking_supported/json_compliance/context_chars） | ① registry 数据源 | /v1/models 只回别名无能力元数据（G1） |
-| **P1 R11** | `/api/status` 增 `route_config`（cloud_model/route_enabled/cloud_key_set） | ③ 探测依据统一 | 健康检查探测依据不一致（G4） |
-| **P2 R12** | `POST /admin/reload`（HTTP 热重载） | ③ 运维 | 远程/容器场景 reload（等效 manage.sh reload） |
+| **P1 R13-R16** | 上下文工程诊断数据面：响应头扩展（Prompt-Processed-N / Epoch-Count / Feedback-Injected）+ 会话台账端点 + L4 档案查询 + /metrics 会话维度；另需透传 llama-server 原生 `timings` / `/props` / `/slots` | **④ 观测归因** | 缓存命中率 / 延迟分档 / 会话观测 / 压缩后行为复盘无数据源——详见 [llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md) |
 
-**四层闭环支撑**：① registry ← R10；③ 部署拓扑 ← R9/R11/R12；④ 观测归因 ← **R8（最关键，决定 bench 成本/归因可信度）**；② 角色绑定无代理依赖。
+**四层闭环支撑**：① registry ← R10（已交付）；③ 部署拓扑 ← R9/R11/R12（已交付）；④ 观测归因 ← R8（已交付，决定 bench 成本/归因可信度）+ **R13-R16（当前缺口：上下文工程诊断数据面）**；② 角色绑定无代理依赖。
 
 ### 0.3 实施顺序
 
-`R8 → R9 → R10 → R11 → R12`（P0 先行，R8 是归因可信度的前提）— 已按此顺序全部完成
+`timings 透传（Phase 0 闸门）→ R13 → R16 → R14 → R15`（对齐上下文工程设计 Phase 划分：R13 头 + R16 基础落盘是 Phase 1 验收项，R14/R15 属 Phase 2，R15 视形态学复盘是否进 A/B）。R8-R12 已于 2026-08-15 按序全部完成。
 
 ## 1. 需求场景
 
@@ -248,6 +239,64 @@ manage.sh 是**服务启停的主路径**，尤其在 HTTP API 生效前或代�
 - ② 角色场景参数：temperature/max_tokens/thinking 开关/goal/min_difficulty——agent_go config
 - Plan 生成/拆解/e2e 判定——agent_go 核心流程
 
+## 3.2 上下文工程诊断数据面增补需求（R13-R16，2026-08-19）
+
+以下需求来自 [llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md)：上下文工程（压缩/epoch/feedback 注入）落地后，缓存命中率、延迟分档、会话观测、压缩后行为复盘均无数据源。**诊断数据采集责任全部归代理，agent_go 只消费结构化接口**（响应头/端点/jsonl）。完备设计与接口契约见 [02-architecture-design/diagnostics-dataplane-design-20260819.md](02-architecture-design/diagnostics-dataplane-design-20260819.md)。
+
+### R13（P1）：诊断归因返回（非流式 HTTP 头 + 流式 SSE 尾注双通道）
+
+> 2026-08-19 修订：原「复用 R8 头模式」表述仅在**非流式**成立——流式响应头先于任何后端数据发出，而 `Prompt-Processed-N` 要等 prefill 完成后的终块 `timings` 才可知，物理上不可能作为流式 HTTP 头携带。流式经 SSE 尾注携带，见下方格式。
+
+| 字段 | 说明 | 通道 |
+|---|---|---|
+| `X-Proxy-Prompt-Processed-N` | 本轮实算 prefill 数（缓存命中率分子）；后端返回 timings 时才有，**否则缺省，不发假值** | 非流式头；流式尾注 |
+| `X-Proxy-Epoch-Count` | 会话累计 epoch（截断/重构）触发次数（上下文工程 Phase 1 落地后出现，此前不发送） | 头 + 尾注 |
+| `X-Proxy-Feedback-Injected` | 本请求代理注入的全部合成内容 kind（`loop_l1/loop_l2/loop_l3/text_loop/blocker/reread_hard/route_notice/high_drop_notice/truncation_summary`；Phase 2 后增 `negative_feedback`/`recitation`） | 头 + 尾注 |
+| `X-Proxy-Diag-Request-Id` | 诊断关联键，与 R16 jsonl 及 `proxy_metrics.jsonl` 的 `request_id` 字段对齐（metering ↔ 会话指标互查） | 头 + 尾注 |
+
+**流式尾注格式**（SSE 注释行，规范保证所有解析器忽略；在 `message_stop`（Anthropic）/ `data: [DONE]`（OpenAI）之前插入）：
+
+```text
+: x-proxy-diag {"prompt_processed_n":412,"prompt_sent_n":98347,"hit_ratio":0.9958,"epoch_count":3,"feedback_injected":["loop_l1"]}
+```
+
+agent_go metering 采集（`api.py:156` R8 解析模式扩展，见本节边界）→ metering.jsonl 字段 → `eval.py` analyze 可查。
+
+### R14（P1）：会话台账端点
+
+`GET /api/session/<key>/ledger`：dup / last_dup_turn / 材料清单（Phase 2 已设计项）。支撑 agent_go 轮级看门狗（§9 P1-4）+ 无效轮占比一等指标。
+
+**会话发现与 turn 语义**（2026-08-19 补）：
+- `GET /api/sessions` 返回活跃会话列表（`key / key_source / turns / last_seen / route / hit_ratio_p90 / evict_in_min`），供 agent_go/harness 枚举 `<key>`。
+- **turn = 代理所见该会话的请求序号**（一次请求内的多工具调用同 turn）——轮级看门狗与台账轮次以此对齐。
+- 会话 key 契约：优先请求头 `X-Claude-Code-Session-Id`（内部截断 8 字符）；无头时回退 `md5(ip:ua:date)` 会**按天合并所有无头会话**——批跑 harness 必须显式发送该头。
+
+### R15（P2）：L4 档案查询
+
+L4 只读访问 `GET /api/session/<key>/archive`——从 Phase 3 降级形态**提前**与 Phase 2 同期。压缩后行为复盘必须以代理档案为准（视角正确性：模型实际所见 ≠ 客户端所发）；批跑形态学分析（兔子洞）的权威数据源。支持 `?view=sent|client|canonical`（默认 `sent`，即实际发给后端的最终 payload，含注入块标注；`canonical` 视图 Phase 1 前返回 501）。
+
+### R16（P1）：/metrics 会话维度扩展
+
+每轮结构化落盘 jsonl（`session_key / turn / request_id / sent_tokens / processed_tokens / hit_ratio / epoch 触发 / is_epoch_turn（延迟分档前提）/ 注入标记 / canonical_mismatch`）+ 按 session 聚合时序（`GET /api/session/<key>/metrics`、`GET /metrics/history?session=`）。支撑时间线复盘、`canonical_mismatch` 监控、A/B 出数；与 `proxy_metrics.jsonl` 经 `request_id` 关联（per-request 全端点记录与 per-turn 深度记录并行，不合并 schema）。
+
+**`/api/status` 增 `ctx_config` 段**（2026-08-19 补，仿 R11 `route_config` 先例）：`{compression_mode, feedback_injection_enabled, epoch_S, window_K, diag_enabled}`——bench manifest 口径标注（上下文工程设计 §9 P0-1）的机读数据源，S/K 在 Phase 1 前为 null。
+
+### 附：llama-server 原生数据透传（零上游改动）
+
+| 数据 | 原生位置 | 用途 |
+|---|---|---|
+| per-request `timings`（prompt_n / prompt_ms / predicted_*）+ `usage` | 响应体（版本需实测） | 每轮缓存命中率 = 1 − prompt_n / usage.prompt_tokens——Phase 0/1 核心指标来源 |
+| `/props`（n_ctx / total_slots / model_path） | GET /props | slot/并发协调、epoch 触发阈值 ctx_max 同步 |
+| `/slots` 实时状态 | GET /slots（需 `--slots` 启动） | 并发会话 vs slot 匹配监控 |
+
+透传形态：`GET /api/backend/props` / `GET /api/backend/slots` 只读反代；后端不支持（如 rapid-mlx）时返回结构化 501 + `{"supported": false}`，消费方 fail-open。
+
+### 边界（R13-R16 的 agent_go 侧职责）
+
+- **metering 双来源解析**：`api.py:156` 的 R8 头解析扩展需同时支持 HTTP 头（非流式）与 SSE 注释行 `: x-proxy-diag {...}`（流式）——两个通道字段同名同义。
+- **批跑 harness 必须显式发送 `X-Claude-Code-Session-Id`**（会话 key 契约，见 R14；无头回退 key 会按天合并会话，污染台账与档案）。
+- 形态学复盘以 `archive?view=sent`（代理 sent_view）为准，不以 claude CLI 客户端转录为准（视角错位）。
+
 ## 4. 接口协议要求汇总
 
 | 维度 | 要求 |
@@ -277,6 +326,10 @@ manage.sh 是**服务启停的主路径**，尤其在 HTTP API 生效前或代�
 | R10 模型能力元数据 | P1 | ① registry 自动同步能力属性，免手工录入 |
 | R11 status 路由配置段 | P1 | 健康检查探测依据统一（cloud_model/key_set） |
 | R12 HTTP 热重载 | P2（可选） | 远程/容器场景可 reload |
+| R13 诊断响应头扩展 | P1 | metering 采集 Prompt-Processed-N / Epoch-Count / Feedback-Injected（R8 解析模式扩展） |
+| R14 会话台账端点 | P1 | 轮级看门狗消费 dup / last_dup_turn / 材料清单 |
+| R15 L4 档案查询 | P2 | 压缩后行为复盘以代理档案为准（L4 只读） |
+| R16 /metrics 会话维度 | P1 | 每轮 jsonl 落盘 + session 聚合时序，A/B 出数 |
 
 ## 6. 兼容策略
 
