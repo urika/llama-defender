@@ -700,6 +700,9 @@ _start_proxy() {
     info "  Profile: $active_profile"
 
     # 使用 bash -c wrapper 捕获崩溃输出到日志；wrapper 在函数末尾删除
+    # R13-R16: 后端名透传给代理进程（conf 内为非 export 的 shell 变量，
+    # 不导出则 python 子进程看不到 → /api/status backend.name 显示 unknown）
+    export LLAMA_BACKEND
     local proxy_wrapper="$SCRIPT_DIR/.start_proxy_$$.sh"
     cat > "$proxy_wrapper" <<EOF
 #!/usr/bin/env bash
