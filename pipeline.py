@@ -39,6 +39,15 @@ def _import_lifecycle():
     return lifecycle
 
 
+def _warn_diag(site, exc):
+    """诊断层异常落 WARN(前 N 次每挂点)——fail-open 但故障不可静默(评审 P2)。"""
+    try:
+        import diagnostics
+        diagnostics.warn_suppressed(site, exc)
+    except Exception:
+        pass
+
+
 def _import_loop_detection():
     import loop_detection
     return loop_detection
@@ -404,8 +413,8 @@ class RequestParser(PipelineStage):
                         key_source=getattr(_ps._diag_ctx, "key_source", "unknown")):
                     import diagnostics
                     diagnostics.mark_canonical_mismatch()
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("ledger_scan", _e)
 
         # Extract X-Proxy-Route-To header override (pre-extracted by Handler.do_POST)
         route_override = body.get("_x_proxy_route_to", "")
@@ -886,8 +895,8 @@ class RouteNotification(PipelineStage):
             try:
                 import diagnostics
                 diagnostics.record_injection("route_notice")
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("inject_route_notice", _e)
 
         log(
             f"  -> [route_notification] Session {session_id} switched to cloud "
@@ -1023,8 +1032,8 @@ class BlockerDetector(ConditionalStage):
                 try:
                     import diagnostics
                     diagnostics.record_injection("blocker")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _warn_diag("inject_blocker", _e)
 
         return ctx
 
@@ -1344,8 +1353,8 @@ class SessionLoopState(PipelineStage):
                 try:
                     import diagnostics
                     diagnostics.record_injection("session_loop_warning")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _warn_diag("inject_session_loop", _e)
 
         return ctx
 
@@ -1405,8 +1414,8 @@ class LoopIntervention(PipelineStage):
                     # kind 契约: loop_l1/l2/l3 或 text_loop(设计 D6,agent_go metering 依赖)
                     diagnostics.record_injection(
                         "text_loop" if loop_tool_name == "text_loop" else f"loop_l{loop_level}")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _warn_diag("inject_loop_intervention", _e)
             if loop_tool_name == "text_loop":
                 log(f"  -> TEXT LOOP LEVEL {loop_level}: text_run={ctx.text_loop_run} max_run={ctx.max_run}")
             else:
@@ -1519,8 +1528,8 @@ class RereadDetector(PipelineStage):
                     try:
                         import diagnostics
                         diagnostics.record_injection("reread_hard")
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _warn_diag("inject_reread_hard", _e)
 
         ctx.re_read_info = re_read_info
         return ctx
@@ -1608,8 +1617,8 @@ class ContextTruncator(ConditionalStage):
                     import diagnostics
                     # 截断会注入结构化摘要占位(DEF-107)——按合成内容计量
                     diagnostics.record_injection("truncation_summary")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _warn_diag("inject_truncation_summary", _e)
             strategy = trunc_stats.get("strategy", "char")
             if strategy == "rounds":
                 chars_after = trunc_stats.get("chars", trunc_stats.get("estimated_tokens", "?"))
@@ -1728,8 +1737,8 @@ class HighDropRatioNotice(ConditionalStage):
                     try:
                         import diagnostics
                         diagnostics.record_injection("high_drop_notice")
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _warn_diag("inject_high_drop", _e)
                 log(f"  -> High drop ratio notice injected ({dropped}/{dropped + kept} = "
                     f"{dropped / (kept + dropped) * 100:.0f}%)")
 
@@ -2227,8 +2236,8 @@ class BackendDispatcher(PipelineStage):
             try:
                 import diagnostics
                 diagnostics.set_route(display, actual)
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("set_route", _e)
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         target = getattr(ctx, '_route_target', 'local')
@@ -2295,8 +2304,8 @@ class BackendDispatcher(PipelineStage):
                     getattr(self._handler, '_request_id', ''),
                     diagnostics.peek_injections(),
                 )
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("diag_headers", _e)
 
         if target == 'cloud':
             # Iterate the catalog candidates: primary model first, then the
@@ -2611,8 +2620,8 @@ class BackendDispatcher(PipelineStage):
             try:
                 import diagnostics
                 diagnostics.capture_sent_view(ctx)
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("capture_sent_view", _e)
 
         req = urllib.request.Request(
             f"{base_url}/chat/completions",
@@ -2673,8 +2682,8 @@ class BackendDispatcher(PipelineStage):
                                 _dh = getattr(self._handler, "_diag_response_headers", None) or {}
                                 _dh["X-Proxy-Prompt-Processed-N"] = str(_processed)
                                 self._handler._diag_response_headers = _dh
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _warn_diag("nonstream_timings", _e)
                     # R8 (非流式): usage-based actual cost + proxy_route body field
                     # on OpenAI-protocol responses (Anthropic-format responses carry
                     # attribution via headers — body field would be dropped by the
@@ -2757,8 +2766,8 @@ class BackendDispatcher(PipelineStage):
                         payload=anthropic_req, injections=diagnostics.peek_injections(),
                         meta={"model": cand["model"], "route_target": getattr(ctx, "_route_target", None),
                               "messages": len(anthropic_req.get("messages", []) or [])})
-            except Exception:
-                pass
+            except Exception as _e:
+                _warn_diag("sent_view_anthropic", _e)
 
         if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
             log(f"  -> Request body too large for anthropic backend: "
@@ -2807,8 +2816,8 @@ class BackendDispatcher(PipelineStage):
                             _diag.set_prompt_tokens(
                                 sent_n=usage.get("input_tokens"),
                                 generation_n=usage.get("output_tokens"))
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _warn_diag("anthropic_usage", _e)
                     pin, pout = self._model_prices(cand["model"])
                     ctx._route_actual_cost = round(
                         (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)

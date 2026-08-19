@@ -41,6 +41,15 @@ def _reload_config(signum=None, frame=None):
 signal.signal(signal.SIGHUP, _reload_config)
 
 
+def _warn_diag(site, exc):
+    """诊断层异常落 WARN(前 N 次每挂点)——fail-open 但故障不可静默(评审 P2)。"""
+    try:
+        import diagnostics
+        diagnostics.warn_suppressed(site, exc)
+    except Exception:
+        pass
+
+
 import loop_detection
 from loop_detection import *
 
@@ -780,8 +789,8 @@ class Handler(BaseHTTPRequestHandler):
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
                             mc["request_id"] = _req_id
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _warn_diag("begin_request", _e)
                 # Phase 3: request failure snapshot — save original body before processing
                 _write_request_snapshot(_req_id, parsed)
                 _snapshot_written = False
@@ -854,8 +863,8 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             import diagnostics
                             diagnostics.finalize_request(getattr(_metrics_ctx, 'mc', None) or {})
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _warn_diag("finalize_request", _e)
                 except Exception as e:
                     _dur = (_time.monotonic() - _t0) * 1000
                     log(f"  -> Error: {e}", level="ERROR")
@@ -1195,8 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
                                 prompt_eval_ms=timings.get("prompt_ms"),
                                 gen_ms=timings.get("predicted_ms"),
                                 generation_n=timings.get("predicted_n"))
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _warn_diag("stream_timings", _e)
             usage = chunk.get("usage")
             if usage:
                 input_tokens = usage.get("prompt_tokens", input_tokens)
@@ -1208,8 +1217,8 @@ class Handler(BaseHTTPRequestHandler):
                         diagnostics.set_prompt_tokens(
                             sent_n=usage.get("prompt_tokens"),
                             generation_n=usage.get("completion_tokens"))
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _warn_diag("stream_usage", _e)
 
             # Handle tool_calls in streaming
             tc_delta = delta.get("tool_calls")
@@ -1369,8 +1378,10 @@ class Handler(BaseHTTPRequestHandler):
                     import diagnostics
                     self.wfile.write(diagnostics.sse_tail_line(
                         diagnostics.build_diag_payload()).encode("utf-8"))
-                except Exception:
-                    pass
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # client disconnected — response pointless
+                except Exception as _e:
+                    _warn_diag("sse_tail_anthropic", _e)
 
             # Send message_stop
             event = {"type": "message_stop"}
@@ -1420,8 +1431,10 @@ class Handler(BaseHTTPRequestHandler):
                         import diagnostics
                         self.wfile.write(diagnostics.sse_tail_line(
                             diagnostics.build_diag_payload()).encode("utf-8"))
-                    except Exception:
-                        pass
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # client disconnected
+                    except Exception as _e:
+                        _warn_diag("sse_tail_done", _e)
                 self.wfile.write(line)
                 try:
                     decoded = _dec
@@ -1448,8 +1461,8 @@ class Handler(BaseHTTPRequestHandler):
                                         diagnostics.set_prompt_tokens(
                                             sent_n=_u.get("prompt_tokens"),
                                             generation_n=_u.get("completion_tokens"))
-                                except Exception:
-                                    pass
+                                except Exception as _e:
+                                    _warn_diag("passthrough_diag", _e)
                 except Exception:
                     pass
             self.wfile.flush()
@@ -1535,30 +1548,44 @@ class Handler(BaseHTTPRequestHandler):
         self._send_common_headers("text/event-stream")
         self.end_headers()
         _first_token_time = None
+        _tail_written = False
         try:
             for raw in resp:
                 if not isinstance(raw, bytes):
                     raw = raw.encode("utf-8")
                 if _first_token_time is None and raw.strip() and not raw.startswith(b":"):
                     _first_token_time = time.monotonic()
+                # R13 流式通道: 尾注必须在 message_stop 之前(设计 D1——解析器
+                # 收到终止事件后停止读取,流尾追加会被静默丢弃)。该路径不解析
+                # usage(云端 anthropic 协议无 timings),token 字段按 P3 保持 null。
+                if (PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL
+                        and not _tail_written and b"message_stop" in raw):
+                    _tail_written = self._write_diag_sse_tail()
                 self.wfile.write(raw)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client disconnected
-        # R13 流式通道: 透传流结束后追加诊断尾注(该路径不解析 usage——云端
-        # anthropic 协议无 timings,token 字段按 P3 原则保持 null)
-        if PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
-            try:
-                import diagnostics
-                self.wfile.write(diagnostics.sse_tail_line(
-                    diagnostics.build_diag_payload()).encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+        # 兜底: 流异常截断(未收到 message_stop)时在结尾追加,保证诊断仍可达
+        if PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL and not _tail_written:
+            self._write_diag_sse_tail()
         if _first_token_time is not None:
             mc = getattr(_metrics_ctx, 'mc', None)
             if mc:
                 mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
+
+    def _write_diag_sse_tail(self):
+        """Write the R13 SSE tail line; returns True if written. Never raises."""
+        try:
+            import diagnostics
+            self.wfile.write(diagnostics.sse_tail_line(
+                diagnostics.build_diag_payload()).encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False  # client disconnected
+        except Exception as _e:
+            _warn_diag("sse_tail_passthrough", _e)
+            return False
 
     def _handle_anthropic_response(self, status, body_bytes, ctx):
         """Return a non-streaming Anthropic-protocol response unchanged (Phase D)."""

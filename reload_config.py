@@ -129,6 +129,14 @@ def reload_config(signum=None, frame=None, target_module=None):
         proxy_state.PROXY_PRE_TRUNCATE_CHARS = int(oom)
         setattr(target_module, "PROXY_PRE_TRUNCATE_CHARS", int(oom))
 
+        # R13-R16: 后端可能随 reload 切换(local↔cloud),timings 能力探测的进程级
+        # 状态须重置,避免跨后端切换后 timings_supported() 语义失真(评审 P2)。
+        try:
+            import diagnostics
+            diagnostics.reset_timings_probe()
+        except Exception:
+            pass
+
         log("[RELOAD] OK: backend=%s base=%s model=%s concurrent=%d clear=%s ctx_limit=%s frozen=%d truncate=%s"
             % (bt, base[:60], model, new_max, getattr(target_module, "PROXY_CLEAR_ENABLED"),
                getattr(target_module, "PROXY_CTX_LIMIT_ENABLED"), getattr(target_module, "PROXY_FROZEN_HEAD"),

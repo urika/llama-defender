@@ -26,6 +26,11 @@ JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 与 proxy_metrics.jsonl 同策略
 _timings_state = {"supported": None}
 _timings_probe_lock = threading.Lock()
 
+# 诊断层异常可见性: fail-open 不抛异常,但每挂点前 N 次异常记 WARN(防止静默故障)
+_EXCEPTION_LOG_LIMIT = 3
+_exception_log_counts = {}
+_exception_log_lock = threading.Lock()
+
 
 # ============================================================================
 # 纯函数(单元测试友好)
@@ -131,6 +136,36 @@ def timings_supported():
     if _ps.PROXY_DIAG_TIMINGS_SOURCE == "off":
         return False
     return _timings_state["supported"]
+
+
+def reset_timings_probe():
+    """SIGHUP 热重载时重置 timings 能力探测(后端可能切换 local↔cloud)。
+
+    不重新探测——下一次带/不带 timings 的响应自然翻转状态;此处仅清除
+    陈旧的真值,避免跨后端切换后 timings_supported() 语义失真(评审 P2)。
+    """
+    with _timings_probe_lock:
+        _timings_state["supported"] = None
+
+
+def warn_suppressed(site, exc):
+    """记录一处被吞掉的诊断层异常(每挂点前 _EXCEPTION_LOG_LIMIT 次 WARN)。
+
+    diagnostics 故障不得影响请求路径(fail-open),但也不能完全静默——
+    前 N 次出现即 WARN,便于定位;之后自动降噪。
+    """
+    if exc is None:
+        return
+    with _exception_log_lock:
+        n = _exception_log_counts.get(site, 0)
+        if n >= _EXCEPTION_LOG_LIMIT:
+            return
+        _exception_log_counts[site] = n + 1
+    try:
+        from proxy_logging import log
+        log(f"[diag:{site}] suppressed {type(exc).__name__}: {exc}", level="WARN")
+    except Exception:
+        pass
 
 
 def set_prompt_tokens(processed_n=None, sent_n=None, generation_n=None,
@@ -342,6 +377,7 @@ __all__ = [
     "compute_hit_ratio", "sse_tail_line", "diag_headers",
     "begin_request", "record_injection", "peek_injections", "set_route",
     "mark_canonical_mismatch", "probe_timings", "timings_supported",
+    "reset_timings_probe", "warn_suppressed",
     "set_prompt_tokens", "build_diag_payload", "capture_sent_view",
     "log_session_diag", "log_lifecycle_event", "finalize_request",
     "read_session_metrics",

@@ -226,5 +226,136 @@ class TestDisabledPlane(unittest.TestCase):
             _ps.PROXY_DIAG_ENABLED = saved
 
 
+class TestWarnSuppressed(unittest.TestCase):
+    """评审 P2: 诊断层异常可见性——fail-open 但每挂点前 N 次记 WARN。"""
+
+    def setUp(self):
+        diag._exception_log_counts.clear()
+
+    def test_first_n_logged_then_silent(self):
+        from unittest.mock import patch
+        with patch("proxy_logging.log") as mlog:
+            diag.warn_suppressed("site_a", ValueError("boom"))
+            diag.warn_suppressed("site_a", ValueError("boom2"))
+            diag.warn_suppressed("site_a", ValueError("boom3"))
+            diag.warn_suppressed("site_a", ValueError("boom4"))  # 超限静默
+        self.assertEqual(mlog.call_count, 3)
+        for call in mlog.call_args_list:
+            args, kwargs = call
+            self.assertEqual(kwargs.get("level"), "WARN")
+            self.assertIn("site_a", args[0])
+
+    def test_per_site_limit_independent(self):
+        from unittest.mock import patch
+        with patch("proxy_logging.log") as mlog:
+            diag.warn_suppressed("site_a", ValueError("x"))
+            diag.warn_suppressed("site_a", ValueError("x"))
+            diag.warn_suppressed("site_a", ValueError("x"))
+            diag.warn_suppressed("site_b", ValueError("y"))
+            diag.warn_suppressed("site_b", ValueError("y"))
+        self.assertEqual(mlog.call_count, 5)
+
+    def test_none_exc_noop(self):
+        from unittest.mock import patch
+        with patch("proxy_logging.log") as mlog:
+            diag.warn_suppressed("site_c", None)
+        mlog.assert_not_called()
+
+
+class TestTimingsProbeReset(unittest.TestCase):
+    """评审 P2: SIGHUP 重载后 timings 能力探测状态重置（后端可 local↔cloud 切换）。"""
+
+    def test_reset_clears_probe_state(self):
+        diag._timings_state["supported"] = True
+        diag.reset_timings_probe()
+        self.assertIsNone(diag._timings_state["supported"])
+
+    def test_probe_rearms_after_reset(self):
+        diag._timings_state["supported"] = None
+        self.assertTrue(diag.probe_timings({"prompt_n": 1}))
+        self.assertIs(diag.timings_supported(), True)
+        diag.reset_timings_probe()
+        self.assertIsNone(diag.timings_supported())
+        self.assertTrue(diag.probe_timings({"prompt_n": 1}))
+        self.assertIs(diag.timings_supported(), True)
+
+
+class TestPassthroughSseTail(unittest.TestCase):
+    """评审 P1: 透传路径（anthropic 协议云端）诊断尾注必须位于 message_stop 之前。
+
+    设计 D1: 解析器收到终止事件后停止读取——流尾追加的尾注会被静默丢弃。
+    修复后: 拦截含 message_stop 的 chunk,尾注写在其前;流异常截断时兜底追加。
+    """
+
+    def _run(self, chunks):
+        import io
+        from unittest.mock import patch
+        import anthropic_proxy as proxy
+        h = proxy.Handler.__new__(proxy.Handler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h._send_common_headers = lambda *a, **k: None
+        h.end_headers = lambda: None
+        saved_mc = getattr(proxy._metrics_ctx, "mc", None)
+        proxy._metrics_ctx.mc = None
+        try:
+            with patch.object(proxy, "PROXY_DIAG_ENABLED", True), \
+                    patch.object(proxy, "PROXY_DIAG_SSE_TAIL", True):
+                h._handle_anthropic_stream_passthrough(iter(chunks), {})
+        finally:
+            proxy._metrics_ctx.mc = saved_mc
+        return h.wfile.getvalue().decode("utf-8")
+
+    def test_tail_before_message_stop(self):
+        out = self._run([
+            b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta"}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+        self.assertEqual(out.count("x-proxy-diag"), 1)
+        self.assertLess(out.index("x-proxy-diag"), out.index("event: message_stop"))
+
+    def test_tail_before_message_stop_single_chunk(self):
+        # message_stop 与正文在同一 chunk(上游常见)——尾注仍在其前
+        out = self._run([
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta"}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+        self.assertEqual(out.count("x-proxy-diag"), 1)
+        self.assertLess(out.index("x-proxy-diag"), out.index("event: message_stop"))
+
+    def test_fallback_tail_when_stream_truncated(self):
+        # 流被截断(无 message_stop)——尾注兜底追加在结尾,诊断仍可达
+        out = self._run([
+            b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
+        ])
+        self.assertEqual(out.count("x-proxy-diag"), 1)
+        self.assertTrue(out.rstrip().endswith("}"))
+
+    def test_tail_disabled_no_tail(self):
+        import io
+        from unittest.mock import patch
+        import anthropic_proxy as proxy
+        h = proxy.Handler.__new__(proxy.Handler)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h._send_common_headers = lambda *a, **k: None
+        h.end_headers = lambda: None
+        saved_mc = getattr(proxy._metrics_ctx, "mc", None)
+        proxy._metrics_ctx.mc = None
+        try:
+            with patch.object(proxy, "PROXY_DIAG_SSE_TAIL", False):
+                h._handle_anthropic_stream_passthrough(iter([
+                    b'event: message_stop\ndata: {"type":"message_stop"}\n\n']), {})
+        finally:
+            proxy._metrics_ctx.mc = saved_mc
+        self.assertNotIn("x-proxy-diag", h.wfile.getvalue().decode("utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
