@@ -63,6 +63,7 @@ docs/
 | `ab-test-task-log-system.md` | A/B 测试任务：为代理添加结构化日志系统（M1 结构化日志 + M2 状态页统计） |
 | `test-strategy.md` | 测试策略与覆盖矩阵，审计发现自动化测试覆盖 7/23 = 30%，列出补齐优先级 |
 | `refactor-test-strategy.md` | 重构测试策略与回归保障方案，覆盖模块拆分等价性校验、Cache Aligner/结构化压缩效果评估、云端模式硬化、84+ 新增测试案例 |
+| `diag-dataplane-verification-20260819.md` | R13-R16 诊断数据面验证方案与实测记录：五层验证金字塔（L0 自动化回归 / L1 冒烟命令组 / L2 场景化验收——注入可观测性、dup 计数、双账本 request_id 关联实测全过 / L3 agent_go 消费方清单 / L4 运行期观察）；rapid-mlx 无 timings 定案与离线兜底路径；已知边界（字段缺省语义、8 字符 key 截断） |
 | `swe-bench-pro-eval.md` | SWE-bench Pro 测评接口层说明：独立项目 `~/APP/swe-eval` 的用法、代理接口约定（路由强制/会话隔离）、两阶段计划与口径声明 |
 
 ---
