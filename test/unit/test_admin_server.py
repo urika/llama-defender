@@ -164,7 +164,8 @@ class TestBuildStatusJson(unittest.TestCase):
     def test_returns_expected_schema(self):
         status = admin_server._build_status_json()
         self.assertIsInstance(status, dict)
-        self.assertEqual(status.get("api_version"), "1")
+        # G-C: api_version "2" = R13-R16 诊断数据面端点就绪（agent_go 存在性探测依据）
+        self.assertEqual(status.get("api_version"), "2")
         self.assertIn("proxy", status)
         self.assertIn("backend", status)
         self.assertIn("active_profile", status)
@@ -183,6 +184,20 @@ class TestBuildStatusJson(unittest.TestCase):
         self.assertIn("model_name", backend)
         self.assertIn("backend_type", backend)
         self.assertIn("base_url", backend)
+        self.assertIn("name", backend)  # G-D 配套: 运行时后端名（LLAMA_BACKEND）
+
+    def test_ctx_config_effective_compression_state(self):
+        """G-E: ctx_config 必须暴露压缩「有效状态」——bench 口径以有效行为标注。"""
+        status = admin_server._build_status_json()
+        ctx = status.get("ctx_config")
+        self.assertIsInstance(ctx, dict)
+        for field in ("diag_enabled", "compression_mode", "compress_enabled",
+                      "compression_profile", "bm25_enabled",
+                      "feedback_injection_enabled", "epoch_S", "window_K"):
+            self.assertIn(field, ctx, f"ctx_config missing '{field}'")
+        self.assertIsInstance(ctx["diag_enabled"], bool)
+        self.assertIsInstance(ctx["compress_enabled"], bool)
+        self.assertIsInstance(ctx["bm25_enabled"], bool)
 
     def test_state_is_valid_enum(self):
         status = admin_server._build_status_json()

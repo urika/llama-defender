@@ -371,9 +371,14 @@ def _build_status_json():
         # R16: context-engineering config digest（仿 R11 route_config 先例）—
         # bench manifest 口径标注的机读数据源（上游设计 §9 P0-1）。
         # epoch_S / window_K 在上下文工程 Phase 1 落地前为 None。
+        # G-E: 补压缩「有效状态」——mode 是配置值,enabled=false 时 mode 无意义,
+        # bench 口径须以有效行为标注(臂间误标会让 A/B 结论不可信)。
         "ctx_config": {
             "diag_enabled": bool(getattr(_ps, "PROXY_DIAG_ENABLED", False)),
             "compression_mode": getattr(_ps, "PROXY_COMPRESS_MODE", None),
+            "compress_enabled": bool(getattr(_ps, "PROXY_COMPRESS_ENABLED", False)),
+            "compression_profile": getattr(_ps, "PROXY_COMPRESSION_PROFILE", None),
+            "bm25_enabled": bool(getattr(_ps, "PROXY_BM25_ENABLED", False)),
             "feedback_injection_enabled": False,  # 合成负反馈 Phase 2 落地后接线
             "epoch_S": None,
             "window_K": None,

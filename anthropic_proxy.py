@@ -1885,6 +1885,17 @@ class Handler(BaseHTTPRequestHandler):
         import session_ledger
         import diagnostics
 
+        # G-D: 允许消费方持完整会话头值查询——精确 key 未命中且其 8 字符
+        # 截断形式有台账/档案时按截断 key 归并（代理内部路由本就如此归并，
+        # 语义一致；harness 无需自行实现截断）。
+        if len(key) > 8:
+            _short = key[:8]
+            if (not session_ledger.LEDGER.session_alive(key)
+                    and not session_ledger.ARCHIVE.has_archive(key)
+                    and (session_ledger.LEDGER.session_alive(_short)
+                         or session_ledger.ARCHIVE.has_archive(_short))):
+                key = _short
+
         if tail == "ledger":
             ledger = session_ledger.LEDGER.build_ledger_json(
                 key, limit_turns=_q("limit_turns", None, int))

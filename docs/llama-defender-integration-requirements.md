@@ -252,8 +252,13 @@ manage.sh 是**服务启停的主路径**，尤其在 HTTP API 生效前或代�
 **流式尾注格式**（SSE 注释行，规范保证所有解析器忽略；在 `message_stop`（Anthropic）/ `data: [DONE]`（OpenAI）之前插入）：
 
 ```text
-: x-proxy-diag {"prompt_processed_n":412,"prompt_sent_n":98347,"hit_ratio":0.9958,"epoch_count":3,"feedback_injected":["loop_l1"]}
+: x-proxy-diag {"request_id":"req_...","session_key":"a1b2c3d4","prompt_processed_n":412,"prompt_sent_n":98347,"hit_ratio":0.9958,"epoch_count":3,"feedback_injected":["loop_l1"]}
 ```
+
+**L3 接入补全（2026-08-19 G 系列补丁）**：
+- 尾注与载荷**恒含 `session_key`**（代理侧实际归并的 8 字符 key）——metering 归因落会话无需自行实现截断。
+- **OpenAI 协议非流式**响应体带 `proxy_diag` 字段（与 `proxy_route` 并列，本地/云端路由均注入）。
+- `api_version` 升为 **`"2"`**（`/api/status`、`/admin/reload`、`/api/route/policies`）——agent_go 存在性探测以版本区分新旧代理（本节 §4 fail-open 的前提）。
 
 agent_go metering 采集（`api.py:156` R8 解析模式扩展，见本节边界）→ metering.jsonl 字段 → `eval.py` analyze 可查。
 
@@ -265,6 +270,7 @@ agent_go metering 采集（`api.py:156` R8 解析模式扩展，见本节边界�
 - `GET /api/sessions` 返回活跃会话列表（`key / key_source / turns / last_seen / route / hit_ratio_p90 / evict_in_min`），供 agent_go/harness 枚举 `<key>`。
 - **turn = 代理所见该会话的请求序号**（一次请求内的多工具调用同 turn）——轮级看门狗与台账轮次以此对齐。
 - 会话 key 契约：优先请求头 `X-Claude-Code-Session-Id`（内部截断 8 字符）；无头时回退 `md5(ip:ua:date)` 会**按天合并所有无头会话**——批跑 harness 必须显式发送该头。
+- **端点接受完整会话头值**（G-D）：`<key>` 传完整 id 时，精确未命中且其 8 字符截断形式有台账/档案则自动归并——harness 无需自行截断。
 
 ### R15（P2）：L4 档案查询
 

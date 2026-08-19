@@ -416,7 +416,10 @@ _jsonl_counter = 0
 # ---------------------------------------------------------------------------
 # Status API / agent_go integration
 # ---------------------------------------------------------------------------
-PROXY_STATUS_API_VERSION = "1"
+# G-C (2026-08-19): "2" = R13-R16 诊断数据面已就绪(/api/sessions、
+# /api/session/<key>/*、/api/backend/*、/api/status ctx_config 段、proxy_diag
+# 体字段)。agent_go 存在性探测以版本区分新旧代理(集成契约 §4 fail-open 前提)。
+PROXY_STATUS_API_VERSION = "2"
 _ACTIVE_CONF_PATH = os.path.join(_SCRIPT_DIR, "configs", "active.conf")
 _WATCHDOG_STATE_PATH = os.path.join(_LOG_DIR, "watchdog_state.json")
 _LIFECYCLE_EVENTS_PATH = os.path.join(_LOG_DIR, "lifecycle_events.jsonl")

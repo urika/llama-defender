@@ -191,12 +191,19 @@ def set_prompt_tokens(processed_n=None, sent_n=None, generation_n=None,
 
 
 def build_diag_payload():
-    """构建 SSE 尾注/头/落盘共用的诊断载荷(缺失字段不出现)。"""
+    """构建 SSE 尾注/头/落盘共用的诊断载荷(缺失字段不出现)。
+
+    G-B: 恒含 session_key——metering 归因落会话无需自行实现 8 字符截断；
+    fallback key 场景(无头客户端)亦可自省代理侧实际归并的 key。
+    """
     ctx = _ps._diag_ctx
     diag = {}
     request_id = getattr(ctx, "request_id", None)
     if request_id:
         diag["request_id"] = request_id
+    session_key = getattr(ctx, "session_key", None)
+    if session_key:
+        diag["session_key"] = session_key
     processed = getattr(ctx, "prompt_processed_tokens", None)
     sent = getattr(ctx, "prompt_sent_tokens", None)
     if processed is not None:

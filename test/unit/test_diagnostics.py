@@ -112,6 +112,11 @@ class TestPerRequestAccumulation(unittest.TestCase):
         self.assertEqual(payload["hit_ratio"], 0.9958)
         self.assertEqual(payload["feedback_injected"], ["blocker"])
 
+    def test_build_diag_payload_contains_session_key(self):
+        """G-B: 恒含 session_key——metering 归因落会话无需自行实现 8 字符截断。"""
+        payload = diag.build_diag_payload()
+        self.assertEqual(payload.get("session_key"), "sess_a")
+
     def test_build_diag_payload_omits_unknown(self):
         payload = diag.build_diag_payload()
         self.assertNotIn("hit_ratio", payload)

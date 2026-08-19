@@ -388,6 +388,13 @@ class ArchiveStore(object):
     def _session_path(self, session_key):
         return os.path.join(_ps._DIAG_ARCHIVE_DIR, sanitize_session_key(session_key) + ".jsonl")
 
+    def has_archive(self, session_key):
+        """该会话是否有档案文件（G-D：端点 key 归并判据之一）。"""
+        try:
+            return os.path.isfile(self._session_path(session_key))
+        except OSError:
+            return False
+
     def append_turn(self, session_key, turn, payload, injections, meta=None):
         """追加一轮 sent_view。payload 为发给后端的完整请求体 dict。
 

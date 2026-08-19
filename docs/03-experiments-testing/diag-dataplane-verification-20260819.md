@@ -124,11 +124,13 @@ action[2]:   {"turn":1,"tool":"WebSearch","target":"github ansible pull 80376","
 | `canonical_mismatch` | `logs/lifecycle_events.jsonl` 频率 | 频繁 >0 = 客户端自行裁剪历史 → 缓存收益打折前兆（上游设计 §4.7.4） |
 | 会话 key 污染 | `/api/sessions` 的 `key_source` | 出现大量 `fallback` = 有客户端没发 `X-Claude-Code-Session-Id`（按天合并，台账污染） |
 
-## 8. L3 消费方验收清单（agent_go 侧，未闭环）
+## 8. L3 消费方验收清单（agent_go 侧）
 
-1. **metering 双来源解析**：`api.py:156` 的 R8 头解析扩展为「HTTP 头（非流式）+ SSE 注释行 `: x-proxy-diag {...}`（流式）」——两个通道字段同名同义；metering.jsonl 增字段 `prompt_processed_n / hit_ratio / epoch_count / feedback_injected[] / diag_request_id`。
-2. **批跑 harness 显式发送 `X-Claude-Code-Session-Id`**（key 契约，见需求文档 R14 节）。
-3. **bench manifest 口径标注**：读 `GET /api/status` 的 `ctx_config` 段（压缩模式/注入开关/S/K）。
+> 2026-08-19 更新：代理侧接口审计发现的 G-A~E 缺口已全部补齐并活体验证（api_version="2"、`proxy_diag` 体字段、尾注含 `session_key`、端点接受完整 key、ctx_config 有效压缩状态）——agent_go 侧接入零妥协。
+
+1. **metering 双来源解析**：`api.py:156` 的 R8 头解析扩展为「HTTP 头（非流式）+ SSE 注释行 `: x-proxy-diag {...}`（流式）」——两个通道字段同名同义；metering.jsonl 增字段 `prompt_processed_n / hit_ratio / epoch_count / feedback_injected[] / diag_request_id / session_key`。
+2. **批跑 harness 显式发送 `X-Claude-Code-Session-Id`**（key 契约，见需求文档 R14 节；端点已接受完整值，无需自行截断）。
+3. **bench manifest 口径标注**：读 `GET /api/status` 的 `ctx_config` 段（含 `compress_enabled / compression_profile / bm25_enabled` 有效状态 + S/K）。
 4. 形态学复盘切换数据源：`GET /api/session/<key>/archive?view=sent`（弃用 claude CLI 客户端转录——视角错位）。
 
 ---

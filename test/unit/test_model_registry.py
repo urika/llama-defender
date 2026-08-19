@@ -578,7 +578,7 @@ class TestAdminReload(unittest.TestCase):
         data, status = h._responses[0]["data"], h._responses[0]["status"]
         self.assertEqual(status, 200)
         self.assertTrue(data["reloaded"])
-        self.assertEqual(data["api_version"], "1")
+        self.assertEqual(data["api_version"], "2")
         self.assertIn("active_profile", data)
 
     def test_reloaded_failure_500(self):

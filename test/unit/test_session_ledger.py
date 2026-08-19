@@ -225,6 +225,13 @@ class TestArchiveStore(unittest.TestCase):
         _, err = self.archive.read("nope")
         self.assertEqual(err, "not_found")
 
+    def test_has_archive(self):
+        """G-D: 端点 key 归并判据——有档案文件返回 True。"""
+        self.assertFalse(self.archive.has_archive("sH"))
+        self.archive.append_turn("sH", 1, {"a": 1}, [], {})
+        self.assertTrue(self.archive.has_archive("sH"))
+        self.assertFalse(self.archive.has_archive("other"))
+
     def test_payload_truncation(self):
         saved = sl.MAX_ARCHIVE_PAYLOAD_CHARS
         try:

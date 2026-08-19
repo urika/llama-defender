@@ -2688,6 +2688,7 @@ class BackendDispatcher(PipelineStage):
                     # on OpenAI-protocol responses (Anthropic-format responses carry
                     # attribution via headers — body field would be dropped by the
                     # converter anyway).
+                    _body_modified = False
                     if getattr(ctx, '_route_target', 'local') == 'cloud':
                         pin, pout = self._model_prices(getattr(ctx, '_route_cloud_model', ''))
                         ctx._route_actual_cost = round(
@@ -2699,7 +2700,19 @@ class BackendDispatcher(PipelineStage):
                                 "reason": getattr(ctx, '_route_reason', ''),
                                 "cost": ctx._route_actual_cost,
                             }
-                            body_bytes = json.dumps(openai_resp).encode("utf-8")
+                            _body_modified = True
+                    # G-A (R13): OpenAI 协议非流式响应体 proxy_diag 字段——与
+                    # proxy_route 并列(设计 §4.1 契约;本地路由同样注入,timings
+                    # 此刻已解析完,payload 含全部已知事实)
+                    if _ps.PROXY_DIAG_ENABLED and getattr(self._handler, '_openai_mode', False):
+                        try:
+                            import diagnostics as _diag
+                            openai_resp["proxy_diag"] = _diag.build_diag_payload()
+                            _body_modified = True
+                        except Exception as _e:
+                            _warn_diag("proxy_diag_body", _e)
+                    if _body_modified:
+                        body_bytes = json.dumps(openai_resp).encode("utf-8")
                 except Exception:
                     pass
                 wrapped = _BytesIOResponse(resp.status, body_bytes)
