@@ -29,10 +29,12 @@ Extracted modules:
 
 | Module | Lines | Purpose |
 |--------|------|---------|
-| `admin_server.py` | ~2650 | Status HTML dashboard, metrics, memory checks, concurrency, `/api/*` JSON endpoints |
+| `admin_server.py` | ~2700 | Status HTML dashboard, metrics, memory checks, concurrency, `/api/*` JSON endpoints |
 | `truncation.py` | ~1680 | Context truncation: single-pass content compression (L2 clearing + L4 thinking strip), smart truncation with tool-pair atomic protection (TS-2) |
 | `message_converter.py` | ~900 | Anthropic↔OpenAI bidirectional format conversion (incl. `convert_openai_request_to_anthropic` for the dual-protocol endpoint) |
 | `content_compressor.py` | ~680 | TokenSieve semantic compression + BM25 relevance-driven compression (TS-1) + TS-4 结构化 drop 分支 (`_structured_compress`, BM25 低分先保结构压缩再按 `PROXY_BM25_DROP_TARGET_RATIO` 封顶) |
+| `session_ledger.py` | ~430 | R14/R15 diagnostics stores: per-session action ledger (dup/last_dup_turn/materials, incremental client-history scan with prefix-diff rebuild) + sent_view archive (`logs/diag/archive/<sid>.jsonl`, MB-capped) |
+| `diagnostics.py` | ~330 | R13/R16 diagnostics recorder: per-request accumulation (injections/timings probe/token facts), `X-Proxy-Diag-*` headers, SSE tail `: x-proxy-diag {...}`, `logs/diag/sessions.jsonl` per-turn records, lifecycle events |
 | `tool_parser.py` | ~470 | XML→JSON fallback, content-tools extraction, streaming extractor |
 | `loop_detection.py` | ~410 | Loop/blocker detection, text similarity, intervention |
 | `tool_filter.py` | ~210 | Tool definition filtering, keyword extraction, error translation |
@@ -117,7 +119,12 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/queue` | Priority request queue state (Phase 1, default off) | JSON: `enabled`, `workers`, `waiting`, `by_bucket`, `oldest_wait_ms` |
 | GET | `/api/profiles` | Available model configs | JSON: `profiles[]` with `name`, `desc`, `memory_gb`, `active` |
 | GET | `/metrics[?n=N]` | Recent request metrics | JSON |
-| GET | `/metrics/history` | Historical metrics | JSON |
+| GET | `/metrics/history[?session=K]` | Historical metrics (R16: optional per-session filter) | JSON |
+| GET | `/api/sessions` | Active diagnostics sessions (R14 discovery) | JSON: `sessions[]` with `key`/`key_source`/`turns`/`last_seen` |
+| GET | `/api/session/<key>/ledger` | Session action ledger (R14) | JSON: `actions[]` (dup/last_dup_turn), `dup_queries[]`, `materials[]`; 404 unknown / 410 evicted |
+| GET | `/api/session/<key>/archive?view=sent` | Per-turn sent_view archive (R15) | JSON: turn index (payload only with `include_payload=true`); 501 for `canonical` until Phase 1 |
+| GET | `/api/session/<key>/metrics` | Per-session diag aggregates (R16) | JSON: `hit_ratio_p50/p90`, `latency_by_kind` (epoch/normal split), `series[]` |
+| GET | `/api/backend/props` / `/api/backend/slots` | llama-server native endpoints, read-only reverse proxy | JSON or 501 `{"supported": false}` when backend lacks them |
 | POST | `/admin/route/force-local` / `force-cloud` | Session-level route override | JSON |
 | POST | `/admin/reload` | HTTP hot-reload, equivalent to `manage.sh reload` (R12) | JSON: `reloaded`, `active_profile`, `api_version` |
 | GET | `/status` | Human-readable HTML status page | HTML |
@@ -127,6 +134,8 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 - Watchdog auto-restart events are logged to `logs/watchdog_state.json`; lifecycle events (`service_start`, `config_reload`, `profile_switch`, `watchdog_auto_restart`, …) to `logs/lifecycle_events.jsonl`.
 
 **llama-defender integration** (`docs/llama-defender-integration-requirements.md`): R1-R12 **all delivered**. R1-R7: structured status, readiness semantics, manage.sh call contract, profiles/watchdog APIs. R8: `X-Proxy-Route-Target/Actual-Model/Reason/Cost` attribution headers + OpenAI-mode `proxy_route` body field. R9: `GET /api/route/policies` (sanitized catalog + `catalog_hash` for agent_go drift detection). R10: `/v1/models` capability metadata (`real_model`/`thinking_*`/`json_compliance`/`context_chars`/`price`/`direct_capable`). R11: `/api/status` `route_config` digest. R12: `POST /admin/reload`.
+
+**Diagnostics data plane** (R13-R16, `docs/02-architecture-design/diagnostics-dataplane-design-20260819.md`, 2026-08-19 delivered): R13 diag attribution — non-streaming HTTP headers `X-Proxy-Diag-Request-Id` / `X-Proxy-Feedback-Injected` (csv) / `X-Proxy-Prompt-Processed-N` (only when backend returns `timings`), streaming via SSE comment tail `: x-proxy-diag {...}` before `message_stop` / `[DONE]`; all 7 existing synthetic-content injections instrumented (`loop_l1/l2/l3`, `text_loop`, `blocker`, `reread_hard`, `route_notice`, `high_drop_notice`, `truncation_summary`, `session_loop_warning`). R14 session ledger (`/api/session/<key>/ledger` + `/api/sessions`). R15 sent_view archive (per-turn final backend payload — the authoritative "what the model actually saw"). R16 per-turn `logs/diag/sessions.jsonl` (request_id-correlated with `proxy_metrics.jsonl`; `hit_ratio = 1 − prompt_n/prompt_tokens`; `is_epoch_turn` reserved null until context-engineering Phase 1) + `/api/status` `ctx_config` digest + `lifecycle_events.jsonl` activated (`canonical_mismatch`). Master switch `PROXY_DIAG_ENABLED` (SIGHUP-reloadable family `PROXY_DIAG_*`).
 
 **Dual-mode auto-detection**: `BACKEND_TYPE` is automatically inferred from `LLAMA_BASE_URL`: contains `deepseek` / `openai` / `api.` → `cloud`, otherwise → `local`. `MODEL_NAME` auto-set accordingly; manual override via env var is rarely needed.
 

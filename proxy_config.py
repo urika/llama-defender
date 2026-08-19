@@ -781,6 +781,47 @@ CONFIG_REGISTRY = {
         "doc": "Action for huge bucket: cloud (route via SmartRouter if enabled) | reject (413).",
     },
 
+    # ---- R13-R16 诊断数据面（diagnostics dataplane，2026-08-19）----
+    "PROXY_DIAG_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Master switch for the diagnostics data plane (R13-R16): diag response "
+               "headers, SSE tail notes, session ledger, sent_view archive, sessions.jsonl.",
+    },
+    "PROXY_DIAG_SSE_TAIL": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Emit the ': x-proxy-diag {...}' SSE comment line at stream tail (R13 "
+               "streaming channel). Comment lines are ignored by all SSE parsers per spec.",
+    },
+    "PROXY_DIAG_SESSION_TTL_MIN": {
+        "defaults": {"all": "180"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Minutes a session's ledger/archive stays resident after last activity.",
+    },
+    "PROXY_DIAG_SESSION_MAX": {
+        "defaults": {"all": "64"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max sessions kept in the in-memory ledger (FIFO eviction beyond this).",
+    },
+    "PROXY_DIAG_ARCHIVE_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Persist per-turn sent_view (final backend payload + injection marks) to "
+               "logs/diag/archive/<sid>.jsonl (R15).",
+    },
+    "PROXY_DIAG_ARCHIVE_MAX_MB": {
+        "defaults": {"all": "200"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Total archive size cap in MB; oldest session files are deleted beyond it.",
+    },
+    "PROXY_DIAG_TIMINGS_SOURCE": {
+        "defaults": {"all": "auto"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Where prompt-processed counts come from: auto (probe backend response "
+               "timings; fields stay null when unsupported) | off (never emit).",
+    },
+
     # ---- 后端启动参数（由 manage.sh 消费，代理运行时不读取，scope=module）----
     "LLAMA_BACKEND": {
         "defaults": {"all": "llama-server"},

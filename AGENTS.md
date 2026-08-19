@@ -65,6 +65,8 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`tool_parser.py`](tool_parser.py) | XML ↔ JSON 工具参数解析、`<tools>` 内容块 fallback、流式工具提取器 |
 | [`content_compressor.py`](content_compressor.py) | TokenSieve 语义压缩 + BM25 相关性驱动压缩（TS-1）：JSON / 代码 / 日志 / 文本的分层压缩。TS-4（2026-08-18 日志分析落地）：BM25 drop 分支改为类型感知结构化压缩（`_structured_compress`，json/code/log 保结构），结果超 `PROXY_BM25_DROP_TARGET_RATIO`（默认 0.45）再截断封顶；`PROXY_BM25_DROP_THRESHOLD` 默认 0.5→0.1；客户端断连（BrokenPipe）按 499 记账不再计 500 |
 | [`compression_types.py`](compression_types.py) | TS-3 统一压缩结果类型契约：`CompressionResult` / `CompressionSubResult` TypedDict（JSON 可序列化，兼容 Py3.8+） |
+| [`session_ledger.py`](session_ledger.py) | R14/R15 诊断存储：会话台账（action 轨迹 / dup / last_dup_turn / 材料清单，客户端原始历史增量扫描 + 前缀失配全量重建 → `canonical_mismatch`）+ sent_view 档案（`logs/diag/archive/<sid>.jsonl`，MB 上限，TTL 驱逐） |
+| [`diagnostics.py`](diagnostics.py) | R13/R16 诊断记录器：per-request 累积（7 处注入登记 / timings 能力探测 / token 事实）、`X-Proxy-Diag-*` 响应头、SSE 尾注 `: x-proxy-diag {...}`、`logs/diag/sessions.jsonl` per-turn 深度记录（request_id 与 proxy_metrics 关联）、lifecycle 事件（R7 兑现） |
 | [`truncation.py`](truncation.py) | 上下文截断：char / rounds / fifo / smart 策略、单遍合并压缩（L2 清除 + L4 thinking 剥离）、工具对原子保护（TS-2）、关键词索引、摘要缓存 |
 | [`lifecycle.py`](lifecycle.py) | 生命周期阶段分类（init/growth/expansion/saturation/oom_danger/pre_trunc）与动态 token 预算 |
 | [`loop_detection.py`](loop_detection.py) | 工具循环、文本输出循环、阻塞模式检测与干预 |
@@ -196,7 +198,12 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/queue` | 请求优先级队列状态（Phase 1 默认关闭）：`enabled`、`workers`、`waiting`、`by_bucket`、`oldest_wait_ms` |
 | GET | `/api/profiles` | 可用模型配置列表：`name`、`desc`、`memory_gb`、`active` |
 | GET | `/metrics[?n=N]` | 最近请求指标（JSON） |
-| GET | `/metrics/history` | 历史指标（JSON） |
+| GET | `/metrics/history[?session=K]` | 历史指标（JSON，R16 可选会话过滤） |
+| GET | `/api/sessions` | 活跃诊断会话列表（R14 发现端点）：`key`/`key_source`/`turns`/`last_seen` |
+| GET | `/api/session/<key>/ledger` | 会话台账（R14）：actions（dup/last_dup_turn）/ dup_queries / materials；404 未知、410 已驱逐 |
+| GET | `/api/session/<key>/archive?view=sent` | sent_view 档案（R15）：默认索引模式，`include_payload=true` 拉正文；canonical 视图 Phase 1 前 501 |
+| GET | `/api/session/<key>/metrics` | 会话诊断聚合（R16）：hit_ratio 分位、epoch/非 epoch 延迟分档、per-turn 时序 |
+| GET | `/api/backend/props` / `/api/backend/slots` | llama-server 原生端点只读反代；后端不支持时 501 结构化降级 |
 | POST | `/admin/route/force-local` / `force-cloud` | 会话级路由覆盖 |
 | POST | `/admin/reload` | HTTP 热重载（R12，等效 `manage.sh reload`，含模型目录重载） |
 | GET | `/status` | 人类可读 HTML 状态页 |
@@ -207,6 +214,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 - 多提供商分发（Phase B）：按模型解析目录 provider 凭证/并发锁；路由 `fallback_chain` 跨商降级（跳过冷却中/无 key 的提供商）；分商熔断互不影响；按模型目录价格计费 + 全局/分商预算双上限。
 - Anthropic 协议分发（Phase D）：provider 可声明 `protocol: anthropic`（双端点双 key：`anthropic_base_url` + `anthropic_key_env`）——该 provider 的模型走 `{anthropic_base_url}/v1/messages`（Anthropic 协议，如 Z.ai Coding Plan 订阅），SSE 原样透传、非流式直返 + `proxy_route` 归因；OpenAI 协议客户端自动跳过 anthropic 候选并沿链降级。当前 zhipu=protocol anthropic（订阅路径，glm 边际成本 0）。
 - **R8-R12 已全部交付（2026-08-15）**：R8 归因头四件套 `X-Proxy-Route-*`（含 Cost 与 local_forced）+ OpenAI 协议非流式 `proxy_route` 体字段；R9 `GET /api/route/policies`（脱敏目录 + `catalog_hash`）；R10 `/v1/models` 能力元数据（`real_model`/`thinking_*`/`json_compliance`/`context_chars`/`price`/`direct_capable`）；R11 `/api/status` `route_config` 段；R12 `POST /admin/reload`。CLI 侧配套 `./manage.sh models` / `models-validate`。
+- **R13-R16 诊断数据面已交付（2026-08-19，设计文档 [`docs/02-architecture-design/diagnostics-dataplane-design-20260819.md`](docs/02-architecture-design/diagnostics-dataplane-design-20260819.md)）**：R13 诊断归因双通道——非流式 HTTP 头 `X-Proxy-Diag-Request-Id` / `X-Proxy-Feedback-Injected`（csv）/ `X-Proxy-Prompt-Processed-N`（仅后端返回 timings 时，`hit_ratio = 1 − prompt_n/prompt_tokens`），流式经 SSE 注释行尾注 `: x-proxy-diag {...}`（message_stop / [DONE] 之前，规范保证被所有解析器忽略）；现有 7 处合成内容注入全部可计量。R14 台账 + `/api/sessions` 发现。R15 sent_view 每轮落盘（「模型实际所见」唯一权威）。R16 `logs/diag/sessions.jsonl` per-turn 深度记录 + `/api/status` `ctx_config` 段（bench 口径机读源）+ `lifecycle_events.jsonl` 激活（`canonical_mismatch`）。总开关 `PROXY_DIAG_ENABLED`。
 
 ### 4.4 后端类型自动检测
 
@@ -499,6 +507,18 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_QUEUE_LARGE_THRESHOLD_CHARS` | `80000` | large bucket 阈值（低优先级排队） |
 | `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理 |
 | `PROXY_QUEUE_HUGE_ACTION` | `cloud` | huge 处理：`cloud`（强制路由云端，需 `PROXY_ROUTE_ENABLED=true`）/ `reject`（413） |
+
+### 11.6 诊断数据面参数（R13-R16，全部 reloadable）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_DIAG_ENABLED` | `true` | 诊断数据面总开关（头/尾注/台账/档案/落盘） |
+| `PROXY_DIAG_SSE_TAIL` | `true` | 流式 SSE 尾注 `: x-proxy-diag`（关 = 纯头模式） |
+| `PROXY_DIAG_SESSION_TTL_MIN` | `180` | 台账/档案会话 TTL（分钟） |
+| `PROXY_DIAG_SESSION_MAX` | `64` | 内存台账会话数上限（FIFO 驱逐，驱逐后端点 410） |
+| `PROXY_DIAG_ARCHIVE_ENABLED` | `true` | sent_view 常态每轮落盘（`logs/diag/archive/`） |
+| `PROXY_DIAG_ARCHIVE_MAX_MB` | `200` | archive 磁盘总量上限（超限删最老会话文件） |
+| `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 

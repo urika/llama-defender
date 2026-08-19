@@ -14,6 +14,10 @@ Configurable via env vars:
   MOCK_FINISH      (default: "tool_calls") finish_reason in response
   MOCK_USAGE_PROMPT      (default: 100)
   MOCK_USAGE_COMPLETION  (default: 20)
+  MOCK_TIMINGS_PROMPT_N        (default: empty) when set, add llama-server style
+                               `timings` object (prompt_n/prompt_ms/predicted_*)
+                               — R13/R16 diagnostics integration tests
+  MOCK_TIMINGS_PREDICTED_N     (default: 10)
 
 Run:
   python3 test/integration/mock_backend.py [PORT]
@@ -38,12 +42,27 @@ PLAIN_TEXT = os.environ.get("MOCK_PLAIN_TEXT", "")
 FINISH = os.environ.get("MOCK_FINISH", "tool_calls")
 USAGE_PROMPT = int(os.environ.get("MOCK_USAGE_PROMPT", "100"))
 USAGE_COMPLETION = int(os.environ.get("MOCK_USAGE_COMPLETION", "20"))
+TIMINGS_PROMPT_N = os.environ.get("MOCK_TIMINGS_PROMPT_N", "")
+TIMINGS_PREDICTED_N = int(os.environ.get("MOCK_TIMINGS_PREDICTED_N", "10"))
+
+
+def _timings():
+    """llama-server style timings object (empty dict when not configured)."""
+    if not TIMINGS_PROMPT_N:
+        return {}
+    return {
+        "prompt_n": int(TIMINGS_PROMPT_N),
+        "prompt_ms": 123.4,
+        "predicted_n": TIMINGS_PREDICTED_N,
+        "predicted_ms": 45.6,
+    }
 
 
 def _build_response():
     """Return a canned OpenAI-format chat completion response."""
+    timings = _timings()
     if PLAIN_TEXT:
-        return {
+        resp = {
             "id": "chatcmpl-mock",
             "object": "chat.completion",
             "choices": [{
@@ -55,7 +74,10 @@ def _build_response():
                 "completion_tokens": USAGE_COMPLETION,
             },
         }
-    return {
+        if timings:
+            resp["timings"] = timings
+        return resp
+    resp = {
         "id": "chatcmpl-mock",
         "object": "chat.completion",
         "choices": [{
@@ -75,6 +97,9 @@ def _build_response():
             "completion_tokens": USAGE_COMPLETION,
         },
     }
+    if timings:
+        resp["timings"] = timings
+    return resp
 
 
 def _write_capture(body):
@@ -122,7 +147,40 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {"_raw": raw}
         _write_capture(body)
+        if body.get("stream"):
+            self._send_stream_response()
+            return
         self._send_json(200, _build_response())
+
+    def _send_stream_response(self):
+        """SSE 流式响应：2 个 content delta + 终块（usage + timings）+ [DONE]。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def _chunk(delta, finish=None, extra=None):
+            obj = {"id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if extra:
+                obj.update(extra)
+            return f"data: {json.dumps(obj)}\n\n".encode("utf-8")
+
+        final_extra = {"usage": {"prompt_tokens": USAGE_PROMPT,
+                                 "completion_tokens": USAGE_COMPLETION}}
+        timings = _timings()
+        if timings:
+            final_extra["timings"] = timings
+        chunks = [
+            _chunk({"role": "assistant", "content": ""}),
+            _chunk({"content": "hello "}),
+            _chunk({"content": "diag"}),
+            _chunk({}, finish="stop", extra=final_extra),
+            b"data: [DONE]\n\n",
+        ]
+        for c in chunks:
+            self.wfile.write(c)
+            self.wfile.flush()
 
 
 def main():

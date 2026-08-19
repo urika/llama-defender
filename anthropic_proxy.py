@@ -516,6 +516,19 @@ class Handler(BaseHTTPRequestHandler):
                             self.send_header("request-id", self._request_id)
                             self.end_headers()
                             self.wfile.write(html.encode("utf-8"))
+                # ---- R13-R16 诊断数据面端点（见 diagnostics-dataplane-design）----
+                elif self.path == "/api/sessions":
+                    # R14: 会话发现（key 契约见设计 D5）
+                    import session_ledger
+                    self._respond_json(session_ledger.LEDGER.list_sessions())
+                elif self.path.startswith("/api/session/"):
+                    if not self._handle_diag_session_endpoint():
+                        self._respond_json(
+                            {"error": {"type": "not_found", "message": "unknown session endpoint"}}, 404)
+                elif self.path == "/api/backend/props":
+                    self._handle_backend_props_endpoint("props")
+                elif self.path == "/api/backend/slots":
+                    self._handle_backend_props_endpoint("slots")
                 else:
                     self._respond_json({"detail": "Not found"}, 404)
             except Exception as e:
@@ -756,6 +769,19 @@ class Handler(BaseHTTPRequestHandler):
                 _req_id = self._request_id
                 self._last_jsonl_token = _next_jsonl_token()
                 _jsonl_output_map[self._last_jsonl_token] = 0
+                # R13-R16: 本请求诊断累积态初始化(key_source 记录会话 key 来源,
+                # 供 /api/sessions 暴露无头回退 key 的合并风险,设计 D5)
+                if PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.begin_request(
+                            _req_id, raw_sid[:8],
+                            "header" if self.headers.get("X-Claude-Code-Session-Id") else "fallback")
+                        mc = getattr(_metrics_ctx, 'mc', None)
+                        if mc:
+                            mc["request_id"] = _req_id
+                    except Exception:
+                        pass
                 # Phase 3: request failure snapshot — save original body before processing
                 _write_request_snapshot(_req_id, parsed)
                 _snapshot_written = False
@@ -818,8 +844,18 @@ class Handler(BaseHTTPRequestHandler):
                             mc["output_chars"] = _out_chars
                             mc["duration_ms"] = round(_dur, 1)
                             mc["status"] = _status
+                            if not mc.get("request_id"):
+                                mc["request_id"] = _req_id
                             _finalize_metrics(mc)
                             log_metrics(mc)
+                    # R16: per-turn 深度记录落盘(sessions.jsonl,经 request_id 与
+                    # proxy_metrics.jsonl 关联;canonical_mismatch → lifecycle 事件)
+                    if PROXY_DIAG_ENABLED:
+                        try:
+                            import diagnostics
+                            diagnostics.finalize_request(getattr(_metrics_ctx, 'mc', None) or {})
+                        except Exception:
+                            pass
                 except Exception as e:
                     _dur = (_time.monotonic() - _t0) * 1000
                     log(f"  -> Error: {e}", level="ERROR")
@@ -1062,6 +1098,8 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R13 诊断归因头
+        self._send_diag_headers()
         self.end_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
@@ -1117,7 +1155,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
         stream_finish_reason = None
-        last_chunk = None
         for line in resp:
             line = line.decode("utf-8").strip()
             if not line.startswith("data: "):
@@ -1127,7 +1164,6 @@ class Handler(BaseHTTPRequestHandler):
                 break
             try:
                 chunk = json.loads(data_str)
-                last_chunk = chunk
             except json.JSONDecodeError:
                 continue
 
@@ -1149,10 +1185,31 @@ class Handler(BaseHTTPRequestHandler):
             if timings:
                 input_tokens = timings.get("prompt_n", input_tokens)
                 output_tokens = timings.get("predicted_n", output_tokens)
+                # R13/R16: timings 扩展采集(prompt_ms/predicted_ms + 能力探测)
+                if PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        if diagnostics.probe_timings(timings):
+                            diagnostics.set_prompt_tokens(
+                                processed_n=timings.get("prompt_n"),
+                                prompt_eval_ms=timings.get("prompt_ms"),
+                                gen_ms=timings.get("predicted_ms"),
+                                generation_n=timings.get("predicted_n"))
+                    except Exception:
+                        pass
             usage = chunk.get("usage")
             if usage:
                 input_tokens = usage.get("prompt_tokens", input_tokens)
                 output_tokens = usage.get("completion_tokens", output_tokens)
+                # R13/R16: sent/usage 是 hit_ratio 分母(1 − prompt_n/prompt_tokens)
+                if PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.set_prompt_tokens(
+                            sent_n=usage.get("prompt_tokens"),
+                            generation_n=usage.get("completion_tokens"))
+                    except Exception:
+                        pass
 
             # Handle tool_calls in streaming
             tc_delta = delta.get("tool_calls")
@@ -1305,6 +1362,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(f"event: message_delta\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
+            # R13 流式通道: SSE 注释行尾注——message_stop 之前(设计 D1)。
+            # 注释行(: 前缀)被所有 SSE 解析器忽略(claude CLI/Anthropic SDK/OpenAI SDK)。
+            if PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
+                try:
+                    import diagnostics
+                    self.wfile.write(diagnostics.sse_tail_line(
+                        diagnostics.build_diag_payload()).encode("utf-8"))
+                except Exception:
+                    pass
+
             # Send message_stop
             event = {"type": "message_stop"}
             self.wfile.write(f"event: message_stop\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
@@ -1336,20 +1403,53 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R13 诊断归因头
+        self._send_diag_headers()
         self.end_headers()
 
         total_text = ""
         try:
             for line in resp:
+                # R13 流式通道: [DONE] 前插入诊断尾注(设计 D1,注释行规范保证被忽略)
+                try:
+                    _dec = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
+                except Exception:
+                    _dec = ""
+                if _dec == "data: [DONE]" and PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
+                    try:
+                        import diagnostics
+                        self.wfile.write(diagnostics.sse_tail_line(
+                            diagnostics.build_diag_payload()).encode("utf-8"))
+                    except Exception:
+                        pass
                 self.wfile.write(line)
                 try:
-                    decoded = line.decode("utf-8").strip()
+                    decoded = _dec
                     if decoded.startswith("data: "):
                         data_str = decoded[6:].strip()
                         if data_str and data_str != "[DONE]":
                             chunk = json.loads(data_str)
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
                             total_text += delta.get("content", "") or ""
+                            # R13/R16: 该透传路径此前完全不解析 usage/timings——
+                            # 补齐采集(OpenAI 协议流式的诊断数据来源)
+                            if PROXY_DIAG_ENABLED:
+                                try:
+                                    import diagnostics
+                                    _t = chunk.get("timings")
+                                    if diagnostics.probe_timings(_t):
+                                        diagnostics.set_prompt_tokens(
+                                            processed_n=_t.get("prompt_n"),
+                                            prompt_eval_ms=_t.get("prompt_ms"),
+                                            gen_ms=_t.get("predicted_ms"),
+                                            generation_n=_t.get("predicted_n"))
+                                    _u = chunk.get("usage")
+                                    if _u:
+                                        diagnostics.set_prompt_tokens(
+                                            sent_n=_u.get("prompt_tokens"),
+                                            generation_n=_u.get("completion_tokens"))
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
             self.wfile.flush()
@@ -1411,6 +1511,18 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R13 诊断归因头（X-Proxy-Diag-*），与 route headers 同机制
+        self._send_diag_headers()
+
+    def _send_diag_headers(self):
+        """R13: 发送暂存的 X-Proxy-Diag-* 响应头（发后清空，仿 _route_response_headers）。
+
+        值未知（如后端无 timings）的字段从不出现——时序诚实原则（设计 P1）。
+        """
+        diag_headers = getattr(self, '_diag_response_headers', None) or {}
+        for hk, hv in diag_headers.items():
+            self.send_header(hk, str(hv))
+        self._diag_response_headers = None
 
     def _handle_anthropic_stream_passthrough(self, resp, anthropic_body):
         """Relay an Anthropic-protocol SSE stream to the client unchanged (Phase D).
@@ -1433,6 +1545,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client disconnected
+        # R13 流式通道: 透传流结束后追加诊断尾注(该路径不解析 usage——云端
+        # anthropic 协议无 timings,token 字段按 P3 原则保持 null)
+        if PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
+            try:
+                import diagnostics
+                self.wfile.write(diagnostics.sse_tail_line(
+                    diagnostics.build_diag_payload()).encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
         if _first_token_time is not None:
             mc = getattr(_metrics_ctx, 'mc', None)
             if mc:
@@ -1483,6 +1605,8 @@ class Handler(BaseHTTPRequestHandler):
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, str(v))
+        # R13 诊断归因头（非流式路径含响应期回填的 Processed-N）
+        self._send_diag_headers()
         self.end_headers()
         log(f"  <- Response body: {raw[:500]}")
         self.wfile.write(raw_bytes)
@@ -1598,16 +1722,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_metrics_history_endpoint(self):
         from collections import defaultdict
+        from urllib.parse import parse_qs, urlparse
         metrics_dir = os.environ.get("PROXY_METRICS_DIR", "logs")
         metrics_path = os.path.join(metrics_dir, "proxy_metrics.jsonl")
+        # R16: ?session=<key> 过滤(会话维度历史,与 sessions.jsonl 互补)
+        sess_filter = (parse_qs(urlparse(self.path).query).get("session", [""])[0] or "").strip()
         records = []
         try:
             with open(metrics_path, "r") as f:
                 for line in f:
                     try:
-                        records.append(json.loads(line.strip()))
+                        rec = json.loads(line.strip())
                     except (json.JSONDecodeError, ValueError):
-                        pass
+                        continue
+                    if sess_filter and rec.get("session_id") != sess_filter:
+                        continue
+                    records.append(rec)
         except (FileNotFoundError, OSError):
             pass
         if not records:
@@ -1697,6 +1827,107 @@ class Handler(BaseHTTPRequestHandler):
                 "memory_rejected": b["memory_rejected"],
             })
         self._respond_json({"schema": "v2", "buckets": buckets})
+
+    # ------------------------------------------------------------------
+    # R13-R16 诊断数据面端点（docs/02-architecture-design/
+    # diagnostics-dataplane-design-20260819.md §4）
+    # ------------------------------------------------------------------
+    def _handle_diag_session_endpoint(self):
+        """R14/R15/R16: /api/session/<key>/{ledger,archive,metrics} 分发。
+
+        错误语义（集成契约 §4 fail-open）：未知 key → 404 JSON；已驱逐 → 410 +
+        evicted_at；canonical 视图 Phase 1 前未启用 → 501。
+        """
+        from urllib.parse import parse_qs, urlparse, unquote
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if len(parts) < 4 or parts[0] != "api" or parts[1] != "session":
+            return False
+        key = unquote(parts[2])[:64]
+        tail = parts[3]
+        params = parse_qs(urlparse(self.path).query)
+
+        def _q(name, default=None, cast=str):
+            vals = params.get(name, [])
+            if not vals:
+                return default
+            try:
+                return cast(vals[0])
+            except (TypeError, ValueError):
+                return default
+
+        import session_ledger
+        import diagnostics
+
+        if tail == "ledger":
+            ledger = session_ledger.LEDGER.build_ledger_json(
+                key, limit_turns=_q("limit_turns", None, int))
+            if ledger is None:
+                evicted = session_ledger.LEDGER.evicted_at(key)
+                if evicted:
+                    self._respond_json(
+                        {"error": {"type": "session_evicted", "evicted_at": evicted}}, 410)
+                else:
+                    self._respond_json({"error": {"type": "session_not_found"}}, 404)
+                return True
+            self._respond_json(ledger)
+            return True
+
+        if tail == "archive":
+            view = _q("view", "sent")
+            if view != "sent":
+                self._respond_json({
+                    "error": {
+                        "type": "view_not_enabled",
+                        "supported": False,
+                        "message": "only view=sent is available; canonical lands with "
+                                   "context-engineering Phase 1; client transcript is the "
+                                   "client's own record (perspective mismatch, design D7).",
+                    }}, 501)
+                return True
+            result, err = session_ledger.ARCHIVE.read(
+                key, turn=_q("turn", None, int),
+                limit=_q("limit", 50, int), offset=_q("offset", 0, int),
+                include_payload=_q("include_payload", "false") in ("true", "1"))
+            if err == "not_found":
+                self._respond_json({"error": {"type": "session_not_found"}}, 404)
+                return True
+            self._respond_json({"session_key": key, "view": "sent", **result})
+            return True
+
+        if tail == "metrics":
+            records = diagnostics.read_session_metrics(key)
+            if not records and not session_ledger.LEDGER.session_alive(key):
+                self._respond_json({"error": {"type": "session_not_found"}}, 404)
+                return True
+            self._respond_json(_build_session_metrics_json(key, records))
+            return True
+
+        return False
+
+    def _handle_backend_props_endpoint(self, which):
+        """llama-server 原生 /props、/slots 只读反代（R16 附表透传）。
+
+        后端不支持（rapid-mlx / cloud）→ 501 + {"supported": false}，
+        agent_go fail-open（设计 D9）。LLAMA_BASE 形如 http://host:port/v1，
+        原生端点挂在根路径。
+        """
+        if _ps.IS_CLOUD:
+            self._respond_json(
+                {"supported": False, "error": "cloud backend has no local slots/props"}, 501)
+            return
+        base = _ps.LLAMA_BASE.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        url = f"{base}/{which}"
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(url, method="GET")
+            with _ur.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            self._respond_json({"supported": True, "source": url, "data": data})
+        except Exception as e:
+            self._respond_json(
+                {"supported": False, "error": str(e)[:200], "source": url}, 501)
 
 
 lifecycle._get_system_memory = _get_system_memory

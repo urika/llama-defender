@@ -20,20 +20,15 @@
 | manage.sh 生命周期 | `start/stop/status/restart/reload/switch/watchdog`（pidfile + 日志 + 热重载 SIGHUP） |
 | 基础接口 | `GET /v1/models`、`GET /status`(HTML)、`GET /api/status`(JSON)、`GET /metrics`、`GET /api/profiles`、`GET /api/watchdog`、`POST /admin/route/force-local`、`POST /admin/route/force-cloud` |
 | **R8-R12 路由归因与部署可视** | **2026-08-15 全部交付**（模型目录 Phase B/C，commit b35b608/后续）。**R8** ✅ 四头 `X-Proxy-Route-Target(cloud\|local\|local_forced)/Actual-Model/Reason/Cost`（Cost 为预估，OpenAI 协议非流式响应体另带 `proxy_route` 实际 usage 计费字段）；**R9** ✅ `GET /api/route/policies`：providers（key 只回 `key_set` 布尔）+ models（tier/price/capabilities/direct_capable）+ preferences + defaults + `catalog_hash`（漂移检测）+ `api_version`；**R10** ✅ `/v1/models` metadata 增 `real_model/thinking_supported/thinking_required/json_compliance/context_chars/price/direct_capable/fallback_models`；**R11** ✅ `/api/status` 增 `route_config{route_enabled,cloud_model,cloud_key_set,cloud_concurrent}`；**R12** ✅ `POST /admin/reload`（幂等，等效 SIGHUP，含 configs/models.json 目录重载）；CLI 配套：`./manage.sh models` / `models-validate` |
+| **R13-R16 上下文工程诊断数据面** | **2026-08-19 全部交付**（设计文档 [02-architecture-design/diagnostics-dataplane-design-20260819.md](02-architecture-design/diagnostics-dataplane-design-20260819.md)）。**R13** ✅ 诊断归因双通道：非流式头 `X-Proxy-Diag-Request-Id` / `X-Proxy-Feedback-Injected`（7 处既有注入全部可计量）/ `X-Proxy-Prompt-Processed-N`（后端返回 timings 时），流式 SSE 尾注 `: x-proxy-diag {...}`；**R14** ✅ 台账 `GET /api/session/<key>/ledger`（dup/last_dup_turn/材料清单，增量扫描 + canonical_mismatch 重建）+ `GET /api/sessions` 发现端点；**R15** ✅ sent_view 档案 `GET /api/session/<key>/archive?view=sent`（每轮最终 payload 落盘，MB 上限/TTL）；**R16** ✅ `logs/diag/sessions.jsonl` per-turn 深度记录（request_id 关联、hit_ratio、is_epoch_turn 预留）+ `GET /api/session/<key>/metrics` 聚合 + `/metrics/history?session=` + `/api/status` `ctx_config` 段 + `/api/backend/props\|slots` 反代 + `lifecycle_events.jsonl` 激活（R7 兑现）；总开关 `PROXY_DIAG_ENABLED`（`PROXY_DIAG_*` 家族 SIGHUP 可热更） |
 
-### 0.2 待做（R13-R16，按优先级与四层闭环支撑映射）
+### 0.2 待做（当前无）
 
-> **2026-08-19 增补**：来自 [llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md)（上下文工程设计的数据面缺口），详尽定义以该文档为准。
-
-| 优先级 | 需求 | 支撑层 | 解决的 Gap |
-|--------|------|--------|-----------|
-| **P1 R13-R16** | 上下文工程诊断数据面：响应头扩展（Prompt-Processed-N / Epoch-Count / Feedback-Injected）+ 会话台账端点 + L4 档案查询 + /metrics 会话维度；另需透传 llama-server 原生 `timings` / `/props` / `/slots` | **④ 观测归因** | 缓存命中率 / 延迟分档 / 会话观测 / 压缩后行为复盘无数据源——详见 [llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md) |
-
-**四层闭环支撑**：① registry ← R10（已交付）；③ 部署拓扑 ← R9/R11/R12（已交付）；④ 观测归因 ← R8（已交付，决定 bench 成本/归因可信度）+ **R13-R16（当前缺口：上下文工程诊断数据面）**；② 角色绑定无代理依赖。
+R1-R16 已全部交付。上下文工程本体（canonical history / epoch 状态机 / 写入期压缩 / 复述块 / 合成负反馈）见 [llama-defender-context-engineering-design.md](llama-defender-context-engineering-design.md)——落地后点亮 `X-Proxy-Epoch-Count` 头、`is_epoch_turn` 分档字段与 archive `canonical` 视图（接口字段名均已预留）。
 
 ### 0.3 实施顺序
 
-`timings 透传（Phase 0 闸门）→ R13 → R16 → R14 → R15`（对齐上下文工程设计 Phase 划分：R13 头 + R16 基础落盘是 Phase 1 验收项，R14/R15 属 Phase 2，R15 视形态学复盘是否进 A/B）。R8-R12 已于 2026-08-15 按序全部完成。
+R13-R16 已于 2026-08-19 按 `timings 透传 → R13 → R16 → R14 → R15` 顺序全部完成（D-Phase 0-2 合并交付，见设计文档 §11）。
 
 ## 1. 需求场景
 

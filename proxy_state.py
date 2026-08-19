@@ -422,6 +422,36 @@ _WATCHDOG_STATE_PATH = os.path.join(_LOG_DIR, "watchdog_state.json")
 _LIFECYCLE_EVENTS_PATH = os.path.join(_LOG_DIR, "lifecycle_events.jsonl")
 
 # ---------------------------------------------------------------------------
+# R13-R16 diagnostics data plane (see docs/02-architecture-design/
+# diagnostics-dataplane-design-20260819.md)
+# ---------------------------------------------------------------------------
+# Runtime backend name (startup axis, from LLAMA_BACKEND env set by configs/*.conf
+# via manage.sh). "unknown" when not provided — runtime code must not rely on it
+# for correctness, only for capability hints / display.
+PROXY_BACKEND_NAME = os.environ.get("LLAMA_BACKEND", "") or "unknown"
+
+PROXY_DIAG_ENABLED = os.environ.get(
+    "PROXY_DIAG_ENABLED", get_default("PROXY_DIAG_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_DIAG_SSE_TAIL = os.environ.get(
+    "PROXY_DIAG_SSE_TAIL", get_default("PROXY_DIAG_SSE_TAIL")).lower() in ("1", "true", "yes")
+PROXY_DIAG_SESSION_TTL_MIN = int(os.environ.get(
+    "PROXY_DIAG_SESSION_TTL_MIN", get_default("PROXY_DIAG_SESSION_TTL_MIN")))
+PROXY_DIAG_SESSION_MAX = int(os.environ.get(
+    "PROXY_DIAG_SESSION_MAX", get_default("PROXY_DIAG_SESSION_MAX")))
+PROXY_DIAG_ARCHIVE_ENABLED = os.environ.get(
+    "PROXY_DIAG_ARCHIVE_ENABLED", get_default("PROXY_DIAG_ARCHIVE_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_DIAG_ARCHIVE_MAX_MB = int(os.environ.get(
+    "PROXY_DIAG_ARCHIVE_MAX_MB", get_default("PROXY_DIAG_ARCHIVE_MAX_MB")))
+PROXY_DIAG_TIMINGS_SOURCE = os.environ.get(
+    "PROXY_DIAG_TIMINGS_SOURCE", get_default("PROXY_DIAG_TIMINGS_SOURCE"))
+
+_DIAG_DIR = os.path.join(_LOG_DIR, "diag")
+_DIAG_SESSIONS_PATH = os.path.join(_DIAG_DIR, "sessions.jsonl")
+_DIAG_ARCHIVE_DIR = os.path.join(_DIAG_DIR, "archive")
+_diag_lock = threading.Lock()
+_diag_ctx = threading.local()  # per-request diagnostics accumulation (see diagnostics.py)
+
+# ---------------------------------------------------------------------------
 # Intelligent model routing
 # ---------------------------------------------------------------------------
 PROXY_ROUTE_ENABLED = os.environ.get("PROXY_ROUTE_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -955,6 +985,14 @@ _RELOAD_SPEC = [
     ("PROXY_QUEUE_LARGE_THRESHOLD_CHARS", "PROXY_QUEUE_LARGE_THRESHOLD_CHARS", "int", "80000", "80000"),
     ("PROXY_QUEUE_HUGE_THRESHOLD_CHARS", "PROXY_QUEUE_HUGE_THRESHOLD_CHARS", "int", "350000", "350000"),
     ("PROXY_QUEUE_HUGE_ACTION", "PROXY_QUEUE_HUGE_ACTION", "str", "cloud", "cloud"),
+    # R13-R16 诊断数据面（reloadable 开关；路径类为 module 常量不热更）
+    ("PROXY_DIAG_ENABLED", "PROXY_DIAG_ENABLED", "bool", "true", "true"),
+    ("PROXY_DIAG_SSE_TAIL", "PROXY_DIAG_SSE_TAIL", "bool", "true", "true"),
+    ("PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_TTL_MIN", "int", "180", "180"),
+    ("PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_SESSION_MAX", "int", "64", "64"),
+    ("PROXY_DIAG_ARCHIVE_ENABLED", "PROXY_DIAG_ARCHIVE_ENABLED", "bool", "true", "true"),
+    ("PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_ARCHIVE_MAX_MB", "int", "200", "200"),
+    ("PROXY_DIAG_TIMINGS_SOURCE", "PROXY_DIAG_TIMINGS_SOURCE", "str", "auto", "auto"),
 ]
 
 
@@ -1039,6 +1077,11 @@ __all__ = [
     "LLAMA_BASE", "LLAMA_API_KEY", "BACKEND_TYPE", "IS_CLOUD", "_strategy", "_SCRIPT_DIR",
     # Status API / agent_go integration
     "PROXY_STATUS_API_VERSION", "_ACTIVE_CONF_PATH", "_WATCHDOG_STATE_PATH", "_LIFECYCLE_EVENTS_PATH",
+    # R13-R16 diagnostics data plane
+    "PROXY_BACKEND_NAME", "PROXY_DIAG_ENABLED", "PROXY_DIAG_SSE_TAIL",
+    "PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_ARCHIVE_ENABLED",
+    "PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_TIMINGS_SOURCE",
+    "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
     # Tool-result clearing

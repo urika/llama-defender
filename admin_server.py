@@ -354,6 +354,8 @@ def _build_status_json():
             "model_name": backend_model_name or _ps.MODEL_NAME,
             "backend_type": _ps.BACKEND_TYPE or ("rapid-mlx" if not _ps.IS_CLOUD else "cloud"),
             "base_url": _ps.LLAMA_BASE,
+            # R13-R16: 运行时后端名（启动轴 LLAMA_BACKEND，manage.sh source conf 注入）
+            "name": getattr(_ps, "PROXY_BACKEND_NAME", "unknown"),
         },
         "active_profile": active_profile,
         "state": state,
@@ -365,6 +367,16 @@ def _build_status_json():
             "cloud_model": _ps.PROXY_CLOUD_MODEL,
             "cloud_key_set": bool(_ps.PROXY_CLOUD_API_KEY),
             "cloud_concurrent": _ps.PROXY_ROUTE_CLOUD_CONCURRENT,
+        },
+        # R16: context-engineering config digest（仿 R11 route_config 先例）—
+        # bench manifest 口径标注的机读数据源（上游设计 §9 P0-1）。
+        # epoch_S / window_K 在上下文工程 Phase 1 落地前为 None。
+        "ctx_config": {
+            "diag_enabled": bool(getattr(_ps, "PROXY_DIAG_ENABLED", False)),
+            "compression_mode": getattr(_ps, "PROXY_COMPRESS_MODE", None),
+            "feedback_injection_enabled": False,  # 合成负反馈 Phase 2 落地后接线
+            "epoch_S": None,
+            "window_K": None,
         },
     }
 # --- _build_watchdog_json ---
@@ -2719,6 +2731,61 @@ def _mc_put(step_key, data):
     if mc and _ps.PROXY_METRICS_ENABLED:
         mc["pipeline"][step_key] = data
 
+# --- _build_session_metrics_json ---
+def _build_session_metrics_json(session_key, records):
+    """R16: GET /api/session/<key>/metrics 聚合体（设计 §4.4）。
+
+    records 来自 diagnostics.read_session_metrics(sessions.jsonl 的 per-turn
+    深度记录)。latency_by_kind 的 epoch/非 epoch 分档是上下文工程 Phase 1
+    验收门禁 2（非 epoch 轮 P90 <15s / epoch 轮 <60s）的出数前提——is_epoch_turn
+    为 null 的记录归 normal_turn 桶。
+    """
+    hit_ratios = [r.get("hit_ratio") for r in records
+                  if isinstance(r.get("hit_ratio"), (int, float))]
+    ttfts = [r.get("ttft_ms") for r in records
+             if isinstance(r.get("ttft_ms"), (int, float))]
+    durs_normal, durs_epoch = [], []
+    injection_counts = {}
+    for r in records:
+        bucket = durs_epoch if r.get("is_epoch_turn") else durs_normal
+        d = r.get("duration_ms")
+        if isinstance(d, (int, float)) and d > 0:
+            bucket.append(d)
+        for k in r.get("feedback_injected") or []:
+            injection_counts[k] = injection_counts.get(k, 0) + 1
+    series = [{
+        "turn": r.get("turn"),
+        "hit_ratio": r.get("hit_ratio"),
+        "ttft_ms": r.get("ttft_ms"),
+        "duration_ms": r.get("duration_ms"),
+        "prompt_processed_tokens": r.get("prompt_processed_tokens"),
+        "is_epoch_turn": r.get("is_epoch_turn"),
+        "feedback_injected": r.get("feedback_injected"),
+        "canonical_mismatch": r.get("canonical_mismatch"),
+    } for r in records[-200:]]
+    return {
+        "session_key": session_key,
+        "turns": len(records),
+        "hit_ratio_p50": round(_percentile(hit_ratios, 0.5), 4) if hit_ratios else None,
+        "hit_ratio_p90": round(_percentile(hit_ratios, 0.9), 4) if hit_ratios else None,
+        "ttft_p50_ms": round(_percentile(ttfts, 0.5), 1) if ttfts else None,
+        "ttft_p90_ms": round(_percentile(ttfts, 0.9), 1) if ttfts else None,
+        "latency_by_kind": {
+            "normal_turn": {
+                "count": len(durs_normal),
+                "p90_ms": round(_percentile(durs_normal, 0.9), 1) if durs_normal else None,
+            },
+            "epoch_turn": {
+                "count": len(durs_epoch),
+                "p90_ms": round(_percentile(durs_epoch, 0.9), 1) if durs_epoch else None,
+            },
+        },
+        "epoch_count": (records[-1].get("epoch_count") if records else None),
+        "injection_counts": injection_counts,
+        "canonical_mismatch_count": sum(1 for r in records if r.get("canonical_mismatch")),
+        "series": series,
+    }
+
 __all__ = [
     "_run",
     "_get_process_info",
@@ -2753,4 +2820,5 @@ __all__ = [
     "_build_session_html",
     "_finalize_metrics",
     "_mc_put",
+    "_build_session_metrics_json",
 ]

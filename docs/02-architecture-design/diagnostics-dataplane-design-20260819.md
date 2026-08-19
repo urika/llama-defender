@@ -1,6 +1,6 @@
 # llama-defender 诊断数据面设计（R13-R16：缓存 / 会话 / 行为复盘观测）
 
-> 状态：设计 v1.0（2026-08-19，基于需求评估与代码现状探索定稿）
+> 状态：设计 v1.0 → **已实施（2026-08-19，D-Phase 0-2 合并交付）**。新增模块 `diagnostics.py` + `session_ledger.py`；`X-Proxy-Epoch-Count`、`is_epoch_turn`、archive `canonical` 视图按计划预留 null/501，待上下文工程 Phase 1 落地后点亮。单元测试 45 个（`test_diagnostics.py` + `test_session_ledger.py`）。
 > 需求来源：[llama-defender-integration-requirements.md §3.2](../llama-defender-integration-requirements.md)（R13-R16）
 > 上游设计：[llama-defender-context-engineering-design.md §10](../llama-defender-context-engineering-design.md)（数据面缺口与分层）
 > 目标：为上下文工程改造（append-only + epoch 压缩）提供**观测先行**的数据面：缓存命中率 / 延迟分档 / 会话台账 / 压缩后行为复盘四域的结构化数据源，全部经「响应头 + 端点 + jsonl」供 agent_go / 批跑 harness 消费。

@@ -393,6 +393,20 @@ class RequestParser(PipelineStage):
         # Initialize messages from body
         ctx.messages = body.get("messages", [])
 
+        # R14: 台账旁路扫描——客户端原始 Anthropic 视图(stage 5 压缩/注入之前),
+        # 增量 diff + dup/材料派生(设计 D3);前缀失配 → canonical_mismatch。
+        if _ps.PROXY_DIAG_ENABLED and ctx.session_id:
+            try:
+                import session_ledger
+                _turn = _ps._SESSION_REQUEST_COUNT.get(ctx.session_id, 0) + 1
+                if session_ledger.LEDGER.record_request(
+                        ctx.session_id, ctx.messages, _turn,
+                        key_source=getattr(_ps._diag_ctx, "key_source", "unknown")):
+                    import diagnostics
+                    diagnostics.mark_canonical_mismatch()
+            except Exception:
+                pass
+
         # Extract X-Proxy-Route-To header override (pre-extracted by Handler.do_POST)
         route_override = body.get("_x_proxy_route_to", "")
         ctx._route_header_override = route_override if route_override in ("local", "cloud") else ""
@@ -868,6 +882,12 @@ class RouteNotification(PipelineStage):
             "role": "user",
             "content": [{"type": "text", "text": notice}],
         })
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("route_notice")
+            except Exception:
+                pass
 
         log(
             f"  -> [route_notification] Session {session_id} switched to cloud "
@@ -999,6 +1019,12 @@ class BlockerDetector(ConditionalStage):
                 blocker_info["error_type"],
                 blocker_info["run_length"],
             ))
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    diagnostics.record_injection("blocker")
+                except Exception:
+                    pass
 
         return ctx
 
@@ -1314,6 +1340,12 @@ class SessionLoopState(PipelineStage):
                     f"Continue with a DIFFERENT approach. Do NOT repeat previous actions.]"
                 }]
             })
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    diagnostics.record_injection("session_loop_warning")
+                except Exception:
+                    pass
 
         return ctx
 
@@ -1367,6 +1399,14 @@ class LoopIntervention(PipelineStage):
             if loop_level >= 2 and raw_tools is not None and new_tools != raw_tools:
                 ctx.body["tools"] = new_tools
             ctx.messages = new_messages
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    # kind 契约: loop_l1/l2/l3 或 text_loop(设计 D6,agent_go metering 依赖)
+                    diagnostics.record_injection(
+                        "text_loop" if loop_tool_name == "text_loop" else f"loop_l{loop_level}")
+                except Exception:
+                    pass
             if loop_tool_name == "text_loop":
                 log(f"  -> TEXT LOOP LEVEL {loop_level}: text_run={ctx.text_loop_run} max_run={ctx.max_run}")
             else:
@@ -1475,6 +1515,12 @@ class RereadDetector(PipelineStage):
                     }]
                 })
                 log(f"  -> Re-read HARD BLOCK injected for: {blocked_files}")
+                if _ps.PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.record_injection("reread_hard")
+                    except Exception:
+                        pass
 
         ctx.re_read_info = re_read_info
         return ctx
@@ -1557,6 +1603,13 @@ class ContextTruncator(ConditionalStage):
         ctx.trunc_stats = trunc_stats
 
         if trunc_stats.get("truncated"):
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    # 截断会注入结构化摘要占位(DEF-107)——按合成内容计量
+                    diagnostics.record_injection("truncation_summary")
+                except Exception:
+                    pass
             strategy = trunc_stats.get("strategy", "char")
             if strategy == "rounds":
                 chars_after = trunc_stats.get("chars", trunc_stats.get("estimated_tokens", "?"))
@@ -1671,6 +1724,12 @@ class HighDropRatioNotice(ConditionalStage):
                     "content": [{"type": "text", "text": notice}],
                 })
                 ctx.high_drop_notice_injected = True
+                if _ps.PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.record_injection("high_drop_notice")
+                    except Exception:
+                        pass
                 log(f"  -> High drop ratio notice injected ({dropped}/{dropped + kept} = "
                     f"{dropped / (kept + dropped) * 100:.0f}%)")
 
@@ -2163,6 +2222,13 @@ class BackendDispatcher(PipelineStage):
             "X-Proxy-Route-Reason": reason,
             "X-Proxy-Route-Cost": "%.6f" % cost,
         }
+        # R13: 诊断记录与 R8 头同源(fallback 重写 route 时保持一致)
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.set_route(display, actual)
+            except Exception:
+                pass
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         target = getattr(ctx, '_route_target', 'local')
@@ -2218,6 +2284,19 @@ class BackendDispatcher(PipelineStage):
 
         # R8 route-attribution response headers (X-Proxy-Route-* contract names)
         self._set_route_headers(ctx)
+
+        # R13: 诊断归因头(早期已知字段: Request-Id + 注入标记——管线 stage
+        # 2.6-15 的注入到此已全部登记;Processed-N 属响应期字段,见 _do_dispatch
+        # 与 SSE 尾注)。流式/非流式响应路径统一经 _diag_response_headers 发送。
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                self._handler._diag_response_headers = diagnostics.diag_headers(
+                    getattr(self._handler, '_request_id', ''),
+                    diagnostics.peek_injections(),
+                )
+            except Exception:
+                pass
 
         if target == 'cloud':
             # Iterate the catalog candidates: primary model first, then the
@@ -2526,6 +2605,15 @@ class BackendDispatcher(PipelineStage):
             )
             return
 
+        # R15: sent_view 档案——实际发给后端的最终 payload(model 已按路由定稿),
+        # "模型实际所见"的唯一权威(设计 D7),形态学复盘以此为准。
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.capture_sent_view(ctx)
+            except Exception:
+                pass
+
         req = urllib.request.Request(
             f"{base_url}/chat/completions",
             data=body_bytes,
@@ -2560,6 +2648,33 @@ class BackendDispatcher(PipelineStage):
                     usage = openai_resp.get("usage") or {}
                     self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                     self._output_tokens = usage.get("completion_tokens", self._output_tokens)
+                    # R13/R16 (非流式): timings.prompt_n = 实算 prefill 数(缓存
+                    # 未命中部分);无 timings 的后端字段保持缺省(P1 不发假值)。
+                    if _ps.PROXY_DIAG_ENABLED:
+                        try:
+                            import diagnostics as _diag
+                            _t = openai_resp.get("timings")
+                            if _diag.probe_timings(_t):
+                                _diag.set_prompt_tokens(
+                                    processed_n=_t.get("prompt_n"),
+                                    prompt_eval_ms=_t.get("prompt_ms"),
+                                    gen_ms=_t.get("predicted_ms"),
+                                    generation_n=_t.get("predicted_n"),
+                                    sent_n=usage.get("prompt_tokens"),
+                                )
+                            else:
+                                _diag.set_prompt_tokens(
+                                    sent_n=usage.get("prompt_tokens"),
+                                    generation_n=usage.get("completion_tokens"),
+                                )
+                            # 非流式头补 Processed-N(此时 _respond_json 尚未发生)
+                            _processed = getattr(_ps._diag_ctx, "prompt_processed_tokens", None)
+                            if isinstance(_processed, int):
+                                _dh = getattr(self._handler, "_diag_response_headers", None) or {}
+                                _dh["X-Proxy-Prompt-Processed-N"] = str(_processed)
+                                self._handler._diag_response_headers = _dh
+                        except Exception:
+                            pass
                     # R8 (非流式): usage-based actual cost + proxy_route body field
                     # on OpenAI-protocol responses (Anthropic-format responses carry
                     # attribution via headers — body field would be dropped by the
@@ -2630,6 +2745,21 @@ class BackendDispatcher(PipelineStage):
         anthropic_req.pop("_x_proxy_route_to", None)
         body_bytes = json.dumps(anthropic_req, ensure_ascii=False).encode("utf-8")
 
+        # R15: sent_view(anthropic-protocol 云端路径)——转换后的最终 payload
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                import session_ledger
+                _sk = getattr(ctx, "session_id", "")
+                if _sk:
+                    session_ledger.ARCHIVE.append_turn(
+                        _sk, _ps._SESSION_REQUEST_COUNT.get(_sk, 0) or 1,
+                        payload=anthropic_req, injections=diagnostics.peek_injections(),
+                        meta={"model": cand["model"], "route_target": getattr(ctx, "_route_target", None),
+                              "messages": len(anthropic_req.get("messages", []) or [])})
+            except Exception:
+                pass
+
         if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
             log(f"  -> Request body too large for anthropic backend: "
                 f"{len(body_bytes)} > {_ps.PROXY_CLOUD_MAX_REQUEST_BYTES}")
@@ -2670,6 +2800,15 @@ class BackendDispatcher(PipelineStage):
                     usage = anth_resp.get("usage") or {}
                     self._input_tokens = usage.get("input_tokens", self._input_tokens)
                     self._output_tokens = usage.get("output_tokens", self._output_tokens)
+                    # R16: 云端 anthropic 路径 token 事实(无 timings——P3 降级为 null)
+                    if _ps.PROXY_DIAG_ENABLED:
+                        try:
+                            import diagnostics as _diag
+                            _diag.set_prompt_tokens(
+                                sent_n=usage.get("input_tokens"),
+                                generation_n=usage.get("output_tokens"))
+                        except Exception:
+                            pass
                     pin, pout = self._model_prices(cand["model"])
                     ctx._route_actual_cost = round(
                         (self._input_tokens * pin + self._output_tokens * pout) / 1_000_000, 6)
