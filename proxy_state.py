@@ -98,7 +98,7 @@ def _default(env_key, cloud_val, local_val):
 
 PROXY_MAX_CONCURRENT = int(os.environ.get("PROXY_MAX_CONCURRENT", _default("PROXY_MAX_CONCURRENT", "4", "1")))
 _llama_lock = threading.Semaphore(PROXY_MAX_CONCURRENT)
-MODEL_NAME = os.environ.get("MODEL_NAME", _default("MODEL_NAME", "deepseek-v4-pro", "mlx-community/Qwen3.6-35B-A3B-4bit"))
+MODEL_NAME = os.environ.get("MODEL_NAME", _default("MODEL_NAME", "deepseek-v4-pro", "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"))
 
 # ---------------------------------------------------------------------------
 # Tool-result clearing: proxy-side context management
@@ -447,10 +447,18 @@ PROXY_DIAG_ARCHIVE_MAX_MB = int(os.environ.get(
     "PROXY_DIAG_ARCHIVE_MAX_MB", get_default("PROXY_DIAG_ARCHIVE_MAX_MB")))
 PROXY_DIAG_TIMINGS_SOURCE = os.environ.get(
     "PROXY_DIAG_TIMINGS_SOURCE", get_default("PROXY_DIAG_TIMINGS_SOURCE"))
+# A3 台账持久化(logging-trajectory-improvement-design-20260820 Phase A)：
+# R14 台账增量落盘 logs/diag/ledger/<sid>.jsonl，端点内存优先、档案兜底——
+# agent_go 轮级看门狗(集成契约 §3.2 / 上下文工程 §9 P1-4)跨重启不失忆。
+PROXY_DIAG_LEDGER_ENABLED = os.environ.get(
+    "PROXY_DIAG_LEDGER_ENABLED", get_default("PROXY_DIAG_LEDGER_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_DIAG_LEDGER_MAX_MB = int(os.environ.get(
+    "PROXY_DIAG_LEDGER_MAX_MB", get_default("PROXY_DIAG_LEDGER_MAX_MB")))
 
 _DIAG_DIR = os.path.join(_LOG_DIR, "diag")
 _DIAG_SESSIONS_PATH = os.path.join(_DIAG_DIR, "sessions.jsonl")
 _DIAG_ARCHIVE_DIR = os.path.join(_DIAG_DIR, "archive")
+_DIAG_LEDGER_DIR = os.path.join(_DIAG_DIR, "ledger")
 _diag_lock = threading.Lock()
 _diag_ctx = threading.local()  # per-request diagnostics accumulation (see diagnostics.py)
 
@@ -995,6 +1003,8 @@ _RELOAD_SPEC = [
     ("PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_SESSION_MAX", "int", "64", "64"),
     ("PROXY_DIAG_ARCHIVE_ENABLED", "PROXY_DIAG_ARCHIVE_ENABLED", "bool", "true", "true"),
     ("PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_ARCHIVE_MAX_MB", "int", "200", "200"),
+    ("PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_ENABLED", "bool", "true", "true"),
+    ("PROXY_DIAG_LEDGER_MAX_MB", "PROXY_DIAG_LEDGER_MAX_MB", "int", "100", "100"),
     ("PROXY_DIAG_TIMINGS_SOURCE", "PROXY_DIAG_TIMINGS_SOURCE", "str", "auto", "auto"),
 ]
 
@@ -1084,7 +1094,8 @@ __all__ = [
     "PROXY_BACKEND_NAME", "PROXY_DIAG_ENABLED", "PROXY_DIAG_SSE_TAIL",
     "PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_ARCHIVE_ENABLED",
     "PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_TIMINGS_SOURCE",
-    "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_diag_lock", "_diag_ctx",
+    "PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_MAX_MB",
+    "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_DIAG_LEDGER_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
     # Tool-result clearing

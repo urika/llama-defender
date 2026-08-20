@@ -30,6 +30,8 @@ MAX_ACTIONS_PER_SESSION = 5000
 MAX_ARCHIVE_PAYLOAD_CHARS = 400_000
 # 每隔多少次 archive append 检查一次磁盘总量
 ARCHIVE_SIZE_CHECK_INTERVAL = 64
+# A3: 每隔多少次 ledger 落盘检查一次磁盘总量(同 archive 模式)
+LEDGER_SIZE_CHECK_INTERVAL = 64
 
 # Bash 输出中识别"产出文件"的保守启发式(材料清单,设计 D3)
 _MATERIAL_RE = re.compile(
@@ -153,6 +155,7 @@ class LedgerStore(object):
         self._sessions = collections.OrderedDict()  # key → entry (FIFO 驱逐依赖有序)
         self._evicted = {}  # key → evicted_at iso (410 语义)
         self._archive_writes = 0
+        self._ledger_writes = 0
 
     # ------------------------------------------------------------- record --
     def record_request(self, session_key, messages, turn, key_source="unknown"):
@@ -160,6 +163,9 @@ class LedgerStore(object):
 
         在管线 stage 0(RequestParser)之后调用——messages 必须是客户端原始
         Anthropic 格式,任何压缩/注入之前的视图。
+
+        A3: 每请求的动作增量落盘 logs/diag/ledger/<sid>.jsonl(内存丢失后
+        R14 端点可从档案重建——agent_go 轮级看门狗跨重启不失忆)。
         """
         if not _ps.PROXY_DIAG_ENABLED or not session_key:
             return False
@@ -206,12 +212,26 @@ class LedgerStore(object):
             entry["msg_count"] = len(messages or [])
             entry["msg_hashes"] = hashes
 
-            self._scan_window(entry, window, turn or 1)
+            # A3: 采集本轮增量(供落盘)——计数器在扫描前后取差值
+            _dropped_before = entry["aggregated_dropped"]
+            _materials_before = len(entry["materials"])
+            new_actions, cross_fills = self._scan_window(entry, window, turn or 1)
+            _new_materials = list(entry["materials"][_materials_before:])
+            self._persist_delta_locked(
+                session_key, entry, turn or 1, mismatch, new_actions, cross_fills,
+                _new_materials, entry["aggregated_dropped"] - _dropped_before)
             self._evict_locked(now)
             return mismatch
 
     def _scan_window(self, entry, window, turn):
-        """处理增量窗口内的消息: tool_use/tool_result 配对 → action 记录。"""
+        """处理增量窗口内的消息: tool_use/tool_result 配对 → action 记录。
+
+        A3: 返回 (new_actions, cross_fills)——本轮新增 action 与对既往
+        action 的 result 回填,供台账落盘增量重建使用。
+        """
+        new_actions = []
+        cross_fills = []
+        _new_action_ids = set()  # id() 身份集合: 区分本窗口新增 vs 跨请求回填
         for msg in window:
             role = msg.get("role")
             if role == "assistant":
@@ -231,6 +251,8 @@ class LedgerStore(object):
                             "_tid": block.get("id") or f"{thash}:{len(entry['actions'])}",
                         }
                         self._append_action(entry, action)
+                        new_actions.append(action)
+                        _new_action_ids.add(id(action))
                         self._collect_material_from_args(entry, tool, args, turn)
             elif role == "user":
                 for block in _iter_blocks(msg):
@@ -240,6 +262,11 @@ class LedgerStore(object):
                         for act in reversed(entry["actions"]):
                             if act.get("_tid") == tid and act.get("result_chars") is None:
                                 act["result_chars"] = _result_chars(block)
+                                # 本窗口新增的 action 已随 action 行落盘(含回填值);
+                                # 仅跨请求回填需要单独记录
+                                if id(act) not in _new_action_ids:
+                                    cross_fills.append(
+                                        {"_tid": tid, "result_chars": act["result_chars"]})
                                 # Bash 类命令输出跑材料启发式(saved/created 模式)
                                 if "bash" in (act.get("tool") or "").lower() \
                                         or "shell" in (act.get("tool") or "").lower() \
@@ -250,6 +277,7 @@ class LedgerStore(object):
                         else:
                             # result 无配对(孤儿/压缩后残留)——材料启发式仍可跑
                             self._collect_material_from_text(entry, _result_text(block), turn)
+        return new_actions, cross_fills
 
     def _append_action(self, entry, action):
         actions = entry["actions"]
@@ -299,11 +327,17 @@ class LedgerStore(object):
 
     # -------------------------------------------------------------- query --
     def build_ledger_json(self, session_key, limit_turns=None):
-        """R14: GET /api/session/<key>/ledger 响应体。未知会话 → None。"""
+        """R14: GET /api/session/<key>/ledger 响应体。未知会话 → None。
+
+        A3: 内存优先,内存无(重启/TTL 驱逐)时从台账档案重建(契约验收:
+        跨重启 5 分钟内可查;内存驱逐 ≠ 档案删除——驱逐会话有档案仍 200)。
+        """
         with self._lock:
             entry = self._sessions.get(session_key)
             if entry is None:
-                return None
+                entry = self._load_from_file(session_key)
+                if entry is None:
+                    return None
             actions = [dict(a) for a in entry["actions"]]
             materials = list(entry["materials"])
             entry_turn = entry["turn"]
@@ -376,6 +410,120 @@ class LedgerStore(object):
     def session_alive(self, session_key):
         with self._lock:
             return session_key in self._sessions
+
+    # ---------------------------------------------------- A3 persistence --
+    def _ledger_path(self, session_key):
+        return os.path.join(_ps._DIAG_LEDGER_DIR, sanitize_session_key(session_key) + ".jsonl")
+
+    def _persist_delta_locked(self, session_key, entry, turn, mismatch,
+                              new_actions, cross_fills, new_materials, dropped_delta):
+        """A3: 每请求动作增量落盘(调用方持 self._lock;写失败静默——archive 同模式)。
+
+        增量行 schema: {ts, turn, mismatch, msg_count, key_source, dropped,
+                        actions: [action dict...], filled: [{_tid, result_chars}...],
+                        materials: [{path, turn, via}...]}
+        mismatch 行的 actions 为全量重建结果(重放时清空再灌)。
+        """
+        if not getattr(_ps, "PROXY_DIAG_LEDGER_ENABLED", True):
+            return
+        try:
+            record = {
+                "ts": datetime.now().isoformat(),
+                "turn": turn,
+                "mismatch": bool(mismatch),
+                "msg_count": entry["msg_count"],
+                "key_source": entry["key_source"],
+                "dropped": int(dropped_delta),
+                "actions": [dict(a) for a in new_actions],
+                "filled": list(cross_fills),
+                "materials": [dict(m) for m in new_materials],
+            }
+            os.makedirs(_ps._DIAG_LEDGER_DIR, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False) + "\n"
+            with open(self._ledger_path(session_key), "a", encoding="utf-8") as f:
+                f.write(line)
+            self._ledger_writes += 1
+            if self._ledger_writes % LEDGER_SIZE_CHECK_INTERVAL == 0:
+                self._enforce_ledger_cap_locked()
+        except OSError:
+            pass
+
+    def _enforce_ledger_cap_locked(self):
+        """ledger 目录总量 MB 上限: 删最老会话文件(archive 同模式)。"""
+        cap = max(10, getattr(_ps, "PROXY_DIAG_LEDGER_MAX_MB", 100)) * 1024 * 1024
+        try:
+            files = []
+            for name in os.listdir(_ps._DIAG_LEDGER_DIR):
+                p = os.path.join(_ps._DIAG_LEDGER_DIR, name)
+                if os.path.isfile(p):
+                    files.append((os.path.getmtime(p), os.path.getsize(p), p))
+            total = sum(sz for _, sz, _ in files)
+            if total <= cap:
+                return
+            files.sort()
+            for _, sz, p in files:
+                if total <= cap:
+                    break
+                try:
+                    os.remove(p)
+                    total -= sz
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _load_from_file(self, session_key):
+        """从台账档案重建 entry(内存未命中时;无档案 → None)。调用方持锁。"""
+        path = self._ledger_path(session_key)
+        if not os.path.isfile(path):
+            return None
+        entry = {
+            "actions": [], "msg_count": 0, "msg_hashes": [], "materials": [],
+            "material_keys": set(), "key_source": "unknown",
+            "first_seen": time.time(), "last_seen": time.time(),
+            "turn": 0, "canonical_mismatch_count": 0, "aggregated_dropped": 0,
+        }
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if rec.get("mismatch"):
+                        # 客户端侧裁剪触发的全量重建行——重放时同样清空
+                        entry["actions"] = []
+                        entry["materials"] = []
+                        entry["material_keys"] = set()
+                        entry["canonical_mismatch_count"] += 1
+                    for a in rec.get("actions") or []:
+                        if isinstance(a, dict) and "tool" in a:
+                            entry["actions"].append(dict(a))
+                    for fl in rec.get("filled") or []:
+                        tid = fl.get("_tid")
+                        for act in reversed(entry["actions"]):
+                            if act.get("_tid") == tid and act.get("result_chars") is None:
+                                act["result_chars"] = fl.get("result_chars")
+                                break
+                    for m in rec.get("materials") or []:
+                        key = m.get("path")
+                        if key and key not in entry["material_keys"]:
+                            entry["material_keys"].add(key)
+                            entry["materials"].append(dict(m))
+                    entry["msg_count"] = max(entry["msg_count"], rec.get("msg_count") or 0)
+                    entry["turn"] = max(entry["turn"], rec.get("turn") or 0)
+                    entry["aggregated_dropped"] += rec.get("dropped") or 0
+                    ks = rec.get("key_source")
+                    if ks and ks != "unknown":
+                        entry["key_source"] = ks
+        except OSError:
+            return None
+        if not entry["actions"] and not entry["materials"] and entry["turn"] == 0:
+            return None  # 空档案视同无档案
+        return entry
 
 
 class ArchiveStore(object):

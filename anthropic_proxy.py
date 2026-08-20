@@ -845,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
                         status=_status,
                         duration_ms=_dur,
                         start_time=_req_start_time,
+                        session_id=raw_sid,
+                        request_id=_req_id,
                     )
                     _record_request_for_concurrency(_dur, _status)
                     if PROXY_METRICS_ENABLED:
@@ -877,6 +879,8 @@ class Handler(BaseHTTPRequestHandler):
                         status=500,
                         duration_ms=_dur,
                         start_time=_req_start_time,
+                        session_id=raw_sid,
+                        request_id=_req_id,
                     )
                     _record_request_for_concurrency(_dur, status_code)
                     if PROXY_METRICS_ENABLED:

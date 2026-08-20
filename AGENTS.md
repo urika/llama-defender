@@ -65,7 +65,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`tool_parser.py`](tool_parser.py) | XML ↔ JSON 工具参数解析、`<tools>` 内容块 fallback、流式工具提取器 |
 | [`content_compressor.py`](content_compressor.py) | TokenSieve 语义压缩 + BM25 相关性驱动压缩（TS-1）：JSON / 代码 / 日志 / 文本的分层压缩。TS-4（2026-08-18 日志分析落地）：BM25 drop 分支改为类型感知结构化压缩（`_structured_compress`，json/code/log 保结构），结果超 `PROXY_BM25_DROP_TARGET_RATIO`（默认 0.45）再截断封顶；`PROXY_BM25_DROP_THRESHOLD` 默认 0.5→0.1；客户端断连（BrokenPipe）按 499 记账不再计 500 |
 | [`compression_types.py`](compression_types.py) | TS-3 统一压缩结果类型契约：`CompressionResult` / `CompressionSubResult` TypedDict（JSON 可序列化，兼容 Py3.8+） |
-| [`session_ledger.py`](session_ledger.py) | R14/R15 诊断存储：会话台账（action 轨迹 / dup / last_dup_turn / 材料清单，客户端原始历史增量扫描 + 前缀失配全量重建 → `canonical_mismatch`）+ sent_view 档案（`logs/diag/archive/<sid>.jsonl`，MB 上限，TTL 驱逐） |
+| [`session_ledger.py`](session_ledger.py) | R14/R15 诊断存储：会话台账（action 轨迹 / dup / last_dup_turn / 材料清单，客户端原始历史增量扫描 + 前缀失配全量重建 → `canonical_mismatch`）+ sent_view 档案（`logs/diag/archive/<sid>.jsonl`，MB 上限，TTL 驱逐）+ **台账增量落盘**（`logs/diag/ledger/<sid>.jsonl`，A3 2026-08-20：R14 端点内存优先、档案兜底，跨重启/驱逐可查——agent_go 轮级看门狗不失忆） |
 | [`diagnostics.py`](diagnostics.py) | R13/R16 诊断记录器：per-request 累积（7 处注入登记 / timings 能力探测 / token 事实）、`X-Proxy-Diag-*` 响应头、SSE 尾注 `: x-proxy-diag {...}`、`logs/diag/sessions.jsonl` per-turn 深度记录（request_id 与 proxy_metrics 关联）、lifecycle 事件（R7 兑现） |
 | [`truncation.py`](truncation.py) | 上下文截断：char / rounds / fifo / smart 策略、单遍合并压缩（L2 清除 + L4 thinking 剥离）、工具对原子保护（TS-2）、关键词索引、摘要缓存 |
 | [`lifecycle.py`](lifecycle.py) | 生命周期阶段分类（init/growth/expansion/saturation/oom_danger/pre_trunc）与动态 token 预算 |
@@ -302,7 +302,7 @@ git commit --no-verify               # 绕过所有钩子
 - `anthropic_proxy.py` 顶部使用 `from proxy_state import *` 导入所有常量。
 - 辅助函数多为模块级函数；只有一个 `Handler` 类处理 HTTP。
 - 新增管线阶段：继承 `PipelineStage`，保持为已抽取模块之上的薄封装（deferred import 规避 `proxy_state` 循环依赖），并在 `test/unit/test_pipeline_stages.py` 补测试。
-- 日志同时输出到 stdout 和 `/tmp/anthropic_proxy.log`。
+- 日志同时输出到 stdout 和 `/tmp/anthropic_proxy.log`（manage.sh 启动时为 `logs/anthropic_proxy.log`）。主日志按大小 copytruncate 轮转（`PROXY_LOG_ROTATE_MB`，默认 50MB × `PROXY_LOG_ROTATE_KEEP`=3 份备份，A2 2026-08-20）；manage.sh wrapper 将 stdout 指向 /dev/null、仅 stderr 落文件——`log()` 是唯一按路径写入方，无双写。
 
 ### 6.3 配置文件
 
@@ -518,6 +518,8 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_DIAG_SESSION_MAX` | `64` | 内存台账会话数上限（FIFO 驱逐，驱逐后端点 410） |
 | `PROXY_DIAG_ARCHIVE_ENABLED` | `true` | sent_view 常态每轮落盘（`logs/diag/archive/`） |
 | `PROXY_DIAG_ARCHIVE_MAX_MB` | `200` | archive 磁盘总量上限（超限删最老会话文件） |
+| `PROXY_DIAG_LEDGER_ENABLED` | `true` | 台账增量落盘 `logs/diag/ledger/`（R14 端点档案兜底；关 = 仅内存） |
+| `PROXY_DIAG_LEDGER_MAX_MB` | `100` | ledger 磁盘总量上限（超限删最老会话文件） |
 | `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。

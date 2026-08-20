@@ -69,10 +69,20 @@ class TestLedgerStore(unittest.TestCase):
     def setUp(self):
         self._saved_enabled = _ps.PROXY_DIAG_ENABLED
         _ps.PROXY_DIAG_ENABLED = True
+        # A3: 台账持久化默认开启——测试一律重定向到临时目录,不污染 logs/
+        self._tmp = tempfile.mkdtemp(prefix="ledger_persist_")
+        self._saved_ledger_dir = _ps._DIAG_LEDGER_DIR
+        self._saved_ledger_enabled = getattr(_ps, "PROXY_DIAG_LEDGER_ENABLED", True)
+        _ps._DIAG_LEDGER_DIR = os.path.join(self._tmp, "ledger")
+        _ps.PROXY_DIAG_LEDGER_ENABLED = True
         self.store = sl.LedgerStore()
 
     def tearDown(self):
         _ps.PROXY_DIAG_ENABLED = self._saved_enabled
+        _ps._DIAG_LEDGER_DIR = self._saved_ledger_dir
+        _ps.PROXY_DIAG_LEDGER_ENABLED = self._saved_ledger_enabled
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_incremental_append(self):
         msgs1 = [_tu("hi"), _assistant_tool("WebSearch", {"query": "ansible 80376"}, "t1")]
@@ -140,9 +150,13 @@ class TestLedgerStore(unittest.TestCase):
                 self.store.record_request(f"sk{i}", [_tu(f"m{i}")], 1)
             listing = self.store.list_sessions()
             self.assertEqual(len(listing["sessions"]), 4)
-            self.assertIsNone(self.store.build_ledger_json("sk0"))       # 最老被逐
-            self.assertIsNotNone(self.store.evicted_at("sk0"))            # 410 语义
+            # A3 新契约: 内存驱逐 ≠ 档案删除——被逐会话有台账档案仍可查
+            self.assertIsNotNone(self.store.build_ledger_json("sk0"))
+            self.assertIsNotNone(self.store.evicted_at("sk0"))            # 410 语义保留
             self.assertIsNotNone(self.store.build_ledger_json("sk5"))     # 最新保留
+            # 档案也被清理(磁盘 cap 删除/未启用落盘)后 → None → 端点走 410
+            os.remove(os.path.join(_ps._DIAG_LEDGER_DIR, "sk0.jsonl"))
+            self.assertIsNone(self.store.build_ledger_json("sk0"))
         finally:
             _ps.PROXY_DIAG_SESSION_MAX = saved_max
 
@@ -248,6 +262,103 @@ class TestArchiveStore(unittest.TestCase):
         self.archive.append_turn("sE", 1, {"a": 1}, [], {})
         _, err = self.archive.read("sE")
         self.assertEqual(err, "not_found")
+
+
+class TestLedgerPersistence(unittest.TestCase):
+    """A3(2026-08-20): 台账增量落盘 + 跨重启/驱逐后 R14 端点档案兜底。
+
+    契约验收(logging-trajectory-improvement-design §3.1): 代理重启/TTL 驱逐后
+    build_ledger_json 仍可从 logs/diag/ledger/<sid>.jsonl 重建——agent_go 轮级
+    看门狗不失忆;内存驱逐 ≠ 档案删除。
+    """
+
+    def setUp(self):
+        self._saved_enabled = _ps.PROXY_DIAG_ENABLED
+        _ps.PROXY_DIAG_ENABLED = True
+        self._tmp = tempfile.mkdtemp(prefix="ledger_a3_")
+        self._saved_dir = _ps._DIAG_LEDGER_DIR
+        self._saved_ledger_enabled = getattr(_ps, "PROXY_DIAG_LEDGER_ENABLED", True)
+        _ps._DIAG_LEDGER_DIR = os.path.join(self._tmp, "ledger")
+        _ps.PROXY_DIAG_LEDGER_ENABLED = True
+
+    def tearDown(self):
+        _ps.PROXY_DIAG_ENABLED = self._saved_enabled
+        _ps._DIAG_LEDGER_DIR = self._saved_dir
+        _ps.PROXY_DIAG_LEDGER_ENABLED = self._saved_ledger_enabled
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _path(self, key):
+        return os.path.join(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(key) + ".jsonl")
+
+    def test_persist_and_rebuild_after_restart(self):
+        store = sl.LedgerStore()
+        msgs1 = [_tu("q"), _assistant_tool("WebSearch", {"query": "same q"}, "t1")]
+        store.record_request("sA", msgs1, 1, key_source="header")
+        # 第二请求: 前缀一致 + 新增 tool_result 回填 + 新 dup action(跨请求回填路径)
+        msgs2 = msgs1 + [_tool_result("t1", "x" * 42),
+                         _assistant_tool("WebSearch", {"query": "same q"}, "t2")]
+        store.record_request("sA", msgs2, 2, key_source="header")
+        self.assertTrue(os.path.isfile(self._path("sA")))
+        with open(self._path("sA")) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(lines), 2)
+        # 第二行: 1 个新增 action + 1 条跨请求回填
+        self.assertEqual(len(lines[1]["actions"]), 1)
+        self.assertEqual(len(lines[1]["filled"]), 1)
+        self.assertEqual(lines[1]["filled"][0]["result_chars"], 42)
+        # "重启": 新 LedgerStore 实例(内存空) → 档案兜底重建
+        store2 = sl.LedgerStore()
+        led = store2.build_ledger_json("sA")
+        self.assertIsNotNone(led)
+        self.assertEqual(len(led["actions"]), 2)
+        self.assertTrue(all(a.get("result_chars") == 42 for a in led["actions"]
+                            if a.get("dup") == 1))
+        # dup 派生正确(同 tool+target_hash → count=2)
+        self.assertEqual(len(led["dup_queries"]), 1)
+        self.assertEqual(led["dup_queries"][0]["count"], 2)
+        self.assertEqual(led["key_source"], "header")
+        self.assertEqual(led["turns_seen"], 2)
+
+    def test_evicted_session_serves_from_file(self):
+        store = sl.LedgerStore()
+        msgs = [_tu("q"), _assistant_tool("Read", {"file_path": "/a.py"}, "t1")]
+        store.record_request("sB", msgs, 1)
+        # 模拟 TTL/FIFO 驱逐: 从内存移除并记 evicted(410 语义)
+        with store._lock:
+            del store._sessions["sB"]
+            store._evicted["sB"] = "2026-08-20T00:00:00"
+        # 档案仍在 → 端点 200(内存驱逐 ≠ 档案删除),不因 evicted 变 None
+        led = store.build_ledger_json("sB")
+        self.assertIsNotNone(led)
+        self.assertEqual(len(led["actions"]), 1)
+
+    def test_disabled_writes_no_file(self):
+        _ps.PROXY_DIAG_LEDGER_ENABLED = False
+        store = sl.LedgerStore()
+        msgs = [_tu("q"), _assistant_tool("Bash", {"command": "ls"}, "t1")]
+        store.record_request("sC", msgs, 1)
+        self.assertFalse(os.path.exists(self._path("sC")))
+        # 内存路径不受影响
+        self.assertIsNotNone(store.build_ledger_json("sC"))
+
+    def test_mismatch_line_rebuilds_state(self):
+        store = sl.LedgerStore()
+        msgs1 = [_tu("q1"), _assistant_tool("Read", {"file_path": "/old.py"}, "t1")]
+        store.record_request("sD", msgs1, 1)
+        # 客户端裁剪: 前缀变化 → mismatch 全量重建(旧 action 不留)
+        msgs2 = [_tu("q2"), _assistant_tool("Read", {"file_path": "/new.py"}, "t2")]
+        store.record_request("sD", msgs2, 2)
+        store2 = sl.LedgerStore()
+        led = store2.build_ledger_json("sD")
+        self.assertIsNotNone(led)
+        tools = [a["target"] for a in led["actions"]]
+        self.assertEqual(tools, ["/new.py"])
+        self.assertEqual(led["canonical_mismatch_count"], 1)
+
+    def test_unknown_session_no_file_returns_none(self):
+        store = sl.LedgerStore()
+        self.assertIsNone(store.build_ledger_json("never_seen"))
 
 
 if __name__ == "__main__":

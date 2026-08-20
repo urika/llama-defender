@@ -48,6 +48,7 @@ docs/
 | `multi-cloud-model-catalog-design-20260815.md` | 多云端模型目录（Model Catalog）设计与整体架构 Review（v2）：模型管理现状梳理（8 处硬编码触点）、`configs/models.json` 声明式目录（providers/models/routes 对齐 agent_go 三层设计）、直连 vs 走代理双源真相边界（catalog_hash 漂移检测）、R8 响应头命名契约对齐（`X-Proxy-Route-*`）、多提供商分发与 fallback chain、按模型成本核算，Phase A-C 实施计划（顺带交付 llama-defender R8-R12） |
 | `config-unification-and-request-queue-design-20260815.md` | 配置统一与请求队列设计方案：解决配置默认值分散四处导致的漂移风险（如 qwen3.8 MODEL_NAME 缺失），以及单信号量下大请求阻塞小请求的公平性问题；含 CONFIG_REGISTRY 单一事实源、启动校验、请求四级分桶、准入控制、优先级队列、超时取消、与 SmartRouter 集成、迁移与测试计划 |
 | `diagnostics-dataplane-design-20260819.md` | 诊断数据面设计（R13-R16，**已实施 2026-08-19**）：上下文工程改造的观测先行层——R13 诊断归因双通道（非流式 HTTP 头 + 流式 SSE 尾注，修正「复用 R8 头模式」的流式时序矛盾）、R14 会话台账端点（dup/last_dup_turn/材料清单，每请求派生、与 Phase 1 解耦）、R15 L4 档案三视图（sent_view 为压缩后行为复盘唯一权威）、R16 会话维度 metrics（含 is_epoch_turn 分档前提、request_id 关联）；后端能力矩阵（llama-server/rapid-mlx/cloud 降级链）、D-Phase 0-2 实施计划（约 2 天，先诊断后改造，四臂 A/B 统一口径） |
+| `logging-trajectory-improvement-design-20260820.md` | 日志体系评估与改进设计（对标 DSH 轨迹视图四层模型）：现状 7 类日志/档案对标事件/动作/语义/性能层——R13-R16 已是正确的"最小轨迹系统"；差距 G1-G6（台账不持久、requests.jsonl 缺 session_id/request_id、主日志 510MB 无轮转、无统一事件契约、无离线投影工具、导出空白）；Phase A 地基三项（P0，1-2 天）+ Phase B 投影工具（trace_query/trace_replay 含 A/B diff）+ Phase C 按需；明确不做清单（请求级重放/事件溯源重构/进程内 SDK） |
 | `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
 
 ---

@@ -706,7 +706,10 @@ _start_proxy() {
     local proxy_wrapper="$SCRIPT_DIR/.start_proxy_$$.sh"
     cat > "$proxy_wrapper" <<EOF
 #!/usr/bin/env bash
-exec >> "$PROXY_LOGFILE" 2>&1
+# A2 单一写入方: proxy_logging.log() 按路径 append 全部日志行(含轮转),
+# stdout 不再重定向到同一文件(此前 exec >> 与按路径 append 双写同一行);
+# stderr 仍捕获到日志文件——python 崩溃 traceback 只走 stderr,不丢。
+exec > /dev/null 2>> "$PROXY_LOGFILE"
 exec python3 "$SCRIPT_DIR/anthropic_proxy.py"
 EOF
     chmod +x "$proxy_wrapper"

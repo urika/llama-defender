@@ -392,10 +392,28 @@
     "params": [],
     "defaults": {}
   },
+  "_build_queue_json": {
+    "name": "_build_queue_json",
+    "params": [],
+    "defaults": {}
+  },
+  "_build_route_policies_json": {
+    "name": "_build_route_policies_json",
+    "params": [],
+    "defaults": {}
+  },
   "_build_session_html": {
     "name": "_build_session_html",
     "params": [
       "session_id"
+    ],
+    "defaults": {}
+  },
+  "_build_session_metrics_json": {
+    "name": "_build_session_metrics_json",
+    "params": [
+      "session_key",
+      "records"
     ],
     "defaults": {}
   },
@@ -577,6 +595,11 @@
       "text1",
       "text2"
     ],
+    "defaults": {}
+  },
+  "_current_active_profile": {
+    "name": "_current_active_profile",
+    "params": [],
     "defaults": {}
   },
   "_dedupe_scalars": {
@@ -924,6 +947,24 @@
     ],
     "defaults": {}
   },
+  "_maybe_rotate_jsonl": {
+    "name": "_maybe_rotate_jsonl",
+    "params": [
+      "path",
+      "lock",
+      "rotate_bytes"
+    ],
+    "defaults": {
+      "rotate_bytes": null
+    }
+  },
+  "_maybe_rotate_main_log": {
+    "name": "_maybe_rotate_main_log",
+    "params": [
+      "log_path"
+    ],
+    "defaults": {}
+  },
   "_mc_put": {
     "name": "_mc_put",
     "params": [
@@ -1108,6 +1149,18 @@
     ],
     "defaults": {}
   },
+  "_structured_compress": {
+    "name": "_structured_compress",
+    "params": [
+      "original",
+      "mime_hint",
+      "mode"
+    ],
+    "defaults": {
+      "mime_hint": null,
+      "mode": null
+    }
+  },
   "_translate_tool_result_errors": {
     "name": "_translate_tool_result_errors",
     "params": [
@@ -1131,6 +1184,14 @@
     "defaults": {
       "min_prefix": 4
     }
+  },
+  "_warn_diag": {
+    "name": "_warn_diag",
+    "params": [
+      "site",
+      "exc"
+    ],
+    "defaults": {}
   },
   "_write_request_snapshot": {
     "name": "_write_request_snapshot",
@@ -1249,6 +1310,11 @@
     "params": [],
     "defaults": {}
   },
+  "get_queue_manager": {
+    "name": "get_queue_manager",
+    "params": [],
+    "defaults": {}
+  },
   "invalidate_model_aliases_cache": {
     "name": "invalidate_model_aliases_cache",
     "params": [],
@@ -1284,10 +1350,14 @@
       "output_chars",
       "status",
       "duration_ms",
-      "start_time"
+      "start_time",
+      "session_id",
+      "request_id"
     ],
     "defaults": {
-      "start_time": ""
+      "start_time": "",
+      "session_id": "",
+      "request_id": ""
     }
   },
   "log_structured": {

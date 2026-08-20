@@ -61,7 +61,7 @@ CONFIG_REGISTRY = {
         "doc": "Override backend type: 'local' or 'cloud'. Auto-detected from LLAMA_BASE_URL when empty.",
     },
     "MODEL_NAME": {
-        "defaults": {"local": "mlx-community/Qwen3.6-35B-A3B-4bit", "cloud": "deepseek-v4-pro"},
+        "defaults": {"local": "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit", "cloud": "deepseek-v4-pro"},
         "type": "str", "scope": "reloadable",
         "doc": "Model identifier sent to backend. Auto-set by BACKEND_TYPE.",
     },
@@ -820,6 +820,17 @@ CONFIG_REGISTRY = {
         "type": "str", "scope": "reloadable",
         "doc": "Where prompt-processed counts come from: auto (probe backend response "
                "timings; fields stay null when unsupported) | off (never emit).",
+    },
+    "PROXY_DIAG_LEDGER_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Persist R14 session ledger increments to logs/diag/ledger/<sid>.jsonl; "
+               "/api/session/<key>/ledger serves from memory first, file fallback.",
+    },
+    "PROXY_DIAG_LEDGER_MAX_MB": {
+        "defaults": {"all": "100"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Total ledger dir size cap in MB; oldest session files are deleted beyond it.",
     },
 
     # ---- 后端启动参数（由 manage.sh 消费，代理运行时不读取，scope=module）----
