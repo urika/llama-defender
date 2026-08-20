@@ -674,10 +674,10 @@ class TestRouteNotificationFull(unittest.TestCase):
         ctx.stage_config = {"total_chars": 100000, "stage": "saturation"}
         result = RouteNotification().process(ctx)
         notice = result.messages[-1]["content"][0]["text"]
-        # Must contain dynamic cost info from config, not hardcoded
+        # Must contain dynamic cost info from catalog price, not hardcoded
         self.assertIn("¥", notice)
-        self.assertIn("¥0.50/M", notice)  # PROXY_CLOUD_PRICE_INPUT
-        self.assertIn("¥1.50/M", notice)  # PROXY_CLOUD_PRICE_OUTPUT
+        self.assertIn("¥3.00/M", notice)  # catalog deepseek-v4-flash input (2026-08-17 分时高峰价)
+        self.assertIn("¥9.00/M", notice)  # catalog deepseek-v4-flash output
         # Should NOT contain the old hardcoded string
         self.assertNotIn("¥0.01-0.04", notice)
 

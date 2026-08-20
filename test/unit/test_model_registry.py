@@ -551,8 +551,8 @@ class TestV1ModelsMetadata(unittest.TestCase):
     def test_sonnet_flash_metadata(self):
         meta = self._get_entries()["claude-sonnet-4-6"]
         self.assertEqual(meta["real_model"], "deepseek-v4-flash")
-        self.assertFalse(meta["thinking_supported"])  # thinking: unsupported
-        self.assertFalse(meta["thinking_required"])
+        self.assertTrue(meta["thinking_supported"])   # thinking: supported (2026-08-20 修订, 官方支持双模式)
+        self.assertFalse(meta["thinking_required"])  # 默认思考但可关闭; 代理侧 quirk 强制关(成本策略)
 
     def test_legacy_alias_minimal_metadata(self):
         meta = self._get_entries()["claude-3-5-sonnet-20241022"]

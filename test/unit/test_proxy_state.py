@@ -331,8 +331,8 @@ class TestRouteCost(unittest.TestCase):
         self.assertAlmostEqual(total, 1000 * 0.5 / 1_000_000, places=6)
 
     def test_accumulate_per_model_catalog_price(self):
-        """Catalog price (deepseek-v4-pro 2.0/8.0) overrides the global pair;
-        provider totals accumulate alongside the global total (Phase B)."""
+        """Catalog price (deepseek-v4-pro 9.0/27.0, 2026-08-17 分时高峰价) overrides
+        the global pair; provider totals accumulate alongside the global (Phase B)."""
         import time as _time
         from proxy_state import _accumulate_route_daily_cost
         with proxy_state._state_lock:
@@ -342,14 +342,14 @@ class TestRouteCost(unittest.TestCase):
         t_in = _accumulate_route_daily_cost(
             input_tokens=1_000_000, output_tokens=0,
             model="deepseek-v4-pro", provider="deepseek")
-        self.assertAlmostEqual(t_in, 3.0, places=6)   # catalog price ¥3/M in
+        self.assertAlmostEqual(t_in, 9.0, places=6)   # catalog price ¥9/M in (peak)
         t_out = _accumulate_route_daily_cost(
             input_tokens=0, output_tokens=1_000_000,
             model="deepseek-v4-pro", provider="deepseek")
-        self.assertAlmostEqual(t_out - t_in, 6.0, places=6)  # ¥6/M out
+        self.assertAlmostEqual(t_out - t_in, 27.0, places=6)  # ¥27/M out (peak)
         with proxy_state._state_lock:
             self.assertAlmostEqual(
-                proxy_state._route_provider_cost.get("deepseek", 0.0), 9.0, places=6)
+                proxy_state._route_provider_cost.get("deepseek", 0.0), 36.0, places=6)
 
     def test_accumulate_unknown_model_uses_global_price(self):
         from proxy_state import _accumulate_route_daily_cost
