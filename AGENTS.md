@@ -129,7 +129,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 
 ### 3.4 工具与文档
 
-- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）等。
+- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）等。
 - `docs/`：按 7 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标、项目看板 `07-project-board/`）。入口 [`docs/README.md`](docs/README.md)；根级关键文档含 `llama-defender-integration-requirements.md`（agent_go 集成契约）、`DEFECT-LIST.md`、`requirement-matrix.md`。
 - `test/`：自动化测试，见下节。
 - `logs/`：运行时日志、测试日志、metrics、快照（git-ignored）。

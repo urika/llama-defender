@@ -91,5 +91,6 @@
 
 ---
 
-> 状态：**Phase A 已落地（2026-08-20）**——A1 requests.jsonl 补 session_id/request_id + 10MB 轮转；A2 主日志 copytruncate 轮转（PROXY_LOG_ROTATE_MB=50 × KEEP=3）+ wrapper 单一写入方（stdout→/dev/null，stderr 仍落文件）；A3 台账增量落盘 `logs/diag/ledger/`（PROXY_DIAG_LEDGER_ENABLED/MAX_MB，R14 端点内存优先档案兜底，FIFO/TTL 驱逐后仍 200）。新增配置已注册 CONFIG_REGISTRY + _RELOAD_SPEC；单测 1121 全绿，签名快照重生成。Phase B（trace_query/trace_replay）待排期。
+> 状态：**Phase A 已落地（2026-08-20）**——A1 requests.jsonl 补 session_id/request_id + 10MB 轮转；A2 主日志 copytruncate 轮转（PROXY_LOG_ROTATE_MB=50 × KEEP=3）+ wrapper 单一写入方（stdout→/dev/null，stderr 仍落文件）；A3 台账增量落盘 `logs/diag/ledger/`（PROXY_DIAG_LEDGER_ENABLED/MAX_MB，R14 端点内存优先档案兜底，FIFO/TTL 驱逐后仍 200）。新增配置已注册 CONFIG_REGISTRY + _RELOAD_SPEC；单测 1121 全绿，签名快照重生成。
+> **Phase B 已落地（2026-08-21）**——`tools/trace_common.py`（五流只读索引 + ledger 离线重放，dup 口径与 R14 端点一致）；`tools/trace_query.py`（sessions/show/request/failures/last 跨流查询 CLI，--json 机读）；`tools/trace_replay.py`（timeline/actions/diff/html 投影——ledger 优先、archive payload 兜底解析，diff 支持两会话或同会话两时段，HTML 自包含零依赖）。单测 +16（test_trace_tools，合成 fixture 覆盖 join 键/兜底/mismatch 重建），1137 全绿。真实数据冒烟通过。Phase C（导出通道）按需暂缓。
 > 风险：A3 需注意 ledger 档案写入在请求热路径上——沿用 archive 的"写失败静默 + 有界"模式，不新增阻塞点；agent_go 看门狗轮询 R14 端点（轮级频率）依赖读路径内存优先
