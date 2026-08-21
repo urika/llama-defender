@@ -455,6 +455,19 @@ PROXY_DIAG_LEDGER_ENABLED = os.environ.get(
 PROXY_DIAG_LEDGER_MAX_MB = int(os.environ.get(
     "PROXY_DIAG_LEDGER_MAX_MB", get_default("PROXY_DIAG_LEDGER_MAX_MB")))
 
+# ---------------------------------------------------------------------------
+# 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
+# engineering-design §4.3/§4.9，Phase 0 §12 结论已坐实击穿根因为每轮回溯改写）
+# ---------------------------------------------------------------------------
+PROXY_CTX_ENGINE_ENABLED = os.environ.get(
+    "PROXY_CTX_ENGINE_ENABLED", get_default("PROXY_CTX_ENGINE_ENABLED")).lower() in ("1", "true", "yes")
+# S: epoch 触发 token 预算; 0 = auto → min(65%×ctx_chars/4, 70K)（§12.4 35B 校准）
+PROXY_CTX_EPOCH_TRIGGER_TOKENS = int(os.environ.get(
+    "PROXY_CTX_EPOCH_TRIGGER_TOKENS", get_default("PROXY_CTX_EPOCH_TRIGGER_TOKENS")))
+# K: epoch 重切保留最近轮数; 0 = auto → 24（§4.4）
+PROXY_CTX_WINDOW_K = int(os.environ.get(
+    "PROXY_CTX_WINDOW_K", get_default("PROXY_CTX_WINDOW_K")))
+
 _DIAG_DIR = os.path.join(_LOG_DIR, "diag")
 _DIAG_SESSIONS_PATH = os.path.join(_DIAG_DIR, "sessions.jsonl")
 _DIAG_ARCHIVE_DIR = os.path.join(_DIAG_DIR, "archive")
@@ -1005,6 +1018,9 @@ _RELOAD_SPEC = [
     ("PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_ARCHIVE_MAX_MB", "int", "200", "200"),
     ("PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_ENABLED", "bool", "true", "true"),
     ("PROXY_DIAG_LEDGER_MAX_MB", "PROXY_DIAG_LEDGER_MAX_MB", "int", "100", "100"),
+    ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
+    ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
+    ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
     ("PROXY_DIAG_TIMINGS_SOURCE", "PROXY_DIAG_TIMINGS_SOURCE", "str", "auto", "auto"),
 ]
 
@@ -1095,6 +1111,7 @@ __all__ = [
     "PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_ARCHIVE_ENABLED",
     "PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_TIMINGS_SOURCE",
     "PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_MAX_MB",
+    "PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_WINDOW_K",
     "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_DIAG_LEDGER_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",

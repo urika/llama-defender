@@ -832,6 +832,23 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Total ledger dir size cap in MB; oldest session files are deleted beyond it.",
     },
+    "PROXY_CTX_ENGINE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Context-engineering engine (R8.1-R8.3): append-only canonical + "
+               "write-time compression + epoch state machine; replaces retro "
+               "ContentCompressor/ContextTruncator/OOMSafetyFIFO when on.",
+    },
+    "PROXY_CTX_EPOCH_TRIGGER_TOKENS": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Epoch budget S in tokens; 0 = auto → min(65% × ctx_chars/4, 70000).",
+    },
+    "PROXY_CTX_WINDOW_K": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Rounds kept verbatim at epoch re-cut (K); 0 = auto → 24.",
+    },
 
     # ---- 后端启动参数（由 manage.sh 消费，代理运行时不读取，scope=module）----
     "LLAMA_BACKEND": {

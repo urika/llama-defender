@@ -145,6 +145,9 @@ def _detect_text_loop(tail_assistant, threshold=None, session_id="",
 # --- _classify_exception ---
 def _classify_exception(e):
     import socket as _socket
+    # 上下文工程引擎硬上限(§4.9): 会话该结束,而非失真压缩——413 不可重试
+    if type(e).__name__ == "ContextOverflowError":
+        return 413, "context_window_exceeded", False
     exc_name = type(e).__name__
     msg = str(e).lower()
     if isinstance(e, (TimeoutError, _socket.timeout)) or "timeout" in exc_name.lower():

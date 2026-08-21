@@ -216,6 +216,15 @@ def build_diag_payload():
     injections = peek_injections()
     if injections:
         diag["feedback_injected"] = injections
+    # R13 契约: X-Proxy-Epoch-Count——上下文工程 Phase 1(引擎)开启且非零时出现
+    if getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False) and session_key:
+        try:
+            import context_engine
+            epoch_count = context_engine.ENGINE.epoch_count(session_key)
+            if epoch_count:
+                diag["epoch_count"] = epoch_count
+        except Exception:
+            pass
     return diag
 
 
@@ -347,6 +356,16 @@ def finalize_request(mc):
             "ratio": (mc or {}).get("compression_ratio"),
         },
     }
+    # R8 上下文工程引擎开启时回填 epoch 事实(与 X-Proxy-Epoch-Count 头同源)
+    if getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False) and session_key:
+        try:
+            import context_engine
+            record["epoch_count"] = context_engine.ENGINE.epoch_count(session_key)
+            record["is_epoch_turn"] = context_engine.ENGINE.is_epoch_turn(
+                session_key, record["turn"])
+            record["epoch_triggered"] = record["is_epoch_turn"]
+        except Exception:
+            pass
     log_session_diag(record)
     if record["canonical_mismatch"]:
         log_lifecycle_event("canonical_mismatch",

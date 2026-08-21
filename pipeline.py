@@ -436,6 +436,80 @@ class RequestParser(PipelineStage):
 
 
 # ============================================================================
+# Stage 0.5: ContextEngine — 上下文工程 Phase 1（R8.1-R8.3）
+# ============================================================================
+
+def _ctx_engine_on():
+    return bool(getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False))
+
+
+class ContextEngineStage(ConditionalStage):
+    """Stage 0.5: append-only canonical + 写入期压缩 + epoch 状态机。
+
+    设计: llama-defender-context-engineering-design §4.3/§4.9/§11/§12.4。
+    位置在任何注入/改写 stage 之前——absorb 的输入是纯客户端原始历史,
+    canonical 与客户端历史两套账(§4.10 实现注意 1)。引擎开启时
+    ContentCompressor(7)/ContextTruncator(14)/OOMSafetyFIFO(17) 跳过
+    (should_run 联动), 前缀缓存不被回溯改写击穿(Phase 0 §12.3 结论 4)。
+    """
+
+    name = "context_engine"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        return _ctx_engine_on() and bool(ctx.session_id)
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        if not _ctx_engine_on() or not ctx.session_id:
+            return ctx  # 双保险(ConditionalStage 语义之外的直接调用路径)
+        import context_engine
+        sess = context_engine.ENGINE.get_or_create(ctx.session_id)
+        canonical, mismatch, new_msgs = sess.absorb(ctx.messages)
+        if mismatch:
+            log("  -> [context_engine] client prefix mismatch — canonical rebuilt",
+                level="WARN")
+        triggered, final = sess.maybe_epoch(
+            context_engine.effective_trigger_tokens(),
+            context_engine.effective_window_k())
+        if triggered:
+            context_engine.ENGINE.mark_epoch_turn(ctx.session_id, sess.turn)
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    # D6 kind 契约新增: epoch_collapse(压缩区为合成内容,计量可见)
+                    diagnostics.record_injection("epoch_collapse")
+                except Exception as _e:
+                    _warn_diag("inject_epoch", _e)
+            log(f"  -> [context_engine] EPOCH #{sess.epoch_count} triggered "
+                f"(turn={sess.turn}, K={context_engine.effective_window_k()})")
+        if final is None:
+            # §4.9 回退保护硬上限: 代理无权把历史压到失真假装放得下
+            raise context_engine.ContextOverflowError(
+                "canonical history exceeds epoch budget even after collapse "
+                "(K=4 + L3 halved); session should end or ctx budget raised")
+        # 发送副本: 下游注入 stage 对 ctx.messages 的就地改写不回污染 canonical
+        ctx.messages = [context_engine._frozen_copy(m) for m in final]
+        ctx._ctx_engine_epoch = triggered
+        log(f"  -> [context_engine] msgs={len(final)} est_tokens≈{sess.est_tokens()} "
+            f"epochs={sess.epoch_count} new_window={new_msgs}")
+        return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        if not _ctx_engine_on():
+            return None
+        try:
+            import context_engine
+            sess = context_engine.ENGINE.get_or_create(ctx.session_id)
+            return {
+                "est_tokens": sess.est_tokens(),
+                "epoch_count": sess.epoch_count,
+                "epoch_triggered": 1 if getattr(ctx, "_ctx_engine_epoch", False) else 0,
+                "canonical_msgs": len(sess.canonical),
+            }
+        except Exception:
+            return None
+
+
+# ============================================================================
 # Stage 1: LifecycleClassifier — classify context size into lifecycle stage
 # ============================================================================
 
@@ -1118,6 +1192,10 @@ class ContentCompressor(ConditionalStage):
     def should_run(self, ctx: PipelineContext) -> bool:
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
+        # 上下文工程引擎接管压缩(写入期,append-only)时跳过回溯压缩——
+        # 每轮改写历史 = 前缀缓存击穿元凶(Phase 0 §12.3 结论 4)
+        if _ctx_engine_on():
+            return False
         return True  # always runs for local
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
@@ -1599,6 +1677,10 @@ class ContextTruncator(ConditionalStage):
     def should_run(self, ctx: PipelineContext) -> bool:
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
+        # 引擎接管预算控制(epoch 状态机)时跳过 fifo/rounds 截断——
+        # 头部丢消息 = 前缀全断
+        if _ctx_engine_on():
+            return False
         return _ps.PROXY_CTX_LIMIT_ENABLED
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
@@ -1774,6 +1856,8 @@ class OOMSafetyFIFO(ConditionalStage):
     def should_run(self, ctx: PipelineContext) -> bool:
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
+        if _ctx_engine_on():
+            return False  # 引擎的 epoch 回退保护接管超限路径
         if not ctx.stage_config:
             return False
         return (ctx.stage_config.get("oom_safety", False)

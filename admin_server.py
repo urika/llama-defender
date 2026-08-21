@@ -375,15 +375,28 @@ def _build_status_json():
         # bench 口径须以有效行为标注(臂间误标会让 A/B 结论不可信)。
         "ctx_config": {
             "diag_enabled": bool(getattr(_ps, "PROXY_DIAG_ENABLED", False)),
+            "engine_enabled": bool(getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False)),
             "compression_mode": getattr(_ps, "PROXY_COMPRESS_MODE", None),
             "compress_enabled": bool(getattr(_ps, "PROXY_COMPRESS_ENABLED", False)),
             "compression_profile": getattr(_ps, "PROXY_COMPRESSION_PROFILE", None),
             "bm25_enabled": bool(getattr(_ps, "PROXY_BM25_ENABLED", False)),
             "feedback_injection_enabled": False,  # 合成负反馈 Phase 2 落地后接线
-            "epoch_S": None,
-            "window_K": None,
+            "epoch_S": _ctx_engine_values()[0],
+            "window_K": _ctx_engine_values()[1],
         },
     }
+
+
+def _ctx_engine_values():
+    """epoch_S / window_K 生效值（引擎关 = None 保持原语义；S/K auto 推导）。"""
+    if not getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False):
+        return None, None
+    try:
+        import context_engine
+        return (context_engine.effective_trigger_tokens(),
+                context_engine.effective_window_k())
+    except Exception:
+        return None, None
 # --- _build_watchdog_json ---
 def _build_watchdog_json():
     """Return structured watchdog status by reading logs/watchdog_state.json."""

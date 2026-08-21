@@ -64,6 +64,7 @@ from pipeline import (
     PipelineContext,
     InstrumentedPipeline,
     RequestParser,
+    ContextEngineStage,
     LifecycleClassifier,
     DynamicMaxTokens,
     SmartRouter,
@@ -960,6 +961,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         InstrumentedPipeline([
             RequestParser(),              # 0
+            ContextEngineStage(),         # 0.5 — 上下文工程引擎(默认关;开启时 7/14/17 跳过)
             LifecycleClassifier(),        # 1
             DynamicMaxTokens(),           # 2
             SmartRouter(),                # 2.5 — route decision (local vs cloud)

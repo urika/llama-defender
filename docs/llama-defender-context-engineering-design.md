@@ -293,6 +293,8 @@ L0 内容（system prompt + 工具定义）由客户端决定，代理只能「�
 
 ### Phase 1：核心改造（1-2 天）——append-only + 写入期压缩 + epoch
 
+> **状态（2026-08-21）**：已实施——`context_engine.py`（写入期压缩模板 §4.3 / canonical 会话两套账 §4.10 / epoch 状态机 §4.9 含回退保护与 413 硬上限）+ 管线 stage 0.5（开启时 7/14/17 联动跳过）+ 诊断接线（R16 `epoch_count/is_epoch_turn/epoch_triggered` 回填、R13 `epoch_count` 头/尾注、D6 新 kind `epoch_collapse`）+ `/api/status` `ctx_config.engine_enabled/epoch_S/window_K` 真值。**默认关**（`PROXY_CTX_ENGINE_ENABLED=false`，`PROXY_CTX_EPOCH_TRIGGER_TOKENS=0` auto→min(65%×ctx/4,70K)，`PROXY_CTX_WINDOW_K=0` auto→24），待验收门禁 1-4 实测后开启。§12.4 修正已纳入（cache_prompt 降可选、S 受 pflash 96K 与 epoch P90<60s 门禁约束）。单测 +19（test_context_engine），全量 1156 绿。
+
 | 改动点 | 内容 |
 |--------|------|
 | llama-defender | canonical history + 前缀 diff + 写入期压缩模板（§4.3）+ epoch 状态机（§4.9）+ `cache_prompt`/`id_slot` 请求参数 |

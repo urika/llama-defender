@@ -66,6 +66,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`content_compressor.py`](content_compressor.py) | TokenSieve 语义压缩 + BM25 相关性驱动压缩（TS-1）：JSON / 代码 / 日志 / 文本的分层压缩。TS-4（2026-08-18 日志分析落地）：BM25 drop 分支改为类型感知结构化压缩（`_structured_compress`，json/code/log 保结构），结果超 `PROXY_BM25_DROP_TARGET_RATIO`（默认 0.45）再截断封顶；`PROXY_BM25_DROP_THRESHOLD` 默认 0.5→0.1；客户端断连（BrokenPipe）按 499 记账不再计 500 |
 | [`compression_types.py`](compression_types.py) | TS-3 统一压缩结果类型契约：`CompressionResult` / `CompressionSubResult` TypedDict（JSON 可序列化，兼容 Py3.8+） |
 | [`session_ledger.py`](session_ledger.py) | R14/R15 诊断存储：会话台账（action 轨迹 / dup / last_dup_turn / 材料清单，客户端原始历史增量扫描 + 前缀失配全量重建 → `canonical_mismatch`）+ sent_view 档案（`logs/diag/archive/<sid>.jsonl`，MB 上限，TTL 驱逐）+ **台账增量落盘**（`logs/diag/ledger/<sid>.jsonl`，A3 2026-08-20：R14 端点内存优先、档案兜底，跨重启/驱逐可查——agent_go 轮级看门狗不失忆） |
+| [`context_engine.py`](context_engine.py) | R8.1-R8.3 上下文工程引擎（Phase 1 2026-08-21，**默认关**）：append-only canonical 会话（客户端历史写入期压缩后冻结，永不回溯改写——修复前缀缓存击穿）+ epoch 状态机（超 S 预算一次性收编 K 窗口外轮次入压缩区，回退保护 K=4→L3 减半→413 硬上限）；开启时管线 7/14/17 三 stage 联动跳过 |
 | [`diagnostics.py`](diagnostics.py) | R13/R16 诊断记录器：per-request 累积（7 处注入登记 / timings 能力探测 / token 事实）、`X-Proxy-Diag-*` 响应头、SSE 尾注 `: x-proxy-diag {...}`、`logs/diag/sessions.jsonl` per-turn 深度记录（request_id 与 proxy_metrics 关联）、lifecycle 事件（R7 兑现） |
 | [`truncation.py`](truncation.py) | 上下文截断：char / rounds / fifo / smart 策略、单遍合并压缩（L2 清除 + L4 thinking 剥离）、工具对原子保护（TS-2）、关键词索引、摘要缓存 |
 | [`lifecycle.py`](lifecycle.py) | 生命周期阶段分类（init/growth/expansion/saturation/oom_danger/pre_trunc）与动态 token 预算 |
@@ -83,6 +84,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
   → Handler._handle_messages()
   → InstrumentedPipeline 依次执行 24 个 stage（编号为代码注释中的历史层号）
        0. RequestParser
+       0.5. ContextEngine (上下文工程引擎, 默认关; 开启时 7/14/17 跳过)
        1. LifecycleClassifier
        2. DynamicMaxTokens
        2.5. SmartRouter (local/cloud 路由决策)
@@ -520,6 +522,9 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_DIAG_ARCHIVE_MAX_MB` | `200` | archive 磁盘总量上限（超限删最老会话文件） |
 | `PROXY_DIAG_LEDGER_ENABLED` | `true` | 台账增量落盘 `logs/diag/ledger/`（R14 端点档案兜底；关 = 仅内存） |
 | `PROXY_DIAG_LEDGER_MAX_MB` | `100` | ledger 磁盘总量上限（超限删最老会话文件） |
+| `PROXY_CTX_ENGINE_ENABLED` | `false` | R8 上下文工程引擎（append-only + 写入期压缩 + epoch；开启时 7/14/17 跳过） |
+| `PROXY_CTX_EPOCH_TRIGGER_TOKENS` | `0` | epoch 预算 S（tokens）；0=auto → min(65%×ctx/4, 70K) |
+| `PROXY_CTX_WINDOW_K` | `0` | epoch 重切保留最近 K 轮；0=auto → 24 |
 | `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
