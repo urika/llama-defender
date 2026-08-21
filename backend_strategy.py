@@ -32,7 +32,7 @@ class LocalStrategy(BackendStrategy):
     # proxy_config.get_default(), which checks CONFIG_REGISTRY first.
     DEFAULTS = {
         "PROXY_MAX_CONCURRENT": "1",
-        "MODEL_NAME": "mlx-community/Qwen3.6-35B-A3B-4bit",
+        "MODEL_NAME": "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
         "PROXY_CLEAR_ENABLED": "true", "PROXY_CLEAR_THRESHOLD": "15000",
         "PROXY_TOOL_KEEP": "2", "PROXY_FROZEN_HEAD": "12",
         "PROXY_CACHE_ALIGN_ENABLED": "true",
