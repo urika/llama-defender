@@ -65,6 +65,7 @@ from pipeline import (
     InstrumentedPipeline,
     RequestParser,
     ContextEngineStage,
+    _ctx_engine_on,
     LifecycleClassifier,
     DynamicMaxTokens,
     SmartRouter,
@@ -746,6 +747,14 @@ class Handler(BaseHTTPRequestHandler):
                 early_route = self._early_route_decision(parsed, total_chars)
                 if early_route == "cloud":
                     log(f"  -> OOM safety pre-truncation skipped: early route decision=cloud ({total_chars:,} chars)")
+                elif _ctx_engine_on() and total_chars > PROXY_OOM_SAFE_CHARS and msgs:
+                    # §12.4「优先级最高」: 引擎开启时退役预截断——按轮砍重排历史与
+                    # append-only 布局冲突(缓存全量击穿 + 模型静默失忆, 42355d18
+                    # 死循环成因)。引擎的 canonical 视图已被写入期压缩兜底, 超限
+                    # 走 §4.9 回退保护(ContextOverflowError → 413 拒绝)而非静默砍轮。
+                    log(f"  -> OOM safety pre-truncation skipped: ctx engine on — "
+                        f"overflow handled by epoch fallback 413 ({total_chars:,} chars)",
+                        level="WARN")
                 elif total_chars > PROXY_OOM_SAFE_CHARS and msgs:
                         log(f"  -> OOM safety pre-truncation triggered: {total_chars:,} chars > {PROXY_OOM_SAFE_CHARS:,} threshold", level="WARN")
                         pre_session_id = getattr(_log_ctx, 'session_id', None) or ""
@@ -1216,6 +1225,25 @@ class Handler(BaseHTTPRequestHandler):
             if usage:
                 input_tokens = usage.get("prompt_tokens", input_tokens)
                 output_tokens = usage.get("completion_tokens", output_tokens)
+                # 验收门禁 1: cached_tokens 回填引擎会话(流式路径; 需要
+                # FormatConverter 的 stream_options.include_usage 使后端发本块)
+                if _ctx_engine_on():
+                    _sid = getattr(_log_ctx, 'session_id', None)
+                    if _sid:
+                        try:
+                            import context_engine
+                            _details = usage.get("prompt_tokens_details") or {}
+                            _hit = context_engine.ENGINE.get_or_create(_sid).record_usage(
+                                usage.get("prompt_tokens", 0),
+                                _details.get("cached_tokens"))
+                            if _hit is not None:
+                                log(f"  -> [context_engine] usage: "
+                                    f"prompt={usage.get('prompt_tokens')} "
+                                    f"cached={_details.get('cached_tokens')} "
+                                    f"hit={_hit:.1%}")
+                        except Exception as _e:
+                            log(f"  -> [context_engine] usage record failed: {_e}",
+                                level="WARN")
                 # R13/R16: sent/usage 是 hit_ratio 分母(1 − prompt_n/prompt_tokens)
                 if PROXY_DIAG_ENABLED:
                     try:

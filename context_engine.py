@@ -249,8 +249,20 @@ class CanonicalSession(object):
         self.epoch_count = 0
         self.last_epoch_turn = 0
         self.compression_region = []  # L3 压缩区文本行（epoch 收编产物）
+        self.last_sent_tokens = 0     # 后端 usage 回填(验收门禁 1 计量)
+        self.last_cached_tokens = 0
         self.first_seen = time.time()
         self.last_seen = time.time()
+
+    # ------------------------------------------------------------------ %
+    def record_usage(self, prompt_tokens, cached_tokens):
+        """后端 usage 回填: cached_tokens/prompt_tokens 是 Phase 1 验收门禁 1
+        (增量 prefill >90%)的主口径。返回 hit_ratio(0-1; 无数据时 None)。"""
+        self.last_sent_tokens = int(prompt_tokens or 0)
+        self.last_cached_tokens = int(cached_tokens or 0)
+        if not self.last_sent_tokens:
+            return None
+        return self.last_cached_tokens / self.last_sent_tokens
 
     # ------------------------------------------------------------------ %
     def absorb(self, client_messages):
@@ -287,7 +299,13 @@ class CanonicalSession(object):
 
     # ------------------------------------------------------------------ %
     def est_tokens(self, messages=None):
-        """canonical（或指定列表）+ 压缩区的 token 估算（序列化长度 /4 口径）。"""
+        """canonical（或指定列表）的 token 估算（序列化长度 /4 口径）。
+
+        压缩区不单独加计: 只要压缩区非空, 台账消息就内嵌在 canonical /
+        折叠视图里（_collapse 组装时写入）, 从目标消息本身序列化已覆盖。
+        单独加计会把 epoch 后的视图重复计一遍（over-estimate → 提前误触
+        下一轮 epoch）。
+        """
         import json as _json
         target = self.canonical if messages is None else messages
         try:
@@ -295,7 +313,6 @@ class CanonicalSession(object):
                                     default=str))
         except (TypeError, ValueError):
             chars = sum(len(repr(m)) for m in target)
-        chars += len("\n".join(self.compression_region))
         return estimate_tokens(chars)
 
     def maybe_epoch(self, trigger_tokens, window_k):
@@ -311,7 +328,12 @@ class CanonicalSession(object):
             return False, list(self.canonical)
         self.epoch_count += 1
         self.last_epoch_turn = self.turn
+        # 每次回退尝试都从同一基线重算压缩区——_collapse 会就地追加
+        # self.compression_region, 不重置会把 K=24 失败尝试的台账行重复
+        # 累计进 K=4 的产物(重复行膨胀 → 误触硬上限)。
+        base_region = list(self.compression_region)
         for k, halve in ((window_k, False), (4, False), (4, True)):
+            self.compression_region = list(base_region)
             messages = self._collapse(k, halve)
             if self.est_tokens(messages) <= trigger_tokens:
                 self.canonical = messages
@@ -330,7 +352,9 @@ class CanonicalSession(object):
             new_lines.append(_round_summary(rnd, i + 1))
         region = self.compression_region + new_lines
         if halve and len(region) > 20:
-            region = region[:max(10, len(region) // 2)]
+            # 留尾半段: 最新收编轮次紧邻保留窗口, 是模型「最近在做什么」的最直接
+            # 记忆(§4.4 近期窗口是元认知主作用区)——留头丢尾会记远古忘刚才。
+            region = region[-max(10, len(region) // 2):]
         self.compression_region = region
         out = []
         for r in system_rounds:

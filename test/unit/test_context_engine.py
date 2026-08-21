@@ -8,7 +8,8 @@ import os
 import sys
 import unittest
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# test/unit/<file> → 三次 dirname 到仓库根(两次只到 test/, 直接跑会 ImportError)
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

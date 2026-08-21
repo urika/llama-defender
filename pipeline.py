@@ -443,6 +443,28 @@ def _ctx_engine_on():
     return bool(getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False))
 
 
+def _ctx_record_usage(ctx, usage):
+    """验收门禁 1 计量: 后端 usage → 引擎会话(cached_tokens 口径)。
+
+    非流式路径调用(BackendDispatcher); 流式路径见 anthropic_proxy
+    `_handle_streaming_response` 的 usage 块处理。仅引擎开启时生效。
+    """
+    if not (_ctx_engine_on() and getattr(ctx, 'session_id', None)):
+        return
+    try:
+        import context_engine
+        _u = usage or {}
+        _details = _u.get("prompt_tokens_details") or {}
+        _cached = _details.get("cached_tokens")
+        _hit = context_engine.ENGINE.get_or_create(ctx.session_id).record_usage(
+            _u.get("prompt_tokens", 0), _cached)
+        if _hit is not None:
+            log(f"  -> [context_engine] usage: prompt={_u.get('prompt_tokens')} "
+                f"cached={_cached} hit={_hit:.1%}")
+    except Exception as _e:
+        log(f"  -> [context_engine] usage record failed: {_e}", level="WARN")
+
+
 class ContextEngineStage(ConditionalStage):
     """Stage 0.5: append-only canonical + 写入期压缩 + epoch 状态机。
 
@@ -471,7 +493,11 @@ class ContextEngineStage(ConditionalStage):
             context_engine.effective_trigger_tokens(),
             context_engine.effective_window_k())
         if triggered:
-            context_engine.ENGINE.mark_epoch_turn(ctx.session_id, sess.turn)
+            # 诊断对齐口径: is_epoch_turn 按请求序号(_SESSION_REQUEST_COUNT+1,
+            # 与 diagnostics.finalize_request 同源), 不能用引擎内部 turn
+            # (按 user 消息计数, 两者必然错开——gate 实测发现的接线 bug)
+            _req_turn = _ps._SESSION_REQUEST_COUNT.get(ctx.session_id, 0) + 1
+            context_engine.ENGINE.mark_epoch_turn(ctx.session_id, _req_turn)
             if _ps.PROXY_DIAG_ENABLED:
                 try:
                     import diagnostics
@@ -1155,6 +1181,11 @@ class CacheAligner(ConditionalStage):
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if getattr(ctx, '_route_target', 'local') == 'cloud':
+            return False
+        # 引擎接管布局(L0 冻结头即 canonical 前缀)时跳过——CacheAligner 把
+        # messages 拆 prefix/dynamic 后由 ContentCompressor 重组,7 被跳过则
+        # dynamic 为空 → 后端收到空 messages(实测 gate turn1 400)
+        if _ctx_engine_on():
             return False
         return _ps.PROXY_CACHE_ALIGN_ENABLED
 
@@ -2078,6 +2109,14 @@ class FormatConverter(PipelineStage):
             openai_body["thinking"] = body["thinking"]
         if "response_format" in body:
             openai_body["response_format"] = body["response_format"]
+        # 上下文工程(§12.4): 本地臂加 cache_prompt + 流式 include_usage——计量
+        # cached_tokens(验收门禁 1 主口径)。rapid-mlx 默认即复用前缀缓存,
+        # cache_prompt 是计量开关不改行为;云端臂不加(无计量需求, 个别云端
+        # 后端可能拒收未知字段)。
+        if _ctx_engine_on() and getattr(ctx, '_route_target', 'local') != 'cloud':
+            openai_body["cache_prompt"] = True
+            if ctx.is_stream:
+                openai_body["stream_options"] = {"include_usage": True}
 
         # 4. Model request quirks from the catalog (e.g. deepseek-v4-flash
         #    force-disables thinking — request_quirks.force_thinking_disabled).
@@ -2741,6 +2780,7 @@ class BackendDispatcher(PipelineStage):
                     usage = openai_resp.get("usage") or {}
                     self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                     self._output_tokens = usage.get("completion_tokens", self._output_tokens)
+                    _ctx_record_usage(ctx, usage)
                     # R13/R16 (非流式): timings.prompt_n = 实算 prefill 数(缓存
                     # 未命中部分);无 timings 的后端字段保持缺省(P1 不发假值)。
                     if _ps.PROXY_DIAG_ENABLED:

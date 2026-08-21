@@ -871,13 +871,27 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
         "role": "assistant",
         "model": anthropic_model,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": openai_resp.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": openai_resp.get("usage", {}).get("completion_tokens", 0),
-        },
+        "usage": _build_anthropic_usage(openai_resp.get("usage") or {}),
         "content": content,
         "stop_reason": anthropic_stop_reason,
     }
+
+
+def _build_anthropic_usage(openai_usage):
+    """OpenAI usage → Anthropic usage(含 R8 门禁的 cached 透传)。
+
+    cache_read_input_tokens 为 Anthropic 原生字段;后端无该数据时缺省
+    (P1 时序诚实——不发假值)。
+    """
+    usage = {
+        "input_tokens": openai_usage.get("prompt_tokens", 0),
+        "output_tokens": openai_usage.get("completion_tokens", 0),
+    }
+    details = openai_usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if isinstance(cached, int) and cached > 0:
+        usage["cache_read_input_tokens"] = cached
+    return usage
 
 
 # ---------------------------------------------------------------------------

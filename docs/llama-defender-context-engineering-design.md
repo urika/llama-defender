@@ -152,6 +152,8 @@ Agent 会话 prefill 主导（Manus 实测 input:output ≈ 100:1）。设会话
 
 **句柄（handle）定义**（Manus 可恢复原则）：能够重新取得该内容的充分信息——URL / 文件路径+offset / 规范化查询串。内容可丢，句柄必留。
 
+> **2026-08-21 修订（35B 实施追认）**：四类常规预算按 ~4 chars/token 折算与上表一致（实现值 6K/8K/8K/6K chars）。错误/异常实现为「全文保留至工具类预算×2 封顶（≈3K tokens）」——比上表 1K tokens 更宽：负反馈是稀缺信号，35B 上下文加宽（S=60K tokens）后有意放宽；超封顶截断并附 `[truncated-error]` 标记。
+
 ### 4.4 L2 近期正文（保护窗口）
 
 - 本 epoch 内的全部轮次（原生消息格式，observation 已过写入期压缩）逐字保留——这是**唯一的每轮 append 增长区**（§4.7 布局不变式）
@@ -293,7 +295,9 @@ L0 内容（system prompt + 工具定义）由客户端决定，代理只能「�
 
 ### Phase 1：核心改造（1-2 天）——append-only + 写入期压缩 + epoch
 
-> **状态（2026-08-21）**：已实施——`context_engine.py`（写入期压缩模板 §4.3 / canonical 会话两套账 §4.10 / epoch 状态机 §4.9 含回退保护与 413 硬上限）+ 管线 stage 0.5（开启时 7/14/17 联动跳过）+ 诊断接线（R16 `epoch_count/is_epoch_turn/epoch_triggered` 回填、R13 `epoch_count` 头/尾注、D6 新 kind `epoch_collapse`）+ `/api/status` `ctx_config.engine_enabled/epoch_S/window_K` 真值。**默认关**（`PROXY_CTX_ENGINE_ENABLED=false`，`PROXY_CTX_EPOCH_TRIGGER_TOKENS=0` auto→min(65%×ctx/4,70K)，`PROXY_CTX_WINDOW_K=0` auto→24），待验收门禁 1-4 实测后开启。§12.4 修正已纳入（cache_prompt 降可选、S 受 pflash 96K 与 epoch P90<60s 门禁约束）。单测 +19（test_context_engine），全量 1156 绿。
+> **状态（2026-08-21）**：已实施——`context_engine.py`（写入期压缩模板 §4.3 / canonical 会话两套账 §4.10 / epoch 状态机 §4.9 含回退保护与 413 硬上限）+ 管线 stage 0.5（开启时 6/7/14/17 四 stage 联动跳过——6 CacheAligner 须一并跳过：其拆 prefix/dynamic 后由 7 重组，7 跳过则空 messages 送后端，gate 实测 400 拦截）+ 诊断接线（R16 `epoch_count/is_epoch_turn/epoch_triggered` 回填、R13 `epoch_count` 头/尾注、D6 新 kind `epoch_collapse`）+ `/api/status` `ctx_config.engine_enabled/epoch_S/window_K` 真值 + cached_tokens 透传（`cache_read_input_tokens`，Anthropic 原生字段）。§12.4 修正已纳入。单测 +19，全量 1156 绿。
+>
+> **验收门禁实测（2026-08-21，方案 A 合成会话 `tools/gate_test_ctx_engine.py`，35B 后端，S=60K/K=24）**：80 轮 agentic 会话——G1 非epoch轮 P90 **4.6s**（<15s ✅）/ G2 epoch轮 **2.4s**（<60s ✅，turn 54 触发，prompt 51.9K→12.1K）/ G3 **0** 断连错误 ✅ / G4 epoch后hit恢复 **0.921**（>0.8 ✅，爬回 0.97）/ 门禁1 增量prefill占比 P90 **2.3%**（<10% ✅）。诊断标记闭环：`is_epoch_turn(turn=54)`+`epoch_collapse`+`epoch_count=1` 全命中。**门禁 1-3 合成口径通过；门禁 3 句柄抽查与门禁 4 端到端双臂待真实任务（roadmap M3）。** 实测教训：① rapid-mlx 缓存要求"已存条目 ⊂ 新请求"（严格前缀扩展），客户端必须回显模型真实回复（claude CLI 天然满足；自建 harness 丢弃回复即全量 MISS）；② 会话 key 截断 8 字符下，相同前缀的 harness 会话共享引擎状态（内容无损但缓存互扰），harness 应保证 sid 前 8 字符唯一。生产 conf 已开启引擎（rapid-mlx-35b-opt `PROXY_CTX_ENGINE_ENABLED=true`）。
 
 | 改动点 | 内容 |
 |--------|------|
