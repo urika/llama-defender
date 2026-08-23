@@ -9,7 +9,9 @@
   - epoch 状态机（§4.9）: 发送前检查 total > S（默认 min(65%×ctx, 70K) tokens,
     35B 校准: 受 pflash 96K 阈值与 epoch 轮 P90<60s 门禁约束）→ 超限触发
     一次性收编: K 窗口外轮次折叠入压缩区（台账格式动作行+句柄），原生流
-    重切为最近 K 轮。epoch 后公共前缀止于 L0（system+tools），缓存重建
+    重切为最近 K 轮。**S 为真实 prompt_tokens 口径**（2026-08-22 校准:
+    est 低估 1.6×, 触发信号取后端 usage 回填, 见 EST_REAL_RATIO）。
+    epoch 后公共前缀止于 L0（system+tools），缓存重建
     范围 = 压缩区+原生流（有界的每-epoch-一次成本，摊销进多轮）。
   - 回退保护: 压缩后仍超限 → K=4 收紧 → L3 行数减半 → 仍超限返回错误
     （代理无权把历史压到失真假装放得下，超长会话该结束的是任务）。
@@ -23,10 +25,16 @@ from datetime import datetime
 
 import proxy_state as _ps
 
-DEFAULT_EPOCH_TRIGGER_TOKENS = 70000   # S: 35B 校准(§12.4) — pflash 96K 与 epoch P90<60s 取小
+DEFAULT_EPOCH_TRIGGER_TOKENS = 70000   # S: 真实 prompt_tokens 口径(2026-08-22 校准)
 DEFAULT_WINDOW_K = 24                  # K: epoch 重切时保留的最近轮数(§4.4)
 TOKEN_CHAR_RATIO = 4                   # 仓库统一估算口径: 1 token ≈ 4 chars
 MIN_RESULT_KEEP_CHARS = 512            # §4.3 最小阈值: 小结果逐字保留不包装
+# est(/4 口径)→真实 tokens 校准系数(实测 82346/51248=1.61, 2026-08-22 42355d18
+# 重跑后端 adaptive_prefill prompt= 与引擎 est 对比)。est 口径触发会迟到 1.6×:
+# est 60K = 真实 ~96K 恰贴 pflash 阈值——本次重跑系统在真实 82K 崩溃, est 触发点
+# 永远到不了。故 epoch 触发与容量判定一律用真实口径(后端 usage 回填优先,
+# 无回填时 est×本系数换算)。
+EST_REAL_RATIO = 1.6
 
 
 class ContextOverflowError(Exception):
@@ -112,6 +120,18 @@ def compress_observation(tool_name, args, text, budget=None):
     return head + "\n" + marker + "\n" + tail, handle, kind
 
 
+# 重建幂等守卫（2026-08-21 轮轮冷诊断）：compress_observation 的压缩输出恒 >
+# budget（标记行自带长度），对已压缩文本再压缩会切穿旧标记继续漂移；error 截断
+# 同理（capped 尾部再次被切）。Qwen3.8 GDN(SSM) 层条目 non_trimmable，后端只
+# 接受完整前缀复用——absorb mismatch 重建后的转发字节必须逐字节稳定，故已含
+# 引擎标记的 tool_result 一律跳过再压缩。详见 docs/background-analysis.md 轮轮冷节。
+_ENGINE_MARKERS = ("[ctx-engine:", "[truncated-error]")
+
+
+def _already_compressed(text):
+    return any(m in text for m in _ENGINE_MARKERS)
+
+
 def _msg_hash(msg):
     """与 session_ledger._msg_hash 同口径（客户端原始历史前缀 diff）。"""
     import hashlib
@@ -144,6 +164,10 @@ def _transform_message(msg, hints):
         if isinstance(block, dict) and block.get("type") == "tool_result":
             hint = hints.get(id(block)) or ("", {})
             text = _result_text(block)
+            # 幂等守卫（见 _ENGINE_MARKERS 注释）：已压缩/已截断结果原样保留
+            if _already_compressed(text):
+                new_blocks.append(block)
+                continue
             compressed, handle, kind = compress_observation(hint[0], hint[1], text)
             if compressed is not text:
                 nb = dict(block)
@@ -239,12 +263,23 @@ def _round_summary(rnd, turn):
 
 
 class CanonicalSession(object):
-    """单会话 canonical 状态: 客户端原始前缀 + 冻结的 canonical 消息列表。"""
+    """单会话 canonical 状态: 发送视图 + 已发送指纹集合。
+
+    M2.1(2026-08-22) 语义升级:
+    - canonical = 发送视图(append-only 冻结列表)——缓存命中的是「代理发了
+      什么」; 客户端历史如何扰动(compaction/改写)都不触发发送视图重建
+    - sent_set = 已发送客户端消息的 hash 集合——新观测判定 = 客户端历史中
+      hash 未见过者, 按客户端顺序追加; 已见过的(含被客户端 compaction
+      掉后又重发的)一律跳过 → 发送前缀逐位稳定 → 缓存逐位命中
+    - mismatch = 诊断信号(客户端尾部不再含最近发送的末尾消息 = append-only
+      纪律被客户端破坏); 只上报不重建
+    """
 
     def __init__(self, session_key):
         self.session_key = session_key
-        self.client_hashes = []       # 客户端原始消息 hash 前缀（diff 基准）
-        self.canonical = []           # 冻结消息（写入期压缩后, append-only）
+        self.canonical = []           # 发送视图(冻结消息, append-only)
+        self.sent_set = set()         # 已发送客户端消息 hash(新观测判定)
+        self.sent_order = []          # 发送视图对应的客户端指纹序(尾部检查/折叠同步)
         self.turn = 0
         self.epoch_count = 0
         self.last_epoch_turn = 0
@@ -266,36 +301,45 @@ class CanonicalSession(object):
 
     # ------------------------------------------------------------------ %
     def absorb(self, client_messages):
-        """吸收客户端全量历史 → (canonical 消息列表, mismatch, new_turns)。
+        """吸收客户端全量历史 → (发送视图, mismatch, new_msgs)。
 
-        - 前缀一致: 只对新增窗口做写入期压缩并 append（append-only 不变量）
-        - 前缀失配（客户端裁剪/自带 microcompaction, §4.10 边界 2）: 全量重建
-          canonical（压缩全部 observation）——缓存击穿不可避免，如实走
-          canonical_mismatch 语义
+        M2.1(2026-08-22): 新观测判定 = sent_set(hash 集合)去重, 发送视图
+        纯 append-only。缓存命中的是**代理发送了什么**, 不是**客户端说了
+        什么**(§4.7 缓存纪律的正确落点; 8-22 真实任务 70% 失配→全量重建→
+        TTFT 131s 的根因修复):
+        - 遍历客户端新历史: hash 未见过(不在 sent_set)的消息 = 新观测, 按
+          客户端顺序追加进发送视图并登记; 已见过的(含客户端 compaction 后
+          重发的旧轮)一律跳过 → 发送前缀逐位稳定 → 缓存逐位命中, 与客户端
+          如何改写(中间/头部/尾部)完全无关
+        - 客户端 compaction 摘要是"新消息" → 自然追加; 被删除的旧段保留在
+          发送视图(token 略涨, 由 epoch 收编)——稳定的前缀优先于紧凑性
+        - mismatch = 诊断信号: 客户端尾部不再含最近发送的末尾消息
+          (append-only 纪律被客户端破坏, §4.10 边界 2); 只上报不重建
+          (发送视图不变, 缓存不受影响; 重建反而击穿)
         """
         now = time.time()
         self.last_seen = now
-        hashes = [_msg_hash(m) for m in (client_messages or [])]
-        common = 0
-        for a, b in zip(self.client_hashes, hashes):
-            if a != b:
-                break
-            common += 1
-        mismatch = common < len(self.client_hashes)
-        if mismatch:
-            self.canonical = []
-            self.compression_region = []
-            window = client_messages or []
-        else:
-            window = (client_messages or [])[len(self.client_hashes):]
+        fp = [_msg_hash(m) for m in (client_messages or [])]
+        fp_set = set(fp)
+        # 失配信号: 最近发送的末尾消息不在客户端本次历史 → 尾部被改
+        tail_hash = self.sent_order[-1] if self.sent_order else None
+        mismatch = bool(tail_hash and tail_hash not in fp_set)
+        # 新观测 = hash 未见过(按客户端顺序收集, 再统一压缩冻结)
+        new_items = []
+        for msg in (client_messages or []):
+            h = _msg_hash(msg)
+            if h in self.sent_set:
+                continue
+            self.sent_set.add(h)
+            self.sent_order.append(h)
+            new_items.append(msg)
         hints = {id(b): hint for b, hint in _pair_tool_hints(client_messages or [])}
-        for msg in window:
+        for msg in new_items:
             self.canonical.append(_frozen_copy(_transform_message(msg, hints)))
-        self.client_hashes = hashes
-        new_turns = sum(1 for m in window if m.get("role") == "user")
-        if window:
+        new_turns = sum(1 for m in new_items if m.get("role") == "user")
+        if new_turns:
             self.turn += max(1, new_turns)
-        return self.canonical, mismatch, len(window)
+        return self.canonical, mismatch, len(new_items)
 
     # ------------------------------------------------------------------ %
     def est_tokens(self, messages=None):
@@ -315,16 +359,27 @@ class CanonicalSession(object):
             chars = sum(len(repr(m)) for m in target)
         return estimate_tokens(chars)
 
+    def _real_scale(self, messages=None):
+        """真实 prompt_tokens 口径: 后端 usage 回填优先(上一轮实测值);
+        无回填(会话首轮/回填缺失)时用 est × EST_REAL_RATIO 换算。
+        messages 参数用于收编产物容量判定(产物未发送、无 usage)。"""
+        if messages is None and self.last_sent_tokens > 0:
+            return self.last_sent_tokens
+        return int(self.est_tokens(messages) * EST_REAL_RATIO)
+
     def maybe_epoch(self, trigger_tokens, window_k):
         """发送前 epoch 检查 → (epoch_triggered, final_messages)。
 
+        触发与容量判定均为**真实 prompt_tokens 口径**(2026-08-22 校准, 见
+        EST_REAL_RATIO 注释): est(/4) 低估 1.6×, est 口径下 S=60K 等于真实
+        ~96K——epoch 永远在系统崩溃(实测 82K)之后才到, 形同虚设。
         未超限: canonical 原样（append-only, 前缀 = 上轮所发）。
         超限: 一次 epoch——K 窗口外轮次收编入压缩区, 重切为 L0 + 压缩区
               + 最近 K 轮并**回写 canonical**（后续轮在其上继续 append）;
               压缩后仍超限 → K=4 收紧 → L3 减半 → 仍超限返回 None
               （硬上限: 调用方返回 context 超限错误, §4.9 回退保护）。
         """
-        if self.est_tokens() <= trigger_tokens:
+        if self._real_scale() <= trigger_tokens:
             return False, list(self.canonical)
         self.epoch_count += 1
         self.last_epoch_turn = self.turn
@@ -335,10 +390,26 @@ class CanonicalSession(object):
         for k, halve in ((window_k, False), (4, False), (4, True)):
             self.compression_region = list(base_region)
             messages = self._collapse(k, halve)
-            if self.est_tokens(messages) <= trigger_tokens:
+            if self._real_scale(messages) <= trigger_tokens:
                 self.canonical = messages
+                self._sync_order_after_collapse(messages)
                 return True, messages
         return True, None
+
+    def _sync_order_after_collapse(self, messages):
+        """epoch 回写后同步 sent_order（折叠视图 = system + 压缩区 + K 窗口）。
+
+        sent_order 取旧序列尾部 keep 条(即 K 窗口对应指纹)；
+        sent_set **不收缩**——折叠掉的旧消息 hash 仍登记, 客户端重发旧轮时
+        会被跳过, 不会错误地重新 append(发送视图稳定性不因 epoch 破坏)。
+        """
+        keep_msgs = sum(1 for m in messages
+                        if m.get("role") != "system" and not m.get("_ctx_engine_epoch"))
+        if keep_msgs <= 0:
+            self.sent_order = []
+            return
+        tail = self.sent_order[-keep_msgs:]
+        self.sent_order = list(tail)
 
     def _collapse(self, window_k, halve):
         """K 窗口外轮次 → 压缩区动作行; 返回重切后的消息列表（不落 self.canonical）。"""
@@ -424,7 +495,9 @@ ENGINE = EngineStore()
 
 
 def effective_trigger_tokens():
-    """S: 0/auto → min(65% × ctx_chars/4, DEFAULT)（reloadable 热读）。"""
+    """S: 0/auto → min(65% × ctx_chars/4, DEFAULT)（reloadable 热读）。
+    口径: 真实 prompt_tokens(2026-08-22 校准)——显式配置值直接采用,
+    auto 推导的 65%×ctx/4 恰为同量级真实触发点, 无需再乘系数。"""
     raw = getattr(_ps, "PROXY_CTX_EPOCH_TRIGGER_TOKENS", 0) or 0
     if raw and raw > 0:
         return int(raw)

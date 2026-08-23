@@ -93,14 +93,63 @@ class TestCanonicalSession(unittest.TestCase):
         self.assertEqual(len(canon2), 4)
         self.assertIs(canon2[2], canon[2])  # 前缀对象引用稳定(未重建)
 
-    def test_absorb_prefix_mismatch_rebuild(self):
+    def test_absorb_mid_history_rewrite_no_rebuild(self):
+        """M2.1: 客户端改写中间段不重建——发送视图前缀稳定(缓存复用)。"""
         r1 = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "out")
         self.sess.absorb(r1)
-        # 客户端裁剪/重写: 前缀失配 → 全量重建
-        r2 = [{"role": "user", "content": "trimmed"}] + r1[1:]
+        # 客户端 compaction: 摘要替换头部, 但 append 新轮
+        r2 = [{"role": "user", "content": "compacted summary"}] + r1[1:] + [
+            {"role": "assistant", "content": [{"type": "text", "text": "more"}]}]
+        canon, mism, n = self.sess.absorb(r2)
+        # 发送视图: 旧 q1 仍在前缀(稳定) + 摘要 + more 追加
+        self.assertEqual(canon[0]["content"][0]["text"], "q1")
+        self.assertEqual(n, 2)                      # 摘要 + more 为新观测
+        self.assertEqual(canon[-1]["content"][0]["text"], "more")
+        # 头部插入改写只要尾部完整 = 缓存可复用 → 不报失配
+        self.assertFalse(mism)
+
+    def test_absorb_tail_mutation_no_rebuild(self):
+        """M2.1: 客户端尾部改写 → mismatch 信号, 但发送视图不重建(追加)。"""
+        r1 = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "out")
+        self.sess.absorb(r1)
+        r2 = _tu("q1-CHANGED") + _tool_round("t2", "Bash", {"command": "ls"}, "out")
         canon, mism, n = self.sess.absorb(r2)
         self.assertTrue(mism)
-        self.assertEqual(len(canon), len(r2))
+        # 发送视图 = 旧 r1 全保留 + r2 全部信消息追加(绝不推倒重建)
+        self.assertGreater(len(canon), len(r1))
+        self.assertEqual(canon[0]["content"][0]["text"], "q1")
+        self.assertEqual(n, len(r2))
+
+    def test_absorb_tail_match_new_window_only(self):
+        """M2.1: 尾部匹配段之后才是新观测(匹配段=全部旧历史)。"""
+        r1 = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "out")
+        self.sess.absorb(r1)
+        r2 = r1 + [{"role": "assistant", "content": [{"type": "text", "text": "done"}]}]
+        canon, mism, n = self.sess.absorb(r2)
+        self.assertFalse(mism)
+        self.assertEqual(n, 1)                      # 只吸收 1 条新消息
+        self.assertEqual(len(canon), len(r1) + 1)
+
+    def test_epoch_after_collapse_tail_match_continues(self):
+        """M2.1 + epoch: 收编后 client_hashes 与 K 窗口对齐——下一轮尾部
+        匹配成功, 缓存继续复用(不因 epoch 断链)。"""
+        msgs = [{"role": "system", "content": "SYS"}]
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, "o" * 4000)
+        self.sess.absorb(msgs)
+        before_len = len(self.sess.canonical)
+        triggered, final = self.sess.maybe_epoch(self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        self.assertLess(len(final), before_len)
+        # epoch 后下一轮: 客户端补发新轮 → 尾部匹配命中(SYS 段已折叠)
+        tail = msgs[-2:]  # 最后一轮(assistant + user tool_result)
+        next_msgs = msgs + [{"role": "assistant",
+                             "content": [{"type": "text", "text": "reply after epoch"}]}]
+        canon2, mism, n = self.sess.absorb(next_msgs)
+        self.assertFalse(mism)
+        self.assertEqual(n, 1)
+        self.assertIn("reply after epoch", canon2[-1]["content"][0]["text"])
 
     def test_frozen_copy_not_polluted(self):
         msgs = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "keep me")
@@ -292,6 +341,89 @@ class TestDiagnosticsEpochFields(unittest.TestCase):
             _ps._DIAG_SESSIONS_PATH = saved_path
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestTransformIdempotence(unittest.TestCase):
+    """重建幂等(2026-08-21 轮轮冷诊断): Qwen3.8 GDN(SSM) 层 ArraysCache 条目
+    non_trimmable,后端只接受完整前缀复用——absorb mismatch 重建后转发字节
+    必须逐字节稳定,已压缩 tool_result 不得二次压缩(compress_observation 输出
+    恒 > budget,二次压缩会切穿旧标记继续漂移)。"""
+
+    def _hints(self, msgs):
+        return {id(b): h for b, h in ce._pair_tool_hints(msgs)}
+
+    def test_big_result_recompress_skipped(self):
+        # Read 预算 8000 chars,20000 输入必走 head+tail 压缩路径
+        msgs = _tool_round("t1", "Read", {"file_path": "/a/b.py"}, "y" * 20000)
+        once = [ce._transform_message(m, self._hints(msgs)) for m in msgs]
+        # 一次压缩后含引擎标记;二次变换必须原样(否则每轮重建持续漂移)
+        twice = [ce._transform_message(m, self._hints(once)) for m in once]
+        self.assertEqual(once, twice)
+        joined = ce._result_text(once[1]["content"][0])
+        self.assertIn("[ctx-engine:", joined)
+
+    def test_big_error_result_recompress_skipped(self):
+        # Bash 预算 6000,error 上限 ×2=12000;15013 输入必走 error_capped
+        msgs = _tool_round("t1", "Bash", {"command": "pytest"}, "ERROR: fail\n" + "z" * 15000)
+        once = [ce._transform_message(m, self._hints(msgs)) for m in msgs]
+        twice = [ce._transform_message(m, self._hints(once)) for m in once]
+        self.assertEqual(once, twice)
+
+    def test_small_result_still_compresses_later_growth(self):
+        # 小结果 verbatim(无标记)不被守卫误伤: 后续长到超限时仍可压缩
+        small = _tool_round("t1", "Bash", {"command": "ls"}, "ok")
+        once = [ce._transform_message(m, self._hints(small)) for m in small]
+        joined = ce._result_text(once[1]["content"][0])
+        self.assertNotIn("[ctx-engine:", joined)
+
+
+class TestRealTokenTrigger(unittest.TestCase):
+    """epoch 触发真实口径(2026-08-22 校准): est(/4) 低估 1.6×(实测
+    82346/51248), est 口径下 S=60K = 真实 ~96K——触发永远迟到。触发信号
+    取后端 usage 回填的真实 prompt_tokens; 无回填时 est×EST_REAL_RATIO 换算;
+    收编产物容量判定同口径(est 口径下"看似放下"的产物不得放行)。"""
+
+    def setUp(self):
+        self.sess = ce.CanonicalSession("t-real")
+
+    def test_usage_backfill_triggers_epoch_below_est_threshold(self):
+        # est 远低于触发点但真实回填超限 → 必须触发(est 口径下本会漏触发)
+        msgs = _tu("q") + _tool_round("t1", "Bash", {"command": "ls"}, "o" * 6000)
+        self.sess.absorb(msgs)
+        self.sess.record_usage(70000, 30000)      # 真实 70K > 65K
+        triggered, _ = self.sess.maybe_epoch(65000, 24)
+        self.assertTrue(triggered)
+        self.assertEqual(self.sess.epoch_count, 1)
+
+    def test_usage_below_trigger_no_epoch(self):
+        msgs = _tu("q") + _tool_round("t1", "Bash", {"command": "ls"}, "o" * 6000)
+        self.sess.absorb(msgs)
+        self.sess.record_usage(30000, 15000)      # 真实 30K ≤ 65K
+        triggered, final = self.sess.maybe_epoch(65000, 24)
+        self.assertFalse(triggered)
+        self.assertEqual(len(final), 3)           # 1 user + 1 轮工具往返(2 条)
+
+    def test_no_usage_falls_back_to_est_scaled(self):
+        # 无回填(会话首轮): est × 1.6 超限 → 触发
+        # (40K chars 结果在写入期被压到 ~6.3K, 压缩后 est ≈ 1.6K ×1.6 ≈ 2.5K)
+        msgs = _tu("q") + _tool_round("t1", "Bash", {"command": "ls"}, "o" * 40000)
+        self.sess.absorb(msgs)
+        triggered, _ = self.sess.maybe_epoch(2000, 24)
+        self.assertTrue(triggered)
+
+    def test_collapse_fit_checked_in_real_scale(self):
+        # 收编产物按真实口径判定(est×1.6 ≤ S); K=24 产物 ~30K 真实 ≤ 40K 放行
+        msgs = []
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, "x" * 3000)
+        self.sess.absorb(msgs)
+        self.sess.record_usage(90000, 0)          # 真实 90K 超限 → 触发
+        triggered, final = self.sess.maybe_epoch(40000, 24)
+        self.assertTrue(triggered)
+        self.assertIsNotNone(final)
+        self.assertLessEqual(
+            int(self.sess.est_tokens(final) * ce.EST_REAL_RATIO), 40000)
 
 
 if __name__ == "__main__":

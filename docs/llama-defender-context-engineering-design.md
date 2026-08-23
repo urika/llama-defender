@@ -298,6 +298,18 @@ L0 内容（system prompt + 工具定义）由客户端决定，代理只能「�
 > **状态（2026-08-21）**：已实施——`context_engine.py`（写入期压缩模板 §4.3 / canonical 会话两套账 §4.10 / epoch 状态机 §4.9 含回退保护与 413 硬上限）+ 管线 stage 0.5（开启时 6/7/14/17 四 stage 联动跳过——6 CacheAligner 须一并跳过：其拆 prefix/dynamic 后由 7 重组，7 跳过则空 messages 送后端，gate 实测 400 拦截）+ 诊断接线（R16 `epoch_count/is_epoch_turn/epoch_triggered` 回填、R13 `epoch_count` 头/尾注、D6 新 kind `epoch_collapse`）+ `/api/status` `ctx_config.engine_enabled/epoch_S/window_K` 真值 + cached_tokens 透传（`cache_read_input_tokens`，Anthropic 原生字段）。§12.4 修正已纳入。单测 +19，全量 1156 绿。
 >
 > **验收门禁实测（2026-08-21，方案 A 合成会话 `tools/gate_test_ctx_engine.py`，35B 后端，S=60K/K=24）**：80 轮 agentic 会话——G1 非epoch轮 P90 **4.6s**（<15s ✅）/ G2 epoch轮 **2.4s**（<60s ✅，turn 54 触发，prompt 51.9K→12.1K）/ G3 **0** 断连错误 ✅ / G4 epoch后hit恢复 **0.921**（>0.8 ✅，爬回 0.97）/ 门禁1 增量prefill占比 P90 **2.3%**（<10% ✅）。诊断标记闭环：`is_epoch_turn(turn=54)`+`epoch_collapse`+`epoch_count=1` 全命中。**门禁 1-3 合成口径通过；门禁 3 句柄抽查与门禁 4 端到端双臂待真实任务（roadmap M3）。** 实测教训：① rapid-mlx 缓存要求"已存条目 ⊂ 新请求"（严格前缀扩展），客户端必须回显模型真实回复（claude CLI 天然满足；自建 harness 丢弃回复即全量 MISS）；② 会话 key 截断 8 字符下，相同前缀的 harness 会话共享引擎状态（内容无损但缓存互扰），harness 应保证 sid 前 8 字符唯一。生产 conf 已开启引擎（rapid-mlx-35b-opt `PROXY_CTX_ENGINE_ENABLED=true`）。
+>
+> **M2.1 语义修正（2026-08-22）**：8-22 真实任务重跑（303 轮）暴露
+> canonical_mismatch 70%→每轮全量重建→TTFT_p90 131s 的 P0 缺陷，根因是
+> diff 基准用了「客户端原始历史前缀」（M2 初始实现）——客户端任何扰动
+> （microcompaction/头部改写/尾部裁剪，§4.10 边界 2 实锤）都触发重建。
+> 修正：**新观测判定改为 sent_set（已发送消息 hash 集合）去重**，发送视图
+> 纯 append-only——缓存键是「代理发送了什么」而非「客户端说了什么」。
+> 客户端 compaction 摘要是新消息自然追加，被删除旧段保留（token 略涨，
+> 由 epoch 收编）；mismatch 降级为纯诊断信号（仅当最近发送末尾消息不再
+> 出现在客户端历史时置位，只上报不重建）。epoch 折叠后 sent_order 同步收
+> 缩但 sent_set 不清（防重放）。单测 +2 调整（mid_rewrite/tail_mutation
+> 场景按新语义断言）。
 
 | 改动点 | 内容 |
 |--------|------|
