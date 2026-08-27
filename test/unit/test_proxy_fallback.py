@@ -3631,5 +3631,81 @@ class TestMetricsSchemaV1(unittest.TestCase):
         self.assertIn("est_output_tokens", mc)
 
 
+class TestStreamingTailUsageChunk(unittest.TestCase):
+    """include_usage 尾块回归: 后端末块 choices 为空列表时不得 IndexError。
+
+    2026-08-21 #39 门禁实测: rapid-mlx 在 stream_options.include_usage 下
+    发出 `{"choices": [], "usage": {...}}` 尾块, 旧代码
+    `chunk.get("choices", [{}])[0]` 的默认值只在 key 缺席时生效, 空列表
+    直接 [][0] → 每个流式请求在生成末必崩, claude CLI 全部降级非流式
+    重试(每轮双倍请求)。修复: 空列表显式兜底, usage 块照常处理。
+    """
+
+    class _FakeWfile:
+        def __init__(self):
+            self.chunks = []
+
+        def write(self, b):
+            self.chunks.append(b)
+
+        def flush(self):
+            pass
+
+    class _FakeHandler:
+        def __init__(self):
+            self._openai_mode = False
+            self._request_id = "req_test"
+            self._route_response_headers = None
+            self._queue_response_headers = None
+            self._diag_response_headers = {}
+            self._last_jsonl_token = "test_tail_token"
+            self.wfile = TestStreamingTailUsageChunk._FakeWfile()
+
+        def send_response(self, code):
+            pass
+
+        def send_header(self, k, v):
+            pass
+
+        def end_headers(self):
+            pass
+
+        def _send_diag_headers(self):
+            pass
+
+    def _run_stream(self, lines):
+        import io
+        payload = b"".join((ln + "\n").encode("utf-8") for ln in lines)
+        resp = io.BytesIO(payload)
+        body = {"model": "claude-sonnet-4-6", "max_tokens": 4096}
+        h = self._FakeHandler()
+        with patch.object(proxy, "log"), \
+             patch.object(proxy, "PROXY_DIAG_ENABLED", False):
+            proxy.Handler._handle_streaming_response(h, resp, body)
+        return h
+
+    def test_tail_chunk_with_empty_choices_does_not_crash(self):
+        lines = [
+            'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"}}]}',
+            'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            'data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1}}',
+            'data: [DONE]',
+        ]
+        h = self._run_stream(lines)
+        joined = b"".join(h.wfile.chunks).decode("utf-8")
+        self.assertIn("hello", joined)
+        self.assertIn("message_stop", joined)
+
+    def test_missing_choices_key_still_works(self):
+        lines = [
+            'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}',
+            'data: [DONE]',
+        ]
+        h = self._run_stream(lines)
+        joined = b"".join(h.wfile.chunks).decode("utf-8")
+        self.assertIn("hi", joined)
+        self.assertIn("message_stop", joined)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

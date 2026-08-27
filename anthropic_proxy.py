@@ -1013,7 +1013,8 @@ class Handler(BaseHTTPRequestHandler):
             output_chars = 0
             force_stopped = False
 
-            choice = openai_resp.get("choices", [{}])[0]
+            _choices = openai_resp.get("choices") or []
+            choice = _choices[0] if _choices else {}
             message = choice.get("message", {})
             content = message.get("content") or ""
             if content:
@@ -1075,7 +1076,9 @@ class Handler(BaseHTTPRequestHandler):
             for block in anthropic_resp.get("content", []):
                 if block.get("type") == "tool_use" and block.get("input") == {}:
                     tool_name = block.get("name", "")
-                    for tc in (openai_resp.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []):
+                    _choices = openai_resp.get("choices") or []
+                    _msg0 = _choices[0].get("message", {}) if _choices else {}
+                    for tc in (_msg0.get("tool_calls") or []):
                         if tc.get("function", {}).get("name") == tool_name:
                             raw_args = tc["function"].get("arguments", "{}")
                             try:
@@ -1160,7 +1163,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(ev.encode("utf-8"))
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass  # Client disconnected, stop emitting
+                # 2026-08-27 修复: 原为 `pass`——吞掉后读循环继续消费后端流,
+                # 客户端已消失仍让 rapid-mlx 烧完整段生成(MAX_CONCURRENT=1 下
+                # 把唯一 sequence 占满, 后续请求排队放大成分钟级积压; 08-27
+                # probe 排队 25 分钟事故根因)。改为向上抛给 backend_dispatcher
+                # 的断连处理: 立即停止中继并 close() 到后端的连接取消在途生成。
+                raise
 
         # Send message_start (usage will be updated from llama-server timings)
         event = {
@@ -1197,7 +1205,12 @@ class Handler(BaseHTTPRequestHandler):
             if _first_token_time is None:
                 _first_token_time = time.monotonic()
 
-            choice = chunk.get("choices", [{}])[0]
+            # include_usage 尾块 choices 为空列表(rapid-mlx 实测)——.get 默认值
+            # 只在 key 缺席时生效, 空列表须显式兜底, 否则 [][0] IndexError
+            # (2026-08-21 #39 门禁实测: 每个流式请求在生成末必崩, claude CLI
+            # 全部降级非流式重试, 每轮双倍请求)。
+            choices = chunk.get("choices") or []
+            choice = choices[0] if choices else {}
             delta = choice.get("delta", {})
 
             # Track finish_reason from the stream
@@ -1476,7 +1489,8 @@ class Handler(BaseHTTPRequestHandler):
                         data_str = decoded[6:].strip()
                         if data_str and data_str != "[DONE]":
                             chunk = json.loads(data_str)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            _choices = chunk.get("choices") or []
+                            delta = _choices[0].get("delta", {}) if _choices else {}
                             total_text += delta.get("content", "") or ""
                             # R13/R16: 该透传路径此前完全不解析 usage/timings——
                             # 补齐采集(OpenAI 协议流式的诊断数据来源)
@@ -1501,7 +1515,9 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass  # Client disconnected
+            # 2026-08-27 修复: 原为 `pass`——断连后读循环继续消费后端流, 改为
+            # 上抛给 backend_dispatcher 取消在途生成(同 _emit_text_delta 注释)。
+            raise
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed OpenAI mode text={len(total_text)} chars")
 
@@ -1598,7 +1614,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(raw)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected
+            # 2026-08-27 修复: 原为 `pass`——断连后读循环继续消费后端流, 改为
+            # 上抛给 backend_dispatcher 取消在途生成(同 _emit_text_delta 注释)。
+            raise
         # 兜底: 流异常截断(未收到 message_stop)时在结尾追加,保证诊断仍可达
         if PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL and not _tail_written:
             self._write_diag_sse_tail()

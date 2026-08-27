@@ -516,7 +516,8 @@ class ContextEngineStage(ConditionalStage):
         ctx.messages = [context_engine._frozen_copy(m) for m in final]
         ctx._ctx_engine_epoch = triggered
         log(f"  -> [context_engine] msgs={len(final)} est_tokens≈{sess.est_tokens()} "
-            f"epochs={sess.epoch_count} new_window={new_msgs}")
+            f"last_real≈{sess.last_sent_tokens} epochs={sess.epoch_count} "
+            f"new_window={new_msgs}")
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
@@ -2844,7 +2845,16 @@ class BackendDispatcher(PipelineStage):
         except (BrokenPipeError, ConnectionResetError):
             self._client_disconnected = True
             self._handler._client_disconnected = True
-            log("  <- Client disconnected mid-response (broken pipe) — relay aborted", level="WARN")
+            # 2026-08-27 修复(#1): 显式关闭到后端的连接。原路径直接 return,
+            # rapid-mlx 感知不到代理侧已弃单, 把唯一 sequence 的在途生成烧到底
+            # (--max-num-seqs 1), 断连重试请求逐个排在它后面形成分钟级积压
+            # (08-27 bec27fb4 收尾实测: probe 排队 25.4 分钟超时 → probe_fail
+            # 中止整批)。close() 后 rapid-mlx 检测到对端断开即中止该 sequence。
+            try:
+                resp.close()
+            except Exception:
+                pass  # 尽力清理; resp 未绑定等异常不掩盖原始断连语义
+            log("  <- Client disconnected mid-response (broken pipe) — relay aborted, backend request cancelled", level="WARN")
             return
 
         # Phase 3+ (建议3): record backend-only dispatch latency so cloud vs
@@ -2972,7 +2982,13 @@ class BackendDispatcher(PipelineStage):
         except (BrokenPipeError, ConnectionResetError):
             self._client_disconnected = True
             self._handler._client_disconnected = True
-            log("  <- Client disconnected mid-response (broken pipe) — anthropic relay aborted", level="WARN")
+            # 2026-08-27 修复(#1): 同 openai 路径——close() 取消后端在途生成,
+            # 防断连弃单占满后端唯一 sequence 造成队列积压。
+            try:
+                resp.close()
+            except Exception:
+                pass
+            log("  <- Client disconnected mid-response (broken pipe) — anthropic relay aborted, backend request cancelled", level="WARN")
             return
 
         dispatch_ms = (time.monotonic() - _dispatch_t0) * 1000

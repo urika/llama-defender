@@ -182,10 +182,21 @@ def _probe_backend_model_name():
     """Return the model name reported by the backend, or None if unavailable."""
     data = _probe_backend_models()
     models = data.get("data") if isinstance(data.get("data"), list) else data.get("models") if isinstance(data.get("models"), list) else []
-    if models:
-        first = models[0]
-        return first.get("id") or first.get("model") or None
-    return None
+    if not models:
+        return None
+    ids = [m.get("id") or m.get("model") for m in models if isinstance(m, dict)]
+    ids = [i for i in ids if i]
+    expected = getattr(_ps, "MODEL_NAME", None)
+    # 后端可能列出多个模型(dflash 列出全部本地 MLX 模型):优先精确匹配
+    # 配置 MODEL_NAME,其次家族兼容,避免探到错误的模型触发 model_drift。
+    if expected:
+        for mid in ids:
+            if mid == expected:
+                return mid
+        for mid in ids:
+            if mid and _model_slugs_compatible(mid, expected):
+                return mid
+    return ids[0] if ids else None
 
 
 def _probe_backend_ready():
@@ -299,7 +310,7 @@ def _build_route_policies_json():
 # --- _build_status_json ---
 def _build_status_json():
     """Build the structured JSON status payload for agent_go."""
-    backend_info = _get_process_info("rapid-mlx|llama-server", "Backend")
+    backend_info = _get_process_info("rapid-mlx|llama-server|dflash", "Backend")
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
 
     proxy_alive = proxy_info.get("running", False)
@@ -2077,7 +2088,7 @@ def _get_session_trace():
     return summary + "\n".join(timeline), tools_detail, errors_detail
 # --- _build_status_html ---
 def _build_status_html():
-    backend_info = _get_process_info("rapid-mlx|llama-server", "Backend")
+    backend_info = _get_process_info("rapid-mlx|llama-server|dflash", "Backend")
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
     mem = _get_system_memory()
     log = _get_log_stats()
@@ -2366,7 +2377,7 @@ def _build_status_html():
         alerts_html = '<div class="evt" style="color:#2ecc71;">✅ No anomalies detected (last 10m)</div>'
 
     # Cloud-backend status card (no PID/memory/uptime)
-    if _strategy.oom_safety_enabled:
+    if _ps.IS_CLOUD:
         backend_card = f"""<div class="card">
     <h2>Backend</h2>
     <div class="row"><span class="label">Type</span><span class="value">Cloud API ({_ps.BACKEND_TYPE})</span></div>
@@ -2378,6 +2389,7 @@ def _build_status_html():
         backend_card = f"""<div class="card">
     <h2>Backend</h2>
     <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{backend_color}"></span>{"Running" if backend_info.get("running") else "Stopped"}</span></div>
+    <div class="row"><span class="label">Type</span><span class="value">{getattr(_ps, "PROXY_BACKEND_NAME", "unknown")} ({_ps.BACKEND_TYPE})</span></div>
     <div class="row"><span class="label">Name</span><span class="value">{backend_info.get("name", "N/A")}</span></div>
     <div class="row"><span class="label">PID</span><span class="value">{backend_info.get("pid", "N/A")}</span></div>
     <div class="row"><span class="label">Memory</span><span class="value">{backend_info.get("rss_mb", "N/A")} MB</span></div>

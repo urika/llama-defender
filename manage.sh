@@ -214,12 +214,18 @@ _current_backend() {
             elif [[ "$comm" == "mlx_vlm" ]]; then
                 echo "mlx_vlm"
                 return 0
+            elif [[ "$comm" == "dflash" ]]; then
+                echo "dflash-mlx"
+                return 0
             fi
         fi
     fi
     # fallback: search process
     if pgrep -f "rapid-mlx" >/dev/null 2>&1; then
         echo "rapid-mlx"
+        return 0
+    elif pgrep -f "dflash serve" >/dev/null 2>&1; then
+        echo "dflash-mlx"
         return 0
     elif pgrep -f "mlx_vlm" >/dev/null 2>&1; then
         echo "mlx_vlm"
@@ -278,6 +284,8 @@ _get_pid() {
     local pid
     if [[ "$backend" == "rapid-mlx" || "$backend" == "vllm-mlx" ]]; then
         pid=$(pgrep -f "rapid-mlx" 2>/dev/null | head -1)
+    elif [[ "$backend" == "dflash-mlx" ]]; then
+        pid=$(pgrep -f "dflash serve" 2>/dev/null | head -1)
     elif [[ "$backend" == "mlx_vlm" ]]; then
         pid=$(pgrep -f "mlx_vlm" 2>/dev/null | head -1)
     else
@@ -608,6 +616,58 @@ _start_rapid_mlx() {
 }
 
 # ============================================================
+# 启动 dflash-mlx (DFlash 投机解码推理服务, Apple Silicon)
+# ============================================================
+_start_dflash_mlx() {
+    _check_port "$LLAMA_PORT" || return 1
+
+    local bin="${DFLASH_BIN:-./.venv-dflash/bin/dflash}"
+    if [[ ! -x "$bin" ]]; then
+        error "未找到 dflash-mlx 二进制: $bin"
+        error "安装: python3.12 -m venv .venv-dflash && .venv-dflash/bin/pip install dflash-mlx"
+        return 1
+    fi
+
+    info "启动 ${bin}..."
+    info "  配置: $(_current_config_name)"
+    info "  模型: $LLAMA_MODEL"
+    info "  Draft: ${DFLASH_DRAFT_MODEL:-<无>}"
+    info "  地址: $LLAMA_HOST:$LLAMA_PORT"
+
+    local args=(
+        --model "$LLAMA_MODEL"
+        --host "$LLAMA_HOST"
+        --port "$LLAMA_PORT"
+    )
+
+    if [[ -n "${DFLASH_DRAFT_MODEL:-}" ]]; then
+        args+=(--draft "$DFLASH_DRAFT_MODEL")
+        info "  DFlash 草稿: $DFLASH_DRAFT_MODEL"
+    fi
+
+    # Thinking 默认关闭（与本地后端一致）
+    if [[ "${DFLASH_ENABLE_THINKING:-false}" == "true" ]]; then
+        args+=(--enable-thinking)
+        info "  Thinking: ${GREEN}启用${NC}"
+    else
+        args+=(--chat-template-args '{"enable_thinking": false}')
+        info "  Thinking: 关闭"
+    fi
+
+    if [[ -n "${DFLASH_EXTRA_ARGS:-}" ]]; then
+        read -ra extra <<< "$DFLASH_EXTRA_ARGS"
+        args+=("${extra[@]}")
+    fi
+
+    nohup "$bin" serve "${args[@]}" >> "$LOGFILE" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+
+    info "进程已启动 (PID: $new_pid)，等待就绪..."
+    _wait_for_ready "$new_pid" "dflash-mlx"
+}
+
+# ============================================================
 # 启动 MLX-VLM (Vision Language Model 推理服务)
 # ============================================================
 _start_mlx_vlm() {
@@ -775,6 +835,7 @@ proxy_config.write_defaults_sh('$_bt', '$_defaults_tmp')
     PROXY_CTX_TOKEN_RATIO="${PROXY_CTX_TOKEN_RATIO:-0.2}" \
     PROXY_CTX_KEEP_HEAD="${PROXY_CTX_KEEP_HEAD:-2}" \
     PROXY_CTX_KEEP_TAIL="${PROXY_CTX_KEEP_TAIL:-6}" \
+    PROXY_CTX_KEEP_MESSAGES="${PROXY_CTX_KEEP_MESSAGES:-40}" \
     PROXY_SAVE_REQUESTS="${PROXY_SAVE_REQUESTS:-}" \
     PROXY_SAVE_REQUESTS_DIR="${PROXY_SAVE_REQUESTS_DIR:-/tmp/anthropic_requests}" \
     PROXY_SAVE_REQUESTS_MAX="${PROXY_SAVE_REQUESTS_MAX:-10}" \
@@ -889,6 +950,9 @@ cmd_start() {
     case "$LLAMA_BACKEND" in
         rapid-mlx|vllm-mlx)
             _start_rapid_mlx || return 1
+            ;;
+        dflash-mlx|dflash)
+            _start_dflash_mlx || return 1
             ;;
         mlx_vlm|mlx-vlm)
             _start_mlx_vlm || return 1
@@ -1467,6 +1531,9 @@ cmd_start_backend() {
     case "$LLAMA_BACKEND" in
         rapid-mlx|vllm-mlx)
             _start_rapid_mlx || return 1
+            ;;
+        dflash-mlx|dflash)
+            _start_dflash_mlx || return 1
             ;;
         mlx_vlm|mlx-vlm)
             _start_mlx_vlm || return 1
