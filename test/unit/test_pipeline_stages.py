@@ -73,6 +73,20 @@ class TestRequestParser(unittest.TestCase):
         self.assertEqual(ctx.tools_list, ["Read", "Bash"])
         self.assertEqual(ctx.raw_tools_orig, self.body["tools"])
 
+    def test_extracts_client_timeout_from_header(self):
+        body = dict(self.body, _x_client_timeout_s="300")
+        ctx = RequestParser().process(PipelineContext(body=body))
+        self.assertEqual(ctx.client_timeout_s, 300.0)
+
+    def test_client_timeout_defaults_zero(self):
+        ctx = RequestParser().process(PipelineContext(body=self.body))
+        self.assertEqual(ctx.client_timeout_s, 0.0)
+
+    def test_client_timeout_bad_value_ignored(self):
+        body = dict(self.body, _x_client_timeout_s="abc")
+        ctx = RequestParser().process(PipelineContext(body=body))
+        self.assertEqual(ctx.client_timeout_s, 0.0)
+
     def test_extracts_session_id(self):
         ctx = RequestParser().process(PipelineContext(body=self.body))
         self.assertEqual(ctx.session_id, "sess_test_123")
@@ -1865,3 +1879,44 @@ class TestMinMaxTokensFloor(unittest.TestCase):
     def test_model_without_quirk_untouched(self):
         ctx = self._convert(1000, model="deepseek-v4-flash")
         self.assertEqual(ctx.openai_body["max_tokens"], 1000)
+
+
+class TestBackendDispatcherEffectiveTimeout(unittest.TestCase):
+    """proactive 非流式超时钳制 (客户端超时−margin) 与流式宽松超时."""
+
+    def setUp(self):
+        self.dispatcher = BackendDispatcher()
+
+    def _ctx(self, ct):
+        return PipelineContext(client_timeout_s=ct)
+
+    def test_proactive_clamps_below_client_timeout(self):
+        with patch.object(_ps, "PROXY_BACKEND_TIMEOUT", 600), \
+             patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
+            t = self.dispatcher._effective_backend_timeout(self._ctx(300), proactive=True)
+            self.assertEqual(t, 270)
+
+    def test_proactive_never_exceeds_backend_timeout(self):
+        with patch.object(_ps, "PROXY_BACKEND_TIMEOUT", 600), \
+             patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
+            t = self.dispatcher._effective_backend_timeout(self._ctx(900), proactive=True)
+            self.assertEqual(t, 600)
+
+    def test_proactive_unknown_client_timeout_uses_backend(self):
+        with patch.object(_ps, "PROXY_BACKEND_TIMEOUT", 600), \
+             patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
+            t = self.dispatcher._effective_backend_timeout(self._ctx(0), proactive=True)
+            self.assertEqual(t, 600)
+
+    def test_streaming_keeps_generous_timeout(self):
+        # 流式: prefill/首 token 不受限, stall 由流式空闲看门狗接管
+        with patch.object(_ps, "PROXY_BACKEND_TIMEOUT", 600), \
+             patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
+            t = self.dispatcher._effective_backend_timeout(self._ctx(300), proactive=False)
+            self.assertEqual(t, 600)
+
+    def test_tiny_client_timeout_falls_back(self):
+        with patch.object(_ps, "PROXY_BACKEND_TIMEOUT", 600), \
+             patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
+            t = self.dispatcher._effective_backend_timeout(self._ctx(20), proactive=True)
+            self.assertEqual(t, 600)  # eff = -10 → 回退

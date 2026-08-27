@@ -490,6 +490,8 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_LOOP_LEVEL3` | `9` | `9` | Level 3 触发阈值（移除全部工具） |
 | `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` | `2048` | `8192` | saturation 档输出预算（长上下文收紧，防生成超时；见 `docs/02-architecture-design/agent-output-budget-design-20260827.md`） |
 | `PROXY_DYNAMIC_MAX_TOKENS_OOM` | `4096` | `4096` | oom_danger/pre_trunc 档输出预算（极端上下文兜底；agent 连续会话由 continuation 短路归入 saturation，此档主要首轮兜底） |
+| `PROXY_TIMEOUT_MARGIN_S` | `30` | `30` | 非流式主动 504 余量：后端超时钳为 `客户端超时−30s`，保证错误在客户端断连前送达（消除 `CRITICAL: failed to send error`） |
+| `PROXY_STREAM_IDLE_TIMEOUT_S` | `30` | `30` | 流式 chunk 空闲看门狗：首 token 后无 chunk 超此秒数即中止中继并取消后端在途生成 |
 | `PROXY_COMPRESSION_PROFILE` | `balanced` | `balanced` | 压缩策略预设组合 |
 
 ### 11.3 云端模式关键参数

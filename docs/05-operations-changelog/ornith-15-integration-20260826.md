@@ -213,3 +213,16 @@ audreyt 发布 `dflash_distill_mlx.py`（MLX 原生 DFlash 蒸馏，原目标 Or
   2. ornith-*.conf ×3：`SATURATION=16384→8192`、新增 `OOM=4096`、`PROXY_MAX_TOKENS_OVERRIDE=32768→0`（仅向下钳制的天花板，置 0 彻底排除干扰）。
   3. 单测补四档分支 + override 不反向用例（unit 1172 全过，signature/config-lint 通过）。
 - **预算语义**：预算=天花板非目标值；触顶返回 `stop_reason=max_tokens` 由 Claude Code 下一轮续写，长代码/文档走 Write 工具不受限 → 对 agent 实质产出无影响。
+
+## 十、超时硬化：主动 504 + 流式空闲看门狗（2026-08-27，P1 补强）
+
+- **背景**：§九 预算修复解决了"过大输出"，但预算之外仍存在 **600s 后端 vs 300s 客户端竞速**——非流式请求超时错误在客户端断连后才送达（`CRITICAL: failed to send error`），且流中 stall 会拖满唯一 sequence。
+- **服务端主动 504**：
+  1. do_POST 解析 `X-Stainless-Timeout` → `PipelineContext.client_timeout_s`（缺省 0）。
+  2. BackendDispatcher `_effective_backend_timeout(ctx, proactive=not ctx.is_stream)`：非流式 urlopen 超时钳为 `min(600, 客户端超时−PROXY_TIMEOUT_MARGIN_S=30)` → 300s 客户端在 270s 收到 504+Retry-After（客户端未断、错误可送达）；流式保持宽松超时（prefill 不受限）。
+- **流式空闲看门狗**：
+  1. `_timed_stream_lines`（anthropic_proxy.py）包住三处流式循环；首 token 后把 socket 读超时收紧到 `PROXY_STREAM_IDLE_TIMEOUT_S=30`（已实测 `resp.fp.raw._sock` 路径可用）。
+  2. stall 抛 `StreamIdleTimeout` → BackendDispatcher 捕获后 `resp.close()` 取消后端在途生成（headers 已提交，客户端见截断流自行重试）。
+- **参数**：`PROXY_TIMEOUT_MARGIN_S` / `PROXY_STREAM_IDLE_TIMEOUT_S`（均默认 30，reloadable，`_RELOAD_SPEC`/`__all__`/`CONFIG_REGISTRY` 注册）。
+- **验证**：unit 1182 全过（新增 13 用例：proactive 钳制 5 + 看门狗 2 + client_timeout 解析 3 + RequestParser 续）+ signature 快照重生成 + snapshot + config-lint 通过。
+- **生效**：配置值 reload 已应用；新代码需 `./manage.sh restart` 重启代理进程后生效。

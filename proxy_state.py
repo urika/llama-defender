@@ -193,6 +193,21 @@ PROXY_CHARS_OOM_DANGER = int(os.environ.get("PROXY_CHARS_OOM_DANGER", get_defaul
 PROXY_MAX_TOKENS_OVERRIDE = int(os.environ.get("PROXY_MAX_TOKENS_OVERRIDE", "0"))
 PROXY_OUTPUT_TOKEN_LIMIT_RATIO = float(os.environ.get("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "2.0"))
 PROXY_BACKEND_TIMEOUT = int(os.environ.get("PROXY_BACKEND_TIMEOUT", "600"))
+# 2026-08-27: 主动超时余量——非流式请求在"客户端超时−余量"处主动返回 504,
+# 保证错误送达客户端(而非 CRITICAL: failed to send error)。取客户端
+# X-Stainless-Timeout 头,缺省(非 stainless 客户端)时退回 PROXY_BACKEND_TIMEOUT。
+PROXY_TIMEOUT_MARGIN_S = int(os.environ.get("PROXY_TIMEOUT_MARGIN_S", "30"))
+# 2026-08-27: 流式 chunk 空闲看门狗——首 token 后若无 chunk 超过该秒数即中止
+# 中继并取消后端在途生成(prefill/首 token 不受限,仅限流中 stall)。
+PROXY_STREAM_IDLE_TIMEOUT_S = int(os.environ.get("PROXY_STREAM_IDLE_TIMEOUT_S", "30"))
+
+
+class StreamIdleTimeout(Exception):
+    """流式后端 chunk 空闲超时(首 token 后无 chunk 超过 PROXY_STREAM_IDLE_TIMEOUT_S)。
+
+    由 _timed_stream_lines 抛出,BackendDispatcher 捕获后中止中继并关闭到后端的
+    连接以取消在途生成(防流中 stall 拖满后端唯一 sequence)。
+    """
 
 # DEF-001: hard ceiling for total payload size.
 # Cloud backends (DeepSeek/OpenAI) support 1M+ tokens, so pre_truncate is
@@ -937,6 +952,8 @@ _RELOAD_SPEC = [
     ("PROXY_MAX_TOKENS_OVERRIDE", "PROXY_MAX_TOKENS_OVERRIDE", "int", "0", "0"),
     ("PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "PROXY_OUTPUT_TOKEN_LIMIT_RATIO", "float", "2.0", "2.0"),
     ("PROXY_BACKEND_TIMEOUT", "PROXY_BACKEND_TIMEOUT", "int", "600", "600"),
+    ("PROXY_TIMEOUT_MARGIN_S", "PROXY_TIMEOUT_MARGIN_S", "int", "30", "30"),
+    ("PROXY_STREAM_IDLE_TIMEOUT_S", "PROXY_STREAM_IDLE_TIMEOUT_S", "int", "30", "30"),
     ("PROXY_OOM_SAFE_TOKENS", "PROXY_OOM_SAFE_TOKENS", "int", "60000", "60000"),
     ("PROXY_RETRY_AFTER_SECONDS", "PROXY_RETRY_AFTER_SECONDS", "int", "30", "30"),
     ("PROXY_MAX_REQUEST_BYTES", "PROXY_MAX_REQUEST_BYTES", "int", str(500 * 1024), str(500 * 1024)),
@@ -1145,6 +1162,8 @@ __all__ = [
     "PROXY_MAX_TOKENS_OVERRIDE", "PROXY_OUTPUT_TOKEN_LIMIT_RATIO",
     "PROXY_BACKEND_TIMEOUT", "PROXY_OOM_SAFE_CHARS", "PROXY_PRE_TRUNCATE_CHARS",
     "PROXY_MAX_REQUEST_BYTES", "PROXY_OOM_SAFE_TOKENS", "PROXY_RETRY_AFTER_SECONDS", "PROXY_CLOUD_MAX_REQUEST_BYTES",
+    "PROXY_TIMEOUT_MARGIN_S", "PROXY_STREAM_IDLE_TIMEOUT_S",
+    "StreamIdleTimeout",
     # Token ratios
     "PROXY_TOKEN_RATIO_CHINESE", "PROXY_TOKEN_RATIO_ENGLISH", "PROXY_TOKEN_RATIO_CODE",
     # Memory

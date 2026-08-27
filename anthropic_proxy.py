@@ -379,6 +379,33 @@ from tool_filter import *
 # ---------------------------------------------------------------------------
 
 
+def _timed_stream_lines(resp):
+    """Wrap a backend SSE stream with an inter-chunk idle watchdog.
+
+    首 token 后收紧底层 socket 读超时到 PROXY_STREAM_IDLE_TIMEOUT_S——流中 stall
+    在数秒内被探测而非拖满 PROXY_BACKEND_TIMEOUT(600s)。prefill/首 token 不受
+    限(收紧发生在首个 yield 之后)。stall 时抛 StreamIdleTimeout,由
+    BackendDispatcher 捕获后中止中继并 close() 后端连接取消在途生成。
+    socket 内部结构不匹配时静默降级为默认 socket 超时(无看门狗)。
+    """
+    import socket
+    first = True
+    try:
+        for bline in resp:
+            if first:
+                try:
+                    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+                    if sock is not None:
+                        sock.settimeout(PROXY_STREAM_IDLE_TIMEOUT_S)
+                except Exception:
+                    pass
+                first = False
+            yield bline
+    except socket.timeout:
+        raise StreamIdleTimeout(
+            f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -590,6 +617,9 @@ class Handler(BaseHTTPRequestHandler):
                 parsed = json.loads(body)
                 # Extract X-Proxy-Route-To header for single-request route override
                 parsed["_x_proxy_route_to"] = self.headers.get("X-Proxy-Route-To", "")
+                # 客户端超时（stainless SDK 的 X-Stainless-Timeout）——用于非流式
+                # 主动 504 与流式空闲看门狗的上限推导；缺省则退回后端超时。
+                parsed["_x_client_timeout_s"] = self.headers.get("X-Stainless-Timeout", "")
             except json.JSONDecodeError:
                 log(f"  Body (invalid JSON): {body[:500]}", level="WARN")
                 self._respond_json(
@@ -1187,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
         stream_finish_reason = None
-        for line in resp:
+        for line in _timed_stream_lines(resp):
             line = line.decode("utf-8").strip()
             if not line.startswith("data: "):
                 continue
@@ -1467,7 +1497,7 @@ class Handler(BaseHTTPRequestHandler):
 
         total_text = ""
         try:
-            for line in resp:
+            for line in _timed_stream_lines(resp):
                 # R13 流式通道: [DONE] 前插入诊断尾注(设计 D1,注释行规范保证被忽略)
                 try:
                     _dec = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
@@ -1600,7 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
         _first_token_time = None
         _tail_written = False
         try:
-            for raw in resp:
+            for raw in _timed_stream_lines(resp):
                 if not isinstance(raw, bytes):
                     raw = raw.encode("utf-8")
                 if _first_token_time is None and raw.strip() and not raw.startswith(b":"):

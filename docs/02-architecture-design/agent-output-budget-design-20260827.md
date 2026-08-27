@@ -159,18 +159,21 @@ else:  # saturation/oom_danger/pre_trunc 共用
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| `PROXY_BACKEND_TIMEOUT` | 600（保持） | 客户端超时无法修改（300/600 均有），不做超时竞速 |
+| `PROXY_BACKEND_TIMEOUT` | 600（保持） | 流式 prefill/首 token 的上限；流中 stall 由 6.2 看门狗接管 |
 | 完成保障 | 由预算保证 | 请求生成耗时经 §5.1 控制在超时前 |
 
-### 6.2 流式生成看门狗（补强）
+### 6.2 流式生成看门狗（2026-08-27 已实现）
 
-- 非流式请求在客户端断连前无法感知，只能靠预算。
-- **流式路径**：补后端 chunk 级 idle 看门狗（如 30s 无 chunk 即断连 + 499 记账），区分"首 token 慢"与"生成卡死"，避免等满 600s。
-- 验证 streaming 路径 BrokenPipe 走 499 而非 500（anthropic_proxy.py:850 非流式已按 `_client_disconnected` 计 499，流式需确认）。
+- **`_timed_stream_lines`**（anthropic_proxy.py）：包住三处 `for line in resp:` 流式循环（Anthropic 转换 / OpenAI 透传 / anthropic 协议透传）。**首 token 后**把底层 socket 读超时收紧到 `PROXY_STREAM_IDLE_TIMEOUT_S`（默认 30s）——prefill/首 token 不受限（收紧发生在首个 yield 之后），流中 stall 数秒内被探测而非拖满 600s。
+- stall 时抛 `StreamIdleTimeout`，BackendDispatcher 捕获后 `resp.close()` 取消后端在途生成（headers 已提交，客户端看到截断流自行重试）。
+- socket 内部结构不匹配时静默降级为默认超时（无看门狗），已用后端 `/v1/models` 实测 `resp.fp.raw._sock` 路径可用。
+- 流式路径 BrokenPipe 已在先前提交（2d7ab41）中改为取消在途生成并走 499 语义。
 
-### 6.3 服务端主动 504（补强）
+### 6.3 服务端主动 504（2026-08-27 已实现）
 
-- 当后端生成逼近 `客户端超时 − 30s` 时，代理主动返回 504 + Retry-After，使客户端在自身超时前收到明确"可重试"信号，避免 `CRITICAL: failed to send error`（错误送不出去）与孤儿请求白烧算力。
+- **`_effective_backend_timeout(ctx, proactive=not ctx.is_stream)`**（BackendDispatcher）：非流式请求的 urlopen 超时钳为 `min(PROXY_BACKEND_TIMEOUT, 客户端超时 − PROXY_TIMEOUT_MARGIN_S)`。
+- 客户端超时取自 `X-Stainless-Timeout` 请求头（do_POST 解析 → PipelineContext.client_timeout_s），缺省退回 `PROXY_BACKEND_TIMEOUT`。
+- 命中时 `socket.timeout` → `_classify_exception` → **504 + Retry-After**，在客户端自身超时（300s）**之前**送达（如 300−30=270s），消除 `CRITICAL: failed to send error` 与孤儿请求白烧算力。
 
 ---
 
@@ -189,22 +192,26 @@ else:  # saturation/oom_danger/pre_trunc 共用
 
 ### 8.1 参数变更
 
-| 参数 | 现值 | 目标值 | 位置 |
-|---|---|---|---|
-| `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` | 16384 | **8192** | ornith-*.conf ×3 |
-| `PROXY_DYNAMIC_MAX_TOKENS_OOM`（**新增**） | — | **4096** | proxy_state / proxy_config / _RELOAD_SPEC / __all__ / ornith-*.conf ×3 |
-| `PROXY_MAX_TOKENS_OVERRIDE` | 32768 | **0**（或保持 32768，见 4.4） | ornith-*.conf ×3（置 0 彻底消除干扰） |
+| 参数 | 现值 | 目标值 | 位置 | 状态 |
+|---|---|---|---|---|
+| `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` | 16384 | **8192** | ornith-*.conf ×3 | ✅ 已落地 |
+| `PROXY_DYNAMIC_MAX_TOKENS_OOM`（新增） | — | **4096** | proxy_state / proxy_config / _RELOAD_SPEC / __all__ / ornith-*.conf ×3 | ✅ 已落地 |
+| `PROXY_MAX_TOKENS_OVERRIDE` | 32768 | **0** | ornith-*.conf ×3（置 0 排除天花板干扰） | ✅ 已落地 |
+| `PROXY_TIMEOUT_MARGIN_S`（新增） | — | **30** | proxy_state / proxy_config / _RELOAD_SPEC / __all__（默认即 30，无需 conf） | ✅ 已落地 |
+| `PROXY_STREAM_IDLE_TIMEOUT_S`（新增） | — | **30** | proxy_state / proxy_config / _RELOAD_SPEC / __all__（默认即 30，无需 conf） | ✅ 已落地 |
 
 ### 8.2 代码改动
 
-| 位置 | 变更 |
-|---|---|
-| `lifecycle.py:163` `_compute_dynamic_max_tokens` | 拆分 else 分支：`saturation → SATURATION`；`oom_danger/pre_trunc → PROXY_DYNAMIC_MAX_TOKENS_OOM` |
-| `proxy_state.py` | 新增 `PROXY_DYNAMIC_MAX_TOKENS_OOM`（env 读取，默认 4096）+ `_RELOAD_SPEC` 元组（~line 1004 处）+ `__all__` |
-| `proxy_config.py` | `CONFIG_REGISTRY` 新增条目（`defaults: {all: "4096"}`，scope reloadable，doc：oom_danger/pre_trunc 档 max_tokens 上限） |
-| `pipeline.py:579` `DynamicMaxTokens` | 无需改动（复用返回 cap）；如做 §5.2 连续公式则在此调用处替换 |
-| `pipeline.py:716` SmartRouter | 可选：强制本地 + est_chars>OOM_SAFE_CHARS 时打 WARN（§7） |
-| `reload_config.py` | 经 `_RELOAD_SPEC` 自动覆盖，无需直接改动 |
+| 位置 | 变更 | 状态 |
+|---|---|---|
+| `lifecycle.py:163` `_compute_dynamic_max_tokens` | 拆分 else 分支：`saturation → SATURATION`；`oom_danger/pre_trunc → PROXY_DYNAMIC_MAX_TOKENS_OOM` | ✅ 已落地 |
+| `proxy_state.py` | 新增 `PROXY_DYNAMIC_MAX_TOKENS_OOM` + `PROXY_TIMEOUT_MARGIN_S` + `PROXY_STREAM_IDLE_TIMEOUT_S` + `StreamIdleTimeout`（env + `_RELOAD_SPEC` + `__all__`） | ✅ 已落地 |
+| `proxy_config.py` | `CONFIG_REGISTRY` 新增三个条目（reloadable） | ✅ 已落地 |
+| `pipeline.py` BackendDispatcher | `_effective_backend_timeout(ctx, proactive)`：非流式钳 `min(600, 客户端超时−30)`；两处 urlopen 接入；两个 dispatch 捕获 `StreamIdleTimeout` 中止中继 | ✅ 已落地 |
+| `pipeline.py` RequestParser | 解析 `_x_client_timeout_s` → `ctx.client_timeout_s` | ✅ 已落地 |
+| `anthropic_proxy.py` | do_POST 解析 `X-Stainless-Timeout`；`_timed_stream_lines` 看门狗；三处流式循环接入 | ✅ 已落地 |
+| `pipeline.py:716` SmartRouter | 可选：强制本地 + est_chars>OOM_SAFE_CHARS 时打 WARN（§7） | ⏸ 未做（低优先） |
+| `reload_config.py` | 经 `_RELOAD_SPEC` 自动覆盖，无需直接改动 | — |
 
 ### 8.3 同步文件（全量）
 
@@ -263,9 +270,17 @@ else:  # saturation/oom_danger/pre_trunc 共用
 
 ## 11. 最小可落地改动（DoD）
 
-1. `lifecycle.py` 拆分 oom 档 → `PROXY_DYNAMIC_MAX_TOKENS_OOM`。
-2. `proxy_state.py` + `proxy_config.py` 注册新参数（reloadable）+ `_RELOAD_SPEC` + `__all__`。
-3. ornith-*.conf ×3：`SATURATION=8192`、新增 `OOM=4096`、`OVERRIDE=0`。
-4. 单元测试补四档分支 + override 不反向用例。
-5. 文档同步 CLAUDE.md / AGENTS.md / changelog。
-6. §9.3 复测事故档确认预算生效、无 504/499 循环。
+**第一轮已全部完成（2026-08-27，提交 5c87f63 + 2d7ab41）**：
+
+1. `lifecycle.py` 拆分 oom 档 → `PROXY_DYNAMIC_MAX_TOKENS_OOM`。✅
+2. `proxy_state.py` + `proxy_config.py` 注册新参数（reloadable）+ `_RELOAD_SPEC` + `__all__`。✅
+3. ornith-*.conf ×3：`SATURATION=8192`、新增 `OOM=4096`、`OVERRIDE=0`。✅
+4. 单元测试补四档分支 + override 不反向用例。✅
+5. 文档同步 CLAUDE.md / AGENTS.md / changelog。✅
+6. §9.3 复测事故档：**待真实 115K+ 会话出现后执行**（当前无活会话）。
+
+**第二轮（P1 补强，2026-08-27，代码已就绪待提交）**：
+
+7. §6.2 流式空闲看门狗（`_timed_stream_lines` + `StreamIdleTimeout`，三处流式循环）。✅
+8. §6.3 服务端主动 504（`_effective_backend_timeout` 钳 `min(600, 客户端超时−30)`）。✅
+9. 单测 + 签名快照重生成。✅

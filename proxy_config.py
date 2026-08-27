@@ -215,6 +215,16 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Backend request timeout in seconds. Increase for long-context (100K+ prefill ~5 min).",
     },
+    "PROXY_TIMEOUT_MARGIN_S": {
+        "defaults": {"all": "30"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Proactive timeout margin (s): non-streaming requests return 504 at client_timeout - margin so the error reaches the client before it disconnects.",
+    },
+    "PROXY_STREAM_IDLE_TIMEOUT_S": {
+        "defaults": {"all": "30"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Streaming inter-chunk idle watchdog (s), counted after the first token. A mid-stream stall beyond this aborts the relay and cancels in-flight generation.",
+    },
 
     # ---- Pre-trunc / OOM safety ----
     "PROXY_OOM_SAFE_CHARS": {

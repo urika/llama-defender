@@ -36,6 +36,11 @@
     "params": [],
     "defaults": {}
   },
+  "ContextEngineStage": {
+    "name": "ContextEngineStage",
+    "params": [],
+    "defaults": {}
+  },
   "ContextTruncator": {
     "name": "ContextTruncator",
     "params": [],
@@ -147,7 +152,8 @@
       "_route_fallback_models",
       "_route_provider",
       "_emergency_fallback",
-      "_agent_model_tier"
+      "_agent_model_tier",
+      "client_timeout_s"
     ],
     "defaults": {
       "request_id": "",
@@ -192,7 +198,8 @@
       "_route_fallback_models": "<factory>",
       "_route_provider": "",
       "_emergency_fallback": false,
-      "_agent_model_tier": "sonnet"
+      "_agent_model_tier": "sonnet",
+      "client_timeout_s": 0.0
     }
   },
   "PrefixRatioComputer": {
@@ -595,6 +602,11 @@
       "text1",
       "text2"
     ],
+    "defaults": {}
+  },
+  "_ctx_engine_on": {
+    "name": "_ctx_engine_on",
+    "params": [],
     "defaults": {}
   },
   "_current_active_profile": {
@@ -1160,6 +1172,13 @@
       "mime_hint": null,
       "mode": null
     }
+  },
+  "_timed_stream_lines": {
+    "name": "_timed_stream_lines",
+    "params": [
+      "resp"
+    ],
+    "defaults": {}
   },
   "_translate_tool_result_errors": {
     "name": "_translate_tool_result_errors",

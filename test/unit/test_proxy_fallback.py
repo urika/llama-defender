@@ -3709,3 +3709,48 @@ class TestStreamingTailUsageChunk(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTimedStreamLines(unittest.TestCase):
+    """流式 chunk 空闲看门狗: 首 token 后收紧 socket 超时, stall 抛 StreamIdleTimeout."""
+
+    class _FakeSock:
+        def __init__(self):
+            self.to = None
+        def settimeout(self, t):
+            self.to = t
+        def gettimeout(self):
+            return self.to
+
+    class _FakeResp:
+        fp = type("FakeFp", (), {"raw": type("FakeRaw", (), {"_sock": None})()})()
+        def __init__(self, lines, stall_after=None):
+            self._lines = lines
+            self._stall_after = stall_after
+        def __iter__(self):
+            for i, ln in enumerate(self._lines):
+                yield ln
+                if self._stall_after is not None and i == self._stall_after:
+                    import socket
+                    raise socket.timeout("read timed out")
+
+    def test_yields_lines_and_tightens_socket(self):
+        import socket as _socket
+        self._FakeResp.fp.raw._sock = self._FakeSock()
+        resp = self._FakeResp([b"data: hello", b"data: [DONE]"])
+        with patch.object(proxy, "PROXY_STREAM_IDLE_TIMEOUT_S", 30):
+            got = list(proxy._timed_stream_lines(resp))
+        self.assertEqual(got, [b"data: hello", b"data: [DONE]"])
+        self.assertEqual(self._FakeResp.fp.raw._sock.to, 30)
+
+    def test_stall_raises_stream_idle_timeout(self):
+        import socket as _socket
+        self._FakeResp.fp.raw._sock = self._FakeSock()
+        resp = self._FakeResp([b"data: first"], stall_after=0)
+        with patch.object(proxy, "PROXY_STREAM_IDLE_TIMEOUT_S", 30):
+            with self.assertRaises(proxy.StreamIdleTimeout):
+                list(proxy._timed_stream_lines(resp))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -217,6 +217,7 @@ class PipelineContext:
     _route_provider: str = ""             # provider name of the dispatched model
     _emergency_fallback: bool = False     # emergency fallback mode flag
     _agent_model_tier: str = "sonnet"     # Agent-selected tier ("opus"/"sonnet"/"haiku")
+    client_timeout_s: float = 0.0         # 客户端声明超时(X-Stainless-Timeout); 0=未知
 
 
 # ============================================================================
@@ -419,6 +420,13 @@ class RequestParser(PipelineStage):
         # Extract X-Proxy-Route-To header override (pre-extracted by Handler.do_POST)
         route_override = body.get("_x_proxy_route_to", "")
         ctx._route_header_override = route_override if route_override in ("local", "cloud") else ""
+
+        # 客户端声明超时 (X-Stainless-Timeout) —— 主动 504 上限推导输入
+        _ct_raw = body.get("_x_client_timeout_s", "")
+        try:
+            ctx.client_timeout_s = float(_ct_raw) if _ct_raw else 0.0
+        except (TypeError, ValueError):
+            ctx.client_timeout_s = 0.0
 
         # Classify Agent model tier from request body
         ctx._agent_model_tier = _classify_tier(body.get("model", ""))
@@ -2270,6 +2278,27 @@ class BackendDispatcher(PipelineStage):
         self._output_tokens = 0
         self._dispatch_latency_ms = 0.0
 
+    def _effective_backend_timeout(self, ctx, proactive=True):
+        """Backend socket timeout in seconds.
+
+        proactive=True (non-streaming): clamp to `client_timeout - margin` so the
+        proxy returns 504 BEFORE the client disconnects (avoids
+        "CRITICAL: failed to send error" + orphaned compute). Falls back to
+        PROXY_BACKEND_TIMEOUT when the client didn't declare a timeout.
+        proactive=False (streaming): keep the generous backend timeout — prefill /
+        first-token latency is exempt; mid-stream stalls are handled by the
+        streaming idle watchdog (PROXY_STREAM_IDLE_TIMEOUT_S).
+        """
+        base = _ps.PROXY_BACKEND_TIMEOUT
+        if not proactive:
+            return base
+        ct = float(getattr(ctx, 'client_timeout_s', 0) or 0)
+        if ct > 0:
+            eff = ct - _ps.PROXY_TIMEOUT_MARGIN_S
+            if eff > 10:
+                return min(base, eff)
+        return base
+
     # ------------------------------------------------------------------
     # Phase B: catalog-driven cloud target resolution
     # ------------------------------------------------------------------
@@ -2757,7 +2786,7 @@ class BackendDispatcher(PipelineStage):
             method="POST",
         )
         _dispatch_t0 = time.monotonic()
-        resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=self._effective_backend_timeout(ctx, proactive=not ctx.is_stream))
         self._backend_status = resp.status
         log(f"  <- backend status: {resp.status}")
 
@@ -2856,6 +2885,17 @@ class BackendDispatcher(PipelineStage):
                 pass  # 尽力清理; resp 未绑定等异常不掩盖原始断连语义
             log("  <- Client disconnected mid-response (broken pipe) — relay aborted, backend request cancelled", level="WARN")
             return
+        except _ps.StreamIdleTimeout:
+            # 流式 chunk 空闲看门狗命中: 首 token 后后端超过
+            # PROXY_STREAM_IDLE_TIMEOUT_S 无 chunk(流中 stall)。headers 已提交,
+            # 无法回退为 504——中止中继 + close() 后端连接取消在途生成, 客户端看到
+            # 截断流后自行重试。
+            try:
+                resp.close()
+            except Exception:
+                pass
+            log(f"  <- Backend stream stalled (idle > {_ps.PROXY_STREAM_IDLE_TIMEOUT_S}s) — relay aborted, backend request cancelled", level="WARN")
+            return
 
         # Phase 3+ (建议3): record backend-only dispatch latency so cloud vs
         # long-tail comparison is decoupled from proxy-side pipeline overhead.
@@ -2938,7 +2978,7 @@ class BackendDispatcher(PipelineStage):
             method="POST",
         )
         _dispatch_t0 = time.monotonic()
-        resp = urllib.request.urlopen(req, timeout=_ps.PROXY_BACKEND_TIMEOUT)
+        resp = urllib.request.urlopen(req, timeout=self._effective_backend_timeout(ctx, proactive=not ctx.is_stream))
         self._backend_status = resp.status
         log(f"  <- backend status: {resp.status} (anthropic)")
 
@@ -2989,6 +3029,13 @@ class BackendDispatcher(PipelineStage):
             except Exception:
                 pass
             log("  <- Client disconnected mid-response (broken pipe) — anthropic relay aborted, backend request cancelled", level="WARN")
+            return
+        except _ps.StreamIdleTimeout:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            log(f"  <- Backend stream stalled (idle > {_ps.PROXY_STREAM_IDLE_TIMEOUT_S}s) — anthropic relay aborted, backend request cancelled", level="WARN")
             return
 
         dispatch_ms = (time.monotonic() - _dispatch_t0) * 1000
