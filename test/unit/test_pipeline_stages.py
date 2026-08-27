@@ -173,6 +173,24 @@ class TestDynamicMaxTokens(unittest.TestCase):
             ctx = self.stage.process(ctx)
         self.assertEqual(ctx.body["max_tokens"], 100)
 
+    def test_override_never_raises_above_dynamic_cap(self):
+        """OVERRIDE is a ceiling, not a floor: after the dynamic cap tightens
+        max_tokens, a large OVERRIDE must NOT pull it back up."""
+        ctx = PipelineContext(
+            body={"max_tokens": 16384},
+            max_tokens_orig=16384,
+            stage_config={"stage": "saturation"},
+        )
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 4096), \
+             patch.object(_ps, "PROXY_MAX_TOKENS_OVERRIDE", 32768), \
+             patch("pipeline._import_admin_server") as mock_admin:
+            mock_admin.return_value._get_system_memory.return_value = {
+                "available_gb": 40, "total_gb": 48}
+            ctx = self.stage.process(ctx)
+        self.assertEqual(ctx.body["max_tokens"], 4096)
+        self.assertEqual(ctx.max_tokens_curr, 4096)
+
 
 # ===========================================================================
 # ErrorTranslator — stage 3

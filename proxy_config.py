@@ -286,7 +286,12 @@ CONFIG_REGISTRY = {
     "PROXY_DYNAMIC_MAX_TOKENS_SATURATION": {
         "defaults": {"all": "2048"},
         "type": "int", "scope": "reloadable",
-        "doc": "max_tokens ceiling for saturation/oom_danger/pre_trunc stages.",
+        "doc": "max_tokens ceiling for saturation stage.",
+    },
+    "PROXY_DYNAMIC_MAX_TOKENS_OOM": {
+        "defaults": {"all": "4096"},
+        "type": "int", "scope": "reloadable",
+        "doc": "max_tokens ceiling for oom_danger/pre_trunc stages.",
     },
     "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO": {
         "defaults": {"all": "0.8"},

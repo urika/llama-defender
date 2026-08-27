@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This directory is **not** the llama.cpp C++ source — it's an orchestration layer that wraps an LLM backend and exposes an Anthropic-compatible API. Target: running Qwen-family models locally on Apple Silicon (M-series, 48 GB unified memory) **or** forwarding to cloud APIs (DeepSeek) for agentic coding with Claude Code. The agent_go project calls this service "llama-defender" (see `docs/llama-defender-integration-requirements.md`).
 
 ```
-Local:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → llama-server | rapid-mlx :8081 → model
+Local:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → llama-server | rapid-mlx | dflash-mlx :8081 → model
 Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek/OpenAI API → cloud model
 ```
 
@@ -85,12 +85,17 @@ Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` 
 
 | Config | Backend | Model | Memory | Use case |
 |--------|---------|-------|--------|----------|
-| `rapid-mlx-35b-opt` (active) | rapid-mlx | Qwen3.6-35B-A3B-UD-MLX-4bit | ~14–18 GB | Default: 35B MoE dynamic quant, GPU=70%, prefix cache + KV q4 on |
-| `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative, tool clearing off |
+| `ornith-oq4e` (active) | rapid-mlx | pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp | ~16–20 GB | **Ornith-1.5 自改进 MoE，oQ4e imatrix 混合精度（20.1GB）**，质量优于均匀 4-bit，thinking off，decode ~80 tok/s，`--hybrid-cache-entries 8` 必配（无投机解码） |
+| `ornith-35b` | rapid-mlx | ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit | ~16–20 GB | 均匀 4-bit（19.5GB），decode ~87 tok/s 更快，质量略降 |
+| `ornith-dflash-35b` | dflash-mlx | ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit + z-lab/Qwen3.6-35B-A3B-DFlash | ~20 GB | Ornith + Qwen3.6 DFlash 头，decode ~91 tok/s（acceptance 63.3%），与纯 rapid-mlx 持平 |
+| `dflash-35b` | dflash-mlx | mlx-community/Qwen3.6-35B-A3B-4bit + z-lab/Qwen3.6-35B-A3B-DFlash | ~20 GB | **DFlash 投机解码（~117 tok/s）**，thinking off，prefix cache 有效 |
+| `rapid-mlx-35b-opt` | rapid-mlx | mlx-community/Qwen3.6-35B-A3B-4bit | ~14–18 GB | 35B MoE 标准 4-bit，GPU=70%（必须），prefix cache + KV q4 on，decode ~51 tok/s |
+| `qwen3.8-27b-4bit` | rapid-mlx | Qwen3.8-27B 4bit | ~15–18 GB | Qwen3.8 hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 |
+| `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative，tool clearing off |
 | `gemma4-26b` | rapid-mlx | gemma-4-26b-it | ~14–16 GB | Gemma 4 26B, concurrency=2, temp 0.2 |
 | `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | N/A | Cloud API, no local backend |
 
-Each config sets `LLAMA_*` env vars (backend, model, port, context, sampling, KV-cache type, thinking mode) plus `RAPID_MLX_*` vars (tool/reasoning parsers, prefix cache, KV quantization, extra args — e.g. `RAPID_MLX_TOOL_PARSER="qwen3_coder_xml"`, `RAPID_MLX_REASONING_PARSER="qwen3"`). Metadata fields (`CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY`) are read by `./manage.sh list`. Defaults for any unset variable are applied in `manage.sh` itself.
+Each config sets `LLAMA_*` env vars (backend, model, port, context, sampling, KV-cache type, thinking mode) plus backend-specific vars: `RAPID_MLX_*` (rapid-mlx: tool/reasoning parsers, prefix cache, KV quantization, `--hybrid-cache-entries 8` for hybrid models) or `DFLASH_*` (dflash-mlx: `DFLASH_DRAFT_MODEL`, `DFLASH_ENABLE_THINKING=false`, `DFLASH_EXTRA_ARGS`). Metadata fields (`CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY`) are read by `./manage.sh list`. Defaults for any unset variable are applied in `manage.sh` itself.
 
 **Model catalog** (`configs/models.json`, loaded by `model_registry.py`, hot-reloaded on SIGHUP): declarative providers (endpoints + `key_env` + concurrency, keys live in `secret.local.conf`), models (price/capabilities/quirks — glm-5.x, k3, deepseek-v4-*), and routes (alias → cloud-model binding with optional fallback chains). Deleting the file synthesizes a legacy-equivalent catalog — behavior identical to the pre-catalog hardcode. Route preferences rebuild on reload, so `$env` refs track the live `PROXY_CLOUD_MODEL`.
 
@@ -171,7 +176,7 @@ Model ID → route preference mapping (preference only, safety always overrides)
 - **KV cache**: Default `q8_0` for both K and V on llama-server; rapid-mlx configs use `RAPID_MLX_KV_QUANTIZATION=true` with 4 bits.
 - **Context management defaults tied to backend type** (`backend_strategy.py` is the source of these defaults): cloud = clearing disabled (1M+ context), ctx-limit disabled; local = ctx-limit enabled (180K chars), clearing configurable per config (`rapid-mlx-35b-opt` enables clearing, `qwen3.6-27b-4bit` disables it — rapid-mlx returns `Wasted call` for unchanged re-reads, which interacts with clearing to cause file-re-read death loops). See `docs/research-context-optimization/06-context-compression-strategy.md` for the full strategy.
 - **Concurrency caveat**: `llama-server` on Metal time-slices a single GPU; 2+ concurrent requests cause severe latency spikes. The proxy controls this via `PROXY_MAX_CONCURRENT` (default `1` local, `4` cloud/rapid-mlx) using a `threading.Semaphore`, plus `PROXY_DYNAMIC_CONCURRENT_*` guardrails.
-- **Rapid-MLX `max_tokens` bug** (observed on v0.6.30): parameter is accepted but ignored — generations can run far past the limit. `DynamicMaxTokens` + `PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO=1.0` mitigate; use `llama-server` when hard token limits matter.
+- **Rapid-MLX `max_tokens` bug** (observed on v0.6.30): parameter is accepted but ignored — generations can run far past the limit. `DynamicMaxTokens` + `PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO=1.0` mitigate; use `llama-server` when hard token limits matter. Since 2026-08-27 the budget is context-aware: saturation tier uses `PROXY_DYNAMIC_MAX_TOKENS_SATURATION` (default 2048, ornith 8192), oom_danger/pre_trunc use `PROXY_DYNAMIC_MAX_TOKENS_OOM` (default 4096). `PROXY_MAX_TOKENS_OVERRIDE` is a final *ceiling* only (never raises a tighter dynamic cap). See `docs/02-architecture-design/agent-output-budget-design-20260827.md`.
 - **Rapid-MLX OOM on Apple Silicon** (48GB): `allocation_limit` is a soft target, not a hard wall — prefill activations + KV cache + prefix cache can overshoot 20-40%. Crash signature: `[METAL] Command buffer execution failed: Insufficient Memory`. Mitigation: `PROXY_MAX_CONCURRENT=1`, `--gpu-memory-utilization 0.70`, Phase 3 memory-aware guardrails (`_should_reject_for_memory`, dynamic `max_tokens`, dynamic concurrency). Avoid >40K token contexts when cache is already >6GB.
 - **Prefix cache**: re-enabled on rapid-mlx 0.11.5 (`RAPID_MLX_ENABLE_PREFIX_CACHE=true` in active config). Older 0.6.71 BatchedEngine lacked cross-request prefix cache (PagedCache was within-request only).
 - **HF_HUB_OFFLINE=1**: vllm-mlx tries to reach huggingface.co at startup; network failure causes a silent `ConnectTimeout` retry loop. Add `export HF_HUB_OFFLINE=1` to configs where relevant.

@@ -136,6 +136,40 @@ class TestComputeDynamicMaxTokens(unittest.TestCase):
             )
             self.assertGreaterEqual(adjusted, 1)
 
+    def test_oom_danger_stage_capped_at_oom_ceiling(self):
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                8192, {"stage": "oom_danger"}, mem={"available_gb": 40, "total_gb": 48}
+            )
+            self.assertLessEqual(adjusted, _ps.PROXY_DYNAMIC_MAX_TOKENS_OOM)
+            self.assertIn("stage=oom_danger", reason)
+
+    def test_pre_trunc_stage_capped_at_oom_ceiling(self):
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                8192, {"stage": "pre_trunc"}, mem={"available_gb": 40, "total_gb": 48}
+            )
+            self.assertLessEqual(adjusted, _ps.PROXY_DYNAMIC_MAX_TOKENS_OOM)
+            self.assertIn("stage=pre_trunc", reason)
+
+    def test_oom_stage_distinct_from_saturation(self):
+        """OOM/PRETRUNC ceiling is lower than saturation; the tiers no longer share a cap."""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_OOM", 2048):
+            sat_adj, _ = lifecycle._compute_dynamic_max_tokens(
+                8192, {"stage": "saturation"}, mem={"available_gb": 40, "total_gb": 48}
+            )
+            oom_adj, _ = lifecycle._compute_dynamic_max_tokens(
+                8192, {"stage": "oom_danger"}, mem={"available_gb": 40, "total_gb": 48}
+            )
+            pre_adj, _ = lifecycle._compute_dynamic_max_tokens(
+                8192, {"stage": "pre_trunc"}, mem={"available_gb": 40, "total_gb": 48}
+            )
+            self.assertEqual(sat_adj, 8192)
+            self.assertEqual(oom_adj, 2048)
+            self.assertEqual(pre_adj, 2048)
+
 
 class TestNormalizeSystemMessages(unittest.TestCase):
 

@@ -177,8 +177,10 @@ def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
         cap = _ps.PROXY_DYNAMIC_MAX_TOKENS_INIT
     elif stage in ("growth", "expansion"):
         cap = _ps.PROXY_DYNAMIC_MAX_TOKENS_GROWTH
-    else:  # saturation, oom_danger, pre_trunc
+    elif stage == "saturation":
         cap = _ps.PROXY_DYNAMIC_MAX_TOKENS_SATURATION
+    else:  # oom_danger, pre_trunc
+        cap = _ps.PROXY_DYNAMIC_MAX_TOKENS_OOM
 
     adjusted = min(max_tokens_orig, cap)
     reasons = [f"stage={stage}"]
