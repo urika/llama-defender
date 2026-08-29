@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -40,6 +41,20 @@ class TestPayloadSizeLimit(unittest.TestCase):
 
     LOCAL_LIMIT = 1000
     CLOUD_LIMIT = 5000
+
+    def setUp(self):
+        # 全 handler 流程会经 diagnostics 落盘——重定向到 tmp 防污染生产
+        # sessions.jsonl(Phase 2 效度数据集纯净性,2026-08-29 实测每跑 +4 条)
+        self._tmp = tempfile.mkdtemp(prefix="pl_diag_")
+        self._saved = (proxy_state._DIAG_DIR, proxy_state._DIAG_SESSIONS_PATH,
+                       proxy_state._LIFECYCLE_EVENTS_PATH)
+        proxy_state._DIAG_DIR = self._tmp
+        proxy_state._DIAG_SESSIONS_PATH = os.path.join(self._tmp, "sessions.jsonl")
+        proxy_state._LIFECYCLE_EVENTS_PATH = os.path.join(self._tmp, "lifecycle.jsonl")
+
+    def tearDown(self):
+        (proxy_state._DIAG_DIR, proxy_state._DIAG_SESSIONS_PATH,
+         proxy_state._LIFECYCLE_EVENTS_PATH) = self._saved
 
     def _make_handler(self, body_bytes, path="/v1/messages", headers=None):
         """Create a Handler instance without invoking the HTTP server constructor."""

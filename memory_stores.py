@@ -39,7 +39,6 @@ class ManifestStore(object):
         self._sessions = {}      # key → list[dict]
         self._order = []         # FIFO 驱逐依赖有序
         self._writes = 0
-        self._path_cache = {}
 
     # ------------------------------------------------------------- record --
     def record_units(self, session_key, turn, reason, units, meta=None):
@@ -104,12 +103,9 @@ class ManifestStore(object):
         return os.path.join(_ps._DIAG_DIR, "manifest")
 
     def _path(self, session_key):
-        p = self._path_cache.get(session_key)
-        if p is None:
-            p = os.path.join(self._manifest_dir(),
-                             sanitize_session_key(session_key) + ".jsonl")
-            self._path_cache[session_key] = p
-        return p
+        # 不缓存: _DIAG_DIR 可被测试重定向,缓存会造成跨目录串写(2026-08-29 实测)
+        return os.path.join(self._manifest_dir(),
+                            sanitize_session_key(session_key) + ".jsonl")
 
     def _persist_locked(self, session_key, new_lines):
         """增量落盘（调用方持锁）。OSError 静默——manifest 故障不影响请求路径。"""
@@ -165,9 +161,10 @@ class ManifestStore(object):
                 try:
                     os.remove(p)
                     total -= size
-                    key = next((k for k, v in self._path_cache.items() if v == p), None)
+                    # 路径反查会话键(sanitize 不可逆,按键集比对;驱逐低频 O(n) 无碍)
+                    key = next((k for k in list(self._sessions)
+                                if self._path(k) == p), None)
                     if key:
-                        self._path_cache.pop(key, None)
                         self._sessions.pop(key, None)
                         if key in self._order:
                             self._order.remove(key)
@@ -181,7 +178,6 @@ class ManifestStore(object):
         with self._lock:
             self._sessions.clear()
             self._order.clear()
-            self._path_cache.clear()
 
 
 MANIFEST = ManifestStore()

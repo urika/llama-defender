@@ -6,6 +6,7 @@ Phase 0 §12.3 结论 4(击穿根因=回溯改写)——引擎开启时 7/14/17 
 """
 import os
 import sys
+import tempfile
 import unittest
 
 # test/unit/<file> → 三次 dirname 到仓库根(两次只到 test/, 直接跑会 ImportError)
@@ -75,7 +76,18 @@ class TestCanonicalSession(unittest.TestCase):
     """append-only 吸收 + 冻结 + epoch 状态机。"""
 
     def setUp(self):
+        # manifest 钩子(epoch 折叠)写 _ps._DIAG_DIR——隔离到 tmp,防污染生产页表
+        import memory_stores
+        self._tmp = tempfile.mkdtemp(prefix="ce_test_")
+        self._saved_dir = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._tmp
+        memory_stores.MANIFEST.reset()
         self.sess = ce.CanonicalSession("t")
+
+    def tearDown(self):
+        import memory_stores
+        _ps._DIAG_DIR = self._saved_dir
+        memory_stores.MANIFEST.reset()
 
     def test_absorb_incremental_append_only(self):
         r1 = _tu("q1") + _tool_round("t1", "WebSearch", {"query": "a"}, "r" * 20000)
@@ -384,7 +396,17 @@ class TestRealTokenTrigger(unittest.TestCase):
     收编产物容量判定同口径(est 口径下"看似放下"的产物不得放行)。"""
 
     def setUp(self):
+        import memory_stores
+        self._tmp = tempfile.mkdtemp(prefix="ce_test_")
+        self._saved_dir = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._tmp
+        memory_stores.MANIFEST.reset()
         self.sess = ce.CanonicalSession("t-real")
+
+    def tearDown(self):
+        import memory_stores
+        _ps._DIAG_DIR = self._saved_dir
+        memory_stores.MANIFEST.reset()
 
     def test_usage_backfill_triggers_epoch_below_est_threshold(self):
         # est 远低于触发点但真实回填超限 → 必须触发(est 口径下本会漏触发)

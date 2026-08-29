@@ -559,6 +559,11 @@ class TestFifoPlaceholderStability(unittest.TestCase):
 
     def setUp(self):
         # Force fifo strategy for these tests regardless of the process env.
+        # manifest 钩子(R10.1)随 fifo 截断落盘——重定向 _DIAG_DIR 防污染生产页表
+        import tempfile as _tf
+        self._diag_tmp = _tf.mkdtemp(prefix="pf_diag_")
+        self._diag_saved = proxy_state._DIAG_DIR
+        proxy_state._DIAG_DIR = self._diag_tmp
         self._patches = [
             patch.object(proxy, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"), patch.object(proxy_state, "PROXY_CTX_TRUNCATE_STRATEGY", "fifo"),
             patch.object(proxy, "PROXY_CTX_LIMIT_ENABLED", True), patch.object(proxy_state, "PROXY_CTX_LIMIT_ENABLED", True),
@@ -571,6 +576,7 @@ class TestFifoPlaceholderStability(unittest.TestCase):
     def tearDown(self):
         for p in self._patches:
             p.stop()
+        proxy_state._DIAG_DIR = self._diag_saved
 
     def _make_msgs(self, n_total):
         msgs = [
