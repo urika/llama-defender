@@ -323,16 +323,17 @@ class TestSmartRouterPreference(unittest.TestCase):
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)
-    def test_haiku_prefer_still_uses_bias(self):
-        """haiku (prefer) still uses threshold bias — short context = local."""
-        ctx = PipelineContext(
-            body={"model": "claude-haiku-4-5"},
-            session_id="sess_haiku_pref",
-        )
-        ctx.stage_config = {"total_chars": 5000, "stage": "init"}
-        ctx = SmartRouter().process(ctx)
-        self.assertEqual(ctx._route_target, "local")
-        self.assertEqual(ctx._route_reason, "under_threshold")
+    def test_haiku_force_always_local(self):
+        """haiku (force + prefer_local) → 永远本地(数据保密), 不随阈值/上下文变化."""
+        for total_chars in (5000, 100000, 500000):
+            ctx = PipelineContext(
+                body={"model": "claude-haiku-4-5"},
+                session_id="sess_haiku_force",
+            )
+            ctx.stage_config = {"total_chars": total_chars, "stage": "init" if total_chars < 10000 else "saturation"}
+            ctx = SmartRouter().process(ctx)
+            self.assertEqual(ctx._route_target, "local")
+            self.assertEqual(ctx._route_reason, "model_forced_local(claude-haiku-4-5)")
 
     @patch.object(_ps, "PROXY_ROUTE_ENABLED", True)
     @patch.object(_ps, "PROXY_ROUTE_THRESHOLD_CHARS", 90000)

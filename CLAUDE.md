@@ -162,12 +162,12 @@ DeepSeek model mapping: `deepseek-v4-pro[1m]` ↔ `deepseek-v4-pro` (thinking), 
 - **Session control**: `./manage.sh route-force-local <sid>` / `route-force-cloud <sid>`; **per-request override**: `X-Proxy-Route-To: local|cloud` request header (no session stickiness)
 - **Response headers (R8 contract)**: `X-Proxy-Route-Target` (`cloud|local|local_forced`), `X-Proxy-Route-Actual-Model`, `X-Proxy-Route-Reason`, `X-Proxy-Route-Cost` on every routed response; OpenAI-protocol non-streaming responses also carry a `proxy_route` body field with actual usage-based cost
 
-Model ID → route preference mapping (preference only, safety always overrides):
-| Agent Model ID | Route Bias | Threshold | Cloud Model |
-|---------------|-----------|-----------|-------------|
-| `claude-sonnet-4-6` | auto | 90K | flash |
-| `claude-opus-4-7` | prefer_cloud | 72K | pro |
-| `claude-haiku-4-5` | prefer_local | 120K | flash |
+Model ID → route preference mapping (preference only, safety always overrides; haiku is hard-forced local for data confidentiality):
+| Agent Model ID | Route Bias | Behavior | Threshold | Cloud Chain (零边际优先, deepseek 兜底) |
+|---------------|-----------|----------|-----------|----------------------------------------|
+| `claude-sonnet-4-6` | auto | prefer | 80K chars | glm-5.3-flash-cn → glm-5.3-flash → k3 → glm-5.3 → deepseek-v4-flash |
+| `claude-opus-4-7` | prefer_cloud | force_fallback | 64K chars | glm-5.3-cn → glm-5.3 → kimi-for-coding → glm-5.3-flash → deepseek-v4-pro |
+| `claude-haiku-4-5` | prefer_local | **force** | —（恒本地） | **永不云端（数据保密）** |
 
 ## Key implementation details
 

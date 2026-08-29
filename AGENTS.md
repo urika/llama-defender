@@ -516,7 +516,7 @@ git commit --no-verify               # 绕过所有钩子
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `PROXY_QUEUE_ENABLED` | `false` | 启用优先级请求队列；默认关闭 = 原信号量行为（当前 `qwen3.8-27b-4bit` 灰度开启） |
+| `PROXY_QUEUE_ENABLED` | `false` | 启用优先级请求队列；默认关闭 = 原信号量行为（`qwen3.8-27b-4bit` 与 `ornith-oq4e` 已开启；后者为缓解 haiku 强制本地后长会话饿死小请求） |
 | `PROXY_QUEUE_TIMEOUT_SECONDS` | `300` | 排队超时，超时返回 503 + `Retry-After` |
 | `PROXY_QUEUE_LARGE_THRESHOLD_CHARS` | `80000` | large bucket 阈值（低优先级排队） |
 | `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理 |

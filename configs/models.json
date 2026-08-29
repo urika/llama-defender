@@ -406,7 +406,7 @@
         "kimi-for-coding-highspeed",
         "deepseek-v4-flash"
       ],
-      "behavior": "prefer",
+      "behavior": "force",
       "threshold_factor": 2.0,
       "memory_bias": 0
     }

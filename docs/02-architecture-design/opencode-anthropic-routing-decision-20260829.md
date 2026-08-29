@@ -42,14 +42,15 @@ pipeline.py:2447 _usable() 过滤: not (_oai_client and protocol=="anthropic")
 
 ## 四、预期行为（haiku 档，已实测验证）
 
-| 上下文 | 阈值 | 路由 |
+> **2026-08-29 后续决策：haiku 改为 `behavior: force` + `prefer_local` → 恒走本地（数据保密），不再按阈值切云端。** 该决策优先级高于此前的阈值调整（1.33→2.0）。大上下文强制本地由 Ornith 承受（343K chars 实测 24.7GB < cap 28.1GB；decode 随上下文衰减，250K+ 变慢），confidentiality 优先于成本/延迟。
+
+| 上下文 | 决策 | 路由 |
 |---|---|---|
-| ≤ ~160K chars（80000×2.0） | `under_threshold` | **本地 Ornith**（实测 `Forwarding to http://127.0.0.1:8081` ✅） |
-| > ~160K chars | `chars_exceed_threshold` | **云端 glm-5.3-flash**（订阅零边际）→ deepseek 兜底 |
+| 任意长度 | `model_forced_local(claude-haiku-4-5)` | **恒本地 Ornith**（实测 180K chars 请求 → `Forwarding to http://127.0.0.1:8081` ✅） |
 
-> 2026-08-29 决策：haiku 阈值 factor 1.33→**2.0**（106K→160K chars）。动机=保护订阅配额/隐私（云端 glm-5.3-flash 已零边际，省成本不再是理由）；Ornith 内存余量足（343K chars 实测 24.7GB < cap 28.1GB），160K 内 decode ~40 tok/s 体感尚可，250K+ 才明显变慢（不建议再升）。
-
-阈值路由与协议无关，切协议只改变"云端候选可达性"。
+- 仅 `X-Proxy-Route-To: cloud` 请求头可覆盖（客户端默认不发送，即安全）。
+- sonnet/opus 仍按阈值路由云端（零边际链 glm-5.3-flash-cn → kimi → deepseek 兜底）。
+- 阈值路由与协议无关，切协议只改变"云端候选可达性"。
 
 ## 五、验证
 
@@ -67,5 +68,8 @@ pipeline.py:2447 _usable() 过滤: not (_oai_client and protocol=="anthropic")
 
 ## 七、相关
 
-- 同日：glm-5.3-flash 入库并接入路由（`configs/models.json`，国内站 `zhipu-cn` provider 实测可用）；方案 A 配额感知（1308 → 冷却到重置）已上线。
-- 路由链（sonnet/haiku 首发零边际）：`[glm-5.3-flash, glm-5.3, deepseek-v4-flash]` / `[glm-5.3-flash, deepseek-v4-flash]` / opus `[glm-5.3, glm-5.3-flash, deepseek-v4-pro]`。
+- 同日：glm-5.3-flash 入库并接入路由（`configs/models.json`，国内站 `zhipu-cn` provider 实测可用）；方案 A 配额感知（1308/403 → 冷却到重置，含 Kimi `/usages` 查询）已上线。
+- 路由链（2026-08-29 终态，零边际优先、deepseek 兜底）：
+  - sonnet → `[glm-5.3-flash-cn, glm-5.3-flash, k3, glm-5.3, deepseek-v4-flash]`
+  - opus → `[glm-5.3-cn, glm-5.3, kimi-for-coding, glm-5.3-flash, deepseek-v4-pro]`
+  - **haiku → 恒本地（`behavior: force`，数据保密，永不云端）**

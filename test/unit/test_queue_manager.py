@@ -327,3 +327,23 @@ class TestAdminQueueJson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDecideHugeActionForceLocal(unittest.TestCase):
+    """huge 桶 + 模型级强制本地(haiku 数据保密): 永不路由云端."""
+
+    def test_force_local_within_limit_forwards_local(self):
+        r = decide_huge_action(220000, "", "cloud", True, 400000, force_local=True)
+        self.assertEqual(r["action"], "local")
+
+    def test_force_local_over_limit_rejected_not_cloud(self):
+        r = decide_huge_action(500000, "", "cloud", True, 400000, force_local=True)
+        self.assertEqual(r["action"], "reject")
+
+    def test_force_local_edge_at_limit_boundary(self):
+        self.assertEqual(decide_huge_action(400000, "", "cloud", True, 400000, force_local=True)["action"], "local")
+        self.assertEqual(decide_huge_action(400001, "", "cloud", True, 400000, force_local=True)["action"], "reject")
+
+    def test_non_force_local_still_routes_cloud(self):
+        r = decide_huge_action(220000, "", "cloud", True, 400000, force_local=False)
+        self.assertEqual(r["action"], "cloud")
