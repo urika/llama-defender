@@ -1029,6 +1029,21 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         dropped = messages[_ps.PROXY_CTX_KEEP_HEAD : n - tail_count]
         dropped_count = len(dropped)
 
+        # R10.1 manifest: 丢弃单元留索引行(页表/索引永不丢;fail-open 不影响截断)
+        if getattr(_ps, "PROXY_PD_ENABLED", True) and dropped and session_id:
+            try:
+                import memory_stores
+                memory_stores.record_dropped_messages(
+                    session_id,
+                    _ps._SESSION_REQUEST_COUNT.get(session_id, 0) or 0,
+                    "fifo_drop", dropped)
+            except Exception as _e:
+                try:
+                    import diagnostics
+                    diagnostics.warn_suppressed("manifest_fifo", _e)
+                except Exception:
+                    pass
+
         # Count tools in dropped messages
         tool_count = 0
         for m in dropped:
@@ -1315,6 +1330,19 @@ def _oom_safety_fifo(messages, max_chars=None, keep_head=None, keep_tail=None):
     result = _fix_tool_pairings(result)
 
     dropped_count = len(messages) - len(result)
+    # R10.1 manifest: 紧急截断丢弃同样留索引行(reason 区分紧急路径)
+    if getattr(_ps, "PROXY_PD_ENABLED", True) and dropped_count > 0:
+        _sk = getattr(_ps._log_ctx, "session_id", "") or ""
+        if _sk:
+            try:
+                import memory_stores
+                keep_tail_n = min_keep - keep_head
+                dropped_msgs = messages[keep_head: len(messages) - keep_tail_n]
+                memory_stores.record_dropped_messages(
+                    _sk, _ps._SESSION_REQUEST_COUNT.get(_sk, 0) or 0,
+                    "oom_drop", dropped_msgs)
+            except Exception:
+                pass
     return result, {
         "enabled": True,
         "strategy": "oom_safety_fifo",

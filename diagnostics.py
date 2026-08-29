@@ -86,6 +86,7 @@ def begin_request(request_id, session_key, key_source="unknown"):
     _ps._diag_ctx.gen_ms = None
     _ps._diag_ctx.canonical_mismatch = False
     _ps._diag_ctx.backend_timings_note = None
+    _ps._diag_ctx.ifc_view = None  # R9.1: 本轮发送视图摘要(capture 时填充)
 
 
 def record_injection(kind):
@@ -238,12 +239,24 @@ def capture_sent_view(ctx):
     在 BackendDispatcher 发请求前调用;payload 必须是完整 openai_body 拷贝
     (dispatch 路径可能改写 model 字段——调用点在改写之后即可)。
     """
-    if not _ps.PROXY_DIAG_ENABLED or not _ps.PROXY_DIAG_ARCHIVE_ENABLED:
+    if not _ps.PROXY_DIAG_ENABLED:
+        return
+    # R9.1 IFC Tier-0: 视图摘要先于 archive 开关计算(差分基线不依赖档案)。
+    # 格式双态: local 路径为 OpenAI 格式, cloud anthropic 协议路径为 Anthropic
+    # 格式——ifc_metrics.unit_anchors 两种均覆盖。
+    openai_body = getattr(ctx, "openai_body", None)
+    if getattr(_ps, "PROXY_IFC_ENABLED", True) and isinstance(openai_body, dict):
+        try:
+            import ifc_metrics
+            _ps._diag_ctx.ifc_view = ifc_metrics.view_summary(
+                openai_body.get("messages") or [])
+        except Exception as _e:
+            warn_suppressed("ifc_view", _e)
+    if not _ps.PROXY_DIAG_ARCHIVE_ENABLED:
         return
     session_key = getattr(ctx, "session_id", "") or getattr(_ps._diag_ctx, "session_key", "")
     if not session_key:
         return
-    openai_body = getattr(ctx, "openai_body", None)
     if not isinstance(openai_body, dict):
         return
     turn = _ps._SESSION_REQUEST_COUNT.get(session_key, 0) or 1
@@ -366,6 +379,22 @@ def finalize_request(mc):
             record["epoch_triggered"] = record["is_epoch_turn"]
         except Exception:
             pass
+    # R9.1 IFC Tier-0: 视图差分 + 台账动作 → per-turn ifc 段(只写不读执行器,
+    # 数据架构 §3.3 L2 层)。首见会话/基线缺失时 retention 为 null(口径诚实)。
+    if getattr(_ps, "PROXY_IFC_ENABLED", True):
+        try:
+            import ifc_metrics
+            import memory_stores
+            import session_ledger
+            prev = ifc_metrics.BASELINE.get(session_key)
+            cur = getattr(ctx, "ifc_view", None)
+            actions = session_ledger.LEDGER.snapshot_actions(session_key, 40)
+            record["ifc"] = ifc_metrics.build_ifc_section(
+                prev, cur, actions,
+                manifest_lines=memory_stores.MANIFEST.count(session_key))
+            ifc_metrics.BASELINE.update(session_key, cur)
+        except Exception as _e:
+            warn_suppressed("ifc_finalize", _e)
     log_session_diag(record)
     if record["canonical_mismatch"]:
         log_lifecycle_event("canonical_mismatch",

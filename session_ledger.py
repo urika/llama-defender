@@ -338,6 +338,15 @@ class LedgerStore(object):
             **stats_common,
         }
 
+    def snapshot_actions(self, session_key, limit=200):
+        """IFC Tier-0 只读消费: 最近 N 条 action 快照(时间正序,剥离内部字段)。"""
+        with self._lock:
+            entry = self._sessions.get(session_key)
+            if not entry:
+                return []
+            return [{k: v for k, v in a.items() if not k.startswith("_")}
+                    for a in entry["actions"][-limit:]]
+
     def list_sessions(self):
         """GET /api/sessions 列表(发现端点,设计 §4.5)。"""
         now = time.time()

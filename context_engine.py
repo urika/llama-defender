@@ -411,6 +411,16 @@ class CanonicalSession(object):
         body_rounds = [r for r in rounds if not _is_system_round(r)]
         keep = body_rounds[-window_k:] if window_k else []
         collect = body_rounds[:-window_k] if window_k else body_rounds
+        # R10.1 manifest: 收编轮次留索引行(页表;折叠面板行已含摘要,索引行
+        # 提供可寻址性;fail-open)
+        if getattr(_ps, "PROXY_PD_ENABLED", True) and collect and self.session_key:
+            try:
+                import memory_stores
+                memory_stores.record_dropped_messages(
+                    self.session_key, self.turn, "epoch_collapse",
+                    [m for rnd in collect for m in rnd])
+            except Exception:
+                pass
         new_lines = []
         for i, rnd in enumerate(collect):
             new_lines.append(_round_summary(rnd, i + 1))
