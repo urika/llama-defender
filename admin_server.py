@@ -264,6 +264,7 @@ def _build_route_policies_json():
             "key_set": _key_set(eff_key_env),
             "concurrent": p.get("concurrent"),
             "concurrent_env": p.get("concurrent_env", ""),
+            "quota": _ps._provider_quota_state(pname),
         }
 
     models = {}
@@ -378,6 +379,12 @@ def _build_status_json():
             "cloud_model": _ps.PROXY_CLOUD_MODEL,
             "cloud_key_set": bool(_ps.PROXY_CLOUD_API_KEY),
             "cloud_concurrent": _ps.PROXY_ROUTE_CLOUD_CONCURRENT,
+            # 方案 A: 各 cloud provider 配额状态(订阅耗尽 → 冷却到重置时刻)
+            "provider_quota": {
+                pname: _ps._provider_quota_state(pname)
+                for pname in model_registry.list_providers()
+                if pname != "local"
+            },
         },
         # R16: context-engineering config digest（仿 R11 route_config 先例）—
         # bench manifest 口径标注的机读数据源（上游设计 §9 P0-1）。

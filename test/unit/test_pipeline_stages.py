@@ -15,6 +15,7 @@ from unittest.mock import patch, MagicMock
 import proxy_state as _ps
 from pipeline import (
     PipelineContext,
+    _parse_quota_reset_epoch,
     RequestParser,
     LifecycleClassifier,
     DynamicMaxTokens,
@@ -1920,3 +1921,29 @@ class TestBackendDispatcherEffectiveTimeout(unittest.TestCase):
              patch.object(_ps, "PROXY_TIMEOUT_MARGIN_S", 30):
             t = self.dispatcher._effective_backend_timeout(self._ctx(20), proactive=True)
             self.assertEqual(t, 600)  # eff = -10 → 回退
+
+
+class TestParseQuotaReset(unittest.TestCase):
+    """方案 A: 从 provider rate-limit 错误消息解析配额重置时间 (UTC+8)."""
+
+    def test_zai_1308_format(self):
+        from datetime import timezone, timedelta
+        import datetime as _dt
+        msg = "Usage limit reached for 5 hour. Your limit will reset at 2026-08-29 13:04:56"
+        ep = _parse_quota_reset_epoch(msg)
+        expect = _dt.datetime(2026, 8, 29, 13, 4, 56,
+                              tzinfo=timezone(timedelta(hours=8))).timestamp()
+        self.assertEqual(ep, expect)
+
+    def test_reset_with_seconds_optional(self):
+        ep = _parse_quota_reset_epoch("limit reset at 2026-08-29 13:04:56")
+        self.assertGreater(ep, 0)
+
+    def test_bare_datetime(self):
+        ep = _parse_quota_reset_epoch("quota resets 2026-08-29T13:04:56Z elsewhere")
+        self.assertGreater(ep, 0)
+
+    def test_no_reset_returns_zero(self):
+        self.assertEqual(_parse_quota_reset_epoch("rate limit exceeded, retry later"), 0)
+        self.assertEqual(_parse_quota_reset_epoch(""), 0)
+        self.assertEqual(_parse_quota_reset_epoch(None), 0)

@@ -507,6 +507,51 @@ class TestDetectClientType(unittest.TestCase):
         self.assertEqual(proxy_state._detect_client_type(""), "unknown")
         self.assertEqual(proxy_state._detect_client_type("SomeCustomAgent/1.0"), "SomeCustomAgent")
 
+class TestProviderQuotaCooldown(unittest.TestCase):
+    """方案 A: 订阅配额耗尽 → 冷却到重置时刻, 重置后自动恢复."""
+
+    def setUp(self):
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_QUOTA_RESET.clear()
+            proxy_state._PROVIDER_COOLDOWN_START.clear()
+            proxy_state._PROVIDER_FAIL_COUNT.clear()
+
+    def test_quota_deadline_holds_cooldown(self):
+        import time as _t
+        future = _t.time() + 3600
+        proxy_state._record_quota_exhausted("zhipu", future)
+        self.assertTrue(proxy_state._provider_cooldown_active("zhipu"))
+        st = proxy_state._provider_quota_state("zhipu")
+        self.assertTrue(st["exhausted"])
+        self.assertIsNotNone(st["resets_at_iso"])
+        self.assertGreater(st["resets_at_epoch"], _t.time())
+
+    def test_quota_clears_after_reset(self):
+        import time as _t
+        # 重置已过(过去 60s), 固定冷却窗也已过(过去 400s) → provider 恢复
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_QUOTA_RESET["zhipu"] = _t.time() - 60
+            proxy_state._PROVIDER_COOLDOWN_START["zhipu"] = _t.monotonic() - 400
+        self.assertFalse(proxy_state._provider_cooldown_active("zhipu"))
+        with proxy_state._state_lock:
+            self.assertNotIn("zhipu", proxy_state._PROVIDER_QUOTA_RESET)
+        self.assertFalse(proxy_state._provider_quota_state("zhipu")["exhausted"])
+
+    def test_later_deadline_wins(self):
+        import time as _t
+        proxy_state._record_quota_exhausted("zhipu", _t.time() + 600)
+        proxy_state._record_quota_exhausted("zhipu", _t.time() + 900)
+        st = proxy_state._provider_quota_state("zhipu")
+        self.assertGreater(st["resets_at_epoch"], _t.time() + 850)
+
+    def test_no_reset_epoch_ignored(self):
+        proxy_state._record_quota_exhausted("zhipu", 0)
+        self.assertFalse(proxy_state._provider_quota_state("zhipu")["exhausted"])
+        self.assertNotIn("zhipu", proxy_state._PROVIDER_QUOTA_RESET)
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

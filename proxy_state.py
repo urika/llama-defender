@@ -666,13 +666,29 @@ rebuild_provider_locks()
 # Per-provider circuit breaker + cost (all access under _state_lock)
 _PROVIDER_FAIL_COUNT = {}       # provider → consecutive failure count
 _PROVIDER_COOLDOWN_START = {}   # provider → monotonic timestamp
+_PROVIDER_QUOTA_RESET = {}      # provider → epoch (wall-clock) when subscription quota resets
 _route_provider_cost = {}       # provider → daily cost (¥, same date key as _route_daily_date)
 
 
 def _provider_cooldown_active(pname):
-    """True while provider cooldown window is open; clears it once expired."""
+    """True while provider cooldown window is open; clears it once expired.
+
+    Also honors a subscription quota reset deadline (方案 A): while the provider's
+    quota reset epoch is in the future, the provider stays cold even if the
+    fixed cooldown window (PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS) has elapsed. When
+    the reset deadline passes, the quota state clears and the provider returns
+    to service automatically.
+    """
     if not pname:
         return False
+    # Quota reset deadline (wall-clock) takes precedence — skip until reset.
+    with _state_lock:
+        qr = _PROVIDER_QUOTA_RESET.get(pname)
+    if qr:
+        if time.time() < qr:
+            return True
+        with _state_lock:
+            _PROVIDER_QUOTA_RESET.pop(pname, None)
     with _state_lock:
         ts = _PROVIDER_COOLDOWN_START.get(pname)
     if not ts:
@@ -682,6 +698,35 @@ def _provider_cooldown_active(pname):
     with _state_lock:
         _PROVIDER_COOLDOWN_START.pop(pname, None)
     return False
+
+
+def _record_quota_exhausted(pname, reset_epoch):
+    """Record a subscription quota-exhausted event with its reset deadline.
+
+    The provider is held cold until `reset_epoch` (wall-clock). Parse the reset
+    time from the provider's rate-limit error message (e.g. Z.ai 1308 "Your limit
+    will reset at YYYY-MM-DD HH:MM:SS"); 0 disables the deadline (fixed-window
+    cooldown only). Safe to call repeatedly — later deadlines win.
+    """
+    if not pname or not reset_epoch:
+        return
+    with _state_lock:
+        cur = _PROVIDER_QUOTA_RESET.get(pname, 0)
+        if reset_epoch > cur:
+            _PROVIDER_QUOTA_RESET[pname] = reset_epoch
+            _PROVIDER_COOLDOWN_START[pname] = time.monotonic()
+            _PROVIDER_FAIL_COUNT[pname] = 0
+
+
+def _provider_quota_state(pname):
+    """Visibility: {exhausted, resets_at_epoch, resets_at_iso} for a provider."""
+    with _state_lock:
+        qr = _PROVIDER_QUOTA_RESET.get(pname)
+    if not qr:
+        return {"exhausted": False, "resets_at_epoch": None, "resets_at_iso": None}
+    import datetime
+    iso = datetime.datetime.fromtimestamp(qr).strftime("%Y-%m-%d %H:%M:%S")
+    return {"exhausted": time.time() < qr, "resets_at_epoch": qr, "resets_at_iso": iso}
 
 
 def _record_provider_failure(pname, retryable=True):

@@ -628,6 +628,33 @@ class DynamicMaxTokens(ConditionalStage):
 # Stage 2.5: SmartRouter — decide local vs cloud backend
 # ============================================================================
 
+def _parse_quota_reset_epoch(raw_err):
+    """Parse a subscription quota reset time from a provider rate-limit error message.
+
+    Returns wall-clock epoch seconds (UTC), or 0 when no parseable reset time.
+    CN 提供商(Z.ai/bigmodel)在消息中给出北京时间重置时刻(如 Z.ai 1308:
+    "Usage limit reached for 5 hour. Your limit will reset at 2026-08-29 13:04:56"),
+    按 UTC+8 显式换算, 不依赖本机时区。
+    """
+    if not raw_err:
+        return 0
+    import re as _re
+    from datetime import timezone, timedelta
+    m = _re.search(r"reset\s+at\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)", raw_err, _re.I)
+    if not m:
+        m = _re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)", raw_err)
+    if not m:
+        return 0
+    ds = f"{m.group(1)} {m.group(2)}"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(ds, fmt).replace(tzinfo=timezone(timedelta(hours=8)))
+            return dt.timestamp()
+        except ValueError:
+            continue
+    return 0
+
+
 def _classify_tier(model_id: str) -> str:
     """Extract agent model tier from model ID.
 
@@ -2324,6 +2351,7 @@ class BackendDispatcher(PipelineStage):
                 "api_key": creds.get("api_key", ""),
                 "key_env": creds.get("key_env", ""),
                 "lock": lock,
+                "api_model": creds.get("api_model") or model_name,
             }
         return {
             "model": model_name,
@@ -2509,6 +2537,17 @@ class BackendDispatcher(PipelineStage):
                     self._fallback_reason = str(e.code)
                     log(f"  <- Cloud API failed ({e.code}), checking fallback...")
                     _log_cloud_error(ctx, e.code, raw_err)
+                    # 方案 A: rate-limit(429/1308 等)错误消息常含配额重置时间
+                    # (如 Z.ai "Usage limit reached for 5 hour. Your limit will reset
+                    # at YYYY-MM-DD HH:MM:SS")——解析后把该 provider 精确冷却到
+                    # 重置时刻, 避免在 5h 配额窗口内反复重试耗尽方。
+                    if e.code in (408, 429):
+                        _reset_epoch = _parse_quota_reset_epoch(raw_err)
+                        if _reset_epoch:
+                            _ps._record_quota_exhausted(cand["provider"], _reset_epoch)
+                            log(f"  <- provider '{cand['provider']}' quota exhausted — "
+                                f"cooldown until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_reset_epoch))}",
+                                level="WARN")
                     _ps._record_provider_failure(
                         cand["provider"],
                         retryable=e.code in (408, 429, 500, 502, 503, 504),
