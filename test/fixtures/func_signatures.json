@@ -263,16 +263,6 @@
     "params": [],
     "defaults": {}
   },
-  "_SSEHeartbeat": {
-    "name": "_SSEHeartbeat",
-    "params": [
-      "wfile",
-      "interval"
-    ],
-    "defaults": {
-      "interval": 15.0
-    }
-  },
   "_StreamingToolsExtractor": {
     "name": "_StreamingToolsExtractor",
     "params": [],

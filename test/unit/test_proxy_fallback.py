@@ -3681,9 +3681,6 @@ class TestStreamingTailUsageChunk(unittest.TestCase):
         # 时零心跳直通, 测试语义不变)
         _sse_heartbeat_wanted = False
 
-        def _maybe_start_sse_heartbeat(self):
-            return proxy.Handler._maybe_start_sse_heartbeat(self)
-
         def _heartbeat_lines(self, resp):
             return proxy.Handler._heartbeat_lines(self, resp)
 

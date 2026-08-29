@@ -406,55 +406,6 @@ def _timed_stream_lines(resp):
             f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
 
 
-class _SSEHeartbeat:
-    """#51-B1(2026-08-29): 冷 prefill 期间的客户端心跳——把零字节等待变成
-    有字节流动的窗口, 防 CLI idle 断连(epoch 齿尖/新峰值轮实测 184.6s)。
-
-    SSE 注释行(": keepalive\\n\\n")被所有解析器忽略(claude CLI/Anthropic
-    SDK/OpenAI SDK——R13 尾注同款先例), 但刷新传输层字节流。
-    兼任断连哨兵: 心跳写失败(BrokenPipe/Reset/OSError) = 客户端已断,
-    client_disconnected() 置位后 dispatcher 据此立即取消后端在途请求
-    (联动 2026-08-27 修复#1, 比等响应体首写才发现早一个量级)。
-    线程安全: stop() join 后主线程独占 wfile, 与中继无并发写。"""
-
-    def __init__(self, wfile, interval=15.0):
-        self._wfile = wfile
-        # 下限 0.01 只防零/负值死转(生产 15s 远高于此; 单测用 0.05s)
-        self._interval = max(0.01, float(interval))
-        self._stop = threading.Event()
-        self._client_gone = threading.Event()
-        self._thread = None
-        self._beats = 0
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="sse-heartbeat")
-        self._thread.start()
-
-    def _run(self):
-        while not self._stop.wait(self._interval):
-            try:
-                self._wfile.write(b": keepalive\n\n")
-                self._wfile.flush()
-                self._beats += 1
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                self._client_gone.set()
-                return
-
-    def stop(self):
-        """后端响应到达, 停心跳交还 wfile。幂等。"""
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=self._interval + 2)
-
-    def client_disconnected(self):
-        return self._client_gone.is_set()
-
-    @property
-    def beats(self):
-        return self._beats
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -750,12 +701,19 @@ class Handler(BaseHTTPRequestHandler):
                         # - cloud（无 local 头 + 路由开启）→ 强制云端；
                         # - reject → 413 拒绝（本地确实无法承载 / 路由关闭）。
                         _client_route = parsed.get("_x_proxy_route_to", "")
+                        # 模型级强制本地(如 haiku behavior=force+prefer_local, 数据保密)
+                        # → 巨请求不得路由云端
+                        _pref = _ps.MODEL_ROUTE_PREFERENCES.get(parsed.get("model", ""), {})
+                        _force_local = bool(
+                            _pref.get("behavior") == "force"
+                            and _pref.get("route_bias") == "prefer_local")
                         _huge_action = queue_manager.decide_huge_action(
                             total_chars,
                             _client_route,
                             _ps.PROXY_QUEUE_HUGE_ACTION,
                             PROXY_ROUTE_ENABLED,
                             _ps.PROXY_CTX_CHARS_LIMIT,
+                            force_local=_force_local,
                         )
                         if _huge_action["action"] == "local":
                             # 放行本地：保持 local 标记，SmartRouter / _early_route_decision 均走本地；
@@ -1530,52 +1488,89 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._sse_head_sent = True
 
-    def _maybe_start_sse_heartbeat(self):
-        """#51-B1(v2): dispatcher 按 payload 大小(≥PROXY_SSE_HEARTBEAT_BYTES)
-        置 _sse_heartbeat_wanted, 流中继进入首行等待前启动心跳。"""
-        if not getattr(self, '_sse_heartbeat_wanted', False):
-            return None
-        try:
-            hb = _SSEHeartbeat(
-                self.wfile,
-                interval=getattr(_ps, "PROXY_SSE_HEARTBEAT_S", 15))
-            hb.start()
-            return hb
-        except Exception:
-            return None
 
     def _heartbeat_lines(self, resp):
-        """#51-B1(v2): 包装 _timed_stream_lines——等待后端首行(长冷 prefill:
-        epoch 齿尖/会话新峰值轮, 实测 300KB→264s)期间向客户端发 SSE 心跳
-        注释行, 防 CLI idle 断连(实测 184.6s); 首行到达即停心跳, 主线程
-        独占 wfile 后转入正常中继(无并发写)。
-        v1 教训: 后端收到流式请求会**立即回响应头**(urlopen 仅 ~0.1s),
-        预发头+urlopen 周围心跳覆盖不到 prefill——零字节窗口实际在中继
-        读循环首行等待上, 心跳必须挂在这里。
-        首行到达时若心跳已检出客户端断开: 关闭后端连接取消在途生成
-        (联动 2026-08-27 修复#1)并终止中继, 不再白烧生成。"""
-        hb = self._maybe_start_sse_heartbeat()
-        try:
+        """#51-B1(v4, select 心跳): 大 payload 流式中继期间, 用 select 等待
+        后端数据、超时即向客户端发 SSE 心跳注释行——覆盖冷 prefill 的整个
+        静默窗口(后端首 chunk 立即到、真 token 要等 prefill 完成, 实测
+        300KB→225s), 防 CLI idle 断连(实测 184.6s)。
+
+        迭代教训(2026-08-29, 两项实测):
+        · v2 线程版: 主线程阻塞在 resp.readline() 期间心跳线程 216s 不被
+          调度(GIL 饥饿), 并发线程方案在该形态下不可用;
+        · v3 settimeout 版: sock.settimeout(3) 后 readline 仍阻塞 225s
+          ——settimeout 对 urlopen 响应的 BufferedReader 读取链不生效
+          (同因疑使 _timed_stream_lines 的 idle 看门狗在 prefill 场景
+          从未生效)。select 为纯 OS 层等待, 无上述两层依赖。
+
+        心跳写失败(BrokenPipe)=客户端已断: 关闭 resp 取消后端在途生成
+        (联动 2026-08-27 修复#1)。
+        idle 看门狗语义保留: 首行之后连续 PROXY_STREAM_IDLE_TIMEOUT_S 无
+        后端数据 → StreamIdleTimeout(与心跳并存: 心跳只维持字节流, 不
+        影响 stall 判定)。
+        dispatcher 按 payload(≥PROXY_SSE_HEARTBEAT_BYTES) 置
+        _sse_heartbeat_wanted; 未置/False/sock 不可提取时零行为差异。"""
+        wanted = bool(getattr(self, '_sse_heartbeat_wanted', False))
+        if not wanted:
             for line in _timed_stream_lines(resp):
-                if hb is not None:
-                    hb.stop()
-                    if hb.client_disconnected():
-                        log("  <- [sse-heartbeat] client gone during prefill "
-                            "— backend request cancelled", level="WARN")
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
-                        self._client_disconnected = True
-                        return
-                    if hb.beats:
-                        log(f"  -> [sse-heartbeat] kept client alive: "
-                            f"{hb.beats} beats during prefill")
-                    hb = None
                 yield line
-        finally:
-            if hb is not None:
-                hb.stop()
+            return
+        sock = None
+        try:
+            sock = getattr(getattr(getattr(resp, "fp", None), "raw", None),
+                           "_sock", None)
+        except Exception:
+            sock = None
+        if sock is None:
+            for line in _timed_stream_lines(resp):
+                yield line
+            return
+        import select as _select
+        interval = max(0.01, float(
+            getattr(_ps, "PROXY_SSE_HEARTBEAT_S", 15)))
+        idle_limit = max(interval, float(
+            getattr(_ps, "PROXY_STREAM_IDLE_TIMEOUT_S", 30)))
+        beats = 0
+        got_first = False
+        idle_started = None
+        while True:
+            try:
+                r, _, _ = _select.select([sock], [], [], interval)
+            except (OSError, ValueError):
+                for line in _timed_stream_lines(resp):
+                    yield line
+                return
+            if not r:
+                if got_first and idle_started is None:
+                    idle_started = time.monotonic()
+                elif (got_first and idle_started is not None
+                        and time.monotonic() - idle_started >= idle_limit):
+                    raise StreamIdleTimeout(
+                        f"backend stream idle > {idle_limit}s after first line "
+                        f"(heartbeat kept client alive: {beats} beats)")
+                try:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    beats += 1
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    log("  <- [sse-heartbeat] client gone (%d beats) — "
+                        "backend request cancelled" % beats, level="WARN")
+                    self._client_disconnected = True
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return
+                continue
+            idle_started = None
+            line = resp.readline()
+            if not line:
+                if beats:
+                    log(f"  -> [sse-heartbeat] kept client alive: "
+                        f"{beats} beats during prefill/relay")
+                return
+            got_first = True
+            yield line
 
     def _handle_openai_streaming_response(self, resp):
         """Passthrough an OpenAI-format streaming response for /v1/chat/completions."""
