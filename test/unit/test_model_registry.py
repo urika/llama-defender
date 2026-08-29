@@ -404,18 +404,18 @@ class TestProxyStateIntegration(unittest.TestCase):
             self.skipTest("PROXY_CLOUD_MODEL set in env; default-model anchor invalid")
         import proxy_state
         prefs = proxy_state.MODEL_ROUTE_PREFERENCES
-        # 2026-08-29 路由决策: 订阅零边际优先 — sonnet/haiku 从 deepseek-flash
-        # 首发切到 glm-5.3-flash(订阅 0 边际), deepseek 退为链上兜底;
-        # opus 保持 glm-5.3 首发 + glm-5.3-flash 备援 + deepseek-v4-pro 兜底。
-        self.assertEqual(prefs["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash")
+        # 2026-08-29 路由决策: 订阅零边际优先 — sonnet/haiku 首发 glm-5.3-flash,
+        # kimi(Kimi Code 会员)作第二零边际备援(sonnet=k3/haiku=highspeed/opus=coding),
+        # deepseek 退为链上兜底; opus 保持 glm-5.3 首发。
+        self.assertEqual(prefs["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(prefs["claude-sonnet-4-6"]["fallback_models"],
-                         ["glm-5.3", "deepseek-v4-flash"])
-        self.assertEqual(prefs["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash")
+                         ["glm-5.3-flash", "k3", "glm-5.3", "deepseek-v4-flash"])
+        self.assertEqual(prefs["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(prefs["claude-haiku-4-5"]["fallback_models"],
-                         ["deepseek-v4-flash"])
-        self.assertEqual(prefs["claude-opus-4-7"]["cloud_model"], "glm-5.3")
+                         ["glm-5.3-flash", "kimi-for-coding-highspeed", "deepseek-v4-flash"])
+        self.assertEqual(prefs["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(prefs["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3-flash", "deepseek-v4-pro"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
 
     def test_catalog_file_actually_loaded(self):
         import proxy_state
@@ -513,12 +513,12 @@ class TestRoutePoliciesJson(unittest.TestCase):
         self.assertTrue(pj["models"]["k3"]["direct_capable"])
         self.assertFalse(pj["models"]["local-default"]["direct_capable"])
         # opus routed to glm-5.3 (Z.ai subscription) with glm-5.3-flash + deepseek chain backup
-        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"], "glm-5.3")
+        self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(pj["preferences"]["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3-flash", "deepseek-v4-pro"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
         # 订阅零边际优先: sonnet/haiku 首发 glm-5.3-flash
-        self.assertEqual(pj["preferences"]["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash")
-        self.assertEqual(pj["preferences"]["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash")
+        self.assertEqual(pj["preferences"]["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash-cn")
+        self.assertEqual(pj["preferences"]["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash-cn")
         # 方案 A 可见性: providers 暴露 quota 状态(不泄露 key)
         self.assertIn("quota", pj["providers"]["zhipu"])
         self.assertIsInstance(pj["providers"]["zhipu"]["quota"]["exhausted"], bool)
@@ -551,20 +551,21 @@ class TestV1ModelsMetadata(unittest.TestCase):
     def test_opus_metadata_from_catalog(self):
         meta = self._get_entries()["claude-opus-4-7"]
         # 2026-08-15 route decision: opus → glm-5.3 (Z.ai subscription)
-        self.assertEqual(meta["real_model"], "glm-5.3")
+        self.assertEqual(meta["real_model"], "glm-5.3-cn")
         self.assertTrue(meta["thinking_supported"])   # glm-5.3: thinking supported
         self.assertTrue(meta["thinking_required"])    # thinking "only": z.ai ignores the
                                                       # thinking param and always thinks (F1)
         self.assertEqual(meta["context_chars"], 1000000)
         self.assertEqual(meta["price"]["input"], 0)   # subscription marginal cost
-        # 2026-08-29: 链上备援加 glm-5.3-flash(同订阅 0 边际), deepseek 兜底
-        self.assertEqual(meta["fallback_models"], ["glm-5.3-flash", "deepseek-v4-pro"])
+        # 2026-08-29: 国内站(zhipu-cn)置首, 链上备援 glm-5.3 + kimi-for-coding + glm-5.3-flash, deepseek 兜底
+        self.assertEqual(meta["fallback_models"],
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
         self.assertTrue(meta["direct_capable"])       # zhipu has an Anthropic endpoint
 
     def test_sonnet_flash_metadata(self):
         meta = self._get_entries()["claude-sonnet-4-6"]
         # 2026-08-29 路由决策: sonnet 首发从 deepseek-flash 切到 glm-5.3-flash(订阅 0 边际)
-        self.assertEqual(meta["real_model"], "glm-5.3-flash")
+        self.assertEqual(meta["real_model"], "glm-5.3-flash-cn")
         self.assertTrue(meta["thinking_supported"])   # thinking "only" 视为 supported
         self.assertTrue(meta["thinking_required"])    # glm/kimi 始终思考 (F1)
 

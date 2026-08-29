@@ -17,6 +17,7 @@ import collections
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -632,26 +633,77 @@ def _parse_quota_reset_epoch(raw_err):
     """Parse a subscription quota reset time from a provider rate-limit error message.
 
     Returns wall-clock epoch seconds (UTC), or 0 when no parseable reset time.
-    CN 提供商(Z.ai/bigmodel)在消息中给出北京时间重置时刻(如 Z.ai 1308:
-    "Usage limit reached for 5 hour. Your limit will reset at 2026-08-29 13:04:56"),
-    按 UTC+8 显式换算, 不依赖本机时区。
+    Handles:
+      - Z.ai 1308: "... reset at 2026-08-29 13:04:56" (naive datetime → UTC+8)
+      - ISO 8601 with tz: "2026-03-08T09:20:45.248979Z" / "...+08:00" (Kimi /usages resetTime)
+      - bare epoch seconds near a reset keyword
+    Naive datetimes are assumed UTC+8 (CN subscription providers).
     """
     if not raw_err:
         return 0
     import re as _re
     from datetime import timezone, timedelta
-    m = _re.search(r"reset\s+at\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)", raw_err, _re.I)
-    if not m:
-        m = _re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)", raw_err)
-    if not m:
+
+    def _ts(dt, tz):
+        if tz == "Z":
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        if tz:
+            sign = 1 if tz[0] == "+" else -1
+            tzn = tz[1:].replace(":", "")
+            hh = int(tzn[:2]); mm = int(tzn[2:4]) if len(tzn) >= 4 else 0
+            return dt.replace(tzinfo=timezone(sign * timedelta(hours=hh, minutes=mm))).timestamp()
+        return dt.replace(tzinfo=timezone(timedelta(hours=8))).timestamp()
+
+    def _parse_dt(ds, tz):
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return _ts(datetime.strptime(ds, fmt), tz)
+            except ValueError:
+                continue
+        return None
+
+    dt_re = r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(Z|[+-]\d{2}:?\d{2})?"
+    # 1) reset-keyword anchored (Z.ai 1308 style) — preferred
+    m = _re.search(r"reset\w*\s+(?:at|on|time|in)\s+" + dt_re, raw_err, _re.I)
+    if m:
+        v = _parse_dt(f"{m.group(1)} {m.group(2)}", (m.group(3) or "").upper())
+        if v is not None:
+            return v
+    # 2) any ISO datetime with explicit tz (Z/offset) — unambiguous, likely a resetTime
+    m = _re.search(dt_re, raw_err)
+    if m and m.group(3):
+        v = _parse_dt(f"{m.group(1)} {m.group(2)}", m.group(3).upper())
+        if v is not None:
+            return v
+    # 3) bare epoch near reset keyword
+    m = _re.search(r"reset\w*\s*[\"']?[:=]?[\"']?\s*(\d{10,11})", raw_err, _re.I)
+    if m:
+        return float(m.group(1))
+    return 0
+
+
+def _fetch_kimi_usage_reset(api_key, timeout=10):
+    """Query Kimi Code /usages endpoint for the subscription quota resetTime (UTC epoch).
+
+    Kimi 额度耗尽返回 403 且消息不含具体重置时刻, 但提供用量查询端点:
+      GET https://api.kimi.com/coding/v1/usages  (Authorization: Bearer <key>)
+      {"usage": {"limit":..., "remaining":..., "resetTime": "2026-03-08T09:20:45.248979Z"}, ...}
+    Returns reset epoch (UTC) or 0 when unreachable / no resetTime.
+    """
+    if not api_key:
         return 0
-    ds = f"{m.group(1)} {m.group(2)}"
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-        try:
-            dt = datetime.strptime(ds, fmt).replace(tzinfo=timezone(timedelta(hours=8)))
-            return dt.timestamp()
-        except ValueError:
-            continue
+    import urllib.request as _ur, urllib.error as _ue, json as _json
+    req = _ur.Request(
+        "https://api.kimi.com/coding/v1/usages",
+        headers={"Authorization": f"Bearer {api_key}"}, method="GET")
+    try:
+        with _ur.urlopen(req, timeout=timeout) as r:
+            d = _json.loads(r.read().decode("utf-8"))
+        rt = (d.get("usage") or {}).get("resetTime")
+        if rt:
+            return _parse_quota_reset_epoch(rt)
+    except Exception:
+        pass
     return 0
 
 
@@ -2514,7 +2566,7 @@ class BackendDispatcher(PipelineStage):
                 ctx._route_cloud_model = cand["model"]
                 ctx._route_provider = cand["provider"]
                 if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
-                    ctx.openai_body["model"] = cand["model"]
+                    ctx.openai_body["model"] = cand.get("api_model") or cand["model"]
                 self._set_route_headers(ctx)
                 try:
                     if cand.get("protocol") == "anthropic":
@@ -2537,12 +2589,17 @@ class BackendDispatcher(PipelineStage):
                     self._fallback_reason = str(e.code)
                     log(f"  <- Cloud API failed ({e.code}), checking fallback...")
                     _log_cloud_error(ctx, e.code, raw_err)
-                    # 方案 A: rate-limit(429/1308 等)错误消息常含配额重置时间
-                    # (如 Z.ai "Usage limit reached for 5 hour. Your limit will reset
-                    # at YYYY-MM-DD HH:MM:SS")——解析后把该 provider 精确冷却到
-                    # 重置时刻, 避免在 5h 配额窗口内反复重试耗尽方。
-                    if e.code in (408, 429):
+                    # 方案 A: rate-limit/quota 错误 → 解析/查询配额重置时刻, 把该
+                    # provider 精确冷却到重置, 避免在配额窗口内反复重试耗尽方。
+                    # - Z.ai 1308(429): 消息含 "reset at YYYY-MM-DD HH:MM:SS"
+                    # - Kimi 403: 消息无具体时刻, 改查 /usages 端点拿 resetTime
+                    _quota_like = (e.code in (408, 429)) or (
+                        e.code == 403
+                        and bool(re.search(r"usage limit|quota|limit", raw_err, re.I)))
+                    if _quota_like:
                         _reset_epoch = _parse_quota_reset_epoch(raw_err)
+                        if not _reset_epoch and cand["provider"] == "kimi":
+                            _reset_epoch = _fetch_kimi_usage_reset(cand["api_key"])
                         if _reset_epoch:
                             _ps._record_quota_exhausted(cand["provider"], _reset_epoch)
                             log(f"  <- provider '{cand['provider']}' quota exhausted — "
@@ -2550,7 +2607,7 @@ class BackendDispatcher(PipelineStage):
                                 level="WARN")
                     _ps._record_provider_failure(
                         cand["provider"],
-                        retryable=e.code in (408, 429, 500, 502, 503, 504),
+                        retryable=(e.code in (408, 429, 500, 502, 503, 504)) or _quota_like,
                     )
                 except urllib.error.URLError as ue:
                     # Connection-level failure (refused/timeout) — also feeds
@@ -3000,7 +3057,7 @@ class BackendDispatcher(PipelineStage):
                 "max_tokens": ctx.body.get("max_tokens", 4096),
                 "messages": ctx.messages,
             }
-        anthropic_req["model"] = cand["model"]
+        anthropic_req["model"] = cand.get("api_model") or cand["model"]
         anthropic_req["stream"] = bool(ctx.is_stream)
         anthropic_req.pop("_x_proxy_route_to", None)
         body_bytes = json.dumps(anthropic_req, ensure_ascii=False).encode("utf-8")

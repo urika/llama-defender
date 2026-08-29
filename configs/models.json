@@ -16,6 +16,14 @@
       "protocol": "anthropic",
       "anthropic_key_env": "ZAI_API_KEY"
     },
+    "zhipu-cn": {
+      "anthropic_base_url": "https://open.bigmodel.cn/api/anthropic",
+      "anthropic_compatible": true,
+      "concurrent": 2,
+      "note": "国内站 bigmodel.cn 订阅(anthropic 协议, key=BIGMODEL_API_TOKEN, 2026-08-29 实测 glm-5.3/5.2/flash 200; 额度查询 /api/monitor/usage/quota/limit)。Claude Code 国内映射: fable=glm-5.3, opus=glm-5.3-flash, sonnet=glm-5.2, haiku=glm-5.3-flash。端点接受裸模型码(不带 [1M] 后缀)",
+      "protocol": "anthropic",
+      "anthropic_key_env": "BIGMODEL_API_TOKEN"
+    },
     "kimi": {
       "base_url": "https://api.kimi.com/coding/v1",
       "anthropic_base_url": "https://api.kimi.com/coding/",
@@ -91,6 +99,31 @@
         "note": "经 Z.ai Coding Plan 订阅分发(Phase D protocol=anthropic), 额度内边际0; 按量参考价(2026-08-19 独立 API 开放): bigmodel ¥8/2/28, z.ai $1.4/0.26/4.4(与 5.2 同价); 1M ctx/128K out, reasoning_effort low/high/max 默认 max(无 disabled)"
       }
     },
+    "glm-5.3-cn": {
+      "provider": "zhipu-cn",
+      "api_model": "glm-5.3",
+      "tier": "flagship",
+      "capabilities": {
+        "thinking": "only",
+        "context_tokens": 1000000,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
+      "price": {
+        "input": 0,
+        "output": 0,
+        "currency": "CNY",
+        "note": "国内站 bigmodel.cn 订阅(provider=zhipu-cn, api_model=glm-5.3)"
+      }
+    },
     "glm-5.3-flash": {
       "provider": "zhipu",
       "tier": "fast",
@@ -112,6 +145,30 @@
         "output": 0,
         "currency": "CNY",
         "note": "GLM Coding Plan 订阅分发(Phase D protocol=anthropic), 额度内边际0; 按量参考价(2026-08-26 发布, 5折至 09-09): z.ai 促销 $0.075/0.015/0.25, 标准 $0.15/0.03/0.50, bigmodel ¥0.4-0.8/1.4-2.8; 320B/18B MoE 多模态(文本+图像), 1M ctx/128K out; Coding Plan 配额 3× GLM-5.3"
+      }
+    },
+    "glm-5.3-flash-cn": {
+      "provider": "zhipu-cn",
+      "api_model": "glm-5.3-flash",
+      "tier": "fast",
+      "capabilities": {
+        "thinking": "only",
+        "vision": true,
+        "context_tokens": 1000000,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
+      "price": {
+        "input": 0,
+        "output": 0,
+        "currency": "CNY",
+        "note": "国内站 bigmodel.cn 订阅(provider=zhipu-cn, api_model=glm-5.3-flash); 额度实测(2026-08-29): 5h CREDIT_LIMIT 剩 8405/周剩 56405(pro)"
       }
     },
     "glm-5.2": {
@@ -136,6 +193,31 @@
         "output": 0,
         "currency": "CNY",
         "note": "经 Z.ai Coding Plan 订阅分发(Phase D protocol=anthropic), 额度内边际0; 按量参考价(2026-08-19 核): bigmodel ¥8/2/28, z.ai 官方 $1.4/0.26/4.4"
+      }
+    },
+    "glm-5.2-cn": {
+      "provider": "zhipu-cn",
+      "api_model": "glm-5.2",
+      "tier": "flagship",
+      "capabilities": {
+        "thinking": "only",
+        "context_tokens": 1000000,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "request_quirks": {
+        "min_max_tokens": 8192
+      },
+      "price": {
+        "input": 0,
+        "output": 0,
+        "currency": "CNY",
+        "note": "国内站 bigmodel.cn 订阅(provider=zhipu-cn, api_model=glm-5.2)"
       }
     },
     "glm-5.1": {
@@ -293,7 +375,9 @@
     "claude-sonnet-4-6": {
       "route_bias": "auto",
       "cloud_model": [
+        "glm-5.3-flash-cn",
         "glm-5.3-flash",
+        "k3",
         "glm-5.3",
         "deepseek-v4-flash"
       ],
@@ -304,7 +388,9 @@
     "claude-opus-4-7": {
       "route_bias": "prefer_cloud",
       "cloud_model": [
+        "glm-5.3-cn",
         "glm-5.3",
+        "kimi-for-coding",
         "glm-5.3-flash",
         "deepseek-v4-pro"
       ],
@@ -315,7 +401,9 @@
     "claude-haiku-4-5": {
       "route_bias": "prefer_local",
       "cloud_model": [
+        "glm-5.3-flash-cn",
         "glm-5.3-flash",
+        "kimi-for-coding-highspeed",
         "deepseek-v4-flash"
       ],
       "behavior": "prefer",

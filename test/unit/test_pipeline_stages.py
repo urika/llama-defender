@@ -16,6 +16,7 @@ import proxy_state as _ps
 from pipeline import (
     PipelineContext,
     _parse_quota_reset_epoch,
+    _fetch_kimi_usage_reset,
     RequestParser,
     LifecycleClassifier,
     DynamicMaxTokens,
@@ -1947,3 +1948,60 @@ class TestParseQuotaReset(unittest.TestCase):
         self.assertEqual(_parse_quota_reset_epoch("rate limit exceeded, retry later"), 0)
         self.assertEqual(_parse_quota_reset_epoch(""), 0)
         self.assertEqual(_parse_quota_reset_epoch(None), 0)
+
+
+class TestParseQuotaResetExtended(unittest.TestCase):
+    """方案 A 扩展: ISO(Z/offset)/epoch + Kimi /usages resetTime."""
+
+    def test_iso_z_utc(self):
+        from datetime import timezone
+        import datetime as _dt
+        msg = '{"usage": {"resetTime": "2026-03-08T09:20:45.248979Z"}}'
+        ep = _parse_quota_reset_epoch(msg)
+        expect = _dt.datetime(2026, 3, 8, 9, 20, 45, 248979, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(ep, expect)
+
+    def test_iso_offset_eight(self):
+        from datetime import timezone, timedelta
+        import datetime as _dt
+        msg = "quota will reset at 2026-08-29T13:04:56+08:00"
+        ep = _parse_quota_reset_epoch(msg)
+        expect = _dt.datetime(2026, 8, 29, 13, 4, 56,
+                              tzinfo=timezone(timedelta(hours=8))).timestamp()
+        self.assertEqual(ep, expect)
+
+    def test_epoch_near_reset_keyword(self):
+        ep = _parse_quota_reset_epoch('"resetTime": 1787979896')
+        self.assertEqual(ep, 1787979896.0)
+
+    def test_kimi_message_has_no_timestamp(self):
+        # Kimi 403 消息不含具体重置时刻 → 解析返回 0(由 /usages 兜底)
+        msg = ("You've reached your 5-hour usage limit. Your quota will reset "
+               "when the current 5-hour window ends.")
+        self.assertEqual(_parse_quota_reset_epoch(msg), 0)
+
+
+class TestFetchKimiUsageReset(unittest.TestCase):
+    """方案 A: Kimi /usages 端点查询配额 resetTime."""
+
+    def test_returns_reset_epoch(self):
+        from unittest.mock import patch
+        from datetime import timezone
+        import datetime as _dt
+        fake = type("R", (), {
+            "read": lambda self: b'{"usage": {"resetTime": "2026-03-08T09:20:45.248979Z"}}',
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *a: None})()
+        with patch("urllib.request.urlopen", return_value=fake):
+            ep = _fetch_kimi_usage_reset("sk-test")
+        self.assertEqual(ep, _dt.datetime(2026, 3, 8, 9, 20, 45, 248979,
+                                          tzinfo=timezone.utc).timestamp())
+
+    def test_error_returns_zero(self):
+        from unittest.mock import patch
+        import urllib.error
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            self.assertEqual(_fetch_kimi_usage_reset("sk-test"), 0)
+
+    def test_empty_key_returns_zero(self):
+        self.assertEqual(_fetch_kimi_usage_reset(""), 0)
