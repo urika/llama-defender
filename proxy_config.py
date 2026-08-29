@@ -225,6 +225,16 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Streaming inter-chunk idle watchdog (s), counted after the first token. A mid-stream stall beyond this aborts the relay and cancels in-flight generation.",
     },
+    "PROXY_SSE_HEARTBEAT_BYTES": {
+        "defaults": {"all": "100000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "#51-B1 v2: streaming requests with body >= this many bytes run an SSE ': keepalive' heartbeat (every PROXY_SSE_HEARTBEAT_S) while the relay waits for the backend's first chunk during long cold prefills (epoch spikes / new-peak turns) — feeds the client's idle timer so it doesn't disconnect at ~180s.",
+    },
+    "PROXY_SSE_HEARTBEAT_S": {
+        "defaults": {"all": "15"},
+        "type": "float", "scope": "reloadable",
+        "doc": "#51-B1: SSE keepalive comment interval (s) during backend preflight wait.",
+    },
 
     # ---- Pre-trunc / OOM safety ----
     "PROXY_OOM_SAFE_CHARS": {

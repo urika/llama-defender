@@ -3673,6 +3673,20 @@ class TestStreamingTailUsageChunk(unittest.TestCase):
         def _send_diag_headers(self):
             pass
 
+        def _send_sse_stream_headers(self):
+            # #51-B1: 预发头路径的 stub——本 fake 只测流体逻辑
+            self._sse_head_sent = True
+
+        # #51-B1 v2: 绑定真实心跳中继生成器(fake._sse_heartbeat_wanted=False
+        # 时零心跳直通, 测试语义不变)
+        _sse_heartbeat_wanted = False
+
+        def _maybe_start_sse_heartbeat(self):
+            return proxy.Handler._maybe_start_sse_heartbeat(self)
+
+        def _heartbeat_lines(self, resp):
+            return proxy.Handler._heartbeat_lines(self, resp)
+
     def _run_stream(self, lines):
         import io
         payload = b"".join((ln + "\n").encode("utf-8") for ln in lines)

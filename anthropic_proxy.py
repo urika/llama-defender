@@ -406,6 +406,55 @@ def _timed_stream_lines(resp):
             f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
 
 
+class _SSEHeartbeat:
+    """#51-B1(2026-08-29): 冷 prefill 期间的客户端心跳——把零字节等待变成
+    有字节流动的窗口, 防 CLI idle 断连(epoch 齿尖/新峰值轮实测 184.6s)。
+
+    SSE 注释行(": keepalive\\n\\n")被所有解析器忽略(claude CLI/Anthropic
+    SDK/OpenAI SDK——R13 尾注同款先例), 但刷新传输层字节流。
+    兼任断连哨兵: 心跳写失败(BrokenPipe/Reset/OSError) = 客户端已断,
+    client_disconnected() 置位后 dispatcher 据此立即取消后端在途请求
+    (联动 2026-08-27 修复#1, 比等响应体首写才发现早一个量级)。
+    线程安全: stop() join 后主线程独占 wfile, 与中继无并发写。"""
+
+    def __init__(self, wfile, interval=15.0):
+        self._wfile = wfile
+        # 下限 0.01 只防零/负值死转(生产 15s 远高于此; 单测用 0.05s)
+        self._interval = max(0.01, float(interval))
+        self._stop = threading.Event()
+        self._client_gone = threading.Event()
+        self._thread = None
+        self._beats = 0
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="sse-heartbeat")
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self._wfile.write(b": keepalive\n\n")
+                self._wfile.flush()
+                self._beats += 1
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._client_gone.set()
+                return
+
+    def stop(self):
+        """后端响应到达, 停心跳交还 wfile。幂等。"""
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=self._interval + 2)
+
+    def client_disconnected(self):
+        return self._client_gone.is_set()
+
+    @property
+    def beats(self):
+        return self._beats
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1139,25 +1188,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_openai_streaming_response(resp)
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        if not getattr(self, "_request_id", None):
-            self._request_id = f"req_{os.urandom(8).hex()}"
-        self.send_header("request-id", self._request_id)
-        route_headers = getattr(self, '_route_response_headers', None) or {}
-        for hk, hv in route_headers.items():
-            self.send_header(hk, str(hv))
-        self._route_response_headers = None
-        # 请求队列响应头（X-Queue-*），与 route headers 同机制
-        queue_headers = getattr(self, '_queue_response_headers', None) or {}
-        for hk, hv in queue_headers.items():
-            self.send_header(hk, str(hv))
-        self._queue_response_headers = None
-        # R13 诊断归因头
-        self._send_diag_headers()
-        self.end_headers()
+        # #51-B1: 头段(v2 心跳挂 _heartbeat_lines 首行等待, 与此处解耦)
+        self._send_sse_stream_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
         msg_id = f"msg_{os.urandom(8).hex()}"
@@ -1217,7 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
         stream_finish_reason = None
-        for line in _timed_stream_lines(resp):
+        for line in self._heartbeat_lines(resp):
             line = line.decode("utf-8").strip()
             if not line.startswith("data: "):
                 continue
@@ -1473,6 +1505,78 @@ class Handler(BaseHTTPRequestHandler):
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
 
+
+    def _send_sse_stream_headers(self):
+        """流式响应头段(200 + SSE + request-id + route/queue/diag 头)。
+        B1 抽出: 预发路径(_begin_sse_stream)与常规路径共用, 保证头集合一致。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if not getattr(self, "_request_id", None):
+            self._request_id = f"req_{os.urandom(8).hex()}"
+        self.send_header("request-id", self._request_id)
+        route_headers = getattr(self, '_route_response_headers', None) or {}
+        for hk, hv in route_headers.items():
+            self.send_header(hk, str(hv))
+        self._route_response_headers = None
+        # 请求队列响应头（X-Queue-*），与 route headers 同机制
+        queue_headers = getattr(self, '_queue_response_headers', None) or {}
+        for hk, hv in queue_headers.items():
+            self.send_header(hk, str(hv))
+        self._queue_response_headers = None
+        # R13 诊断归因头
+        self._send_diag_headers()
+        self.end_headers()
+        self._sse_head_sent = True
+
+    def _maybe_start_sse_heartbeat(self):
+        """#51-B1(v2): dispatcher 按 payload 大小(≥PROXY_SSE_HEARTBEAT_BYTES)
+        置 _sse_heartbeat_wanted, 流中继进入首行等待前启动心跳。"""
+        if not getattr(self, '_sse_heartbeat_wanted', False):
+            return None
+        try:
+            hb = _SSEHeartbeat(
+                self.wfile,
+                interval=getattr(_ps, "PROXY_SSE_HEARTBEAT_S", 15))
+            hb.start()
+            return hb
+        except Exception:
+            return None
+
+    def _heartbeat_lines(self, resp):
+        """#51-B1(v2): 包装 _timed_stream_lines——等待后端首行(长冷 prefill:
+        epoch 齿尖/会话新峰值轮, 实测 300KB→264s)期间向客户端发 SSE 心跳
+        注释行, 防 CLI idle 断连(实测 184.6s); 首行到达即停心跳, 主线程
+        独占 wfile 后转入正常中继(无并发写)。
+        v1 教训: 后端收到流式请求会**立即回响应头**(urlopen 仅 ~0.1s),
+        预发头+urlopen 周围心跳覆盖不到 prefill——零字节窗口实际在中继
+        读循环首行等待上, 心跳必须挂在这里。
+        首行到达时若心跳已检出客户端断开: 关闭后端连接取消在途生成
+        (联动 2026-08-27 修复#1)并终止中继, 不再白烧生成。"""
+        hb = self._maybe_start_sse_heartbeat()
+        try:
+            for line in _timed_stream_lines(resp):
+                if hb is not None:
+                    hb.stop()
+                    if hb.client_disconnected():
+                        log("  <- [sse-heartbeat] client gone during prefill "
+                            "— backend request cancelled", level="WARN")
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        self._client_disconnected = True
+                        return
+                    if hb.beats:
+                        log(f"  -> [sse-heartbeat] kept client alive: "
+                            f"{hb.beats} beats during prefill")
+                    hb = None
+                yield line
+        finally:
+            if hb is not None:
+                hb.stop()
+
     def _handle_openai_streaming_response(self, resp):
         """Passthrough an OpenAI-format streaming response for /v1/chat/completions."""
         self.send_response(200)
@@ -1497,7 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
 
         total_text = ""
         try:
-            for line in _timed_stream_lines(resp):
+            for line in self._heartbeat_lines(resp):
                 # R13 流式通道: [DONE] 前插入诊断尾注(设计 D1,注释行规范保证被忽略)
                 try:
                     _dec = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
@@ -1630,7 +1734,7 @@ class Handler(BaseHTTPRequestHandler):
         _first_token_time = None
         _tail_written = False
         try:
-            for raw in _timed_stream_lines(resp):
+            for raw in self._heartbeat_lines(resp):
                 if not isinstance(raw, bytes):
                     raw = raw.encode("utf-8")
                 if _first_token_time is None and raw.strip() and not raw.startswith(b":"):

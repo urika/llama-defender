@@ -200,6 +200,9 @@ PROXY_TIMEOUT_MARGIN_S = int(os.environ.get("PROXY_TIMEOUT_MARGIN_S", "30"))
 # 2026-08-27: 流式 chunk 空闲看门狗——首 token 后若无 chunk 超过该秒数即中止
 # 中继并取消后端在途生成(prefill/首 token 不受限,仅限流中 stall)。
 PROXY_STREAM_IDLE_TIMEOUT_S = int(os.environ.get("PROXY_STREAM_IDLE_TIMEOUT_S", "30"))
+# 2026-08-29 #51-B1: 大 payload 流式请求预发 SSE 头 + 冷 prefill 期间心跳注释行。
+PROXY_SSE_HEARTBEAT_BYTES = int(os.environ.get("PROXY_SSE_HEARTBEAT_BYTES", "100000"))
+PROXY_SSE_HEARTBEAT_S = float(os.environ.get("PROXY_SSE_HEARTBEAT_S", "15"))
 
 
 class StreamIdleTimeout(Exception):
@@ -954,6 +957,8 @@ _RELOAD_SPEC = [
     ("PROXY_BACKEND_TIMEOUT", "PROXY_BACKEND_TIMEOUT", "int", "600", "600"),
     ("PROXY_TIMEOUT_MARGIN_S", "PROXY_TIMEOUT_MARGIN_S", "int", "30", "30"),
     ("PROXY_STREAM_IDLE_TIMEOUT_S", "PROXY_STREAM_IDLE_TIMEOUT_S", "int", "30", "30"),
+    ("PROXY_SSE_HEARTBEAT_BYTES", "PROXY_SSE_HEARTBEAT_BYTES", "int", "100000", "100000"),
+    ("PROXY_SSE_HEARTBEAT_S", "PROXY_SSE_HEARTBEAT_S", "float", "15", "15"),
     ("PROXY_OOM_SAFE_TOKENS", "PROXY_OOM_SAFE_TOKENS", "int", "60000", "60000"),
     ("PROXY_RETRY_AFTER_SECONDS", "PROXY_RETRY_AFTER_SECONDS", "int", "30", "30"),
     ("PROXY_MAX_REQUEST_BYTES", "PROXY_MAX_REQUEST_BYTES", "int", str(500 * 1024), str(500 * 1024)),

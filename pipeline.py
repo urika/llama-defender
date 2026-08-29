@@ -2797,7 +2797,21 @@ class BackendDispatcher(PipelineStage):
             method="POST",
         )
         _dispatch_t0 = time.monotonic()
-        resp = urllib.request.urlopen(req, timeout=self._effective_backend_timeout(ctx, proactive=not ctx.is_stream))
+        # #51-B1(2026-08-29, v2): 大 payload 流式请求 → 通知 handler 在流中继
+        # 里启用心跳。v1 教训: 后端收到流式请求会立即回响应头(urlopen 仅
+        # ~0.1s 返回), 客户端真正的零字节窗口在「代理头已发 → 后端首 chunk
+        # 到达」之间(中继读循环阻塞等 prefill 完成, 300KB 实测 264s)——心跳
+        # 必须挂在中继首行等待上, 而非 urlopen 周围。快请求(小于阈值)与
+        # 非流式不受影响, 后端失败仍走原 JSON 错误路径。
+        try:
+            self._handler._sse_heartbeat_wanted = bool(
+                ctx.is_stream
+                and len(body_bytes) >= _ps.PROXY_SSE_HEARTBEAT_BYTES)
+        except Exception:
+            self._handler._sse_heartbeat_wanted = False
+        resp = urllib.request.urlopen(
+            req, timeout=self._effective_backend_timeout(
+                ctx, proactive=not ctx.is_stream))
         self._backend_status = resp.status
         log(f"  <- backend status: {resp.status}")
 
