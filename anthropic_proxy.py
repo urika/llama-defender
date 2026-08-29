@@ -380,30 +380,52 @@ from tool_filter import *
 
 
 def _timed_stream_lines(resp):
-    """Wrap a backend SSE stream with an inter-chunk idle watchdog.
+    """Wrap a backend SSE stream with an inter-chunk idle watchdog (select 版).
 
-    首 token 后收紧底层 socket 读超时到 PROXY_STREAM_IDLE_TIMEOUT_S——流中 stall
-    在数秒内被探测而非拖满 PROXY_BACKEND_TIMEOUT(600s)。prefill/首 token 不受
-    限(收紧发生在首个 yield 之后)。stall 时抛 StreamIdleTimeout,由
-    BackendDispatcher 捕获后中止中继并 close() 后端连接取消在途生成。
-    socket 内部结构不匹配时静默降级为默认 socket 超时(无看门狗)。
+    首 token 后, 若连续 PROXY_STREAM_IDLE_TIMEOUT_S 无后端数据 → 抛
+    StreamIdleTimeout(BackendDispatcher 捕获后中止中继并 close() 取消
+    在途生成)。prefill/首 token 不受限(计时从首个 yield 之后起)。
+
+    2026-08-29 select 重写(原 settimeout 版): 实测 sock.settimeout 在
+    受控环境(socketpair)生效、但在 urlopen 真实后端链上不生效(v3 探针
+    铁证: settimeout(3) 后 readline 阻塞 225s 无超时; 生产 194s 静默
+    亦未触发 30s 看门狗)——两环境行为分叉, 根因在 urlopen 链某层。select
+    为纯 OS 层等待, 与 #51-B1 v4 心跳同原语, 两环境实测可靠。
+    sock 不可提取时退化为裸迭代(无看门狗, 与原版降级语义一致)。
     """
     import socket
-    first = True
+    import select as _select
+    sock = None
     try:
-        for bline in resp:
-            if first:
-                try:
-                    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
-                    if sock is not None:
-                        sock.settimeout(PROXY_STREAM_IDLE_TIMEOUT_S)
-                except Exception:
-                    pass
-                first = False
-            yield bline
-    except socket.timeout:
-        raise StreamIdleTimeout(
-            f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    except Exception:
+        sock = None
+    first = True
+    it = iter(resp)
+    while True:
+        if not first and sock is not None:
+            try:
+                r, _, _ = _select.select([sock], [], [], PROXY_STREAM_IDLE_TIMEOUT_S)
+            except (OSError, ValueError, TypeError):
+                r = True  # select 不可用(fake sock 无 fileno 等)则裸迭代
+            if not r:
+                # 已等满 idle 时限且 fd 无数据。极小概率误杀: fp 缓冲尚有
+                # 未消费行而 fd 静默(SSE 场景消费方逐行高速消费, 窗口极小,
+                # 接受此权衡——原 settimeout 版无此窗口但真实链不生效)。
+                raise StreamIdleTimeout(
+                    f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
+        try:
+            bline = next(it)
+        except StopIteration:
+            return
+        except socket.timeout:
+            # 兜底: sock 不可提取走裸迭代时, settimeout 若在该环境生效,
+            # timeout 归类为 StreamIdleTimeout(向后兼容原语义)
+            raise StreamIdleTimeout(
+                f"backend stream idle > {PROXY_STREAM_IDLE_TIMEOUT_S}s after first token")
+        first = False
+        yield bline
+
 
 
 class Handler(BaseHTTPRequestHandler):

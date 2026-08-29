@@ -3745,14 +3745,38 @@ class TestTimedStreamLines(unittest.TestCase):
                     import socket
                     raise socket.timeout("read timed out")
 
-    def test_yields_lines_and_tightens_socket(self):
-        import socket as _socket
+    def test_yields_lines_select_fallback_on_fake_sock(self):
+        # select 版(2026-08-29): fake sock 无 fileno → select 抛 → 裸迭代
+        # 透传(不再 settimeout——真实链上不生效, 见 _timed_stream_lines docstring)
         self._FakeResp.fp.raw._sock = self._FakeSock()
         resp = self._FakeResp([b"data: hello", b"data: [DONE]"])
         with patch.object(proxy, "PROXY_STREAM_IDLE_TIMEOUT_S", 30):
             got = list(proxy._timed_stream_lines(resp))
         self.assertEqual(got, [b"data: hello", b"data: [DONE]"])
-        self.assertEqual(self._FakeResp.fp.raw._sock.to, 30)
+
+    def test_select_stall_raises_on_real_socket(self):
+        # 真实 socketpair + 沉默 writer: select 等满 idle 时限即抛(核心路径)
+        import socket as _socket, time as _time
+        a, b = _socket.socketpair()
+        class _R:
+            def __init__(self, fp): self.fp = fp
+            def __iter__(self):
+                while True:
+                    l = self.fp.readline()
+                    if not l: return
+                    yield l
+        a.sendall(b"data: first\n\n")
+        resp = _R(b.makefile("rb"))
+        t0 = _time.monotonic()
+        try:
+            with patch.object(proxy, "PROXY_STREAM_IDLE_TIMEOUT_S", 0.3):
+                list(proxy._timed_stream_lines(resp))
+            self.fail("应抛 StreamIdleTimeout")
+        except proxy.StreamIdleTimeout:
+            pass
+        finally:
+            a.close(); b.close()
+        self.assertLess(_time.monotonic() - t0, 3)  # 0.3s 时限内触发
 
     def test_stall_raises_stream_idle_timeout(self):
         import socket as _socket
