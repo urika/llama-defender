@@ -1537,8 +1537,12 @@ class LoopIntervention(PipelineStage):
             if loop_tool_name == "text_loop":
                 log(f"  -> TEXT LOOP LEVEL {loop_level}: text_run={ctx.text_loop_run} max_run={ctx.max_run}")
             else:
+                # #52(2026-08-29): 原 f-string 内联 {{k: v for ...}}——双花括号是
+                # 字面量, 日志打出的是推导式原文而非实际计数。先求值再嵌入。
+                _over_thresh = {k: v for k, v in ctx.consecutive.items()
+                                if v >= _ps.PROXY_LOOP_THRESHOLD}
                 log(f"  -> LOOP LEVEL {loop_level}: tool={loop_tool_name} max_run={ctx.max_run} "
-                    f"consecutive={{k: v for k, v in ctx.consecutive.items() if v >= _ps.PROXY_LOOP_THRESHOLD}}")
+                    f"consecutive={_over_thresh}")
             if loop_level == 2:
                 if loop_tool_name != "text_loop":
                     removed = sorted(set(
@@ -2644,7 +2648,14 @@ class BackendDispatcher(PipelineStage):
 
                 route_reason = getattr(ctx, '_route_reason', '')
                 # Do NOT fallback if the user explicitly forced local.
-                if route_reason == 'session_force_local':
+                # #53(2026-08-29): 判定与归因头显示层(_set_route_headers 的
+                # local_forced 口径)对齐——header 强制(X-Proxy-Route-To: local,
+                # reason=header_override, 批跑臂的强制方式)同样拒绝 fallback。
+                # 原缺口: 仅 session_force_local(管理接口)拒绝, header 强制的
+                # local 400(客户端消息序列错误类)仍送云——云侧同 400 零成功
+                # 纯浪费, 且升级 503 逼迫 CLI 放弃整个 run(2026-08-21 批 38
+                # run 夭折链)。原样返回错误让 CLI 走自身修复/重试路径。
+                if route_reason in ('session_force_local', 'header_override'):
                     log(f"  <- Local manually forced — no fallback")
                     self._handler._respond_json({"error": {"message": err_msg}}, self._backend_status)
                     return ctx

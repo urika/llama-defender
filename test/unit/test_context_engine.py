@@ -411,6 +411,34 @@ class TestRealTokenTrigger(unittest.TestCase):
         triggered, _ = self.sess.maybe_epoch(2000, 24)
         self.assertTrue(triggered)
 
+    def test_trigger_takes_max_of_backfill_and_current_est(self):
+        # #50(2026-08-29): 回填是**上一轮**实测, 不含本轮新增——大增量轮在
+        # 「上轮 60K 未超 → 本轮真实 71K」窗口过冲(42355d18 形态)。触发判定
+        # 须取 max(上轮回填, 本轮 est×R): 本轮 est 覆盖新增内容。
+        # 构造: 每轮工具结果 3500 chars < 写压阈值 4096(不压缩), 40 轮 ≈
+        # 140K+ chars canonical → est ≈ 36K ×1.6 ≈ 58K? 需 >65K → 50 轮。
+        self.sess.absorb(_tu("q"))
+        self.sess.record_usage(60000, 20000)     # 上轮真实 60K ≤ 65K 未触
+        for i in range(50):
+            self.sess.absorb(_tool_round(
+                "t%d" % i, "Bash", {"command": "ls"}, "o" * 3500))
+        # 50×3500 ≈ 175K chars 原始全部保留(未过写压阈值) → est ≈ 46K
+        # ×1.6 ≈ 74K > 65K → 必须触发
+        # (旧行为: _real_scale() 走回填分支返回 60K ≤ 65K → 漏触发 = bug)
+        self.assertGreater(
+            int(self.sess.est_tokens() * ce.EST_REAL_RATIO), 65000)
+        triggered, _ = self.sess.maybe_epoch(65000, 24)
+        self.assertTrue(triggered)
+        self.assertEqual(self.sess.epoch_count, 1)
+
+    def test_trigger_backfill_dominates_when_est_low(self):
+        # 反向: 本轮 est×R 不超但上轮回填超(写入期压缩把消息压小) → 仍触发
+        msgs = _tu("q") + _tool_round("t1", "Bash", {"command": "ls"}, "o" * 6000)
+        self.sess.absorb(msgs)
+        self.sess.record_usage(70000, 30000)
+        triggered, _ = self.sess.maybe_epoch(65000, 24)
+        self.assertTrue(triggered)
+
     def test_collapse_fit_checked_in_real_scale(self):
         # 收编产物按真实口径判定(est×1.6 ≤ S); K=24 产物 ~30K 真实 ≤ 40K 放行
         msgs = []

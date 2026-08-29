@@ -2016,6 +2016,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if tail == "metrics":
             records = diagnostics.read_session_metrics(key)
+            # #60(2026-08-29): ?since=ISO 前缀过滤。sid 设计为重跑同任务同 key
+            # 稳定(断点续跑 key 稳定), sessions.jsonl 按 key 聚合会跨批次串扰——
+            # 实测 s38a5c10 聚合了 8/21-26 六天 490 条记录, 8/22 引擎开启时代的
+            # 40 个 epoch_turn 混入 8/26 引擎关闭批次的读数(误判"幽灵注入")。
+            # since 传 ISO 时间戳/日期前缀, 只保留 ts >= since 的记录。
+            since = _q("since", "")
+            if since:
+                records = [r for r in records
+                           if str(r.get("ts", "")) >= since]
             if not records and not session_ledger.LEDGER.session_alive(key):
                 self._respond_json({"error": {"type": "session_not_found"}}, 404)
                 return True

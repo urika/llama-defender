@@ -367,19 +367,34 @@ class CanonicalSession(object):
             return self.last_sent_tokens
         return int(self.est_tokens(messages) * EST_REAL_RATIO)
 
+    def _trigger_scale(self):
+        """#50(2026-08-29): 触发判定专用口径——上轮实测回填(last_sent_tokens)
+        与本轮 est×R 取大。原判定只看 _real_scale() 的回填分支, 而回填是
+        **上一轮**的实测: 本轮新增内容(长工具结果等)不在内, 大增量轮会在
+        「上轮 60K 未超 → 本轮真实 71K」的窗口里过冲(2026-08-22 42355d18
+        实测: est 51.2K / 真实 82K, swap 挤兑)。est×R 覆盖本轮全量, 两者
+        取大 = 回填精度与增量覆盖兼得。"""
+        candidates = []
+        if self.last_sent_tokens > 0:
+            candidates.append(self.last_sent_tokens)
+        candidates.append(int(self.est_tokens() * EST_REAL_RATIO))
+        return max(candidates)
+
     def maybe_epoch(self, trigger_tokens, window_k):
         """发送前 epoch 检查 → (epoch_triggered, final_messages)。
 
         触发与容量判定均为**真实 prompt_tokens 口径**(2026-08-22 校准, 见
         EST_REAL_RATIO 注释): est(/4) 低估 1.6×, est 口径下 S=60K 等于真实
         ~96K——epoch 永远在系统崩溃(实测 82K)之后才到, 形同虚设。
+        触发用 _trigger_scale(#50: 上轮回填与本轮 est×R 取大, 防大增量轮
+        过冲); 压缩后容量复检仍用 _real_scale(messages)。
         未超限: canonical 原样（append-only, 前缀 = 上轮所发）。
         超限: 一次 epoch——K 窗口外轮次收编入压缩区, 重切为 L0 + 压缩区
               + 最近 K 轮并**回写 canonical**（后续轮在其上继续 append）;
               压缩后仍超限 → K=4 收紧 → L3 减半 → 仍超限返回 None
               （硬上限: 调用方返回 context 超限错误, §4.9 回退保护）。
         """
-        if self._real_scale() <= trigger_tokens:
+        if self._trigger_scale() <= trigger_tokens:
             return False, list(self.canonical)
         self.epoch_count += 1
         self.last_epoch_turn = self.turn
