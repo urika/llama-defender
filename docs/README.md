@@ -27,7 +27,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
-| `PRD-anthropic-proxy.md` | 产品需求文档 (PRD v3.0)，涵盖 7 大领域 / 23 个需求点、8 层处理管线、关键配置参数和迭代路线图 |
+| `PRD-anthropic-proxy.md` | 产品需求文档 (PRD v3.1，2026-08-29 修订)，需求体系 R1-R10（v3.1 新增 R9 信息保真控制 IFC / R10 渐进披露上下文服务 PDC，其中 R9.0 统一词汇表已落地）、8 层处理管线、关键配置参数和信息面分批次迭代路线图 |
 | `system-requirements-analysis.md` | 系统需求分析与验证，基于实测数据（Qwen3.6-35B-A3B + Claude Code + M5 Pro 48GB）提炼性能基线与优化目标 |
 
 **入口文档**：新成员请先阅读 `PRD-anthropic-proxy.md` 了解系统全貌。
@@ -49,6 +49,10 @@ docs/
 | `config-unification-and-request-queue-design-20260815.md` | 配置统一与请求队列设计方案：解决配置默认值分散四处导致的漂移风险（如 qwen3.8 MODEL_NAME 缺失），以及单信号量下大请求阻塞小请求的公平性问题；含 CONFIG_REGISTRY 单一事实源、启动校验、请求四级分桶、准入控制、优先级队列、超时取消、与 SmartRouter 集成、迁移与测试计划 |
 | `diagnostics-dataplane-design-20260819.md` | 诊断数据面设计（R13-R16，**已实施 2026-08-19**）：上下文工程改造的观测先行层——R13 诊断归因双通道（非流式 HTTP 头 + 流式 SSE 尾注，修正「复用 R8 头模式」的流式时序矛盾）、R14 会话台账端点（dup/last_dup_turn/材料清单，每请求派生、与 Phase 1 解耦）、R15 L4 档案三视图（sent_view 为压缩后行为复盘唯一权威）、R16 会话维度 metrics（含 is_epoch_turn 分档前提、request_id 关联）；后端能力矩阵（llama-server/rapid-mlx/cloud 降级链）、D-Phase 0-2 实施计划（约 2 天，先诊断后改造，四臂 A/B 统一口径） |
 | `logging-trajectory-improvement-design-20260820.md` | 日志体系评估与改进设计（对标 DSH 轨迹视图四层模型）：现状 7 类日志/档案对标事件/动作/语义/性能层——R13-R16 已是正确的"最小轨迹系统"；差距 G1-G6（台账不持久、requests.jsonl 缺 session_id/request_id、主日志 510MB 无轮转、无统一事件契约、无离线投影工具、导出空白）；Phase A 地基三项（P0，1-2 天）+ Phase B 投影工具（trace_query/trace_replay 含 A/B diff）+ Phase C 按需；明确不做清单（请求级重放/事件溯源重构/进程内 SDK） |
+| `information-fidelity-control-design-20260829.md` | 信息保真控制（IFC）设计提案（**未实施**）：控制论×信息论框架重读——回路盘点（基础设施/行为表面环已闭环、信息环唯一开环）+ 信道损失链（DPI/Good Regulator/Ashby 品种缺口）；核心算法：三层传感器（Tier-0 结构指标 / logprobs / 自一致性探针）+ 台账对账式信念审计（D_ledger，R14 台账作 ground truth 解决锚定效度盲区）+ epoch 门控/压缩回退/信息钉（第一个保真方向执行器，含 anti-windup）+ 双端失败检测（补高熵游走端）；Phase 0-4 落地计划（效度关卡：≥200 ILE 上 \|ρ\|≥0.4 或 AUC≥0.7，不达标止步于度量）+ 四层指标与六条护栏预算；§9 动态决策能力边界（调节级 Phase 3/4 达到、策略级 Phase 5 预案）；源于 MMPO/信念熵综述分析 |
+| `progressive-disclosure-context-serving-design-20260829.md` | 渐进披露上下文服务（PDC）设计提案（**未实施**，IFC 姊妹篇·建设性补全）：虚拟内存隐喻——代理从"一次性减法编辑器"升级为"交互式信息服务器"；模型信息输入需求四层（任务框架零容忍/可寻址索引零容忍/新鲜工作集/尾部高容忍）、三层存储（V_t/台账 Warm/档案 Cold 全部已存在）+ `ctx_recall` 拉取通道（协议两案：次请求改写先行有 compress_tool_result 先例，微轮重派升级）；三条披露规则（索引永不丢/内容按需给/拉取即历史 append-only 兼容）；与 IFC 合流（探针 Q3=需求信号、游走获得建设性执行器、**拉取日志=压缩策略 revealed ground truth** 驱动钉/权重频率计数自校准）；D0-D3 轨道与 IFC 并行（不依赖 Phase 2 效度关卡）+ 度量（拉后即弃率等）+ 护栏 |
+| `memory-storage-requirements-selection-20260829.md` | 记忆存储需求与技术选型（IFC+PDC 支撑层，**未实施**）：存储从"事后诊断档案"升格为"运行时记忆系统"；六组需求（稳定单元 ID 寻址/absorb 事务性与全量可重建/Hot-Warm-Cold 分层驱逐含优雅缺页/五流 unit_id join/钉生命周期/敏感会话探针降级）+ 缺口汇总（1 命名空间算法+5 小存储+1 中型检索）；选型分层——核心 stdlib only（**sqlite3+FTS5 本机实测可用**：SQLite 3.51.0 FTS5/WAL 验证记录）、双轨形态（热路径 dict+JSONL 沿 A3 模式、检索路径 SQLite 只读索引）、FTS5 中文分词 trigram+LIKE 兜底、DuckDB 限 tools 离线、sqlite-vec 可选加载预留、mem0/Letta/Graphiti 仅概念参考（bi-temporal→unit ID 时序、memory blocks→pins、操作日志→loss journal）+ 存储布局建议 |
+| `context-architecture-evolution-20260829.md` | 上下文架构演进总览（**系列收口·架构评审入口**，未实施）：概念架构五转变（上下文编辑器→服务器/推式单向→推+拉交互/信息环开环→三级闭环/诊断档案→运行时记忆/损失避免→rate-distortion 分配+可恢复性）+ 三面一体目标架构图（IFC 防御/PDC 建设/存储支撑 + 拉取/预取/校准三回路）+ 五条架构不变式（append-only/客户端零改/stdlib/失效安全/确定性优先）；功能架构——模块变更地图（新增 belief_probe/ctx_recall，扩展 8 模块）、管线挂载不重排（入口改写槽位+17.5 事件阶段）、四条新数据流、配置面与部署零变化；风险分级表（低观测/中注入/高门控）与既有子系统冲突检查；实施路线汇总与文档同步时点；定性为"演进而非重构"；§3 数据架构（**8 核心实体** Unit/View/Manifest/ILE/Probe/Pin/Pull/LedgerFact + 血缘骨架、**三级键树** session_key→request_id→unit_id 与五条数据不变量、**指标三级派生体系** L1 原始观测→L2 纯函数派生→L3 趋势关联·唯一可触执行器层、传感/校准双闭环共享 Unit 键空间） |
 | `../research-context-optimization/06-context-compression-strategy.md` | 上下文压缩管理策略总览（Phase 1-3 整合版），含决策矩阵、指标体系与配置建议 |
 
 ---
