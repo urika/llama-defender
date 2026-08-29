@@ -61,6 +61,7 @@ class TraceStore(object):
         self._diag_by_session = None     # session_key → [turn 记录...]（按 turn 升序）
         self._ledger_by_session = None   # session_key → [delta 行...]
         self._archive_by_session = None  # session_key → [sent_view 行...]
+        self._hbe_by_session = None      # session_key → [hbe 探针记录...]（按 turn 升序）
 
     # ------------------------------------------------------------ paths --
     def ledger_path(self, key):
@@ -80,6 +81,11 @@ class TraceStore(object):
     @property
     def diag_sessions_path(self):
         return os.path.join(self.diag_dir, "sessions.jsonl")
+
+    @property
+    def hbe_path(self):
+        """IFC Phase 2 效度验证: hbe_probe 影子探针流（logs/diag/hbe.jsonl）。"""
+        return os.path.join(self.diag_dir, "hbe.jsonl")
 
     # ----------------------------------------------------------- indexes --
     def metrics_by_request(self):
@@ -117,6 +123,20 @@ class TraceStore(object):
         if key not in self._archive_by_session:
             self._archive_by_session[key] = list(iter_jsonl(self.archive_path(key)))
         return self._archive_by_session[key]
+
+    def hbe_by_session(self):
+        """hbe.jsonl → session_key → [探针记录]（按 turn 升序，含非 ok 结果行，
+        消费方按 result=='ok' 与 h_mean_bits 字段过滤）。"""
+        if self._hbe_by_session is None:
+            idx = {}
+            for rec in iter_jsonl(self.hbe_path):
+                key = rec.get("session_key")
+                if key:
+                    idx.setdefault(key, []).append(rec)
+            for rows in idx.values():
+                rows.sort(key=lambda r: (r.get("turn") or 0,))
+            self._hbe_by_session = idx
+        return self._hbe_by_session
 
     # ------------------------------------------------------------ derived --
     def sessions_overview(self):
@@ -175,6 +195,47 @@ def percentile(values, ratio):
         return None
     k = max(0, min(len(vals) - 1, int(round(ratio * (len(vals) - 1)))))
     return vals[k]
+
+
+def _rank(values):
+    """平均秩（ties 取均值）——Spearman 前置。"""
+    n = len(values)
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / ((vx * vy) ** 0.5)
+
+
+def spearman(xs, ys):
+    """Spearman 秩相关（IFC Phase 2 效度统计；样本 <3 或零方差 → None）。"""
+    pairs = [(x, y) for x, y in zip(xs, ys)
+             if isinstance(x, (int, float)) and isinstance(y, (int, float))]
+    if len(pairs) < 3:
+        return None
+    rx = _rank([p[0] for p in pairs])
+    ry = _rank([p[1] for p in pairs])
+    r = _pearson(rx, ry)  # 零方差(常数列) → None
+    return round(r, 4) if r is not None else None
 
 
 def fmt_ms(value):

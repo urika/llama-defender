@@ -20,7 +20,7 @@ from collections import Counter
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from trace_common import (  # noqa: E402
-    TraceStore, iter_jsonl, parse_ts, fmt_ms, replay_ledger_actions)
+    TraceStore, iter_jsonl, parse_ts, fmt_ms, replay_ledger_actions, spearman)
 
 
 # ============================================================================
@@ -59,9 +59,14 @@ def cmd_sessions(store, args):
 
 
 def _join_turn_rows(store, key):
-    """diag/sessions 轮记录 + metrics(request_id) + ledger 该轮 action 数 → 行列表。"""
+    """diag/sessions 轮记录 + metrics(request_id) + ledger 该轮 action 数
+    + ifc Tier-0 段 + hbe 影子探针(按 turn join, result==ok) → 行列表。"""
     diag_rows = store.diag_by_session().get(key) or []
     metrics_idx = store.metrics_by_request()
+    hbe_by_turn = {}
+    for h in store.hbe_by_session().get(key) or []:
+        if h.get("result") == "ok" and isinstance(h.get("h_mean_bits"), (int, float)):
+            hbe_by_turn[h.get("turn")] = h
     # ledger: turn → (新增 action 数, mismatch)
     ledger_turns = {}
     for delta in store.ledger_deltas(key):
@@ -74,6 +79,8 @@ def _join_turn_rows(store, key):
         rid = d.get("request_id")
         m = metrics_idx.get(rid) or {}
         led = ledger_turns.get(d.get("turn")) or {}
+        ifc = d.get("ifc") or {}
+        hbe = hbe_by_turn.get(d.get("turn")) or {}
         rows.append({
             "turn": d.get("turn"),
             "ts": d.get("ts"),
@@ -88,6 +95,16 @@ def _join_turn_rows(store, key):
             "error_type": m.get("error_type"),
             "ledger_actions": led.get("actions"),
             "canonical_mismatch": bool(d.get("canonical_mismatch")),
+            # IFC 信息面(R9.1 Tier-0 + R9.2 影子探针 join)
+            "ifc_ile": bool(ifc.get("ile")),
+            "ifc_kinds": ifc.get("ile_kinds") or [],
+            "retention": ifc.get("retention"),
+            "rationale_ratio": ifc.get("rationale_ratio"),
+            "reread_pressure": ifc.get("reread_pressure"),
+            "action_div": ifc.get("action_div"),
+            "manifest_lines": ifc.get("manifest_lines"),
+            "h_be": hbe.get("h_mean_bits"),
+            "hbe_coverage": hbe.get("coverage_mean"),
         })
     return rows
 
@@ -119,6 +136,87 @@ def cmd_show(store, args):
             ("%.2f" % r["hit_ratio"]) if isinstance(r.get("hit_ratio"), (int, float)) else "-",
             inj, r.get("ledger_actions") if r.get("ledger_actions") is not None else "-",
             tail))
+
+
+def _failure_flagged(row):
+    """失败代理标记(v0 口径): 循环/重读/截断摘要等注入干预, 或 5xx/error。"""
+    if row.get("feedback_injected"):
+        return True
+    if row.get("error_type"):
+        return True
+    st = str(row.get("status") or "")
+    return st.startswith("5")
+
+
+def _ifc_validity_summary(rows):
+    """Phase 2 效度脚手架: H_BE×损失相关 + ILE→失败前瞻列联。"""
+    both = [r for r in rows
+            if isinstance(r.get("h_be"), (int, float))
+            and isinstance(r.get("retention"), (int, float))]
+    rho = spearman([r["h_be"] for r in both],
+                   [1.0 - r["retention"] for r in both]) if len(both) >= 3 else None
+    rho_ra = None
+    ra = [r for r in rows
+          if isinstance(r.get("h_be"), (int, float))
+          and isinstance(r.get("rationale_ratio"), (int, float))]
+    if len(ra) >= 3:
+        rho_ra = spearman([r["h_be"] for r in ra],
+                          [1.0 - r["rationale_ratio"] for r in ra])
+    # 前瞻列联: 上一轮 ILE 后本轮失败率 vs 基线失败率
+    base_fail = sum(1 for r in rows if _failure_flagged(r))
+    n = len(rows)
+    after_fail = after_n = 0
+    for prev, cur in zip(rows, rows[1:]):
+        if prev.get("ifc_ile"):
+            after_n += 1
+            if _failure_flagged(cur):
+                after_fail += 1
+    return {
+        "turns": n,
+        "hbe_samples": len(both),
+        "spearman_hbe_vs_loss": rho,
+        "spearman_hbe_vs_rationale_loss": rho_ra,
+        "failure_rate_baseline": round(base_fail / n, 4) if n else None,
+        "failure_rate_after_ile": round(after_fail / after_n, 4) if after_n else None,
+        "ile_turns": sum(1 for r in rows if r.get("ifc_ile")),
+        "ile_after_n": after_n,
+    }
+
+
+def cmd_ifc(store, args):
+    """IFC 信息面: per-turn Tier-0 × H_BE join + Phase 2 效度相关脚手架。"""
+    if args.session:
+        keys = [args.session]
+    else:
+        keys = sorted(store.diag_by_session().keys())[-args.limit:]
+    out = []
+    for key in keys:
+        rows = _join_turn_rows(store, key)
+        if not rows:
+            continue
+        if args.json:
+            out.append({"session_key": key,
+                        "summary": _ifc_validity_summary(rows),
+                        "turns": rows})
+            continue
+        print("== session %s | IFC 信息面 ==" % key)
+        print("%-4s %-3s %-8s %-9s %-6s %-5s %-8s %-6s %-4s %s" % (
+            "TURN", "ILE", "RETAIN", "RATIONALE", "REREAD", "ADIV", "H_BE", "MANIF", "ST", "KINDS/INJ"))
+        for r in rows:
+            def _f(v, fmt="%.3f"):
+                return fmt % v if isinstance(v, (int, float)) else "-"
+            print("%-4s %-3s %-8s %-9s %-6s %-5s %-8s %-6s %-4s %s" % (
+                r.get("turn"), "Y" if r.get("ifc_ile") else "-",
+                _f(r.get("retention")), _f(r.get("rationale_ratio")),
+                r.get("reread_pressure") if r.get("reread_pressure") is not None else "-",
+                _f(r.get("action_div"), "%.2f"),
+                _f(r.get("h_be"), "%.2f"),
+                r.get("manifest_lines") if r.get("manifest_lines") is not None else "-",
+                r.get("status") if r.get("status") is not None else "?",
+                ",".join((r.get("ifc_kinds") or []) + (r.get("feedback_injected") or []))[:32] or "-"))
+        print("  效度: %s" % json.dumps(_ifc_validity_summary(rows), ensure_ascii=False))
+    if args.json:
+        return out
 
 
 def cmd_request(store, args):
@@ -282,6 +380,10 @@ def main(argv=None):
     p.add_argument("session_key")
     p.add_argument("--turns", type=int, default=0, help="仅展示最近 N 轮")
 
+    p = sub.add_parser("ifc", help="IFC 信息面: Tier-0×H_BE join + 效度相关(Phase 2)")
+    p.add_argument("session_key", nargs="?", default=None, help="单会话; 缺省=最近 N 会话")
+    p.add_argument("--limit", type=int, default=5, help="缺省模式下的会话数")
+
     p = sub.add_parser("request", help="单请求详情(阶段分解/错误/台账)")
     p.add_argument("request_id")
 
@@ -300,7 +402,7 @@ def main(argv=None):
     store = TraceStore(args.logs_dir)
     handlers = {
         "sessions": cmd_sessions, "show": cmd_show, "request": cmd_request,
-        "failures": cmd_failures, "last": cmd_last,
+        "failures": cmd_failures, "last": cmd_last, "ifc": cmd_ifc,
     }
     result = handlers[args.cmd](store, args)
     if args.json and result is not None:

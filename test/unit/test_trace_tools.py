@@ -62,20 +62,38 @@ class _FixtureBase(unittest.TestCase):
              "duration_ms": 40000, "error_type": "BrokenPipeError",
              "error": "Connection reset", "pipeline": {}},
         ])
-        # diag/sessions.jsonl(R16)
+        # diag/sessions.jsonl(R16) —— 含 R9.1 ifc 段
         _w(os.path.join(self.logs, "diag", "sessions.jsonl"), [
             {"ts": "2026-08-20T10:00:05", "request_id": "r1", "session_key": "sessA",
              "turn": 1, "ttft_ms": 300.0, "duration_ms": 5000.0, "hit_ratio": 0.99,
              "feedback_injected": [], "route_target": "local",
-             "actual_model": "m-a", "canonical_mismatch": False},
+             "actual_model": "m-a", "canonical_mismatch": False,
+             "ifc": {"ile": False, "ile_kinds": [], "retention": 1.0,
+                     "rationale_ratio": 1.0, "reread_pressure": 0,
+                     "action_div": None, "manifest_lines": 0}},
             {"ts": "2026-08-20T10:01:40", "request_id": "r2", "session_key": "sessA",
              "turn": 2, "ttft_ms": None, "duration_ms": 40000.0, "hit_ratio": None,
              "feedback_injected": ["loop_l1"], "route_target": "local",
-             "actual_model": "m-a", "canonical_mismatch": False},
+             "actual_model": "m-a", "canonical_mismatch": False,
+             "ifc": {"ile": True, "ile_kinds": ["unit_drop"], "retention": 0.55,
+                     "rationale_ratio": 0.4, "reread_pressure": 3,
+                     "action_div": 0.12, "manifest_lines": 6}},
             {"ts": "2026-08-20T10:02:10", "request_id": "r2b", "session_key": "sessA",
              "turn": 3, "ttft_ms": 200.0, "duration_ms": 2000.0, "hit_ratio": 0.5,
              "feedback_injected": ["loop_l1", "reread_hard"], "route_target": "cloud",
-             "actual_model": "deepseek-v4-flash", "canonical_mismatch": True},
+             "actual_model": "deepseek-v4-flash", "canonical_mismatch": True,
+             "ifc": {"ile": True, "ile_kinds": ["compress_drop"], "retention": 0.8,
+                     "rationale_ratio": 0.9, "reread_pressure": 4,
+                     "action_div": 0.05, "manifest_lines": 9}},
+        ])
+        # diag/hbe.jsonl(R9.2 影子探针: turn1/2 ok, turn3 skipped)
+        _w(os.path.join(self.logs, "diag", "hbe.jsonl"), [
+            {"event": "hbe_shadow", "session_key": "sessA", "turn": 1,
+             "result": "ok", "h_mean_bits": 2.0, "coverage_mean": 0.97},
+            {"event": "hbe_shadow", "session_key": "sessA", "turn": 2,
+             "result": "ok", "h_mean_bits": 5.5, "coverage_mean": 0.95},
+            {"event": "hbe_shadow", "session_key": "sessA", "turn": 3,
+             "result": "skipped_lock"},
         ])
         # diag/ledger/sessA.jsonl(A3 增量: turn1 一个动作, turn2 回填+同目标重复, turn3 mismatch 重建)
         _w(os.path.join(self.logs, "diag", "ledger", "sessA.jsonl"), [
@@ -223,7 +241,76 @@ class TestTraceQuery(_FixtureBase):
         self.assertEqual(len(rows), 3)
 
 
+class TestIfcDimension(_FixtureBase):
+    """R9.1/R9.2 信息面 join 与 Phase 2 效度脚手架。"""
+
+    def test_join_carries_ifc_and_hbe(self):
+        rows = tq._join_turn_rows(self.store, "sessA")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["h_be"], 2.0)          # ok 探针 join
+        self.assertEqual(rows[1]["h_be"], 5.5)
+        self.assertIsNone(rows[2]["h_be"])              # skipped_lock 不 join
+        self.assertEqual(rows[1]["ifc_kinds"], ["unit_drop"])
+        self.assertEqual(rows[1]["retention"], 0.55)
+        self.assertEqual(rows[2]["manifest_lines"], 9)
+        self.assertTrue(rows[1]["ifc_ile"])
+
+    def test_hbe_by_session_only_indexes_ok(self):
+        idx = self.store.hbe_by_session()
+        self.assertEqual(len(idx.get("sessA") or []), 3)  # 全量行(按 turn 升序)
+        ok = [r for r in idx["sessA"] if r.get("result") == "ok"]
+        self.assertEqual([r["turn"] for r in ok], [1, 2])
+
+    def test_spearman_basics(self):
+        self.assertEqual(tc.spearman([1, 2, 3, 4], [10, 20, 30, 40]), 1.0)
+        self.assertEqual(tc.spearman([1, 2, 3, 4], [40, 30, 20, 10]), -1.0)
+        self.assertIsNone(tc.spearman([1, 2], [2, 1]))   # 样本不足
+        self.assertIsNone(tc.spearman([1, 1, 1], [1, 2, 3]))  # 零方差
+        # ties 平均秩: [1,1,2,3] vs [1,2,3,4] → r ≈ 0.9487
+        r = tc.spearman([1, 1, 2, 3], [1, 2, 3, 4])
+        self.assertIsNotNone(r)
+        self.assertLess(abs(r - 0.9487), 0.001)
+
+    def test_validity_summary_pure_function(self):
+        rows = [
+            {"h_be": 1.0, "retention": 1.0, "rationale_ratio": 1.0,
+             "ifc_ile": False, "feedback_injected": [], "status": 200},
+            {"h_be": 2.0, "retention": 0.8, "rationale_ratio": 0.9,
+             "ifc_ile": True, "feedback_injected": [], "status": 200},
+            {"h_be": 3.0, "retention": 0.6, "rationale_ratio": 0.7,
+             "ifc_ile": True, "feedback_injected": ["loop_l1"], "status": 200},
+            {"h_be": 4.0, "retention": 0.4, "rationale_ratio": 0.5,
+             "ifc_ile": False, "feedback_injected": [], "status": 200},
+        ]
+        s = tq._ifc_validity_summary(rows)
+        self.assertEqual(s["turns"], 4)
+        self.assertEqual(s["hbe_samples"], 4)
+        self.assertEqual(s["spearman_hbe_vs_loss"], 1.0)   # 完全单调
+        self.assertEqual(s["failure_rate_after_ile"], 0.5)  # 2 个 ile 后继, 1 失败
+        self.assertEqual(s["failure_rate_baseline"], 0.25)  # 仅 turn3(loop_l1)
+        self.assertEqual(s["ile_turns"], 2)
+
+    def test_cmd_ifc_json_and_table(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            out = tq.cmd_ifc(self.store, Namespace(session="sessA", limit=5, json=True))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["summary"]["ile_turns"], 2)
+        self.assertEqual(out[0]["summary"]["hbe_samples"], 2)
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            self.assertIsNone(tq.cmd_ifc(
+                self.store, Namespace(session="sessA", limit=5, json=False)))
+        text = buf2.getvalue()
+        self.assertIn("IFC 信息面", text)
+        self.assertIn("效度", text)
+        self.assertIn("5.5", text)
+
+
 class TestTraceReplay(_FixtureBase):
+
+
+
     def test_build_timeline_join(self):
         rows = tr.build_timeline(self.store, "sessA")
         self.assertEqual(len(rows), 3)
