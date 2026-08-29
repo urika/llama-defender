@@ -2052,22 +2052,11 @@ class MessageHashDebug(PipelineStage):
     name = "message_hash_debug"
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
-        import hashlib
+        import unit_model as _um
         messages = ctx.messages
         if messages:
-
-            def _msg_hash(m):
-                import content_compressor  # 局部导入,与管线懒加载风格一致
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    c = "".join(content_compressor._text_str(b.get("text", ""))
-                                for b in c if b.get("type") == "text")
-                elif not isinstance(c, str):
-                    c = str(c)
-                return hashlib.md5((m.get("role", "") + ":" + c).encode()).hexdigest()[:8]
-
-            h0 = _msg_hash(messages[0]) if len(messages) > 0 else "none"
-            h1 = _msg_hash(messages[1]) if len(messages) > 1 else "none"
+            h0 = _um.msg_text_hash(messages[0])
+            h1 = _um.msg_text_hash(messages[1]) if len(messages) > 1 else "none"
             log(f"  -> Msg hashes: msg0={h0}, msg1={h1}, total_msgs={len(messages)}")
         return ctx
 

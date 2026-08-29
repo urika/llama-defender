@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 
 import proxy_state as _ps
+import unit_model as _um
 
 DEFAULT_EPOCH_TRIGGER_TOKENS = 70000   # S: 真实 prompt_tokens 口径(2026-08-22 校准)
 DEFAULT_WINDOW_K = 24                  # K: epoch 重切时保留的最近轮数(§4.4)
@@ -49,7 +50,7 @@ _TOOL_BUDGETS = [
 ]
 _ERROR_MARKERS = ("error", "traceback", "exception", "failed", "fatal")
 
-_HANDLE_KEYS = ("url", "file_path", "path", "query", "command", "pattern")
+# _HANDLE_KEYS 已统一至 unit_model.HANDLE_KEYS(词汇表对齐,2026-08-29)
 
 
 def estimate_tokens(chars):
@@ -65,29 +66,13 @@ def _classify_tool(tool_name):
     return ("generic", 6000)
 
 
-def _extract_handle(tool_name, args):
-    """句柄（§4.3 Manus 可恢复原则）: 重新取得该内容的充分信息。"""
-    args = args if isinstance(args, dict) else {}
-    for key in _HANDLE_KEYS:
-        v = args.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()[:300]
-    return None
+# _extract_handle 已统一至 unit_model.extract_handle(结构化 Handle 形态);
+# 本模块展示串场景经 _um.handle_value() 转换。
 
 
 def _result_text(block):
-    content = block.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for b in content:
-            if isinstance(b, dict) and isinstance(b.get("text"), str):
-                parts.append(b["text"])
-            elif isinstance(b, str):
-                parts.append(b)
-        return "\n".join(parts)
-    return ""
+    """tool_result 文本——已迁移 unit_model.result_text(词汇表统一);保留薄委托(测试引用)。"""
+    return _um.result_text(block)
 
 
 def compress_observation(tool_name, args, text, budget=None):
@@ -101,7 +86,8 @@ def compress_observation(tool_name, args, text, budget=None):
     """
     kind, default_budget = _classify_tool(tool_name)
     budget = budget or default_budget
-    handle = _extract_handle(tool_name, args)
+    _h = _um.extract_handle(tool_name, args)
+    handle = _um.handle_value(_h) if _h else None  # 展示串(None 语义保留)
     text = text or ""
     low = text[:200].lower()
     is_error = any(m in low for m in _ERROR_MARKERS)
@@ -132,15 +118,7 @@ def _already_compressed(text):
     return any(m in text for m in _ENGINE_MARKERS)
 
 
-def _msg_hash(msg):
-    """与 session_ledger._msg_hash 同口径（客户端原始历史前缀 diff）。"""
-    import hashlib
-    import json
-    try:
-        raw = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError):
-        raw = repr(msg)
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+# _msg_hash 已统一至 unit_model.msg_hash(两模块原实现同口径,单一实现化)
 
 
 def _frozen_copy(msg):
@@ -242,9 +220,9 @@ def _round_summary(rnd, turn):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 args = block.get("input") if isinstance(block.get("input"), dict) else {}
-                handle = _extract_handle(block.get("name", ""), args) or ""
+                handle = _um.handle_value(_um.extract_handle(block.get("name", ""), args))
                 target = handle or next(
-                    (str(args[k])[:60] for k in _HANDLE_KEYS
+                    (str(args[k])[:60] for k in _um.HANDLE_KEYS
                      if isinstance(args.get(k), str) and args[k].strip()), "")
                 tools.append("- %s %s" % (block.get("name", ""), target[:120]))
     head_text = ""
@@ -319,7 +297,7 @@ class CanonicalSession(object):
         """
         now = time.time()
         self.last_seen = now
-        fp = [_msg_hash(m) for m in (client_messages or [])]
+        fp = [_um.msg_hash(m) for m in (client_messages or [])]
         fp_set = set(fp)
         # 失配信号: 最近发送的末尾消息不在客户端本次历史 → 尾部被改
         tail_hash = self.sent_order[-1] if self.sent_order else None
@@ -327,7 +305,7 @@ class CanonicalSession(object):
         # 新观测 = hash 未见过(按客户端顺序收集, 再统一压缩冻结)
         new_items = []
         for msg in (client_messages or []):
-            h = _msg_hash(msg)
+            h = _um.msg_hash(msg)
             if h in self.sent_set:
                 continue
             self.sent_set.add(h)

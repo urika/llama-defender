@@ -28,12 +28,11 @@ def _text_str(value):
     (上游/转换器的特定消息形态),直接进 str.join 会崩
     (TypeError: sequence item 0: expected str instance, list found),
     代理 500 导致本地臂批跑整任务死亡(swe38-sy 会话实测)。
+
+    实现已统一至 unit_model.text_str(词汇表对齐,2026-08-29);保留薄委托。
     """
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "".join(str(x) for x in value)
-    return str(value)
+    import unit_model as _um
+    return _um.text_str(value)
 
 
 def _bm25_tokenize(text, min_prefix=4):

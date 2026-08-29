@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 
 import proxy_state as _ps
+import unit_model as _um
 
 # 每会话 action 软上限: 超出丢弃最老 occurrence 并累计 aggregated_dropped 计数
 # (设计 §9 风险表: >2000 触发降级聚合的简化实现,保 dup 可见性)
@@ -40,7 +41,7 @@ _MATERIAL_RE = re.compile(
 # 目标参数选择优先级(规范化用): 工具参数里最能代表"这次调用是什么"的字段
 _TARGET_ARG_KEYS = ("query", "q", "search", "url", "file_path", "path",
                     "pattern", "command", "cmd", "name", "body")
-_SEARCH_TOOLS = ("search", "websearch", "web_fetch", "webfetch", "query")
+_SEARCH_TOOLS = _um.SEARCH_TOOLS  # 词汇表统一至 unit_model(extract_handle 共用)
 _FETCH_TOOLS = ("fetch", "curl", "download")
 _FILE_TOOLS = ("read", "write", "edit", "glob", "grep", "ls", "notebookedit")
 _WRITE_TOOLS = ("write", "edit")
@@ -52,12 +53,8 @@ def sanitize_session_key(sid):
 
 
 def _msg_hash(msg):
-    """消息指纹(前缀 diff 用)——sort_keys 保证 key 顺序不稳定不误判。"""
-    try:
-        raw = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError):
-        raw = repr(msg)
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    """消息指纹——已迁移 unit_model.msg_hash(词汇表统一);保留薄委托供 __all__ 导出。"""
+    return _um.msg_hash(msg)
 
 
 def normalize_target(tool_name, args):
@@ -93,54 +90,8 @@ def normalize_target(tool_name, args):
     return norm[:200], h
 
 
-def _extract_handle(tool, args):
-    """句柄(Manus 可恢复原则,上游设计 §4.3): 重新取得该内容的充分信息。"""
-    tool_l = (tool or "").lower()
-    args = args if isinstance(args, dict) else {}
-    for key in ("url", "file_path", "path", "query"):
-        v = args.get(key)
-        if isinstance(v, str) and v.strip():
-            kind = {"url": "url", "file_path": "path", "path": "path"}.get(key, "query")
-            return {"type": kind, "value": v.strip()[:300]}
-    if any(t in tool_l for t in _SEARCH_TOOLS):
-        return {"type": "tool", "value": tool}
-    return None
-
-
-def _iter_blocks(msg):
-    """遍历一条消息的 content block(list 形态);string content 不产出 block。"""
-    content = msg.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                yield block
-
-
-def _result_chars(block):
-    """tool_result 内容规模(字符)。"""
-    content = block.get("content")
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        return sum(len(json.dumps(b, ensure_ascii=False)) for b in content
-                   if isinstance(b, (dict, str)))
-    return 0
-
-
-def _result_text(block, limit=2000):
-    """tool_result 文本(材料启发式用,截断)。"""
-    content = block.get("content")
-    if isinstance(content, str):
-        return content[:limit]
-    if isinstance(content, list):
-        parts = []
-        for b in content:
-            if isinstance(b, dict) and isinstance(b.get("text"), str):
-                parts.append(b["text"])
-            elif isinstance(b, str):
-                parts.append(b)
-        return "\n".join(parts)[:limit]
-    return ""
+# _extract_handle/_iter_blocks/_result_chars/_result_text 已统一至 unit_model
+# (词汇表对齐,2026-08-29 模块化 review 调整 A);调用点直接走 _um.*。
 
 
 class LedgerStore(object):
@@ -235,7 +186,7 @@ class LedgerStore(object):
         for msg in window:
             role = msg.get("role")
             if role == "assistant":
-                for block in _iter_blocks(msg):
+                for block in _um.iter_blocks(msg):
                     if block.get("type") == "tool_use":
                         tool = block.get("name", "")
                         args = block.get("input") or {}
@@ -246,7 +197,7 @@ class LedgerStore(object):
                             "target": target,
                             "target_hash": thash,
                             "result_chars": None,
-                            "handle": _extract_handle(tool, args),
+                            "handle": _um.extract_handle(tool, args),
                             # 同窗口的 tool_result 立即可匹配
                             "_tid": block.get("id") or f"{thash}:{len(entry['actions'])}",
                         }
@@ -255,13 +206,13 @@ class LedgerStore(object):
                         _new_action_ids.add(id(action))
                         self._collect_material_from_args(entry, tool, args, turn)
             elif role == "user":
-                for block in _iter_blocks(msg):
+                for block in _um.iter_blocks(msg):
                     if block.get("type") == "tool_result":
                         tid = block.get("tool_use_id")
                         # 找最近一个未填 result 的同 id action(增量场景 id 唯一)
                         for act in reversed(entry["actions"]):
                             if act.get("_tid") == tid and act.get("result_chars") is None:
-                                act["result_chars"] = _result_chars(block)
+                                act["result_chars"] = _um.result_chars(block)
                                 # 本窗口新增的 action 已随 action 行落盘(含回填值);
                                 # 仅跨请求回填需要单独记录
                                 if id(act) not in _new_action_ids:
@@ -272,11 +223,12 @@ class LedgerStore(object):
                                         or "shell" in (act.get("tool") or "").lower() \
                                         or "exec" in (act.get("tool") or "").lower():
                                     self._collect_material_from_text(
-                                        entry, _result_text(block), turn)
+                                        entry, _um.result_text(block, 2000), turn)
                                 break
                         else:
                             # result 无配对(孤儿/压缩后残留)——材料启发式仍可跑
-                            self._collect_material_from_text(entry, _result_text(block), turn)
+                            self._collect_material_from_text(
+                                entry, _um.result_text(block, 2000), turn)
         return new_actions, cross_fills
 
     def _append_action(self, entry, action):
