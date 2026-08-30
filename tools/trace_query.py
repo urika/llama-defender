@@ -71,9 +71,12 @@ def _join_turn_rows(store, key, include_hbe_artifacts=False):
     for h in store.hbe_by_session().get(key) or []:
         if h.get("result") != "ok" or not isinstance(h.get("h_mean_bits"), (int, float)):
             continue
-        is_artifact = str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>")
-        if is_artifact and not include_hbe_artifacts:
-            continue  # 工具调用语法确定性压低 H,非信念清晰(2026-08-30 分析发现)
+        # 伪迹过滤 v2(2026-08-30 内容级抽检升级): 除 <tool_call> 开头的纯工具
+        # 回答外,还有"文本+内嵌 tool_call"混合型(t8 H=0.40 实测)——回答中
+        # 任何位置含 <tool_call> 即视为伪迹(工具语法确定性压低 H)
+        if "<tool_call>" in str(h.get("answer_preview") or ""):
+            if not include_hbe_artifacts:
+                continue
         hbe_by_turn[h.get("turn")] = h
     # ledger: turn → (新增 action 数, mismatch)
     ledger_turns = {}
@@ -252,7 +255,7 @@ def cmd_ifc(store, args):
             artifacts = sum(
                 1 for h in store.hbe_by_session().get(key) or []
                 if h.get("result") == "ok"
-                and str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>"))
+                and "<tool_call>" in str(h.get("answer_preview") or ""))
         if args.json:
             out.append({"session_key": key,
                         "summary": _ifc_validity_summary(rows),
