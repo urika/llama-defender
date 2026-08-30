@@ -159,7 +159,43 @@ class TestBehaviorMetrics(unittest.TestCase):
         self.assertEqual(im.reread_pressure([]), 0)
 
 
+class TestReconcile(unittest.TestCase):
+    """D_ledger 台账对账(精度轴)——双轴度量的另一半。"""
+
+    LEDGER = [
+        "/repo/txt-abc/src/app.py",
+        "/repo/txt-abc/output/result.txt",
+        "/repo/txt-abc/docs/guide.md",
+    ]
+
+    def test_full_recall_zero_deviation(self):
+        ans = "已读取 src/app.py, 写入 output/result.txt 与 docs/guide.md"
+        r = im.reconcile(ans, self.LEDGER)
+        self.assertEqual(r["d_ledger"], 0.0)
+        self.assertEqual(r["hit"], 3)
+
+    def test_partial_recall(self):
+        ans = "进度: src/app.py 已读, 其余不记得了"
+        r = im.reconcile(ans, self.LEDGER)
+        self.assertAlmostEqual(r["d_ledger"], 2 / 3, places=3)
+        self.assertEqual(r["hit"], 1)
+
+    def test_no_ground_truth_returns_none(self):
+        self.assertIsNone(im.reconcile("什么都还没读", []))
+
+    def test_extras_counted_not_judged(self):
+        ans = "我计划写 output/plan.txt(还没动), src/app.py 已读"
+        r = im.reconcile(ans, self.LEDGER)
+        self.assertEqual(r["hit"], 1)
+        self.assertGreaterEqual(r["extras"], 0)  # 计数口径,不下幻觉判定
+
+    def test_bare_filename_suffix_match(self):
+        r = im.reconcile("guide.md 已更新", self.LEDGER)
+        self.assertEqual(r["hit"], 1)
+
+
 class TestBuildSectionAndStore(unittest.TestCase):
+
     def test_first_turn_no_baseline(self):
         cur = im.view_summary([_anth_msg("user", [{"type": "text", "text": "hi"}])])
         sec = im.build_ifc_section(None, cur, [])

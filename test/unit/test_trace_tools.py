@@ -96,9 +96,11 @@ class _FixtureBase(unittest.TestCase):
         # diag/hbe.jsonl(R9.2 影子探针: turn1/2 ok, turn3 skipped)
         _w(os.path.join(self.logs, "diag", "hbe.jsonl"), [
             {"event": "hbe_shadow", "session_key": "sessA", "turn": 1,
-             "result": "ok", "h_mean_bits": 2.0, "coverage_mean": 0.97},
+             "result": "ok", "h_mean_bits": 2.0, "coverage_mean": 0.97,
+             "answer_preview": "刚开始,还没读文件"},
             {"event": "hbe_shadow", "session_key": "sessA", "turn": 2,
-             "result": "ok", "h_mean_bits": 5.5, "coverage_mean": 0.95},
+             "result": "ok", "h_mean_bits": 5.5, "coverage_mean": 0.95,
+             "answer_preview": "进度: 已写入 /out/a.md, 任务过半"},
             {"event": "hbe_shadow", "session_key": "sessA", "turn": 3,
              "result": "skipped_lock"},
             # 伪迹: 工具调用型回答(H 极低但非信念清晰)——join 必须排除
@@ -261,7 +263,13 @@ class TestIfcDimension(_FixtureBase):
         self.assertEqual(rows[0]["h_be"], 2.0)          # ok 探针 join
         self.assertEqual(rows[1]["h_be"], 5.5)
         self.assertIsNone(rows[2]["h_be"])              # skipped_lock 不 join
-        self.assertIsNone(rows[3]["h_be"])              # <tool_call> 伪迹被过滤        self.assertEqual(rows[1]["ifc_kinds"], ["unit_drop"])
+        self.assertIsNone(rows[3]["h_be"])              # <tool_call> 伪迹被过滤
+        # D_ledger 对账: turn1 无台账材料→None; turn2 提及唯一材料→0.0
+        self.assertIsNone(rows[0]["d_ledger"])
+        self.assertEqual(rows[0]["ledger_paths_n"], 0)
+        self.assertEqual(rows[1]["d_ledger"], 0.0)
+        self.assertEqual(rows[1]["ledger_paths_n"], 1)
+        self.assertEqual(rows[1]["ifc_kinds"], ["unit_drop"])
         self.assertEqual(rows[1]["retention"], 0.55)
         self.assertEqual(rows[2]["manifest_lines"], 9)
         self.assertTrue(rows[1]["ifc_ile"])

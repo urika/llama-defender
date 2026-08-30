@@ -29,6 +29,7 @@ stage、不需要 per-stage 钩子（模块化约束：pipeline.py 由并行工�
 CONFIG_REGISTRY 正式注册待 pipeline/proxy_config 并行工作合并后补两行。
 """
 import math
+import re
 import threading
 
 import unit_model as _um
@@ -340,6 +341,59 @@ def build_ifc_section(prev, cur, actions, manifest_lines=None):
 
 
 # ============================================================================
+# D_ledger: 台账对账偏差(精度轴,与熵的锐度轴配对——双轴度量防"清晰地错")
+# ============================================================================
+
+# 路径/文件提及启发式: 绝对或多段相对路径, 或带扩展名的文件名
+_PATH_TOKEN_RE = re.compile(r'(?:[~/][\w.@/-]{2,200}|[\w-]+(?:/[\w.@-]+){1,8}|[\w.-]+\.[A-Za-z0-9]{1,6})')
+
+
+def extract_path_mentions(text):
+    """从探针答案抽取路径/文件提及(确定性启发式,无 LLM)。"""
+    out = set()
+    for m in _PATH_TOKEN_RE.findall(text or ""):
+        m = m.strip('.,;:()[]{}"\'“”‘’').rstrip('/')
+        if len(m) >= 4:
+            out.add(m)
+    return out
+
+
+def reconcile(answer_text, ledger_paths):
+    """D_ledger = 1 − recall(答案提及, 台账材料)。
+
+    ground truth = 台账 materials(模型实际读/写过的文件,确定性记录,带
+    首见轮次)。漏报口径: 未被答案提及的台账路径占比——"该记住的工作
+    记忆记住了多少"。匹配: 提及是台账路径的后缀(答案常用相对路径)。
+    无台账路径 → None(任务早期无 ground truth 可对账,口径诚实)。
+    extras = 答案提及但台账无对应(计划中的产出/幻觉嫌疑——只计数不判定)。
+    """
+    paths = [p for p in (ledger_paths or []) if p]
+    if not paths:
+        return None
+    mentioned = extract_path_mentions(answer_text)
+    hit, extras = 0, set()
+    ml = {m.lower(): m for m in mentioned}
+    for p in paths:
+        pl = p.lower()
+        base = pl.rsplit('/', 1)[-1]
+        matched = any(pl.endswith(k) or (len(k) >= 4 and k == base)
+                      for k in ml)
+        if matched:
+            hit += 1
+    hit_keys = set()
+    for k in ml:
+        if any(p.lower().endswith(k) for p in paths):
+            hit_keys.add(k)
+    extras = len(ml) - len(hit_keys)
+    return {
+        "d_ledger": round(1.0 - hit / len(paths), 4),
+        "hit": hit,
+        "total": len(paths),
+        "extras": extras,
+    }
+
+
+# ============================================================================
 # 会话基线存储（有界，FIFO 驱逐——台账同款语义）
 # ============================================================================
 
@@ -380,6 +434,7 @@ __all__ = [
     "unit_anchors", "view_summary", "diff_views", "infer_ile_kinds",
     "retention", "rationale_ratio", "action_diversity", "reread_pressure",
     "build_ifc_section", "ViewBaselineStore", "BASELINE",
+    "extract_path_mentions", "reconcile",
     "ACTION_DIV_WINDOW", "REREAD_WINDOW", "SHRINK_MIN_CHARS",
     "IFC_CLS_VERSION",
 ]

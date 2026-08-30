@@ -15,8 +15,15 @@ diag/sessions + diag/ledger，输出人类表格（默认）或 JSON（--json）
 """
 import argparse
 import json
+import os
 import sys
 from collections import Counter
+
+try:
+    import ifc_metrics
+except ImportError:  # CLI 直跑时补仓库根路径
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import ifc_metrics
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from trace_common import (  # noqa: E402
@@ -78,13 +85,17 @@ def _join_turn_rows(store, key, include_hbe_artifacts=False):
             if not include_hbe_artifacts:
                 continue
         hbe_by_turn[h.get("turn")] = h
-    # ledger: turn → (新增 action 数, mismatch)
+    # ledger: turn → (新增 action 数, mismatch) + materials 轮次感知路径集(D_ledger ground truth)
     ledger_turns = {}
+    material_turns = []  # (path, first_turn)
     for delta in store.ledger_deltas(key):
         turn = delta.get("turn") or 0
         item = ledger_turns.setdefault(turn, {"actions": 0, "mismatch": False})
         item["actions"] += len(delta.get("actions") or [])
         item["mismatch"] = item["mismatch"] or bool(delta.get("mismatch"))
+        for m in delta.get("materials") or []:
+            if isinstance(m, dict) and m.get("path"):
+                material_turns.append((m["path"], m.get("turn") or turn))
     rows = []
     for d in diag_rows:
         rid = d.get("request_id")
@@ -92,6 +103,16 @@ def _join_turn_rows(store, key, include_hbe_artifacts=False):
         led = ledger_turns.get(d.get("turn")) or {}
         ifc = d.get("ifc") or {}
         hbe = hbe_by_turn.get(d.get("turn")) or {}
+        d_ledger = None
+        ledger_paths_n = None
+        if hbe:
+            ledger_paths_n = sum(1 for p, t in material_turns
+                                 if t <= (d.get("turn") or 0))
+            if ledger_paths_n:
+                rec = ifc_metrics.reconcile(
+                    hbe.get("answer_preview") or "",
+                    [p for p, t in material_turns if t <= (d.get("turn") or 0)])
+                d_ledger = rec["d_ledger"] if rec else None
         rows.append({
             "turn": d.get("turn"),
             "ts": d.get("ts"),
@@ -116,6 +137,8 @@ def _join_turn_rows(store, key, include_hbe_artifacts=False):
             "manifest_lines": ifc.get("manifest_lines"),
             "h_be": hbe.get("h_mean_bits"),
             "hbe_coverage": hbe.get("coverage_mean"),
+            "d_ledger": d_ledger,
+            "ledger_paths_n": ledger_paths_n,
         })
     return rows
 
@@ -182,11 +205,15 @@ def _ifc_validity_summary(rows):
             after_n += 1
             if _failure_flagged(cur):
                 after_fail += 1
+    # D_ledger 精度轴均值(与熵锐度轴配对的双轴度量)
+    dls = [r["d_ledger"] for r in rows if isinstance(r.get("d_ledger"), (int, float))]
     return {
         "turns": n,
         "hbe_samples": len(both),
         "spearman_hbe_vs_loss": rho,
         "spearman_hbe_vs_rationale_loss": rho_ra,
+        "d_ledger_mean": round(sum(dls) / len(dls), 4) if dls else None,
+        "d_ledger_samples": len(dls),
         "failure_rate_baseline": round(base_fail / n, 4) if n else None,
         "failure_rate_after_ile": round(after_fail / after_n, 4) if after_n else None,
         "ile_turns": sum(1 for r in rows if r.get("ifc_ile")),
