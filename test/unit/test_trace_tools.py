@@ -308,6 +308,7 @@ class TestIfcDimension(_FixtureBase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["summary"]["ile_turns"], 2)
         self.assertEqual(out[0]["summary"]["hbe_samples"], 2)
+        self.assertEqual(out[0]["hbe_artifacts_filtered"], 1)  # turn4 工具调用伪迹
         buf2 = io.StringIO()
         with redirect_stdout(buf2):
             self.assertIsNone(tq.cmd_ifc(
@@ -315,7 +316,13 @@ class TestIfcDimension(_FixtureBase):
         text = buf2.getvalue()
         self.assertIn("IFC 信息面", text)
         self.assertIn("效度", text)
+        self.assertIn("伪迹已滤: 1", text)
         self.assertIn("5.5", text)
+
+    def test_raw_hbe_flag_keeps_artifacts(self):
+        # 原始数据不可变原则: --raw-hbe 保留伪迹样本,分析口径可切换重放
+        rows = tq._join_turn_rows(self.store, "sessA", include_hbe_artifacts=True)
+        self.assertEqual(rows[3]["h_be"], 0.055)  # turn4 伪迹被保留
 
 
 class TestTraceReplay(_FixtureBase):

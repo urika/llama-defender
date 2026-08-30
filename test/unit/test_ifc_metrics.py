@@ -81,7 +81,13 @@ class TestViewDiff(unittest.TestCase):
         self.assertEqual(diff["shrunk_units"], 1)           # tool_result 压缩
         self.assertGreaterEqual(diff["shrunk_chars"], 128)
         self.assertEqual(diff["added_units"], 1)
+        self.assertFalse(diff["view_reset"])                # 尾部存活=持续会话
         self.assertEqual(im.infer_ile_kinds(diff), ["unit_drop", "compress_drop"])
+        # 原始事实层: 分类器版本 + 丢弃明细(可脱离 archive 重分类)
+        sec = im.build_ifc_section(prev, cur, [])
+        self.assertEqual(sec["cls_version"], im.IFC_CLS_VERSION)
+        self.assertEqual(len(sec["dropped_detail"]), 1)
+        self.assertEqual(sec["dropped_detail"][0]["kind"], "text")
         r = im.retention(diff)
         self.assertIsNotNone(r)
         self.assertLess(r, 1.0)

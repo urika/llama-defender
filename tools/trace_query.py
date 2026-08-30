@@ -58,18 +58,23 @@ def cmd_sessions(store, args):
             ",".join(r["sources"])))
 
 
-def _join_turn_rows(store, key):
+def _join_turn_rows(store, key, include_hbe_artifacts=False):
     """diag/sessions 轮记录 + metrics(request_id) + ledger 该轮 action 数
-    + ifc Tier-0 段 + hbe 影子探针(按 turn join, result==ok) → 行列表。"""
+    + ifc Tier-0 段 + hbe 影子探针(按 turn join, result==ok) → 行列表。
+
+    原始数据不可变原则: <tool_call> 伪迹默认过滤(下游派生层),include_
+    hbe_artifacts=True 保留全量——分析可按口径切换重放。
+    """
     diag_rows = store.diag_by_session().get(key) or []
     metrics_idx = store.metrics_by_request()
     hbe_by_turn = {}
     for h in store.hbe_by_session().get(key) or []:
-        # 伪迹过滤(2026-08-30 分析发现): 部分探针回答是 <tool_call> XML 而非
-        # 文本——工具调用语法高度可预测,H 被压到 0.05-0.15,不代表信念清晰
-        if h.get("result") == "ok" and isinstance(h.get("h_mean_bits"), (int, float)) \
-                and not str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>"):
-            hbe_by_turn[h.get("turn")] = h
+        if h.get("result") != "ok" or not isinstance(h.get("h_mean_bits"), (int, float)):
+            continue
+        is_artifact = str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>")
+        if is_artifact and not include_hbe_artifacts:
+            continue  # 工具调用语法确定性压低 H,非信念清晰(2026-08-30 分析发现)
+        hbe_by_turn[h.get("turn")] = h
     # ledger: turn → (新增 action 数, mismatch)
     ledger_turns = {}
     for delta in store.ledger_deltas(key):
@@ -188,18 +193,26 @@ def _ifc_validity_summary(rows):
 
 def cmd_ifc(store, args):
     """IFC 信息面: per-turn Tier-0 × H_BE join + Phase 2 效度相关脚手架。"""
+    raw_hbe = bool(getattr(args, "raw_hbe", False))
     if args.session:
         keys = [args.session]
     else:
         keys = sorted(store.diag_by_session().keys())[-args.limit:]
     out = []
     for key in keys:
-        rows = _join_turn_rows(store, key)
+        rows = _join_turn_rows(store, key, include_hbe_artifacts=raw_hbe)
         if not rows:
             continue
+        artifacts = 0
+        if not raw_hbe:
+            artifacts = sum(
+                1 for h in store.hbe_by_session().get(key) or []
+                if h.get("result") == "ok"
+                and str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>"))
         if args.json:
             out.append({"session_key": key,
                         "summary": _ifc_validity_summary(rows),
+                        "hbe_artifacts_filtered": artifacts,
                         "turns": rows})
             continue
         print("== session %s | IFC 信息面 ==" % key)
@@ -217,7 +230,8 @@ def cmd_ifc(store, args):
                 r.get("manifest_lines") if r.get("manifest_lines") is not None else "-",
                 r.get("status") if r.get("status") is not None else "?",
                 ",".join((r.get("ifc_kinds") or []) + (r.get("feedback_injected") or []))[:32] or "-"))
-        print("  效度: %s" % json.dumps(_ifc_validity_summary(rows), ensure_ascii=False))
+        print("  效度: %s | 伪迹已滤: %d" % (
+            json.dumps(_ifc_validity_summary(rows), ensure_ascii=False), artifacts))
     if args.json:
         return out
 
@@ -386,6 +400,8 @@ def main(argv=None):
     p = sub.add_parser("ifc", help="IFC 信息面: Tier-0×H_BE join + 效度相关(Phase 2)")
     p.add_argument("session_key", nargs="?", default=None, help="单会话; 缺省=最近 N 会话")
     p.add_argument("--limit", type=int, default=5, help="缺省模式下的会话数")
+    p.add_argument("--raw-hbe", action="store_true",
+                   help="保留 <tool_call> 伪迹探针(默认过滤;原始数据始终全量在 hbe.jsonl)")
 
     p = sub.add_parser("request", help="单请求详情(阶段分解/错误/台账)")
     p.add_argument("request_id")

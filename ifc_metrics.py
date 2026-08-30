@@ -35,6 +35,11 @@ import unit_model as _um
 
 # 会话基线上限（对齐 PROXY_DIAG_SESSION_MAX=64 的 FIFO 驱逐语义）
 BASELINE_MAX_SESSIONS = 64
+# 分类器版本(原始数据不可变原则:sessions.jsonl 只追加不改写;分类规则进化
+# 靠版本号区分,离线可按 archive 原始载荷重放任意版本的分类):
+#   1 = 初始锚点差分
+#   2 = +system 单元排除 / view_reset 任务切换分类 / 探针伪迹口径(2026-08-30)
+IFC_CLS_VERSION = 2
 # 就地压缩的计入阈值（chars）：避免格式化噪声误报 compress_drop
 SHRINK_MIN_CHARS = 128
 # Tier-0 指标窗口
@@ -295,6 +300,7 @@ def build_ifc_section(prev, cur, actions, manifest_lines=None):
     manifest_lines: manifest 当前行数（覆盖率观测：有推断损失但行数为 0 → 缺口）。
     """
     section = {
+        "cls_version": IFC_CLS_VERSION,
         "n_msgs": cur["n_msgs"] if cur else None,
         "retention": None,
         "rationale_ratio": None,
@@ -311,6 +317,13 @@ def build_ifc_section(prev, cur, actions, manifest_lines=None):
     if prev and cur:
         diff = diff_views(prev, cur)
         kinds = infer_ile_kinds(diff)
+        # 原始事实层: 丢弃单元明细(锚/类别/角色/规模,截 16 条)——分类规则
+        # 进化时无需回放 archive 即可重分类;事实与分类同记,重放可校验
+        section["dropped_detail"] = [
+            {"anchor": u["anchor"], "kind": u["kind"], "role": u["role"],
+             "size_chars": u["size_chars"]}
+            for a, u in prev["units"].items() if a not in cur["units"]
+        ][:16]
         section.update({
             "retention": retention(diff),
             "rationale_ratio": rationale_ratio(diff),
@@ -368,4 +381,5 @@ __all__ = [
     "retention", "rationale_ratio", "action_diversity", "reread_pressure",
     "build_ifc_section", "ViewBaselineStore", "BASELINE",
     "ACTION_DIV_WINDOW", "REREAD_WINDOW", "SHRINK_MIN_CHARS",
+    "IFC_CLS_VERSION",
 ]
