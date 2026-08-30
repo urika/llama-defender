@@ -474,6 +474,22 @@ PROXY_DIAG_LEDGER_ENABLED = os.environ.get(
 PROXY_DIAG_LEDGER_MAX_MB = int(os.environ.get(
     "PROXY_DIAG_LEDGER_MAX_MB", get_default("PROXY_DIAG_LEDGER_MAX_MB")))
 
+# H_BE shadow 探针（hbe_probe.py，2026-08-29）：只测不动，默认关。
+PROXY_HBE_ENABLED = os.environ.get(
+    "PROXY_HBE_ENABLED", get_default("PROXY_HBE_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_HBE_MIN_CHARS = int(os.environ.get(
+    "PROXY_HBE_MIN_CHARS", get_default("PROXY_HBE_MIN_CHARS")))
+PROXY_HBE_SAMPLE_EVERY = int(os.environ.get(
+    "PROXY_HBE_SAMPLE_EVERY", get_default("PROXY_HBE_SAMPLE_EVERY")))
+PROXY_HBE_TOP_LOGPROBS = int(os.environ.get(
+    "PROXY_HBE_TOP_LOGPROBS", get_default("PROXY_HBE_TOP_LOGPROBS")))
+PROXY_HBE_MAX_TOKENS = int(os.environ.get(
+    "PROXY_HBE_MAX_TOKENS", get_default("PROXY_HBE_MAX_TOKENS")))
+PROXY_HBE_LOCK_WAIT_S = float(os.environ.get(
+    "PROXY_HBE_LOCK_WAIT_S", get_default("PROXY_HBE_LOCK_WAIT_S")))
+PROXY_HBE_TIMEOUT_S = int(os.environ.get(
+    "PROXY_HBE_TIMEOUT_S", get_default("PROXY_HBE_TIMEOUT_S")))
+
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
 # engineering-design §4.3/§4.9，Phase 0 §12 结论已坐实击穿根因为每轮回溯改写）
@@ -1087,6 +1103,14 @@ _RELOAD_SPEC = [
     ("PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_ARCHIVE_MAX_MB", "int", "200", "200"),
     ("PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_ENABLED", "bool", "true", "true"),
     ("PROXY_DIAG_LEDGER_MAX_MB", "PROXY_DIAG_LEDGER_MAX_MB", "int", "100", "100"),
+    # H_BE shadow 探针（只测不动；默认关，SIGHUP 可热开）
+    ("PROXY_HBE_ENABLED", "PROXY_HBE_ENABLED", "bool", "false", "false"),
+    ("PROXY_HBE_MIN_CHARS", "PROXY_HBE_MIN_CHARS", "int", "20000", "20000"),
+    ("PROXY_HBE_SAMPLE_EVERY", "PROXY_HBE_SAMPLE_EVERY", "int", "4", "4"),
+    ("PROXY_HBE_TOP_LOGPROBS", "PROXY_HBE_TOP_LOGPROBS", "int", "20", "20"),
+    ("PROXY_HBE_MAX_TOKENS", "PROXY_HBE_MAX_TOKENS", "int", "160", "160"),
+    ("PROXY_HBE_LOCK_WAIT_S", "PROXY_HBE_LOCK_WAIT_S", "float", "5.0", "5.0"),
+    ("PROXY_HBE_TIMEOUT_S", "PROXY_HBE_TIMEOUT_S", "int", "120", "120"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1180,6 +1204,9 @@ __all__ = [
     "PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_ARCHIVE_ENABLED",
     "PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_TIMINGS_SOURCE",
     "PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_MAX_MB",
+    "PROXY_HBE_ENABLED", "PROXY_HBE_MIN_CHARS", "PROXY_HBE_SAMPLE_EVERY",
+    "PROXY_HBE_TOP_LOGPROBS", "PROXY_HBE_MAX_TOKENS", "PROXY_HBE_LOCK_WAIT_S",
+    "PROXY_HBE_TIMEOUT_S",
     "PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_WINDOW_K",
     "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_DIAG_LEDGER_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency

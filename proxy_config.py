@@ -857,6 +857,51 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Total ledger dir size cap in MB; oldest session files are deleted beyond it.",
     },
+
+    # ---- H_BE shadow 探针（belief-entropy shadow probe，2026-08-29）----
+    # 只测不动：成功的本地响应完成后，搭 prefix cache 便车追加一次双探针锚定
+    # 提问，用 top_logprobs 截断熵估计 MMPO 式信念熵 H_BE，落盘 logs/diag/hbe.jsonl。
+    # 永不改变任何路由/截断/压缩决策；任何失败静默跳过（fail-open）。
+    "PROXY_HBE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Shadow H_BE probe master switch. Off by default; measures only, never acts.",
+    },
+    "PROXY_HBE_MIN_CHARS": {
+        "defaults": {"all": "20000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Skip probe when the sent payload is smaller than this (chars) — small "
+               "contexts have no truncation risk and don't need belief tracking.",
+    },
+    "PROXY_HBE_SAMPLE_EVERY": {
+        "defaults": {"all": "4"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Probe cadence: run on every Nth turn of a session (1 = every turn).",
+    },
+    "PROXY_HBE_TOP_LOGPROBS": {
+        "defaults": {"all": "20"},
+        "type": "int", "scope": "reloadable",
+        "doc": "top_logprobs for the probe call; entropy is computed over this truncated "
+               "distribution (measured top-20 mass coverage ~92-100%).",
+    },
+    "PROXY_HBE_MAX_TOKENS": {
+        "defaults": {"all": "160"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Probe completion budget (tokens). 160 lets the two-sentence anchor answer "
+               "finish; 48 truncated 97.6% of answers mid-way (measured 2026-08-30). "
+               "Cost is ~1s decode — prefill dominates probe latency.",
+    },
+    "PROXY_HBE_LOCK_WAIT_S": {
+        "defaults": {"all": "5.0"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Max seconds the probe waits for the engine concurrency lock; skipped "
+               "beyond this so shadow probing never delays user requests.",
+    },
+    "PROXY_HBE_TIMEOUT_S": {
+        "defaults": {"all": "120"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Probe backend socket timeout in seconds (cache-warm prefill + short gen).",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

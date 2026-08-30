@@ -74,6 +74,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`tool_filter.py`](tool_filter.py) | 动态工具定义过滤，降低长工具列表的 token 开销 |
 | [`admin_server.py`](admin_server.py) | `/status` 状态页、`/api/*` 结构化 JSON 端点、系统内存/进程信息、指标聚合与 `/metrics/history`、请求快照清理、并发统计 |
 | [`proxy_logging.py`](proxy_logging.py) | 结构化 JSONL 日志、敏感头脱敏 |
+| [`hbe_probe.py`](hbe_probe.py) | H_BE shadow 探针（2026-08-29，**默认关**，`PROXY_HBE_*` 均 reloadable）：成功本地响应后搭 prefix cache 便车追加双探针锚定提问，top_logprobs（默认 20）截断熵估计信念熵，落盘 `logs/diag/hbe.jsonl`（10MB 轮转）。只测不动——不改任何路由/截断/压缩决策；仅本地路径触发；引擎锁等待有界（`LOCK_WAIT_S` 超时自动放弃），fail-open。冒烟实测：cache 便车 16K tokens 探针仅 1.2s |
 
 ### 3.2 数据流
 
@@ -121,6 +122,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | `configs/active.conf` | 指向当前激活配置的符号链接（当前 → `ornith-oq4e.conf`） |
 | `configs/ornith-oq4e.conf` | rapid-mlx + Ornith-1.5-35B-A3B-oQ4e-fixed-mtp（**当前激活**，oQ4e imatrix 混合精度 20.1GB，质量优于均匀 4-bit；基于 Qwen3.5 hybrid 架构，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off，decode ~80 tok/s，prefix cache 增量轮秒级；见 docs/05-operations-changelog/ornith-15-integration-20260826.md） |
 | `configs/ornith-35b.conf` | rapid-mlx + Ornith-1.5-35B-A3B-MLX-4bit（均匀 4-bit 19.5GB，decode ~87 tok/s 更快；同 Qwen3.5 hybrid，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off） |
+| `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
 | `configs/ornith-dflash-35b.conf` | dflash-mlx + Ornith-1.5-35B-A3B-MLX-4bit + Qwen3.6-DFlash 草稿头（官方 MTP 头随机初始化不可用；实测 decode ~91 tok/s 与纯 rapid-mlx 持平，无显著增益） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
 | `configs/rapid-mlx-35b-opt.conf` | rapid-mlx + Qwen3.6-35B-A3B-4bit（标准 4-bit，GPU=70% 必须，prefix cache + KV q4 + `--hybrid-cache-entries 8`） |

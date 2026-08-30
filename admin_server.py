@@ -309,6 +309,51 @@ def _build_route_policies_json():
 
 
 # --- _build_status_json ---
+def _get_local_engines_status():
+    """双引擎状态: catalog provider=local/local-9b 各引擎的 liveness/PID/模型.
+
+    主后端(local → LLAMA_BASE 8081)与辅助引擎(local-9b → 8084)并列展示,
+    供 /api/status 与 /status 页面反映双引擎运行态。
+    """
+    import subprocess as _sp, urllib.request as _ur, json as _json
+    out = []
+    for pname in ("local", "local-9b"):
+        creds = model_registry.get_provider_credentials(pname, env_lookup=_ps._env_lookup) or {}
+        base = creds.get("base_url") or ""
+        if not base:
+            continue
+        try:
+            port = str(base.split(":")[-1].split("/")[0])
+        except Exception:
+            port = ""
+        pid = ""
+        if port:
+            try:
+                pid = _sp.run(
+                    ["lsof", "-Pi", f":{port}", "-sTCP:LISTEN", "-t"],
+                    capture_output=True, text=True, timeout=3
+                ).stdout.strip().split("\n")[0]
+            except Exception:
+                pass
+        alive, model = False, None
+        try:
+            with _ur.urlopen(f"{base}/models", timeout=2) as r:
+                data = _json.loads(r.read())
+                models = data.get("data", [])
+                model = models[0]["id"] if models else None
+                alive = True
+        except Exception:
+            alive = False
+        out.append({
+            "provider": pname,
+            "base_url": base,
+            "alive": alive,
+            "pid": pid or None,
+            "model_name": model,
+        })
+    return out
+
+
 def _build_status_json():
     """Build the structured JSON status payload for agent_go."""
     backend_info = _get_process_info("rapid-mlx|llama-server|dflash", "Backend")
@@ -369,6 +414,8 @@ def _build_status_json():
             # R13-R16: 运行时后端名（启动轴 LLAMA_BACKEND，manage.sh source conf 注入）
             "name": getattr(_ps, "PROXY_BACKEND_NAME", "unknown"),
         },
+        # 双引擎: 本地 provider(local/local-9b) 各引擎状态并列展示
+        "local_engines": _get_local_engines_status(),
         "active_profile": active_profile,
         "state": state,
         "ready": ready,
@@ -2404,6 +2451,20 @@ def _build_status_html():
     <div class="row"><span class="label">Uptime</span><span class="value">{backend_info.get("elapsed", "N/A")}</span></div>
   </div>"""
 
+    # 双引擎卡片: local/local-9b 各引擎并列
+    _eng_rows = []
+    for _e in _get_local_engines_status():
+        _col = "#2ecc71" if _e["alive"] else "#e74c3c"
+        _eng_rows.append(
+            f'<div class="row"><span class="label">'
+            f'{_e["provider"]}</span>'
+            f'<span class="value"><span class="status-dot" style="background:{_col}"></span>'
+            f'{"●" if _e["alive"] else "○"} {_e["base_url"]}'
+            f'<span style="color:#888;font-size:0.85em"> '
+            f'PID={_e["pid"] or "—"} · {_e["model_name"] or "?"}</span></span></div>'
+        )
+    engines_card = f"""<div class="card"><h2>Local Engines</h2>{''.join(_eng_rows)}</div>"""
+
     # Conditional log-stat rows (avoid backslashes inside f-strings)
     oom_row = ""
     cache_row = ""
@@ -2480,6 +2541,7 @@ def _build_status_html():
 
 <div class="grid">
   {backend_card}
+  {engines_card}
 
   <div class="card">
     <h2>Proxy</h2>

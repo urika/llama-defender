@@ -534,6 +534,8 @@ def get_route(alias):
         "cloud_model": primary,
         "behavior": r.get("behavior", "prefer"),
     }
+    if r.get("local_model"):
+        out["local_model"] = r["local_model"]
     fallbacks = [_resolve_cloud_model(c, _getter()) for c in chain[1:]]
     fallbacks = [f for f in fallbacks if f]
     if fallbacks:

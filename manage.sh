@@ -283,7 +283,9 @@ _get_pid() {
     # fallback: search by backend name
     local pid
     if [[ "$backend" == "rapid-mlx" || "$backend" == "vllm-mlx" ]]; then
-        pid=$(pgrep -f "rapid-mlx" 2>/dev/null | head -1)
+        # 端口感知: 双引擎模式下可能同时跑多个 rapid-mlx(如 ornith-9b on 8084),
+        # 只能按 active 配置的 LLAMA_PORT 识别主后端, 不能 pgrep 全匹配。
+        pid=$(lsof -Pi :"${LLAMA_PORT:-8081}" -sTCP:LISTEN -t 2>/dev/null | head -1)
     elif [[ "$backend" == "dflash-mlx" ]]; then
         pid=$(pgrep -f "dflash serve" 2>/dev/null | head -1)
     elif [[ "$backend" == "mlx_vlm" ]]; then

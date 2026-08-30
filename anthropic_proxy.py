@@ -527,6 +527,37 @@ class Handler(BaseHTTPRequestHandler):
                             "owned_by": "proxy-router",
                             "metadata": meta,
                         })
+                    # 本地引擎直列: 目录中 provider=local/local-9b 的模型
+                    # (ornith-9b → 9B 引擎 :8084, local-default → 35B :8081),
+                    # 供客户端直选/探测双引擎
+                    for _lm_name in model_registry.list_models():
+                        _lm = model_registry.get_model(_lm_name) or {}
+                        _lm_prov = _lm.get("provider", "")
+                        if _lm_prov not in ("local", "local-9b"):
+                            continue
+                        _lcaps = _lm.get("capabilities") or {}
+                        _creds = model_registry.get_provider_credentials(_lm_prov, env_lookup=_ps._env_lookup) or {}
+                        models.append({
+                            "id": _lm_name,
+                            "object": "model",
+                            "created": 1677610602,
+                            "owned_by": "proxy-router",
+                            "metadata": {
+                                "route": "local",
+                                "provider": _lm_prov,
+                                "model_name": _lm.get("model_name"),
+                                "real_model": _lm_name,
+                                "thinking_supported": (_lcaps.get("thinking") in ("supported", "required", "only")
+                                                       if _lcaps.get("thinking") is not None else None),
+                                "thinking_required": (_lcaps.get("thinking") in ("required", "only")
+                                                      if _lcaps.get("thinking") is not None else None),
+                                "json_compliance": _lcaps.get("json"),
+                                "context_chars": _lcaps.get("context_tokens"),
+                                "price": _lm.get("price"),
+                                "direct_capable": False,
+                                "base_url": _creds.get("base_url") or "",
+                            },
+                        })
                     self._respond_json({"object": "list", "data": models})
                 elif self.path == "/status":
                     html = _build_status_html()
@@ -666,7 +697,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/v1/messages" or self.path.startswith("/v1/messages?") or \
+               self.path == "/messages" or self.path.startswith("/messages?") or \
                self.path == "/v1/chat/completions" or self.path.startswith("/v1/chat/completions?"):
+                # /messages 别名: ai-sdk(如 opencode @ai-sdk/anthropic 4.x)对
+                # baseURL=http://localhost:4000 构造 POST /messages(无 /v1),
+                # 与 /v1/messages 同语义(Anthropic 协议)。
                 is_openai_chat = self.path.startswith("/v1/chat/completions")
                 if is_openai_chat:
                     openai_model = parsed.get("model", MODEL_NAME)
@@ -2150,6 +2185,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond_json({"error": {"type": "session_not_found"}}, 404)
                 return True
             self._respond_json(_build_session_metrics_json(key, records))
+            return True
+
+        if tail == "hbe":
+            # R17: H_BE shadow 探针记录（hbe_probe.py 落盘，schema v2 起含
+            # completion_budget/answer_truncated/h_max_token_idx）。消费方
+            # agent_go diag.py 只读不算——熵/D_ledger 计算永不跨侧重写。
+            records = diagnostics.read_session_hbe(key)
+            since = _q("since", "")
+            if since:
+                records = [r for r in records
+                           if str(r.get("ts", "")) >= since]
+            if not records and not session_ledger.LEDGER.session_alive(key):
+                self._respond_json({"error": {"type": "session_not_found"}}, 404)
+                return True
+            self._respond_json({
+                "session_key": key,
+                "count": len(records),
+                "records": records,
+            })
             return True
 
         return False

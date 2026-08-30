@@ -153,7 +153,8 @@
       "_route_provider",
       "_emergency_fallback",
       "_agent_model_tier",
-      "client_timeout_s"
+      "client_timeout_s",
+      "_route_local_model"
     ],
     "defaults": {
       "request_id": "",
@@ -199,7 +200,8 @@
       "_route_provider": "",
       "_emergency_fallback": false,
       "_agent_model_tier": "sonnet",
-      "client_timeout_s": 0.0
+      "client_timeout_s": 0.0,
+      "_route_local_model": ""
     }
   },
   "PrefixRatioComputer": {

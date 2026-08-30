@@ -219,6 +219,7 @@ class PipelineContext:
     _emergency_fallback: bool = False     # emergency fallback mode flag
     _agent_model_tier: str = "sonnet"     # Agent-selected tier ("opus"/"sonnet"/"haiku")
     client_timeout_s: float = 0.0         # 客户端声明超时(X-Stainless-Timeout); 0=未知
+    _route_local_model: str = ""          # 路由声明本地引擎(如 haiku→ornith-9b); 空=默认 35B
 
 
 # ============================================================================
@@ -789,6 +790,9 @@ class SmartRouter(PipelineStage):
         ctx._route_cloud_model = pref.get("cloud_model", _ps.PROXY_CLOUD_MODEL)
         # Phase B: catalog fallback chain (cross-provider degradation order)
         ctx._route_fallback_models = list(pref.get("fallback_models", []))
+        # 本地引擎选择: 路由可声明 local_model(如 haiku→ornith-9b 轻量引擎),
+        # 空则默认 35B(LLAMA_BASE)
+        ctx._route_local_model = pref.get("local_model", "")
         ctx._agent_model_tier = _classify_tier(requested_model)
 
         # Store model force direction in ctx, don't return yet.
@@ -2172,7 +2176,14 @@ class FormatConverter(PipelineStage):
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             openai_body_model = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
         else:
-            openai_body_model = _ps.MODEL_NAME
+            # 本地引擎: 默认 35B(MODEL_NAME); 若路由声明 local_model(如
+            # haiku→ornith-9b), 用其目录 model_name 作为发送给引擎的模型码
+            _lm = getattr(ctx, '_route_local_model', '') or ''
+            if _lm:
+                _lm_entry = model_registry.get_model(_lm) or {}
+                openai_body_model = _lm_entry.get("model_name") or _ps.MODEL_NAME
+            else:
+                openai_body_model = _ps.MODEL_NAME
         openai_body = {
             "model": openai_body_model,
             "messages": messages,
@@ -2370,6 +2381,22 @@ class BackendDispatcher(PipelineStage):
             if eff > 10:
                 return min(base, eff)
         return base
+
+    def _resolve_local_target(self, ctx):
+        """Resolve the local backend (base_url, api_key, lock) for this request.
+
+        默认返回 LLAMA_BASE(35B)。若路由声明 local_model(如 haiku→ornith-9b),
+        解析该目录模型的 provider base_url + 独立锁——双本地引擎各自并发,
+        互不阻塞(9B 处理轻任务时 35B 可并行处理重型任务)。
+        """
+        local_model = getattr(ctx, '_route_local_model', '') or ''
+        if local_model:
+            creds = model_registry.get_model_credentials(local_model, env_lookup=_ps._env_lookup)
+            if creds and creds.get("base_url"):
+                lock = _ps._provider_locks.get(creds["name"]) or self._llama_lock
+                return (creds["base_url"],
+                        creds.get("api_key") or _ps.LLAMA_API_KEY, lock)
+        return _ps.LLAMA_BASE, _ps.LLAMA_API_KEY, self._llama_lock
 
     # ------------------------------------------------------------------
     # Phase B: catalog-driven cloud target resolution
@@ -2698,8 +2725,9 @@ class BackendDispatcher(PipelineStage):
             if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
                 ctx.openai_body["model"] = _ps.MODEL_NAME
             try:
-                with self._llama_lock:
-                    self._do_dispatch(ctx, _ps.LLAMA_BASE, _ps.LLAMA_API_KEY)
+                _lb, _lk, _ll = self._resolve_local_target(ctx)
+                with _ll:
+                    self._do_dispatch(ctx, _lb, _lk)
             except (urllib.error.HTTPError, urllib.error.URLError) as ue:
                 # Local backend is also down — surface the original cloud error
                 # rather than a misleading connection-refused message.
@@ -2714,12 +2742,20 @@ class BackendDispatcher(PipelineStage):
                 }, err_code)
                 return ctx
         else:
-            base_url = _ps.LLAMA_BASE
-            api_key = _ps.LLAMA_API_KEY
-            log(f"  -> Forwarding to {base_url}/chat/completions (local)")
+            base_url, api_key, _ll = self._resolve_local_target(ctx)
+            log(f"  -> Forwarding to {base_url}/chat/completions (local)"
+                + (f" engine={getattr(ctx, '_route_local_model', '')}" if getattr(ctx, '_route_local_model', '') else ""))
             try:
-                with self._llama_lock:
+                with _ll:
                     self._do_dispatch(ctx, base_url, api_key)
+                # H_BE shadow 探针（hbe_probe.py，只测不动）：成功本地响应后
+                # 异步采样信念熵落盘 logs/diag/hbe.jsonl；fail-open，默认关。
+                if self._backend_status == 200 and not self._client_disconnected:
+                    try:
+                        import hbe_probe
+                        hbe_probe.maybe_schedule(ctx, base_url, api_key, _ll)
+                    except Exception as _e:
+                        _warn_diag("hbe_probe", _e)
             except (urllib.error.HTTPError, urllib.error.URLError) as e:
                 if isinstance(e, urllib.error.HTTPError):
                     err_body = e.read().decode("utf-8")[:500]

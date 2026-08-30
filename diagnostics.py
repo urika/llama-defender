@@ -463,6 +463,33 @@ def read_session_metrics(session_key, max_lines=50000):
     return records
 
 
+def read_session_hbe(session_key, max_lines=50000):
+    """从 hbe.jsonl 读取某会话的 H_BE shadow 探针记录（R17 端点数据源）。
+
+    与 read_session_metrics 同模式：jsonl 是 source of truth，倒序读取，
+    坏行跳过。文件不存在（探针未启用时代）→ 空列表，由端点层决定 404 语义。
+    """
+    records = []
+    path = os.path.join(_ps._DIAG_DIR, "hbe.jsonl")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except (FileNotFoundError, OSError):
+        return records
+    for line in reversed(lines[-max_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("session_key") == session_key:
+            records.append(rec)
+    records.reverse()
+    return records
+
+
 __all__ = [
     "DIAG_SCHEMA_VERSION",
     "compute_hit_ratio", "sse_tail_line", "diag_headers",
@@ -471,5 +498,5 @@ __all__ = [
     "reset_timings_probe", "warn_suppressed",
     "set_prompt_tokens", "build_diag_payload", "capture_sent_view",
     "log_session_diag", "log_lifecycle_event", "finalize_request",
-    "read_session_metrics",
+    "read_session_metrics", "read_session_hbe",
 ]
