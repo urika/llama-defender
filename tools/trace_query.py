@@ -191,18 +191,62 @@ def _ifc_validity_summary(rows):
     }
 
 
+def _load_verdicts(path):
+    """swe-eval runs.jsonl → {sid8: verdict}（resolved/failed；后写覆盖）。
+
+    join 键: runs.session_id 形如 's38d79db488-syn-text-proc-01',前 8 字符
+    即代理会话键(R14 D5 截断口径)——直连,无时间启发式。
+    """
+    verdicts = {}
+    try:
+        for rec in iter_jsonl(path):
+            sid = (rec.get("session_id") or "")[:8]
+            v = rec.get("verdict")
+            if sid and v in ("resolved", "failed"):
+                verdicts[sid] = v
+    except OSError:
+        pass
+    return verdicts
+
+
+def _hbe_trend(rows):
+    """会话熵趋势: 前3 vs 后3 个 h_be 样本均值 → down/flat/up（样本<6 → None）。"""
+    hs = [(r.get("turn"), r["h_be"]) for r in rows
+          if isinstance(r.get("h_be"), (int, float))]
+    if len(hs) < 6:
+        return None
+    hs.sort()
+    head = sum(h for _, h in hs[:3]) / 3.0
+    tail = sum(h for _, h in hs[-3:]) / 3.0
+    if tail > head + 0.05:
+        return "up"
+    if tail < head - 0.05:
+        return "down"
+    return "flat"
+
+
 def cmd_ifc(store, args):
     """IFC 信息面: per-turn Tier-0 × H_BE join + Phase 2 效度相关脚手架。"""
     raw_hbe = bool(getattr(args, "raw_hbe", False))
-    if args.session:
-        keys = [args.session]
+    verdicts = _load_verdicts(args.verdicts) if getattr(args, "verdicts", None) else {}
+    key_arg = getattr(args, "session_key", None) or getattr(args, "session", None)
+    if key_arg:
+        keys = [key_arg]
     else:
         keys = sorted(store.diag_by_session().keys())[-args.limit:]
     out = []
+    cross = {}
     for key in keys:
         rows = _join_turn_rows(store, key, include_hbe_artifacts=raw_hbe)
         if not rows:
             continue
+        trend = _hbe_trend(rows)
+        verdict = verdicts.get(key)
+        if trend and verdict:
+            cross[(trend, verdict)] = cross.get((trend, verdict), 0) + 1
+        for r in rows:
+            r["h_trend_session"] = trend
+            r["verdict"] = verdict
         artifacts = 0
         if not raw_hbe:
             artifacts = sum(
@@ -213,6 +257,8 @@ def cmd_ifc(store, args):
             out.append({"session_key": key,
                         "summary": _ifc_validity_summary(rows),
                         "hbe_artifacts_filtered": artifacts,
+                        "h_trend": trend,
+                        "verdict": verdict,
                         "turns": rows})
             continue
         print("== session %s | IFC 信息面 ==" % key)
@@ -230,8 +276,16 @@ def cmd_ifc(store, args):
                 r.get("manifest_lines") if r.get("manifest_lines") is not None else "-",
                 r.get("status") if r.get("status") is not None else "?",
                 ",".join((r.get("ifc_kinds") or []) + (r.get("feedback_injected") or []))[:32] or "-"))
-        print("  效度: %s | 伪迹已滤: %d" % (
-            json.dumps(_ifc_validity_summary(rows), ensure_ascii=False), artifacts))
+        print("  效度: %s | 伪迹已滤: %d | 趋势: %s | verdict: %s" % (
+            json.dumps(_ifc_validity_summary(rows), ensure_ascii=False), artifacts,
+            trend or "-", verdict or "-"))
+    if verdicts and cross:
+        print("\n== 区分度交叉表(熵趋势 × 成败, ≥6 采样点会话) ==")
+        print("%-10s%-8s%-8s%-8s" % ("", "down", "flat", "up"))
+        for v in ("resolved", "failed"):
+            print("%-10s%-8d%-8d%-8d" % (
+                v, cross.get(("down", v), 0),
+                cross.get(("flat", v), 0), cross.get(("up", v), 0)))
     if args.json:
         return out
 
@@ -402,6 +456,8 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=5, help="缺省模式下的会话数")
     p.add_argument("--raw-hbe", action="store_true",
                    help="保留 <tool_call> 伪迹探针(默认过滤;原始数据始终全量在 hbe.jsonl)")
+    p.add_argument("--verdicts", default=None,
+                   help="swe-eval runs.jsonl 路径——join 成败标签并输出区分度交叉表")
 
     p = sub.add_parser("request", help="单请求详情(阶段分解/错误/台账)")
     p.add_argument("request_id")
