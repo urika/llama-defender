@@ -78,7 +78,15 @@ def reload_config(signum=None, frame=None, target_module=None):
         for env_key, py_name, cast, cloud_def, local_def in target_module._RELOAD_SPEC if hasattr(target_module, "_RELOAD_SPEC") else proxy_state._RELOAD_SPEC:
             default = cloud_def if is_cloud else local_def
             raw = env.get(env_key, default)
-            val = proxy_state._cast_config_value(raw, cast)
+            # DEF-306 修复: 值解析失败 → 拒绝该项保留旧值 + WARN(fail-safe),
+            # 不让异常逃逸 SIGHUP 处理器(否则代理进程死亡)。
+            try:
+                val = proxy_state._cast_config_value(raw, cast)
+            except (ValueError, TypeError) as _cfg_err:
+                _old = getattr(proxy_state, py_name, None)
+                log("[RELOAD] WARN: %s='%s' 解析失败(%s), 保留旧值 %r" % (
+                    env_key, raw[:60], _cfg_err, _old), level="WARN")
+                continue  # 跳过该项, 其余继续
             setattr(proxy_state, py_name, val)
             setattr(target_module, py_name, val)
 
