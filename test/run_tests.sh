@@ -189,6 +189,22 @@ run_integration() {
     fi
   fi
 
+  ifc_out=$(bash "$SCRIPT_DIR/integration/test_ifc_manifest_integration.sh" 2>&1)
+  ifc_rc=$?
+  echo "$ifc_out" | tail -15
+  if [[ $ifc_rc -ne 0 ]]; then
+    record "integration" "fail" "test_ifc_manifest_integration.sh exited $ifc_rc"
+  else
+    local ifc_p ifc_f
+    ifc_p=$(echo "$ifc_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -oE "[0-9]+ passed," | grep -oE "[0-9]+")
+    ifc_f=$(echo "$ifc_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -oE "[0-9]+ failed\." | grep -oE "[0-9]+")
+    if [[ "${ifc_f:-0}" == "0" ]]; then
+      record "integration" "ok" "ifc-manifest: all ${ifc_p:-?} cases passed"
+    else
+      record "integration" "fail" "ifc-manifest: $ifc_f of ${ifc_p:-?} cases failed"
+    fi
+  fi
+
   lock_out=$(bash "$SCRIPT_DIR/integration/test_manage_lock.sh" 2>&1)
   lock_rc=$?
   echo "$lock_out" | tail -10
