@@ -61,6 +61,7 @@ class SignalSnapshot(dict):
 
 def build_signal_snapshot(
     h_be: Optional[float] = None,
+    h_be_trend: Optional[float] = None,
     d_ledger: Optional[float] = None,
     retention: Optional[float] = None,
     rationale_ratio: Optional[float] = None,
@@ -78,6 +79,7 @@ def build_signal_snapshot(
     return SignalSnapshot(
         contract_version=CONTRACT_VERSION,
         h_be=h_be,
+        h_be_trend=h_be_trend,
         d_ledger=d_ledger,
         retention=retention,
         rationale_ratio=rationale_ratio,
