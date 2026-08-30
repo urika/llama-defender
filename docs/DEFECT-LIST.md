@@ -334,6 +334,14 @@
 | **现象** | `start-cloud` 启动后未自动验证 `https://api.deepseek.com/v1/models` 可达性 |
 | **修复** | `cmd_start_cloud` 末尾新增健康检查: curl 云端 API `/models` 端点,验证 HTTP 200。失败时输出警告但不阻止启动 |
 
+### DEF-306: reload_config 坏配置值杀死代理进程（fail-closed 致命） — 🔲 已登记未修复
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | 2026-08-30 exp-1-amnesia 进场实测事故（看板 IFC-1） |
+| **现象** | conf 值行内注释（`PROXY_CTX_KEEP_MESSAGES=12  # ...`）→ `reload_config.py:81` 裸 `int()` 抛 `ValueError` → SIGHUP 处理器未捕获 → **代理进程死亡**（生产中断 ~2 分钟，手动恢复） |
+| **修复方向** | 值解析失败应拒绝该项、保留旧值并 WARN（fail-safe），不得让异常逃逸信号处理器；顺带在 reload 前做 conf 干跑校验（parse-only）|
+
 ---
 
 ## 五、缺陷分布与统计
