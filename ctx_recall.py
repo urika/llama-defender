@@ -243,11 +243,32 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000):
 
 
 def format_recall_result(lines, query, session_key=None):
-    """索引行 → 工具结果文本（含 archive 全文恢复增强）。"""
+    """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。"""
     if not lines:
         return "ctx_recall: 无匹配的已折叠单元（query=%s）。该信息可能从未被丢弃，或在本会话开始前。" % query
     out = ["ctx_recall: 命中 %d 条已折叠上下文索引:" % len(lines)]
-    for l in lines:
+
+    # 收集需要补充的配对 tool_result 行(tool_use 命中时拉取对应的 result)
+    paired_lines = []
+    if session_key:
+        seen_anchors = {l.get("anchor") for l in lines}
+        for line in lines:
+            if line.get("kind") != "tool_use":
+                continue
+            # tool_use anchor "u:t1" → tool_result anchor "r:t1"
+            result_anchor = "r:" + line.get("anchor", "")[2:]
+            if result_anchor in seen_anchors:
+                continue  # 已在结果中
+            for candidate in memory_stores.MANIFEST.lines(session_key):
+                if candidate.get("anchor") == result_anchor:
+                    paired_lines.append(candidate)
+                    break
+
+    all_lines = list(lines) + paired_lines
+    if paired_lines:
+        out[0] = f"ctx_recall: 命中 {len(lines)} 条(含 {len(paired_lines)} 条配对 tool_result):"
+
+    for l in all_lines:
         handle = l.get("handle") or {}
         hval = handle.get("value", "") if isinstance(handle, dict) else ""
         basic = "- turn %s | %s %s | %s | %s chars | %s" % (
@@ -260,6 +281,8 @@ def format_recall_result(lines, query, session_key=None):
                 session_key, l.get("anchor"), l.get("turn"))
             if full:
                 basic += "\n  [恢复内容 (%d chars)]:\n%s" % (len(full), full)
+            elif l.get("head"):
+                basic += "\n  [摘录]: %s" % l["head"]
 
         out.append(basic)
     return "\n".join(out)
