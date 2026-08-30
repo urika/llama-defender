@@ -13,6 +13,7 @@
         为模块全局;jsonl 写入经 _ps._diag_lock。
 """
 import json
+import hashlib
 import os
 import threading
 from datetime import datetime
@@ -21,6 +22,34 @@ import proxy_state as _ps
 
 DIAG_SCHEMA_VERSION = 1
 JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 与 proxy_metrics.jsonl 同策略
+
+# R9 实验前置①: 配置指纹——数据自带产生条件。信息域关键参数快照入每轮
+# 记录,治疗分派变成可查询(config.keep_messages==12)而非依赖外部记忆;
+# conf_hash 相等 = 同一信息域(队列识别)。缺参记 None(未注册本身是信息)。
+_FINGERPRINT_KEYS = (
+    ("truncate_strategy", "PROXY_CTX_TRUNCATE_STRATEGY"),
+    ("keep_messages", "PROXY_CTX_KEEP_MESSAGES"),
+    ("keep_head", "PROXY_CTX_KEEP_HEAD"),
+    ("compress_profile", "PROXY_COMPRESSION_PROFILE"),
+    ("compress_enabled", "PROXY_COMPRESS_ENABLED"),
+    ("compress_mode", "PROXY_COMPRESS_MODE"),
+    ("ctx_engine_enabled", "PROXY_CTX_ENGINE_ENABLED"),
+    ("clear_enabled", "PROXY_CLEAR_ENABLED"),
+    ("hbe_enabled", "PROXY_HBE_ENABLED"),
+    ("hbe_sample_every", "PROXY_HBE_SAMPLE_EVERY"),
+    ("hbe_min_chars", "PROXY_HBE_MIN_CHARS"),
+    ("hbe_completion_budget", "PROXY_HBE_MAX_TOKENS"),
+)
+
+
+def config_fingerprint():
+    """信息域关键参数快照 + 10 位 hash（fail-open，异常 → (None, None)）。"""
+    try:
+        snap = {name: getattr(_ps, attr, None) for name, attr in _FINGERPRINT_KEYS}
+        raw = json.dumps(snap, sort_keys=True, ensure_ascii=False, default=str)
+        return snap, hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return None, None
 
 # 进程级后端 timings 能力探测(None=未知,True/False=已探测,见 D2)
 _timings_state = {"supported": None}
@@ -368,7 +397,14 @@ def finalize_request(mc):
             "mode": ((mc or {}).get("pipeline", {}).get("truncate", {}) or {}).get("strategy"),
             "ratio": (mc or {}).get("compression_ratio"),
         },
+        # ① 配置指纹: 数据自带产生条件(队列识别/实验归因)
+        "config": None,
+        "conf_hash": None,
     }
+    snap, chash = config_fingerprint()
+    if snap:
+        record["config"] = snap
+        record["conf_hash"] = chash
     # R8 上下文工程引擎开启时回填 epoch 事实(与 X-Proxy-Epoch-Count 头同源)
     if getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False) and session_key:
         try:

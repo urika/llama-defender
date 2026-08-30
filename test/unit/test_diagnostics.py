@@ -231,6 +231,51 @@ class TestDisabledPlane(unittest.TestCase):
             _ps.PROXY_DIAG_ENABLED = saved
 
 
+class TestConfigFingerprint(unittest.TestCase):
+    """① 配置指纹——数据自带产生条件(实验队列识别的权威层)。"""
+
+    def test_snapshot_and_hash_stability(self):
+        snap, h = diag.config_fingerprint()
+        self.assertIsInstance(snap, dict)
+        self.assertEqual(len(h), 10)
+        snap2, h2 = diag.config_fingerprint()
+        self.assertEqual(h, h2)  # 同配置同 hash
+        # 参数变化 → hash 变化
+        old = getattr(_ps, "PROXY_CTX_KEEP_MESSAGES", None)
+        try:
+            _ps.PROXY_CTX_KEEP_MESSAGES = 12
+            _, h3 = diag.config_fingerprint()
+            self.assertNotEqual(h, h3)
+        finally:
+            if old is None:
+                delattr(_ps, "PROXY_CTX_KEEP_MESSAGES")
+            else:
+                _ps.PROXY_CTX_KEEP_MESSAGES = old
+
+    def test_unregistered_param_recorded_as_none(self):
+        snap, _ = diag.config_fingerprint()
+        self.assertIn("hbe_completion_budget", snap)  # 键恒在
+        self.assertIn("truncate_strategy", snap)
+
+    def test_finalize_embeds_config(self):
+        saved_enabled = _ps.PROXY_DIAG_ENABLED
+        _ps.PROXY_DIAG_ENABLED = True
+        tmp = tempfile.mkdtemp(prefix="cfp_")
+        saved = (_ps._DIAG_SESSIONS_PATH, _ps._LIFECYCLE_EVENTS_PATH)
+        _ps._DIAG_SESSIONS_PATH = os.path.join(tmp, "s.jsonl")
+        _ps._LIFECYCLE_EVENTS_PATH = os.path.join(tmp, "l.jsonl")
+        try:
+            diag.begin_request("req_cf", "sess_cf", "header")
+            rec = diag.finalize_request({"session_id": "sess_cf"})
+            self.assertIn("config", rec)
+            self.assertIn("conf_hash", rec)
+            self.assertEqual(len(rec["conf_hash"]), 10)
+            self.assertIn("keep_messages", rec["config"])
+        finally:
+            _ps.PROXY_DIAG_ENABLED = saved_enabled
+            _ps._DIAG_SESSIONS_PATH, _ps._LIFECYCLE_EVENTS_PATH = saved
+
+
 class TestWarnSuppressed(unittest.TestCase):
     """评审 P2: 诊断层异常可见性——fail-open 但每挂点前 N 次记 WARN。"""
 

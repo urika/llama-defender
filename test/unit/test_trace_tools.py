@@ -64,28 +64,28 @@ class _FixtureBase(unittest.TestCase):
         ])
         # diag/sessions.jsonl(R16) —— 含 R9.1 ifc 段
         _w(os.path.join(self.logs, "diag", "sessions.jsonl"), [
-            {"ts": "2026-08-20T10:00:05", "request_id": "r1", "session_key": "sessA",
+            {"ts": "2026-08-20T10:00:05", "request_id": "r1", "session_key": "sessA", "config": {"keep_messages": 40}, "conf_hash": "aaa1111",
              "turn": 1, "ttft_ms": 300.0, "duration_ms": 5000.0, "hit_ratio": 0.99,
              "feedback_injected": [], "route_target": "local",
              "actual_model": "m-a", "canonical_mismatch": False,
              "ifc": {"ile": False, "ile_kinds": [], "retention": 1.0,
                      "rationale_ratio": 1.0, "reread_pressure": 0,
                      "action_div": None, "manifest_lines": 0}},
-            {"ts": "2026-08-20T10:01:40", "request_id": "r2", "session_key": "sessA",
+            {"ts": "2026-08-20T10:01:40", "request_id": "r2", "session_key": "sessA", "config": {"keep_messages": 40}, "conf_hash": "aaa1111",
              "turn": 2, "ttft_ms": None, "duration_ms": 40000.0, "hit_ratio": None,
              "feedback_injected": ["loop_l1"], "route_target": "local",
              "actual_model": "m-a", "canonical_mismatch": False,
              "ifc": {"ile": True, "ile_kinds": ["unit_drop"], "retention": 0.55,
                      "rationale_ratio": 0.4, "reread_pressure": 3,
                      "action_div": 0.12, "manifest_lines": 6}},
-            {"ts": "2026-08-20T10:02:10", "request_id": "r2b", "session_key": "sessA",
+            {"ts": "2026-08-20T10:02:10", "request_id": "r2b", "session_key": "sessA", "config": {"keep_messages": 40}, "conf_hash": "aaa1111",
              "turn": 3, "ttft_ms": 200.0, "duration_ms": 2000.0, "hit_ratio": 0.5,
              "feedback_injected": ["loop_l1", "reread_hard"], "route_target": "cloud",
              "actual_model": "deepseek-v4-flash", "canonical_mismatch": True,
              "ifc": {"ile": True, "ile_kinds": ["compress_drop"], "retention": 0.8,
                      "rationale_ratio": 0.9, "reread_pressure": 4,
                      "action_div": 0.05, "manifest_lines": 9}},
-            {"ts": "2026-08-20T10:03:00", "request_id": "r4", "session_key": "sessA",
+            {"ts": "2026-08-20T10:03:00", "request_id": "r4", "session_key": "sessA", "config": {"keep_messages": 40}, "conf_hash": "aaa1111",
              "turn": 4, "ttft_ms": 100.0, "duration_ms": 1000.0, "hit_ratio": 0.9,
              "feedback_injected": [], "route_target": "local",
              "actual_model": "m-a", "canonical_mismatch": False,
@@ -331,6 +331,12 @@ class TestIfcDimension(_FixtureBase):
         # 原始数据不可变原则: --raw-hbe 保留伪迹样本,分析口径可切换重放
         rows = tq._join_turn_rows(self.store, "sessA", include_hbe_artifacts=True)
         self.assertEqual(rows[3]["h_be"], 0.055)  # turn4 伪迹被保留
+
+    def test_cohort_filter_by_config_fingerprint(self):
+        # 队列识别权威层: 多数 config 轮匹配(实验协议 §3)
+        self.assertIn("sessA", tq._cohort_sessions(self.store, "keep_messages=40"))
+        self.assertNotIn("sessA", tq._cohort_sessions(self.store, "keep_messages=12"))
+        self.assertEqual(tq._cohort_sessions(self.store, "keep_messages"), set())
 
 
 class TestTraceReplay(_FixtureBase):

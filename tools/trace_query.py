@@ -255,15 +255,41 @@ def _hbe_trend(rows):
     return "flat"
 
 
+def _cohort_sessions(store, key_expr):
+    """--cohort k=v → 属于该队列的会话集合(多数 config 指纹轮匹配)。
+
+    队列识别权威层 = 每轮记录自带的 config 指纹(实验协议 §3);
+    无 config 段的旧数据(指纹前时代)不匹配任何队列——按时间窗另行分析。
+    """
+    k, _, v = key_expr.partition("=")
+    k, v = k.strip(), v.strip()
+    if not k:
+        return None
+    matched = set()
+    for key, recs in store.diag_by_session().items():
+        votes = [1 for r in recs
+                 if isinstance(r.get("config"), dict)
+                 and str(r["config"].get(k)) == v]
+        if votes and len(votes) * 2 > sum(
+                1 for r in recs if isinstance(r.get("config"), dict)):
+            matched.add(key)
+    return matched
+
+
 def cmd_ifc(store, args):
     """IFC 信息面: per-turn Tier-0 × H_BE join + Phase 2 效度相关脚手架。"""
     raw_hbe = bool(getattr(args, "raw_hbe", False))
     verdicts = _load_verdicts(args.verdicts) if getattr(args, "verdicts", None) else {}
     key_arg = getattr(args, "session_key", None) or getattr(args, "session", None)
+    cohort = getattr(args, "cohort", None)
+    cohort_set = _cohort_sessions(store, cohort) if cohort else None
     if key_arg:
         keys = [key_arg]
     else:
         keys = sorted(store.diag_by_session().keys())[-args.limit:]
+        if cohort_set is not None:
+            keys = [k for k in keys if k in cohort_set]
+            print("(cohort %s: %d 个会话匹配)" % (cohort, len(keys)))
     out = []
     cross = {}
     for key in keys:
@@ -488,6 +514,8 @@ def main(argv=None):
                    help="保留 <tool_call> 伪迹探针(默认过滤;原始数据始终全量在 hbe.jsonl)")
     p.add_argument("--verdicts", default=None,
                    help="swe-eval runs.jsonl 路径——join 成败标签并输出区分度交叉表")
+    p.add_argument("--cohort", default=None,
+                   help="队列过滤,如 --cohort keep_messages=12(按每轮 config 指纹多数匹配)")
 
     p = sub.add_parser("request", help="单请求详情(阶段分解/错误/台账)")
     p.add_argument("request_id")
