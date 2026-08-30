@@ -2175,7 +2175,8 @@ class TestToolFilterStableOrder(unittest.TestCase):
             kept, stats = proxy._filter_tools(tools, [], recent_rounds=5)
             names = [t["name"] for t in kept]
             # TOOL_ALWAYS_KEEP defines the order Read, Write, Edit, Bash, Glob, ...
-            self.assertEqual(names, ["Read", "Write", "Edit", "Bash", "Glob"])
+            # ctx_recall is appended by P4 Recall MVP (always last).
+            self.assertEqual(names, ["Read", "Write", "Edit", "Bash", "Glob", "ctx_recall"])
             self.assertTrue(stats.get("filtered"))
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = orig_max
@@ -2391,7 +2392,7 @@ class TestFilterToolsSorting(unittest.TestCase):
             self.assertTrue(stats.get("filtered"), f"Expected filtering, got {stats}")
             names = [t["name"] for t in kept]
             # Stable order should match TOOL_ALWAYS_KEEP order for all-kept case.
-            self.assertEqual(names, ["Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta"])
+            self.assertEqual(names, ["Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta", "ctx_recall"])
         finally:
             proxy.PROXY_TOOL_FILTER_MAX = original_max
             proxy_state.PROXY_TOOL_FILTER_MAX = original_max

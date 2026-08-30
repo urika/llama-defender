@@ -17,6 +17,7 @@ FTS5/WAL 本机已验证（SQLite 3.51.0，2026-08-29，存储选型文档 §3.2
 连接纪律：每次查询新建连接（召回低频，避免跨线程复用）；索引库为只读派生
 ——行数与 MANIFEST 不一致时自动重建。
 """
+import json
 import os
 import sqlite3
 import threading
@@ -181,21 +182,90 @@ def lookup(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     return fts_search(session_key, query, kind, limit)
 
 
-def format_recall_result(lines, query):
-    """索引行 → 工具结果文本（挂载后作为 ctx_recall 的 tool_result 体）。"""
+# ============================================================================
+# Archive 全文恢复(MVP 增强): manifest 索引行 → archive 完整 tool_result
+# ============================================================================
+
+def recover_full_content(session_key, anchor, turn, max_chars=4000):
+    """从 manifest 索引行恢复完整被丢弃的内容。
+
+    数据流: manifest(地址: anchor+turn) → archive(内容: payload) → 完整 tool_result。
+    anchor "r:t1" → tool_use_id "t1"; "u:t1" → 搜索 tool_use 块的 input(不适合恢复全文)。
+    返回 str 或 None(未找到/archive 不存在)。
+    """
+    if not session_key or not anchor:
+        return None
+    tool_use_id = anchor[2:] if anchor.startswith("r:") else None
+    if not tool_use_id:
+        return None  # tool_use 锚不含 result 正文
+
+    archive_path = os.path.join(_ps._DIAG_DIR, "archive",
+                                session_key + ".jsonl")
+    try:
+        with open(archive_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("turn") != turn:
+                    continue
+                # payload 是 JSON 字符串(R15 落盘格式)
+                payload = entry.get("payload")
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                if not isinstance(payload, dict):
+                    continue
+                for msg in payload.get("messages", []):
+                    if msg.get("role") != "user":
+                        continue
+                    for block in (msg.get("content") or []):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_result" and \
+                           block.get("tool_use_id") == tool_use_id:
+                            content = block.get("content")
+                            if isinstance(content, list):
+                                text = "\n".join(
+                                    b.get("text", "") for b in content
+                                    if isinstance(b, dict))
+                            elif isinstance(content, str):
+                                text = content
+                            else:
+                                text = ""
+                            return text[:max_chars] if text else None
+    except (FileNotFoundError, OSError):
+        return None
+    return None
+
+
+def format_recall_result(lines, query, session_key=None):
+    """索引行 → 工具结果文本（含 archive 全文恢复增强）。"""
     if not lines:
         return "ctx_recall: 无匹配的已折叠单元（query=%s）。该信息可能从未被丢弃，或在本会话开始前。" % query
-    out = ["ctx_recall: 命中 %d 条已折叠上下文索引（按 turn 定位，正文可再取）:" % len(lines)]
+    out = ["ctx_recall: 命中 %d 条已折叠上下文索引:" % len(lines)]
     for l in lines:
         handle = l.get("handle") or {}
         hval = handle.get("value", "") if isinstance(handle, dict) else ""
-        out.append("- turn %s | %s %s | %s | %s chars | %s" % (
+        basic = "- turn %s | %s %s | %s | %s chars | %s" % (
             l.get("turn"), l.get("tool") or l.get("kind"), hval[:80],
-            l.get("reason"), l.get("size_chars"), l.get("anchor")))
+            l.get("reason"), l.get("size_chars"), l.get("anchor"))
+
+        # Archive 全文恢复: tool_result 单元尝试恢复完整内容
+        if session_key and l.get("kind") == "tool_result":
+            full = recover_full_content(
+                session_key, l.get("anchor"), l.get("turn"))
+            if full:
+                basic += "\n  [恢复内容 (%d chars)]:\n%s" % (len(full), full)
+
+        out.append(basic)
     return "\n".join(out)
 
 
 __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
-    "line_text", "DEFAULT_LIMIT",
+    "line_text", "recover_full_content", "DEFAULT_LIMIT",
 ]

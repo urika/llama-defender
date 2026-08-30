@@ -581,6 +581,102 @@ def _generate_tool_summary(tool_name, meta_info):
     return tool_name
 
 
+# ============================================================================
+# P4 Recall MVP 挂载: ctx_recall error result 拦截 + 改写
+# 方案 A(次请求改写)——客户端不认识 ctx_recall 工具, 返回 error result,
+# 本函数在消息处理路径中拦截并替换为真实检索结果。
+# ============================================================================
+
+def rewrite_ctx_recall_results(messages, session_key):
+    """拦截 ctx_recall 的 error tool_result → 替换为真实检索结果。
+
+    流程:
+    1. 扫描 assistant 消息建立 tool_use_id → tool_name 映射
+    2. 扫描 user 消息的 tool_result, 匹配到 ctx_recall 的 result
+    3. 检测 error(客户端不认识工具 → "Error" / "unknown tool" 等)
+    4. 从原始 tool_use.input 提取查询参数
+    5. 调用 ctx_recall.lookup() + format_recall_result() 获取真实结果
+    6. 改写 tool_result 内容
+
+    fail-open: 任何异常静默跳过(不影响正常压缩路径)。
+    """
+    if not getattr(proxy_state, "PROXY_PD_ENABLED", True) or not session_key:
+        return messages
+
+    try:
+        # 建立 tool_use_id → (tool_name, input) 映射
+        tool_map = {}
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for block in (msg.get("content") or []):
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_map[block.get("id", "")] = (
+                        block.get("name", ""), block.get("input") or {})
+
+        if not any(name == "ctx_recall" for name, _ in tool_map.values()):
+            return messages  # 无 ctx_recall 调用, 快速返回
+
+        # 扫描 tool_result 并改写
+        from ctx_recall import lookup, format_recall_result
+        changed = False
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_result":
+                    continue
+                tid = block.get("tool_use_id", "")
+                tool_info = tool_map.get(tid)
+                if not tool_info or tool_info[0] != "ctx_recall":
+                    continue
+
+                # 检测是否是 error result(客户端不认识工具)
+                text = ""
+                rc = block.get("content")
+                if isinstance(rc, list):
+                    text = " ".join(b.get("text", "") for b in rc
+                                    if isinstance(b, dict))
+                elif isinstance(rc, str):
+                    text = rc
+                lower = text.lower()
+                if "error" not in lower and "unknown" not in lower and \
+                   "not found" not in lower and len(text.strip()) >= 20:
+                    continue  # 不像 error, 跳过
+
+                # 从 tool_use.input 提取查询参数
+                tool_input = tool_info[1]
+                query = tool_input.get("query", "")
+                kind = tool_input.get("kind")
+                limit = tool_input.get("limit", 8)
+                if not query:
+                    continue
+
+                # 调用真实检索
+                results = lookup(session_key, query, kind=kind, limit=limit)
+                real_text = format_recall_result(results, query,
+                                                 session_key=session_key)
+
+                # 改写 tool_result
+                if isinstance(block.get("content"), list):
+                    block["content"] = [{"type": "text", "text": real_text}]
+                else:
+                    block["content"] = real_text
+                changed = True
+
+        if changed:
+            import proxy_state as _ps_local
+            _ps_local._DIAG_ENABLED = _ps_local._DIAG_ENABLED  # no-op, keep reference
+    except Exception:
+        pass  # fail-open: 改写失败不影响正常路径
+
+    return messages
+
 
 __all__ = [
     "_scrub_ansi",
@@ -594,6 +690,7 @@ __all__ = [
     "_structured_compress",
     "compress_tool_result",
     "_generate_tool_summary",
+    "rewrite_ctx_recall_results",
     # TS-1 BM25 scoring
     "_bm25_tokenize",
     "_bm25_idf",

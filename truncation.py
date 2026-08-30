@@ -919,22 +919,16 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
     """
     Proxy-side message truncation with dual strategy support.
 
-    Strategy 'char' (default): drop old messages until total chars fall below
-    _ps.PROXY_CTX_CHARS_LIMIT. Preserves head + tail window.
-
-    Strategy 'rounds': keep only the most recent N assistant rounds,
-    replacing dropped messages with a lightweight placeholder.
-    When keep_rounds is provided (from lifecycle stage config), it overrides
-    the default adaptive_rounds computation.
-
-    Char-based budget: uses _ps.PROXY_CHARS_EXPANSION (chars) as the unified
-    trigger threshold, replacing the old token-budget _ps.PROXY_CTX_TOKEN_BUDGET.
-    Operates on Anthropic-format messages in-place.
-    Returns (messages, stats_dict).
-
-    TS-2 (W1 d3-4): 可显式传 strategy= 覆盖 PROXY_CTX_TRUNCATE_STRATEGY;
-    budget_chars= 覆盖 PROXY_CHARS_EXPANSION (仅 smart 路径使用).
+    P4 Recall MVP: 在截断前拦截 ctx_recall error result → 改写为真实检索结果。
+    (必须在截断前——确保模型能在当前轮"看到"召回信息后再做决策)
     """
+    if getattr(_ps, "PROXY_PD_ENABLED", True) and session_id:
+        try:
+            from content_compressor import rewrite_ctx_recall_results
+            messages = rewrite_ctx_recall_results(messages, session_id)
+        except ImportError:
+            pass
+
     # TS-2: 显式 strategy 覆盖全局配置.
     effective_strategy = strategy if strategy is not None else _ps.PROXY_CTX_TRUNCATE_STRATEGY
 

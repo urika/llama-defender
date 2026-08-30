@@ -79,6 +79,16 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, sessi
     all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     filtered_out = sorted(all_names - kept_names)
 
+    # P4 Recall(MVP): 注入 ctx_recall 工具——渐进披露的拉取接口。
+    # 无论过滤与否都追加到列表末尾(不占 PROXY_TOOL_FILTER_MAX 名额)。
+    if getattr(_ps, "PROXY_PD_ENABLED", True):
+        try:
+            from ctx_recall import TOOL_SCHEMA as _CTX_RECALL_TOOL
+            if _CTX_RECALL_TOOL["name"] not in {t.get("name") for t in kept if isinstance(t, dict)}:
+                kept.append(_CTX_RECALL_TOOL)
+        except ImportError:
+            pass
+
     return kept, {
         "filtered": True,
         "original": len(tools),
