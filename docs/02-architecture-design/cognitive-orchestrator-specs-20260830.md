@@ -2,6 +2,13 @@
 
 > **上游**: PRD v4.0 + 设计文档 v1.0 ｜ **日期**: 2026-08-30
 > **原则**: 每个 spec 是一个可独立开发和测试的任务单元，有明确的输入/输出/验收标准
+>
+> **交付状态**（2026-08-30 更新）:
+> - ✅ Spec-A 数据契约 + 契约注册表（signal_types / protocol_types / contract_registry, 22 对齐测试）
+> - ✅ Spec-B ctx_recall 挂载(MVP-2 已端到端验证) + P5 Escalate（escalate.py: 状态机/熔断/决策表, 21 测试）
+> - ✅ Spec-C P1 Decompose + ProtocolOrchestrator + IdempotencyManager（decompose.py / idempotency.py / protocol_orchestrator.py, +72 用例, commit 58bd2a0）
+> - ✅ Spec-D 设计模式 + 并发 + 性能预算（verification_chain.py 三级职责链 / PROTOCOL_BUDGETS / 并发与预算测试, commit 58bd2a0; 性能预算暂为模块常量, proxy_config.py 释放后迁 CONFIG_REGISTRY）
+> - ⏳ Spec-E 后治理 + 运维监控（未开始）
 
 ---
 
