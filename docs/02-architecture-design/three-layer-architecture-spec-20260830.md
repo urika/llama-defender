@@ -122,12 +122,17 @@ def verify(patch: Patch, rules: List[VerificationRule],
             - diff_validity: patch 可干净地应用到 base files
             - format_compliance: 输出格式符合预期 schema
 
-        Level 2 (语义, 模型成本):
+        Level 2 (语义, 模型成本, 按比例抽样):
             - content_accuracy: patch 内容与任务要求一致
             - side_effect_check: patch 不破坏无关功能
+            ⚠️ 相关性失败风险(Self-Refine, 2023): 语义验证用同模型
+               → 评论者与生成者共享偏见 → 错误可能不触发警报。
+               应优先使用 L1 机械校验; L2 仅作补充, 不能替代 L1。
+               缓解: D_ledger 对账提供外部 ground truth, 不受此偏见影响。
 
         Level 3 (对账, 台账成本):
             - d_ledger_check: patch 中声称的事实与台账一致
+            → 不受相关性失败影响(外部真值, 非模型自评)
 
     验证策略: Level 1 全量执行; Level 2 按 PROXY_VERIFY_SEMANTIC 比例抽样;
               Level 3 在有台账数据时执行

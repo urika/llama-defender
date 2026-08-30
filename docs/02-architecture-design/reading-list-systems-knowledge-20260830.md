@@ -47,6 +47,20 @@
 
 ---
 
+## ③-b 补充：反思与元认知经典论文（v1.1 新增，源自 Kimi 对话文档对照）
+
+| 论文 | 贡献 | 与我们的关联 |
+|---|---|---|
+| **Self-Refine** (Madaan et al., 2023) | 同一模型兼任生成者/评论者/改进者，7 项任务提升 ~20% | Verify L2 语义验证的理论基础；**注意相关性失败风险**（§0.2） |
+| **Reflexion** (Shinn et al., 2023) | 失败后语言化反思写入情景记忆，HumanEval 91% | 我们的后治理（PostGovernance）概念源头 |
+| **Tree of Thoughts** (Yao et al., 2023) | 推理路径搜索树逐节点自评估 | 假设树设计的理论基础；"24 点"74% vs CoT 4% |
+| **ANCHOR** (Neurocomputing 2026) | 规划/执行/监控/控制闭环多智能体元认知 | 认知编排器的多智能体变体 |
+| **Resource-Rational Metacognitive Control** (2026) | 按问题难度自适应分配推理深度 | P5 Escalate 的"何时深想"决策理论基础 |
+| **Know What You Know** (2026) | RL 推理中的元认知不确定性校准 | H_BE + D_ledger 双轴的理论定位 |
+| **Think2** (2025) | 轻量 MetaController 做双过程切换 | P5 的 System 1/2 切换实现参考 |
+
+---
+
 ## ④ vLLM / MLX 源码导读 —— 配合 IFC-10 后端选型实操，读码与测数据同步
 
 | 资源 | 链接 | 对位 |
