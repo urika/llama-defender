@@ -8,7 +8,7 @@
 > - ✅ Spec-B ctx_recall 挂载(MVP-2 已端到端验证) + P5 Escalate（escalate.py: 状态机/熔断/决策表, 21 测试）
 > - ✅ Spec-C P1 Decompose + ProtocolOrchestrator + IdempotencyManager（decompose.py / idempotency.py / protocol_orchestrator.py, +72 用例, commit 58bd2a0）
 > - ✅ Spec-D 设计模式 + 并发 + 性能预算（verification_chain.py 三级职责链 / PROTOCOL_BUDGETS / 并发与预算测试, commit 58bd2a0; 性能预算暂为模块常量, proxy_config.py 释放后迁 CONFIG_REGISTRY）
-> - ⏳ Spec-E 后治理 + 运维监控（未开始）
+> - ✅ Spec-E 后治理 + 运维监控（post_governance.py: EntryLayerCalibrator / PatternCompiler / PostGovernance / data_quality_report, +31 用例；admin_server.py 并行占用, /api/data-quality 端点接线延后——data_quality_report() 已为纯函数可直接挂载）
 
 ---
 
