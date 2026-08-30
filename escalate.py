@@ -33,13 +33,15 @@ class TaskState(Enum):
 
 
 # 合法状态转换表——不在表中的转换视为非法
+# PENDING→FAILED_ROUTE: 熔断预检在执行前拦截直接升级(Spec-C 编排器)
+# FAILED_SPLITTABLE→FAILED_ROUTE: 拆不动(原子任务)→升级(Spec-C 编排器)
 TRANSITIONS = {
-    TaskState.PENDING: {TaskState.EXECUTING},
+    TaskState.PENDING: {TaskState.EXECUTING, TaskState.FAILED_ROUTE},
     TaskState.EXECUTING: {TaskState.VERIFYING, TaskState.FAILED_RETRYABLE},
     TaskState.VERIFYING: {TaskState.PASSED, TaskState.FAILED_RETRYABLE,
                           TaskState.FAILED_SPLITTABLE, TaskState.FAILED_ROUTE},
     TaskState.FAILED_RETRYABLE: {TaskState.EXECUTING, TaskState.ESCALATED},
-    TaskState.FAILED_SPLITTABLE: {TaskState.PENDING},  # 重新入队
+    TaskState.FAILED_SPLITTABLE: {TaskState.PENDING, TaskState.FAILED_ROUTE},
     TaskState.FAILED_ROUTE: {TaskState.ESCALATED},
     # 终态不可转出
     TaskState.PASSED: set(),

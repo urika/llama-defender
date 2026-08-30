@@ -80,6 +80,13 @@ CONTRACT_REGISTRY: Dict[str, Dict[str, Any]] = {
         "consumers": ["P5_escalate", "post_governance"],
         "join_keys": ["patch_id"],
     },
+    "CheckResult": {
+        "version": 1,
+        "module": "protocol_types",
+        "producer": ["P3_verify"],
+        "consumers": ["P3_verify", "P5_escalate"],
+        "join_keys": ["rule_name"],
+    },
     "EscalationDecision": {
         "version": 1,
         "module": "protocol_types",
@@ -93,7 +100,7 @@ CONTRACT_REGISTRY: Dict[str, Dict[str, Any]] = {
     "SessionState": {
         "version": 1,
         "module": "protocol_types",
-        "producer": ["protocol_orchestrator._init_state"],
+        "producer": ["protocol_orchestrator.solve"],
         "consumers": ["所有协议"],
         "join_keys": ["session_key"],
     },
