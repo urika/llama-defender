@@ -160,6 +160,11 @@ def view_summary(messages):
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
+        if (msg.get("role") or "") == "system":
+            # system 是每请求重注入的运行时上下文(env/日期/提醒),非会话记忆——
+            # 不进差分,否则客户端 system 微调即误报 unit_drop(2026-08-30 实测:
+            # 92 个 ile 误报轮的成分之一)
+            continue
         for u in unit_anchors(msg):
             if u["anchor"] in units:
                 # 同锚罕见（重发/复制）；保守取首见，规模累加以免低估损失
@@ -200,6 +205,11 @@ def diff_views(prev, cur):
     added = [a for a in cur_units if a not in prev_units]
     dropped_chars = sum(u["size_chars"] for u in dropped)
     dropped_rationale = sum(u["size_chars"] for u in dropped if u.get("is_rationale"))
+    # 视图连续性判定: 真实截断/压缩/compaction 都是「保尾丢头」;任务切换或
+    # 客户端整段重写则连上一视图尾部单元一起消失(swe-eval 同键下「命名请求→
+    # 正式任务」实测)。尾部不存活 → view_reset,不算信息损失事件。
+    tail_keys = list(prev_units.keys())[-2:]
+    view_reset = any(k not in cur_units for k in tail_keys) if tail_keys else False
     return {
         "dropped_units": len(dropped),
         "dropped_chars": dropped_chars,
@@ -209,6 +219,7 @@ def diff_views(prev, cur):
         "added_units": len(added),
         "prev_total_chars": prev["total_chars"],
         "prev_rationale_chars": prev["rationale_chars"],
+        "view_reset": view_reset,
     }
 
 
@@ -265,8 +276,8 @@ def reread_pressure(actions, window=REREAD_WINDOW):
 
 
 def infer_ile_kinds(diff):
-    """损失事实 → ILE 类别推断（v0 视图差分口径）。"""
-    if not diff:
+    """损失事实 → ILE 类别推断(v0 视图差分口径;view_reset 不算损失)。"""
+    if not diff or diff.get("view_reset"):
         return []
     kinds = []
     if diff["dropped_units"] > 0:
@@ -308,6 +319,7 @@ def build_ifc_section(prev, cur, actions, manifest_lines=None):
             "dropped_units": diff["dropped_units"],
             "dropped_chars": diff["dropped_chars"],
             "shrunk_chars": diff["shrunk_chars"],
+            "view_reset": diff.get("view_reset", False),
         })
     if manifest_lines is not None:
         section["manifest_lines"] = manifest_lines

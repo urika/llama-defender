@@ -109,6 +109,35 @@ class TestViewDiff(unittest.TestCase):
         diff = im.diff_views(prev, cur)
         self.assertEqual(diff["shrunk_units"], 0)  # 50 chars < SHRINK_MIN_CHARS
 
+    def test_system_units_excluded_from_diff(self):
+        # system 是每请求重注入的运行时上下文——内容变化不构成信息损失
+        prev = im.view_summary([
+            {"role": "system", "content": "sys v1 env=abc"},
+            _anth_msg("user", [{"type": "text", "text": "任务A" + "x" * 200}])])
+        cur = im.view_summary([
+            {"role": "system", "content": "sys v2 env=xyz 日期 2026-08-30"},
+            _anth_msg("user", [{"type": "text", "text": "任务A" + "x" * 200}])])
+        diff = im.diff_views(prev, cur)
+        self.assertEqual(diff["dropped_units"], 0)
+        self.assertEqual(im.infer_ile_kinds(diff), [])
+
+    def test_task_switch_classified_view_reset(self):
+        # 同会话键下任务切换(swe-eval 命名请求→正式任务): 上一视图尾部
+        # (工具对/末条消息)整体消失 → view_reset,不算 ILE
+        prev = im.view_summary([
+            _anth_msg("user", [{"type": "text", "text": "命名会话请求"}]),
+            _anth_msg("assistant", [_anth_tool_use("t1", "Read", {"file_path": "/a"})]),
+            _anth_msg("user", [_anth_tool_result("t1", "r" * 300)])])
+        cur = im.view_summary([
+            _anth_msg("user", [{"type": "text", "text": "完全不同的正式任务" + "y" * 300}])])
+        diff = im.diff_views(prev, cur)
+        self.assertTrue(diff["view_reset"])
+        self.assertGreater(diff["dropped_units"], 0)   # 事实保留
+        self.assertEqual(im.infer_ile_kinds(diff), [])  # 但不算信息损失
+        sec = im.build_ifc_section(prev, cur, [])
+        self.assertFalse(sec["ile"])
+        self.assertTrue(sec["view_reset"])
+
 
 class TestBehaviorMetrics(unittest.TestCase):
     def test_action_diversity_extremes(self):

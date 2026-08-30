@@ -65,7 +65,10 @@ def _join_turn_rows(store, key):
     metrics_idx = store.metrics_by_request()
     hbe_by_turn = {}
     for h in store.hbe_by_session().get(key) or []:
-        if h.get("result") == "ok" and isinstance(h.get("h_mean_bits"), (int, float)):
+        # 伪迹过滤(2026-08-30 分析发现): 部分探针回答是 <tool_call> XML 而非
+        # 文本——工具调用语法高度可预测,H 被压到 0.05-0.15,不代表信念清晰
+        if h.get("result") == "ok" and isinstance(h.get("h_mean_bits"), (int, float)) \
+                and not str(h.get("answer_preview") or "").lstrip().startswith("<tool_call>"):
             hbe_by_turn[h.get("turn")] = h
     # ledger: turn → (新增 action 数, mismatch)
     ledger_turns = {}

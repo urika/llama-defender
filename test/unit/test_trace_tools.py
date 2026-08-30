@@ -85,6 +85,13 @@ class _FixtureBase(unittest.TestCase):
              "ifc": {"ile": True, "ile_kinds": ["compress_drop"], "retention": 0.8,
                      "rationale_ratio": 0.9, "reread_pressure": 4,
                      "action_div": 0.05, "manifest_lines": 9}},
+            {"ts": "2026-08-20T10:03:00", "request_id": "r4", "session_key": "sessA",
+             "turn": 4, "ttft_ms": 100.0, "duration_ms": 1000.0, "hit_ratio": 0.9,
+             "feedback_injected": [], "route_target": "local",
+             "actual_model": "m-a", "canonical_mismatch": False,
+             "ifc": {"ile": False, "ile_kinds": [], "retention": 1.0,
+                     "rationale_ratio": 1.0, "reread_pressure": 0,
+                     "action_div": None, "manifest_lines": 9}},
         ])
         # diag/hbe.jsonl(R9.2 影子探针: turn1/2 ok, turn3 skipped)
         _w(os.path.join(self.logs, "diag", "hbe.jsonl"), [
@@ -94,6 +101,10 @@ class _FixtureBase(unittest.TestCase):
              "result": "ok", "h_mean_bits": 5.5, "coverage_mean": 0.95},
             {"event": "hbe_shadow", "session_key": "sessA", "turn": 3,
              "result": "skipped_lock"},
+            # 伪迹: 工具调用型回答(H 极低但非信念清晰)——join 必须排除
+            {"event": "hbe_shadow", "session_key": "sessA", "turn": 4,
+             "result": "ok", "h_mean_bits": 0.055, "coverage_mean": 0.99,
+             "answer_preview": "<tool_call>\n<function=Read>"},
         ])
         # diag/ledger/sessA.jsonl(A3 增量: turn1 一个动作, turn2 回填+同目标重复, turn3 mismatch 重建)
         _w(os.path.join(self.logs, "diag", "ledger", "sessA.jsonl"), [
@@ -192,7 +203,7 @@ class TestTraceCommon(_FixtureBase):
 class TestTraceQuery(_FixtureBase):
     def test_join_turn_rows(self):
         rows = tq._join_turn_rows(self.store, "sessA")
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         r2 = rows[1]
         self.assertEqual(r2["request_id"], "r2")
         self.assertEqual(r2["status"], 500)             # metrics join
@@ -238,7 +249,7 @@ class TestTraceQuery(_FixtureBase):
         with redirect_stdout(out):
             tq.main(["--logs-dir", self.logs, "--json", "show", "sessA"])
         rows = json.loads(out.getvalue())
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
 
 
 class TestIfcDimension(_FixtureBase):
@@ -246,20 +257,20 @@ class TestIfcDimension(_FixtureBase):
 
     def test_join_carries_ifc_and_hbe(self):
         rows = tq._join_turn_rows(self.store, "sessA")
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]["h_be"], 2.0)          # ok 探针 join
         self.assertEqual(rows[1]["h_be"], 5.5)
         self.assertIsNone(rows[2]["h_be"])              # skipped_lock 不 join
-        self.assertEqual(rows[1]["ifc_kinds"], ["unit_drop"])
+        self.assertIsNone(rows[3]["h_be"])              # <tool_call> 伪迹被过滤        self.assertEqual(rows[1]["ifc_kinds"], ["unit_drop"])
         self.assertEqual(rows[1]["retention"], 0.55)
         self.assertEqual(rows[2]["manifest_lines"], 9)
         self.assertTrue(rows[1]["ifc_ile"])
 
     def test_hbe_by_session_only_indexes_ok(self):
         idx = self.store.hbe_by_session()
-        self.assertEqual(len(idx.get("sessA") or []), 3)  # 全量行(按 turn 升序)
+        self.assertEqual(len(idx.get("sessA") or []), 4)  # 全量行(按 turn 升序)
         ok = [r for r in idx["sessA"] if r.get("result") == "ok"]
-        self.assertEqual([r["turn"] for r in ok], [1, 2])
+        self.assertEqual([r["turn"] for r in ok], [1, 2, 4])
 
     def test_spearman_basics(self):
         self.assertEqual(tc.spearman([1, 2, 3, 4], [10, 20, 30, 40]), 1.0)
