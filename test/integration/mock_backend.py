@@ -45,6 +45,27 @@ USAGE_COMPLETION = int(os.environ.get("MOCK_USAGE_COMPLETION", "20"))
 TIMINGS_PROMPT_N = os.environ.get("MOCK_TIMINGS_PROMPT_N", "")
 TIMINGS_PREDICTED_N = int(os.environ.get("MOCK_TIMINGS_PREDICTED_N", "10"))
 
+# 序列模式(IFC-3 微轮测试): MOCK_SEQ_FILE 指向 JSON 数组, 每个 POST 依序消费
+# 一个 spec(最后一个重复)。spec: {"tool_call": {"id","name","arguments"}} 或
+# {"text": "..."}。未设置时保持原有单响应 env 脚本行为。
+SEQ_FILE = os.environ.get("MOCK_SEQ_FILE", "")
+_SEQ = []
+_SEQ_IDX = {"n": 0}
+_SEQ_LOCK = threading.Lock()
+if SEQ_FILE and os.path.exists(SEQ_FILE):
+    with open(SEQ_FILE, encoding="utf-8") as _f:
+        _SEQ = json.load(_f)
+
+
+def _next_spec():
+    """序列模式: 返回第 N 个 spec(越界重复最后一个); 空序列返回 None。"""
+    if not _SEQ:
+        return None
+    with _SEQ_LOCK:
+        i = min(_SEQ_IDX["n"], len(_SEQ) - 1)
+        _SEQ_IDX["n"] += 1
+        return _SEQ[i]
+
 
 def _timings():
     """llama-server style timings object (empty dict when not configured)."""
@@ -60,6 +81,40 @@ def _timings():
 
 def _build_response():
     """Return a canned OpenAI-format chat completion response."""
+    spec = _next_spec()
+    if spec is not None:
+        if "tool_call" in spec:
+            tcs = spec["tool_call"]
+            return {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion",
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": tcs.get("id", "call_seq"),
+                            "type": "function",
+                            "function": {"name": tcs.get("name", "ctx_recall"),
+                                         "arguments": tcs.get("arguments", "{}")},
+                        }],
+                    },
+                }],
+                "usage": {"prompt_tokens": USAGE_PROMPT,
+                          "completion_tokens": USAGE_COMPLETION},
+            }
+        return {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant",
+                            "content": spec.get("text", "")},
+            }],
+            "usage": {"prompt_tokens": USAGE_PROMPT,
+                      "completion_tokens": USAGE_COMPLETION},
+        }
     timings = _timings()
     if PLAIN_TEXT:
         resp = {
@@ -153,7 +208,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, _build_response())
 
     def _send_stream_response(self):
-        """SSE 流式响应：2 个 content delta + 终块（usage + timings）+ [DONE]。"""
+        """SSE 流式响应：2 个 content delta + 终块（usage + timings）+ [DONE]。
+
+        序列模式(MOCK_SEQ_FILE)下按 spec 流式: tool_call spec 流
+        tool_calls delta(名称/参数两段), text spec 流文本 delta。"""
+        spec = _next_spec()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -171,6 +230,42 @@ class Handler(BaseHTTPRequestHandler):
         timings = _timings()
         if timings:
             final_extra["timings"] = timings
+
+        if spec is not None:
+            chunks = [_chunk({"role": "assistant", "content": ""})]
+            if "tool_call" in spec:
+                tcs = spec["tool_call"]
+                chunks.append(_chunk({"tool_calls": [{
+                    "index": 0, "id": tcs.get("id", "call_seq"),
+                    "type": "function",
+                    "function": {"name": tcs.get("name", "ctx_recall"),
+                                 "arguments": ""},
+                }]}))
+                args = tcs.get("arguments", "{}")
+                # 参数分两段流式(模拟真实增量拼装路径)
+                mid = max(1, len(args) // 2)
+                chunks.append(_chunk({"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": args[:mid]},
+                }]}))
+                chunks.append(_chunk({"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": args[mid:]},
+                }]}))
+                chunks.append(_chunk({}, finish="tool_calls", extra=final_extra))
+            else:
+                text = spec.get("text", "")
+                if text:
+                    mid = max(1, len(text) // 2)
+                    chunks.append(_chunk({"content": text[:mid]}))
+                    chunks.append(_chunk({"content": text[mid:]}))
+                chunks.append(_chunk({}, finish="stop", extra=final_extra))
+            chunks.append(b"data: [DONE]\n\n")
+            for c in chunks:
+                self.wfile.write(c)
+                self.wfile.flush()
+            return
+
         chunks = [
             _chunk({"role": "assistant", "content": ""}),
             _chunk({"content": "hello "}),

@@ -288,7 +288,73 @@ def format_recall_result(lines, query, session_key=None):
     return "\n".join(out)
 
 
+# ============================================================================
+# IFC-3 微轮自答(方案 B, 2026-08-30): 同请求内构造 follow-up 消息对
+# ============================================================================
+
+MICRO_TURN_RESULT_MAX_CHARS = 2000  # PDC 设计 §5 护栏: pull 结果体积上限
+
+
+def build_follow_up_messages(session_key, tool_calls):
+    """把模型流出的 ctx_recall 调用转为 OpenAI 格式微轮消息对。
+
+    输入 tool_calls: [{"id":..., "function": {"name":..., "arguments": json-str}}]
+    （OpenAI chat completions 流式累计后的结构）。
+    返回 [assistant(tool_calls), tool(result), ...]；全部调用均为 ctx_recall 且
+    参数可解析时才返回，否则 None（调用方走路径 A 客户端回环）。
+    结果截断至 MICRO_TURN_RESULT_MAX_CHARS（护栏，防拉取洪泛回填上下文）。
+    """
+    if not session_key or not tool_calls:
+        return None
+    assistant_tc = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        if fn.get("name") != "ctx_recall":
+            return None  # 混有其他工具 → 无法全部自答
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                raise ValueError("arguments not an object")
+        except (json.JSONDecodeError, ValueError):
+            return None
+        assistant_tc.append({
+            "id": tc.get("id") or "call_%s" % os.urandom(8).hex(),
+            "type": "function",
+            "function": {"name": "ctx_recall",
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+
+    follow_up = [{"role": "assistant", "content": "", "tool_calls": assistant_tc}]
+    for tc in assistant_tc:
+        args = json.loads(tc["function"]["arguments"])
+        query = str(args.get("query", "")).strip()
+        if not query:
+            result = "ctx_recall: 缺少 query 参数。用法: {\"query\": \"文件路径/工具名/关键词\", \"kind\": \"file_edit|tool_use|tool_result|message\", \"limit\": 8}"
+        else:
+            try:
+                kind = args.get("kind") or None
+                if kind in ("", "any", "all"):
+                    kind = None
+                try:
+                    limit = max(1, min(int(args.get("limit") or 8), 20))
+                except (TypeError, ValueError):
+                    limit = 8
+                lines = lookup(session_key, query, kind=kind, limit=limit)
+                result = format_recall_result(lines, query, session_key)
+            except Exception as e:  # 检索失败 → 结果性错误文本(非 fail-open:
+                # 模型需要知道拉取失败, 与路径 A 的 error result 语义一致)
+                result = "ctx_recall: 检索失败(%s)。" % e
+        follow_up.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": result[:MICRO_TURN_RESULT_MAX_CHARS],
+        })
+    return follow_up
+
+
 __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
     "line_text", "recover_full_content", "DEFAULT_LIMIT",
+    "build_follow_up_messages", "MICRO_TURN_RESULT_MAX_CHARS",
 ]

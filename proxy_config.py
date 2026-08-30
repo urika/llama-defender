@@ -858,6 +858,31 @@ CONFIG_REGISTRY = {
         "doc": "Total ledger dir size cap in MB; oldest session files are deleted beyond it.",
     },
 
+    # ---- PDC 渐进披露（IFC-3 方案 B，2026-08-30）----
+    # PROXY_PD_ENABLED 自 MVP 起以 getattr 默认运行，此处正式注册为唯一权威。
+    # 模型流出 ctx_recall 调用时，代理在同一请求内自答并追加结果后重新分发
+    # （子代理模式内置化），客户端全透明。关闭时回落 MVP 路径 A（次请求
+    # content_compressor 改写）。仅当响应未发出任何内容块且全部工具调用均为
+    # ctx_recall 时触发；结果截断 2000 chars（PDC §5 护栏）。
+    "PROXY_PD_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Progressive disclosure master switch: ctx_recall tool injection + "
+               "manifest indexing.",
+    },
+    "PROXY_PD_MICRO_TURN_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Same-request micro-turn re-dispatch for ctx_recall calls (PDC option B). "
+               "Off = MVP path A (next-request tool_result rewrite via content_compressor).",
+    },
+    "PROXY_PD_MICRO_TURN_MAX": {
+        "defaults": {"all": "2"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max micro-turn re-dispatches per request (bounds recursion; each costs "
+               "one incremental prefill).",
+    },
+
     # ---- H_BE shadow 探针（belief-entropy shadow probe，2026-08-29）----
     # 只测不动：成功的本地响应完成后，搭 prefix cache 便车追加一次双探针锚定
     # 提问，用 top_logprobs 截断熵估计 MMPO 式信念熵 H_BE，落盘 logs/diag/hbe.jsonl。

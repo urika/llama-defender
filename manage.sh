@@ -819,6 +819,29 @@ proxy_config.write_defaults_sh('$_bt', '$_defaults_tmp')
     fi
     rm -f "$_defaults_tmp"
 
+    # IFC-2(2026-08-30): 配置双径合一。active.conf 的值是裸 shell 变量(未
+    # export), 此前仅下方枚举块(~56 个)能传给 proxy 子进程, 其余 ~118 个注册
+    # 变量的 conf 值在 start/restart 时静默丢失(回落 registry 默认), 而 SIGHUP
+    # reload 会读 conf——switch+reload 与 stop+start 结果分叉。此处统一 export
+    # 全部"已设置且非空"的注册变量(空值与枚举块 :- 同语义=视为未设置),
+    # 使 start 与 reload 同源; 未设置的变量仍由上方 defaults 机制以 registry
+    # 默认值 export。值经 bash 原生传递, 无文本往返损坏风险。
+    local _reg_keys _rk
+    _reg_keys="$(python3 -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+import proxy_config
+print(' '.join(sorted(proxy_config.CONFIG_REGISTRY)))
+" 2>/dev/null)"
+    if [[ -n "$_reg_keys" ]]; then
+        for _rk in $_reg_keys; do
+            if [[ -n "${!_rk+x}" && -n "${!_rk}" ]]; then
+                export "$_rk"
+            fi
+        done
+    else
+        warn "CONFIG_REGISTRY 键列表获取失败，conf 值仍只经枚举块传递(双径分叉仍在)"
+    fi
+
     LLAMA_BASE_URL="$base_url" \
     LLAMA_API_KEY="${LLAMA_API_KEY:-sk-1234}" \
     MODEL_NAME="${MODEL_NAME:-$LLAMA_MODEL}" \

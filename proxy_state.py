@@ -490,6 +490,14 @@ PROXY_HBE_LOCK_WAIT_S = float(os.environ.get(
 PROXY_HBE_TIMEOUT_S = int(os.environ.get(
     "PROXY_HBE_TIMEOUT_S", get_default("PROXY_HBE_TIMEOUT_S")))
 
+# PDC 渐进披露（ctx_recall.py；IFC-3 方案 B 2026-08-30 起正式注册）
+PROXY_PD_ENABLED = os.environ.get(
+    "PROXY_PD_ENABLED", get_default("PROXY_PD_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_PD_MICRO_TURN_ENABLED = os.environ.get(
+    "PROXY_PD_MICRO_TURN_ENABLED", get_default("PROXY_PD_MICRO_TURN_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_PD_MICRO_TURN_MAX = int(os.environ.get(
+    "PROXY_PD_MICRO_TURN_MAX", get_default("PROXY_PD_MICRO_TURN_MAX")))
+
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
 # engineering-design §4.3/§4.9，Phase 0 §12 结论已坐实击穿根因为每轮回溯改写）
@@ -1111,6 +1119,10 @@ _RELOAD_SPEC = [
     ("PROXY_HBE_MAX_TOKENS", "PROXY_HBE_MAX_TOKENS", "int", "160", "160"),
     ("PROXY_HBE_LOCK_WAIT_S", "PROXY_HBE_LOCK_WAIT_S", "float", "5.0", "5.0"),
     ("PROXY_HBE_TIMEOUT_S", "PROXY_HBE_TIMEOUT_S", "int", "120", "120"),
+    # PDC 渐进披露（MVP 起 PD_ENABLED 为 getattr 默认，2026-08-30 正式注册）
+    ("PROXY_PD_ENABLED", "PROXY_PD_ENABLED", "bool", "true", "true"),
+    ("PROXY_PD_MICRO_TURN_ENABLED", "PROXY_PD_MICRO_TURN_ENABLED", "bool", "false", "false"),
+    ("PROXY_PD_MICRO_TURN_MAX", "PROXY_PD_MICRO_TURN_MAX", "int", "2", "2"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),

@@ -2398,6 +2398,31 @@ class BackendDispatcher(PipelineStage):
                         creds.get("api_key") or _ps.LLAMA_API_KEY, lock)
         return _ps.LLAMA_BASE, _ps.LLAMA_API_KEY, self._llama_lock
 
+    def _make_micro_turn_dispatch(self, ctx, base_url, api_key):
+        """IFC-3 方案B: 微轮重派闭包(挂到 handler 供流式中继调用)。
+
+        返回 dispatch(follow_up_msgs) -> bool: True=已重派(递归 _do_dispatch
+        完成, 客户端已收到最终流); False=开关关闭/预算耗尽(调用方走路径 A
+        正常发射)。重派在闭包内原子计数防并发超发; 异常向上抛——递归流已
+        开始时无法回退到路径 A。
+        """
+        def _dispatch(follow_up_msgs):
+            if not (_ps.PROXY_PD_ENABLED
+                    and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
+                return False
+            if getattr(ctx, '_micro_turn_used', 0) >= int(
+                    getattr(_ps, "PROXY_PD_MICRO_TURN_MAX", 2)):
+                return False
+            ctx._micro_turn_used = getattr(ctx, '_micro_turn_used', 0) + 1
+            ctx.openai_body["messages"] = list(
+                ctx.openai_body.get("messages") or []) + follow_up_msgs
+            log("  -> [MICRO_TURN] ctx_recall self-answered; re-dispatching with "
+                "%d follow-up messages (round %d)"
+                % (len(follow_up_msgs), ctx._micro_turn_used))
+            self._do_dispatch(ctx, base_url, api_key)
+            return True
+        return _dispatch
+
     # ------------------------------------------------------------------
     # Phase B: catalog-driven cloud target resolution
     # ------------------------------------------------------------------
@@ -2946,13 +2971,47 @@ class BackendDispatcher(PipelineStage):
         # 既污染错误率又可能触发无意义的降级链。归类为客户端取消,不视为后端错误。
         try:
             if ctx.is_stream:
-                self._handler._handle_streaming_response(resp, ctx.body)
+                # IFC-3(方案B, 2026-08-30): 微轮重派钩子——流式中继若检测到
+                # 可自答的 ctx_recall 调用, 经此闭包同请求重分发。预算/开关在
+                # 闭包内原子判定; 递归 _do_dispatch 不重取锁(调用方已持有)。
+                self._handler._micro_recall_dispatch = self._make_micro_turn_dispatch(
+                    ctx, base_url, api_key)
+                try:
+                    self._handler._handle_streaming_response(resp, ctx.body)
+                finally:
+                    self._handler._micro_recall_dispatch = None
             else:
                 # Pre-read non-streaming body so we can extract actual usage for
                 # accurate cost tracking, then hand a BytesIO wrapper to the handler.
                 body_bytes = resp.read()
                 try:
                     openai_resp = json.loads(body_bytes.decode("utf-8"))
+                    # IFC-3 方案B(非流式): 响应仅含 ctx_recall 调用 → 同请求自答
+                    # 并重新分发(客户端尚未收到任何字节, 无抑制逻辑)。
+                    if (_ps.PROXY_PD_ENABLED
+                            and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)
+                            and getattr(ctx, '_micro_turn_used', 0)
+                            < int(getattr(_ps, "PROXY_PD_MICRO_TURN_MAX", 2))):
+                        _follow = None
+                        try:
+                            import ctx_recall as _cr
+                            _tcs = ((openai_resp.get("choices") or [{}])[0]
+                                    .get("message", {}).get("tool_calls") or [])
+                            _follow = _cr.build_follow_up_messages(
+                                getattr(ctx, 'session_id', '') or '', _tcs)
+                        except Exception as _e:
+                            _warn_diag("micro_turn_build", _e)
+                        if _follow:
+                            ctx._micro_turn_used = getattr(ctx, '_micro_turn_used', 0) + 1
+                            ctx.openai_body["messages"] = list(
+                                ctx.openai_body.get("messages") or []) + _follow
+                            log("  -> [MICRO_TURN] non-stream ctx_recall self-answered; "
+                                "re-dispatching (round %d)" % ctx._micro_turn_used)
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            return self._do_dispatch(ctx, base_url, api_key)
                     usage = openai_resp.get("usage") or {}
                     self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                     self._output_tokens = usage.get("completion_tokens", self._output_tokens)

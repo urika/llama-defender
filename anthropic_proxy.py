@@ -1203,8 +1203,16 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_openai_streaming_response(resp)
             return
 
+        # IFC-3 方案B: 微轮续流——重派后的递归调用复用已发出的 SSE 头与
+        # message_start, 客户端整轮只见一条消息。标志在入口消费(置回 False),
+        # 嵌套微轮会在重派前重新置 True。
+        _micro_continue = getattr(self, '_micro_continuation', False)
+        if _micro_continue:
+            self._micro_continuation = False
+
         # #51-B1: 头段(v2 心跳挂 _heartbeat_lines 首行等待, 与此处解耦)
-        self._send_sse_stream_headers()
+        if not _micro_continue:
+            self._send_sse_stream_headers()
 
         model_name = anthropic_body.get("model", "claude-3-5-sonnet-20241022")
         msg_id = f"msg_{os.urandom(8).hex()}"
@@ -1248,20 +1256,21 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
         # Send message_start (usage will be updated from llama-server timings)
-        event = {
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model_name,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0}
+        if not _micro_continue:
+            event = {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model_name,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
             }
-        }
-        self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
+            self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
 
         stream_finish_reason = None
         for line in self._heartbeat_lines(resp):
@@ -1429,6 +1438,35 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"  [JSON_REPAIRED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
                 except json.JSONDecodeError:
                     log(f"  [JSON_TRUNCATED_REPAIR_FAILED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+
+        # IFC-3 方案B(2026-08-30): 微轮重派——本响应尚未向客户端发出任何内容
+        # 块(无文本、无内联工具)且工具调用全部为 ctx_recall 时, 代理在同一请求
+        # 内自答并重新分发(append-only 尾部追加, prefix cache 增量友好), 客户端
+        # 全透明。开关关闭/预算耗尽/构造失败 → 正常发射回落路径 A(次请求改写)。
+        # 注: thinking 模型的 reasoning_content 会作为文本增量先发 →
+        # text_block_started=True → 自动回落路径 A(生产配置 thinking off 不受影响)。
+        if (not text_block_started and not content_tools_pending
+                and tool_calls_buffer):
+            _dispatch = getattr(self, '_micro_recall_dispatch', None)
+            if _dispatch is not None:
+                _follow = None
+                try:
+                    import ctx_recall as _cr
+                    _tcs = [tool_calls_buffer[i] for i in sorted(tool_calls_buffer)
+                            if tool_calls_buffer[i].get("function", {}).get("name")]
+                    _follow = _cr.build_follow_up_messages(
+                        getattr(_log_ctx, 'session_id', None) or '', _tcs)
+                except Exception as _e:
+                    _warn_diag("micro_turn_build", _e)
+                if _follow is not None:
+                    # 标志先置 True 供递归入口消费; finally 兜底清除防重派异常
+                    # 时泄漏到同连接的下一请求。
+                    self._micro_continuation = True
+                    try:
+                        if _dispatch(_follow):
+                            return
+                    finally:
+                        self._micro_continuation = False
 
         # Send content_block_stop for text (only if text was output)
         if text_block_started:
