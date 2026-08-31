@@ -618,11 +618,17 @@ class TestFifoPlaceholderStability(unittest.TestCase):
             f"placeholder text must be identical for cache stability; got {len(seen)} variants: {seen}")
 
     def test_placeholder_text_is_static(self):
-        """The placeholder must be exactly the fixed Plan 1 text."""
+        """The plain placeholder must be the fixed text (+ PDC-L1 static
+        ctx_recall hint). Dynamic file lists only appear in the structured
+        variant; the plain one is byte-stable for prefix-cache."""
         msgs = self._make_msgs(60)
         result, _ = proxy.truncate_messages_if_needed(msgs, session_id="t")
         pt = self._find_placeholder(result)
-        self.assertEqual(pt, "[Context folded: earlier messages omitted.]")
+        self.assertEqual(
+            pt,
+            "[Context folded: earlier messages omitted. "
+            "Use ctx_recall tool to recover folded content "
+            "instead of re-reading files.]")
 
     def test_placeholder_dynamic_info_still_in_stats(self):
         """Plan 1 keeps the dropped/tool/file_mentions data available for

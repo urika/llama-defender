@@ -1718,12 +1718,15 @@ class RereadDetector(PipelineStage):
                     f"{len(re_read_targets)}/{len(cleared_files)} cleared files (rate={rate:.1f}%)")
 
                 # P0-FIX: Hard-block re-reads
+                # PDC-L2(2026-08-31): 拦截提示加 ctx_recall 指引——被清内容
+                # 均在 manifest 可寻址, 召回优先于"凭记忆继续"。
                 blocked_files = ", ".join(sorted(re_read_targets))
                 ctx.messages.append({
                     "role": "user",
                     "content": [{"type": "text", "text":
                         f"[System: HARD BLOCK — Read calls to the following files were intercepted "
                         f"because their contents were previously cleared and have not changed: {blocked_files}. "
+                        f"Call the ctx_recall tool (query=file path) to recover the earlier content. "
                         f"DO NOT attempt to read these files again. Use your existing knowledge or "
                         f"proceed without re-reading. If you need file content, ask the user explicitly.]"
                     }]

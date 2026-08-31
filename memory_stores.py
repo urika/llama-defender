@@ -29,6 +29,10 @@ MAX_LINES_PER_SESSION = 2000
 MANIFEST_MAX_SESSIONS = 64
 MANIFEST_MAX_MB = 100
 _SIZE_CHECK_INTERVAL = 64
+# PDC-L3(2026-08-31): 跨批隔离——重启/换批后同一会话键的旧 manifest 会稀释
+# FTS 召回(实测 s384d8ac 混入 8/25 旧任务内容)。超过此间隔的旧文件视为
+# 上一批次, 轮转归档(.prev)后重建。
+SESSION_GAP_SECONDS = 2 * 3600
 
 
 class ManifestStore(object):
@@ -66,6 +70,8 @@ class ManifestStore(object):
         with self._lock:
             entry = self._sessions.get(session_key)
             if entry is None:
+                # PDC-L3: 首次写入前检查磁盘残留是否上一批次(跨批隔离)
+                self._rotate_stale_file(session_key)
                 if len(self._order) >= MANIFEST_MAX_SESSIONS:
                     oldest = self._order.pop(0)
                     self._sessions.pop(oldest, None)
@@ -84,10 +90,15 @@ class ManifestStore(object):
 
     # --------------------------------------------------------------- read --
     def lines(self, session_key, limit=None):
-        """只读快照（时间正序）。内存缺失时尝试从磁盘重建（重启恢复）。"""
+        """只读快照（时间正序）。内存缺失时尝试从磁盘重建（重启恢复）。
+
+        PDC-L3: 磁盘残留超批次间隔时先轮转再读——避免把上一批的索引行
+        当作当前会话的可寻址性基线（召回精度 + IFC 锚点差分同样受益）。
+        """
         with self._lock:
             entry = self._sessions.get(session_key)
             if entry is None:
+                self._rotate_stale_file(session_key)
                 entry = self._load_from_file(session_key)
                 if entry:
                     self._sessions[session_key] = entry
@@ -106,6 +117,46 @@ class ManifestStore(object):
         # 不缓存: _DIAG_DIR 可被测试重定向,缓存会造成跨目录串写(2026-08-29 实测)
         return os.path.join(self._manifest_dir(),
                             sanitize_session_key(session_key) + ".jsonl")
+
+    def _rotate_stale_file(self, session_key):
+        """PDC-L3: 磁盘 manifest 与当前时间间隔超 SESSION_GAP_SECONDS →
+        视为上一批次, 轮转 .prev 后由调用方从空重建。fail-open。
+
+        判据: 文件最后一行的 ts(写入时戳)。批跑断点续跑/同日重跑共用会话键,
+        旧行若混入新批 FTS 会以旧任务内容稀释召回精度。
+        """
+        try:
+            path = self._path(session_key)
+            with open(path, "r", encoding="utf-8") as f:
+                last_ts = None
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        last_ts = json.loads(raw).get("ts")
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+            if not last_ts:
+                return
+            from datetime import datetime as _dt
+            age = _dt.now() - _dt.fromisoformat(last_ts)
+            if age.total_seconds() > SESSION_GAP_SECONDS:
+                archived = path + ".prev"
+                try:
+                    os.replace(path, archived)
+                except OSError:
+                    return
+                # FTS 索引同源失效——一并轮转, 下次查询按空索引重建
+                try:
+                    import ctx_recall as _cr  # 延迟导入防循环
+                    idx = _cr._db_path(session_key)
+                    if os.path.exists(idx):
+                        os.replace(idx, idx + ".prev")
+                except Exception:
+                    pass  # 索引轮转失败不阻塞——行数校验会触发重建
+        except (OSError, ValueError):
+            pass
 
     def _persist_locked(self, session_key, new_lines):
         """增量落盘（调用方持锁）。OSError 静默——manifest 故障不影响请求路径。"""

@@ -1078,6 +1078,10 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         # understand what was lost without needing to re-read files.
         # The text is still kept stable across requests sharing the same
         # truncation boundary (prefix cache compatible).
+        # PDC-L1(2026-08-31): 摘要附带 ctx_recall 召回指引——欠拉修复。
+        # 批跑日志分析(2026-08-31): 模型可见面无任何"信息曾丢失"信号导致
+        # ctx_recall 零调用; DEF-107 占位符是现成的失忆感知通道, 只差
+        # 指引句。指引为静态文本, 不破坏 prefix-cache 稳定性约束。
         drop_ratio = dropped_count / n if n > 0 else 0
         if drop_ratio > 0.7 and (tool_count > 0 or file_mentions):
             parts = ["[Context folded: earlier messages omitted."]
@@ -1085,10 +1089,13 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
                 parts.append(f" {tool_count} tool calls were removed")
             if file_mentions:
                 parts.append(f" referenced files: {', '.join(sorted(file_mentions)[:8])}")
-            parts.append("]")
+            parts.append(". Use ctx_recall tool with the file path or keyword "
+                         "to recover folded content instead of re-reading files]")
             compressed_text = "".join(parts)
         else:
-            compressed_text = "[Context folded: earlier messages omitted.]"
+            compressed_text = ("[Context folded: earlier messages omitted. "
+                               "Use ctx_recall tool to recover folded content "
+                               "instead of re-reading files.]")
 
         if tail and tail[0].get("role") == "user":
             tail_content = tail[0].get("content", [])

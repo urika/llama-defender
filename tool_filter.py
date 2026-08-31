@@ -196,9 +196,12 @@ def _translate_tool_result_errors(messages):
                 continue
             bc = str(block.get("content", ""))
             if "Wasted call" in bc:
+                # PDC-L2(2026-08-31): 提示改指向 ctx_recall——原"用 Bash cat
+                # 代替"把模型推向环境重读; 该文件此前读过, 内容在折叠区可召回。
                 block["content"] = (
                     "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"
-                    "如果需要查看文件内容，用 Bash cat 命令代替。]"
+                    "先用 ctx_recall 工具查询（query=文件路径或关键词）取回此前内容；"
+                    "ctx_recall 无结果再用 Bash cat 命令代替。]"
                 )
                 error_count["wasted"] += 1
             elif "File does not exist" in bc or "No such file" in bc:
