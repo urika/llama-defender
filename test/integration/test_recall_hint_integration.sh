@@ -46,7 +46,11 @@ cleanup() {
   rm -f "$REPO_ROOT/logs/diag/manifest/$SID.jsonl" \
         "$REPO_ROOT/logs/diag/index/$SID.db" \
         "$REPO_ROOT/logs/diag/archive/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/ledger/$SID.jsonl"
+        "$REPO_ROOT/logs/diag/ledger/$SID.jsonl" \
+        "$REPO_ROOT/logs/diag/manifest/$SID2.jsonl" \
+        "$REPO_ROOT/logs/diag/index/$SID2.db" \
+        "$REPO_ROOT/logs/diag/archive/$SID2.jsonl" \
+        "$REPO_ROOT/logs/diag/ledger/$SID2.jsonl"
   python3 - "$REPO_ROOT/logs/diag/sessions.jsonl" "$SID" <<'PYEOF'
 import sys
 path, sid = sys.argv[1], sys.argv[2]
@@ -183,6 +187,88 @@ text = json.dumps(body.get("messages", []), ensure_ascii=False)
 sys.exit(0 if "Wasted call: file unchanged" not in text else 1)
 PYEOF
 if [[ $? -eq 0 ]]; then pass "L2: 原始 Wasted call 字样已被改写(非透传)"; else fail "L2: Wasted call 原样透传"; fi
+
+# ============================================================
+# 场景 3 (状态注入 + 已知答案检索): 预植 manifest/archive →
+# 注入 ctx_recall 调用(路径 A 改写) → 断言后端收到植入的已知内容。
+# 独立会话键 itestplant: 代理内存无该会话 → 走磁盘加载(预植生效路径)。
+# ============================================================
+info "场景 3: 构造报文注入——预植记忆 + 已知答案检索"
+SID2="itestp3"
+MARKER="PLANT-KNOWN-CONTENT-9137"
+
+python3 - "$REPO_ROOT" "$SID2" "$MARKER" <<'PYEOF'
+import json, os, sys
+from datetime import datetime
+repo, sid, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+now = datetime.now().isoformat(timespec="seconds")
+diag = os.path.join(repo, "logs", "diag")
+# 预植 manifest: 一条 fifo_drop 索引行(anchor 可寻址, head 含查询词)
+man_dir = os.path.join(diag, "manifest"); os.makedirs(man_dir, exist_ok=True)
+with open(os.path.join(man_dir, sid + ".jsonl"), "w", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "turn": 3, "reason": "fifo_drop", "anchor": "r:tp1",
+        "kind": "tool_result", "role": "user", "tool": "", "handle": None,
+        "size_chars": 4200, "head": marker + " head excerpt for FTS",
+        "ts": now}, ensure_ascii=False) + "\n")
+# 预植 archive: payload 内嵌 tool_result(recover_full_content 按 tool_use_id 匹配)
+arc_dir = os.path.join(diag, "archive"); os.makedirs(arc_dir, exist_ok=True)
+payload = json.dumps({"messages": [{"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "tp1",
+     "content": [{"type": "text",
+                  "text": marker + " full body zebra quantum unique"}]}]}]},
+    ensure_ascii=False)
+with open(os.path.join(arc_dir, sid + ".jsonl"), "w", encoding="utf-8") as f:
+    f.write(json.dumps({"turn": 3, "ts": now, "payload": payload},
+                       ensure_ascii=False) + "\n")
+print("planted")
+PYEOF
+
+: > "$CAPTURE_PATH"
+REQ3=$(python3 -c "
+import json
+msgs = [
+    {'role': 'user', 'content': 'earlier context question'},
+    {'role': 'assistant', 'content': [
+        {'type': 'tool_use', 'id': 'tc1', 'name': 'ctx_recall',
+         'input': {'query': 'PLANT'}}]},
+    {'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 'tc1',
+         'content': [{'type': 'text',
+                      'text': \"Error: unknown tool 'ctx_recall'\"}]}]},
+    {'role': 'user', 'content': 'continue with recalled info'},
+]
+print(json.dumps({'model': 'claude-3-5-sonnet-20241022', 'max_tokens': 32,
+                  'stream': False, 'messages': msgs}))
+")
+# 注意 header 换成注入会话键
+curl -sf --max-time 30 -X POST "http://127.0.0.1:$PROXY_PORT/v1/messages" \
+  -H "Content-Type: application/json" -H "x-api-key: test" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-claude-code-session-id: $SID2" \
+  -d "$REQ3" > /dev/null 2>>"$PROXY_LOG" || fail "场景3: 请求失败"
+
+python3 - "$CAPTURE_PATH" "$MARKER" <<'PYEOF'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").readlines()
+assert lines, "capture 为空"
+body = json.loads(lines[-1])["body"]
+text = json.dumps(body.get("messages", []), ensure_ascii=False)
+assert "Error: unknown tool" not in text, "error result 未被改写(路径 A 未触发)"
+assert sys.argv[2] in text, f"已知答案 {sys.argv[2]} 未到达后端(检索/恢复链断)"
+sys.exit(0)
+PYEOF
+if [[ $? -eq 0 ]]; then pass "注入状态→代理检索→已知内容到达后端(检索正确性端到端)"; else fail "已知答案检索失败(植入/检索/改写链断)"; fi
+
+# 恢复全文也应在改写结果中(recover_full_content 链)
+python3 - "$CAPTURE_PATH" "$MARKER" <<'PYEOF'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").readlines()
+body = json.loads(lines[-1])["body"]
+text = json.dumps(body.get("messages", []), ensure_ascii=False)
+sys.exit(0 if ("zebra quantum" in text and "fifo_drop" in text) else 1)
+PYEOF
+if [[ $? -eq 0 ]]; then pass "archive 全文恢复 + 索引行元数据一同到达后端"; else fail "全文恢复链断"; fi
 
 echo ""
 if (( FAIL == 0 )); then
