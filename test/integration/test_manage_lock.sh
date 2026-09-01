@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 cd "$REPO_ROOT"
 
 MANAGE="./manage.sh"

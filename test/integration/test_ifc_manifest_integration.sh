@@ -24,6 +24,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 LOG_DIR="$REPO_ROOT/logs/itest_ifc"
 MOCK_PORT="${MOCK_PORT:-8091}"
 PROXY_PORT="${PROXY_PORT:-4003}"
@@ -49,6 +50,7 @@ PROXY_PID=""; MOCK_PID=""
 
 cleanup() {
   set +e
+  diag_cleanup "$REPO_ROOT" "itestifc"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.3
@@ -56,23 +58,6 @@ cleanup() {
   [[ -n "$MOCK_PID"  ]] && kill -9 "$MOCK_PID"  2>/dev/null
   # ITEST_KEEP=1: 保留 diag 产物供调试(常规运行务必清理——防污染效度数据集)
   [[ -n "${ITEST_KEEP:-}" ]] && { warn "ITEST_KEEP=1: 跳过 diag 清理"; return; }
-  # diag 足迹清理: 本测试会话键的四处落点 + sessions.jsonl 行过滤
-  rm -f "$REPO_ROOT/logs/diag/manifest/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/index/$SID.db" \
-        "$REPO_ROOT/logs/diag/archive/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/ledger/$SID.jsonl"
-  python3 - "$REPO_ROOT/logs/diag/sessions.jsonl" "$SID" <<'PYEOF'
-import sys
-path, sid = sys.argv[1], sys.argv[2]
-try:
-    lines = open(path, encoding="utf-8").readlines()
-except OSError:
-    sys.exit(0)
-kept = [l for l in lines if sid not in l[:400]]
-if len(kept) != len(lines):
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(kept)
-PYEOF
 }
 trap cleanup EXIT
 

@@ -7,12 +7,16 @@ through the stages — their own unit tests already cover edge cases.
 """
 import io
 import json
+import os
+import sys
 import threading
 import unittest
 import urllib.error
 from unittest.mock import patch, MagicMock
 
 import proxy_state as _ps
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from test.lib import state_fixture
 from pipeline import (
     PipelineContext,
     _parse_quota_reset_epoch,
@@ -1309,12 +1313,15 @@ class TestBackendDispatcher(unittest.TestCase):
 
 class TestPipelineIntegration(unittest.TestCase):
     def setUp(self):
+        self._diag_fix = state_fixture.isolated_diag(cleanup=True)
+        self._diag_fix.__enter__()
         _ps._LOOP_SESSION_STATE.clear()
         _ps._SESSION_REQUEST_COUNT.clear()
         _ps._SESSION_LAST_MESSAGES.clear()
         _ps._log_ctx.session_id = "itest_sess"
 
     def tearDown(self):
+        self._diag_fix.__exit__(None, None, None)
         _ps._LOOP_SESSION_STATE.clear()
         _ps._SESSION_REQUEST_COUNT.clear()
         _ps._SESSION_LAST_MESSAGES.clear()

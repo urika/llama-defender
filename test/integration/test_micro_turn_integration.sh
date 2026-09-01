@@ -20,6 +20,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 LOG_DIR="$REPO_ROOT/logs/itest_micro"
 MOCK_PORT="${MOCK_PORT:-8093}"
 PROXY_PORT="${PROXY_PORT:-4005}"
@@ -47,27 +48,12 @@ count_matches() { local pat=$1 f=$2; local n; n=$(grep -c -- "$pat" "$f" 2>/dev/
 
 cleanup() {
   set +e
+  diag_cleanup "$REPO_ROOT" "itestmic"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.3
   [[ -n "$PROXY_PID" ]] && kill -9 "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill -9 "$MOCK_PID"  2>/dev/null
-  rm -f "$REPO_ROOT/logs/diag/manifest/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/index/$SID.db" \
-        "$REPO_ROOT/logs/diag/archive/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/ledger/$SID.jsonl"
-  python3 - "$REPO_ROOT/logs/diag/sessions.jsonl" "$SID" <<'PYEOF'
-import sys
-path, sid = sys.argv[1], sys.argv[2]
-try:
-    lines = open(path, encoding="utf-8").readlines()
-except OSError:
-    sys.exit(0)
-kept = [l for l in lines if sid not in l[:400]]
-if len(kept) != len(lines):
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(kept)
-PYEOF
 }
 trap cleanup EXIT
 

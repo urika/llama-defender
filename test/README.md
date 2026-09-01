@@ -4,6 +4,27 @@ This directory holds all automated tests for the project. Every commit to `main`
 the **unit** tier (enforced by a pre-commit hook); the **integration** and **e2e** tiers
 are run manually before merging feature branches.
 
+## 状态矩阵（存储是系统状态的一等维度，2026-09-01）
+
+被测系统的状态不止报文与配置——`logs/diag/` 下的存储同样是系统状态，测试设计中必须显式对待：
+
+| 状态类别 | 存储 | 隔离手段 | 测试纪律 |
+|---|---|---|---|
+| 会话键控存储 | `manifest/index/archive/ledger/<sid>.*` | 按会话键天然隔离；**键 ≤8 字符**（R14 截断契约） | 用 `test/lib/state_fixture.py` 的 `new_sid()`（唯一+截断安全）或已知 sids；集成结束必须清理 |
+| 全局追加流 | `sessions.jsonl`、`hbe.jsonl`、`experiments.jsonl` | 不可隔离，只能行过滤 | 集成测试经 `test/lib/diag_cleanup.sh` 过滤自身行；单测经 `isolated_diag()` 重定向 |
+| 派生缓存 | `index/<sid>.db`（FTS） | 随 manifest 源失效 | 轮转/植入后须验证一致性（L3 先例） |
+| 进程内存态 | MANIFEST/LEDGER 内存表、频次计数、信号量 | 随进程 | 需要时以"新会话键"语义测试（内存命中 vs 磁盘加载两条路径） |
+
+**共享工具**（禁止再手写隔离/清理逻辑）：
+- `test/lib/state_fixture.py` — `isolated_diag()` / `new_sid()` / `plant_session()`（已知答案植入）/ `scrub_sessions()`
+- `test/lib/diag_cleanup.sh` — 集成脚本 trap 用的统一清理（收 SID 列表；`ITEST_KEEP=1` 调试保留）
+- `test/lib/state_sentinel.sh` — 元测试：集成套件末尾断言 itest 会话状态零残留
+
+**层级纪律**：
+- **unit**：零生产状态写入（全部经 `isolated_diag()` 或显式 tmp 路径）
+- **integration**：只允许 itest 前缀会话键；退出时 `diag_cleanup` 必须执行；套件末尾过 state sentinel
+- **promptfoo / e2e**：生产观测层——打真实代理、读写生产状态。**实验批跑窗口禁跑**（pre-commit 自动跳过逻辑见 `.githooks/pre-commit`）
+
 ## Layout
 
 ```

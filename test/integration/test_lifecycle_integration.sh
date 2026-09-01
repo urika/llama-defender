@@ -7,6 +7,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 LOG_DIR="$REPO_ROOT/logs/itest_lifecycle"
 LIFECYCLE_EVENTS_PATH="$LOG_DIR/lifecycle_events.jsonl"
 
@@ -24,6 +25,7 @@ info() { echo -e "${CYAN}→${NC} $1"; }
 
 cleanup() {
   set +e
+  diag_cleanup "$REPO_ROOT" "itest-li"
   # Restore original active profile so the test is non-destructive
   if [[ -n "$CURRENT" ]] && [[ -f "$REPO_ROOT/configs/$CURRENT.conf" ]]; then
     ln -sf "$CURRENT.conf" "$REPO_ROOT/configs/active.conf" 2>/dev/null || true

@@ -65,6 +65,8 @@ run_unit() {
 # ------------------------------------------------------------
 run_integration() {
   print_banner "Integration tests (test/integration/)"
+  source "$SCRIPT_DIR/lib/state_sentinel.sh"
+  state_sentinel_begin
   # Make sure no stale process holds the integration ports.
   for port in 8089 8090 8091 8092 4001 4002 4003 4004; do
     if lsof -ti :"$port" >/dev/null 2>&1; then
@@ -269,6 +271,13 @@ run_integration() {
     else
       record "integration" "fail" "lifecycle: $lc_f of ${lc_p:-?} cases failed"
     fi
+  fi
+
+  # 状态泄漏哨兵(元测试): itest 会话状态残留 = 清理 trap 失效
+  if ! state_sentinel_end; then
+    record "integration" "fail" "state sentinel: itest 会话状态残留(泄漏)"
+  else
+    record "integration" "ok" "state sentinel: no itest leftovers"
   fi
 }
 

@@ -18,6 +18,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 LOG_DIR="$REPO_ROOT/logs/itest_hint"
 MOCK_PORT="${MOCK_PORT:-8094}"
 PROXY_PORT="${PROXY_PORT:-4006}"
@@ -38,31 +39,12 @@ info() { echo -e "${CYAN}→${NC} $1"; }
 PROXY_PID=""; MOCK_PID=""
 cleanup() {
   set +e
+  diag_cleanup "$REPO_ROOT" "itesthin" "itestp3"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.3
   [[ -n "$PROXY_PID" ]] && kill -9 "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill -9 "$MOCK_PID"  2>/dev/null
-  rm -f "$REPO_ROOT/logs/diag/manifest/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/index/$SID.db" \
-        "$REPO_ROOT/logs/diag/archive/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/ledger/$SID.jsonl" \
-        "$REPO_ROOT/logs/diag/manifest/$SID2.jsonl" \
-        "$REPO_ROOT/logs/diag/index/$SID2.db" \
-        "$REPO_ROOT/logs/diag/archive/$SID2.jsonl" \
-        "$REPO_ROOT/logs/diag/ledger/$SID2.jsonl"
-  python3 - "$REPO_ROOT/logs/diag/sessions.jsonl" "$SID" <<'PYEOF'
-import sys
-path, sid = sys.argv[1], sys.argv[2]
-try:
-    lines = open(path, encoding="utf-8").readlines()
-except OSError:
-    sys.exit(0)
-kept = [l for l in lines if sid not in l[:400]]
-if len(kept) != len(lines):
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(kept)
-PYEOF
 }
 trap cleanup EXIT
 

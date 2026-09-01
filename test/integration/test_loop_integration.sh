@@ -17,6 +17,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$REPO_ROOT/test/lib/diag_cleanup.sh"
 LOG_DIR="$REPO_ROOT/logs/itest_loop"
 MOCK_PORT="${MOCK_PORT:-8090}"
 PROXY_PORT="${PROXY_PORT:-4002}"
@@ -46,6 +47,7 @@ SESSION_ID="loop-test-$(date +%s)"
 
 cleanup() {
   set +e
+  diag_cleanup "$REPO_ROOT" "loop-tes" "persist-"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.2
