@@ -77,7 +77,7 @@ def main():
     print(f"  MICRO_TURN 重派触发: {mt}")
 
     # ---- 检查点 C: 任务级对比骨架(数据齐后展开) ----
-    print(f"\n[检查点C] 结局对比: 待治疗臂 10 任务完成后出对照表(对照=runs.jsonl v2 窗口)")
+    print(f"\n[检查点C] 结局对比: python3 tools/ab_compare.py (四维对照表, 样本齐后出结论)")
 
     # ---- 判读提示 ----
     print("\n[判读]")
