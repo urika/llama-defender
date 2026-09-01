@@ -29,6 +29,27 @@ if _REPO_ROOT not in sys.path:
 
 import anthropic_proxy as proxy
 import proxy_state
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from test.lib.config_fixture import ConfigRestoreSentinel
+
+# 模块级配置哨兵: 本文件的 reload 测试会以真实 conf 改写全局属性,
+# 统一在模块退出时恢复(替代逐类手写属性清单——清单跟不上 reload 实际写入面)
+_cfg_sentinel = None
+
+
+def setUpModule():
+    global _cfg_sentinel
+    _cfg_sentinel = ConfigRestoreSentinel().capture()
+
+
+def tearDownModule():
+    global _cfg_sentinel
+    if _cfg_sentinel is not None:
+        for attr, (old, _cur) in _cfg_sentinel.verify().items():
+            setattr(proxy_state, attr, old)
+            if hasattr(proxy, attr):
+                setattr(proxy, attr, old)
+        _cfg_sentinel = None
 
 
 def _write_conf(path, lines):

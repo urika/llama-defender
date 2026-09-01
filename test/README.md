@@ -19,6 +19,8 @@ are run manually before merging feature branches.
 - `test/lib/state_fixture.py` — `isolated_diag()` / `new_sid()` / `plant_session()`（已知答案植入）/ `scrub_sessions()`
 - `test/lib/diag_cleanup.sh` — 集成脚本 trap 用的统一清理（收 SID 列表；`ITEST_KEEP=1` 调试保留）
 - `test/lib/state_sentinel.sh` — 元测试：集成套件末尾断言 itest 会话状态零残留
+- `test/lib/config_fixture.py` — `patch_config()`（配置改写+精确恢复）/ `ConfigRestoreSentinel`
+- `test/lib/config_sentinel.py` — 元测试：单元套件进程内断言 proxy_state 配置零漂移（**改写全局属性必须经 `patch_config()` 或模块级哨兵恢复**；test_proxy_reload.py 为先例）
 
 **层级纪律**：
 - **unit**：零生产状态写入（全部经 `isolated_diag()` 或显式 tmp 路径）

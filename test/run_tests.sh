@@ -48,15 +48,15 @@ run_unit() {
   print_banner "Unit tests (test/unit/)"
   local log="$REPO_ROOT/logs/unit_test.log"
   mkdir -p "$REPO_ROOT/logs"
-  if python3 -m unittest discover \
-        -s "$SCRIPT_DIR/unit" \
-        -p 'test_*.py' \
-        -v 2>&1 | tee "$log" | tail -5; then
+  # 配置恢复哨兵: 进程内包装 discover——套件结束断言 proxy_state 属性
+  # 相对导入基线零漂移(跨测试配置泄漏 = 某测试改全局属性未恢复)
+  if python3 "$SCRIPT_DIR/lib/config_sentinel.py" "$SCRIPT_DIR/unit" \
+        2>&1 | tee "$log" | tail -5; then
     local n
     n=$(grep -c "^test_" "$log" 2>/dev/null || echo "?")
-    record "unit" "ok" "$n tests passed"
+    record "unit" "ok" "$n tests passed (config sentinel ✓)"
   else
-    record "unit" "fail" "see logs/unit_test.log"
+    record "unit" "fail" "see logs/unit_test.log (含配置漂移检查)"
   fi
 }
 
