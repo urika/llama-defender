@@ -618,7 +618,7 @@ def rewrite_ctx_recall_results(messages, session_key):
             return messages  # 无 ctx_recall 调用, 快速返回
 
         # 扫描 tool_result 并改写
-        from ctx_recall import lookup, format_recall_result
+        from ctx_recall import lookup, format_recall_result, parse_query_offset
         changed = False
         for msg in messages:
             if not isinstance(msg, dict) or msg.get("role") != "user":
@@ -657,10 +657,12 @@ def rewrite_ctx_recall_results(messages, session_key):
                 if not query:
                     continue
 
-                # 调用真实检索
-                results = lookup(session_key, query, kind=kind, limit=limit)
+                # 调用真实检索(分页续读: query "r:x@4000" → base+offset)
+                base_q, paged_off = parse_query_offset(query)
+                results = lookup(session_key, base_q, kind=kind, limit=limit)
                 real_text = format_recall_result(results, query,
-                                                 session_key=session_key)
+                                                 session_key=session_key,
+                                                 offset=paged_off)
 
                 # 改写 tool_result
                 if isinstance(block.get("content"), list):

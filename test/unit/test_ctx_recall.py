@@ -7,6 +7,7 @@ import threading
 import unittest
 
 import proxy_state as _ps
+from test.lib import state_fixture as sf
 
 import ctx_recall as cr
 import memory_stores as ms
@@ -422,6 +423,73 @@ class TestSemanticHints(unittest.TestCase):
         r = cr.format_recall_result(lines, "q", "s-c2")
         self.assertIn("仅显示", r)
         self.assertIn("/8 条", r)
+
+
+
+
+class TestPagedDisclosure(unittest.TestCase):
+    """分页续读协议(借鉴 skill 协议按任务粒度披露, 2026-09-01)。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="pg_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+        self.body = ("class List:" + chr(10)
+                     + chr(10).join(f"    def method_{i}(self): pass"
+                                    for i in range(1200)))
+        sf.plant_archive_tool_result("pg-t", turn=42, tool_use_id="call_big",
+                                     content=self.body, diag_dir=self._diag)
+        ms.MANIFEST.record_units("pg-t", 42, "fifo_drop",
+            [{"anchor": "r:call_big", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": len(self.body),
+              "head": self.body[:240]}])
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_first_page_carries_continuation(self):
+        lines = cr.lookup("pg-t", "r:call_big", limit=3)
+        r = cr.format_recall_result(lines, "r:call_big", "pg-t")
+        self.assertIn("第0-4000/37301 chars", r)
+        self.assertIn('r:call_big@4000', r)  # 续读指令
+
+    def test_offset_page_serves_next_window(self):
+        lines = cr.lookup("pg-t", "r:call_big@4000", limit=3)
+        r = cr.format_recall_result(lines, "r:call_big@4000", "pg-t",
+                                    offset=4000)
+        self.assertIn("第4000-8000/", r)
+        self.assertIn("r:call_big@8000", r)
+
+    def test_pages_are_seamless(self):
+        full = cr.recover_full_content("pg-t", "r:call_big", 42,
+                                       max_chars=None)
+        p0 = cr.format_recall_result(
+            cr.lookup("pg-t", "r:call_big"), "q", "pg-t")
+        p1 = cr.format_recall_result(
+            cr.lookup("pg-t", "r:call_big@4000"), "q", "pg-t", offset=4000)
+        self.assertIn(full[100:200], p0)
+        self.assertIn(full[4100:4200], p1)
+
+    def test_small_unit_still_full_recovery(self):
+        """≤ 页大小的单元保持旧行为(单块全文, 无分页噪音)。"""
+        sf.plant_archive_tool_result("pg-t", turn=1, tool_use_id="c_small",
+                                     content="tiny content", diag_dir=self._diag)
+        ms.MANIFEST.record_units("pg-t", 1, "fifo_drop",
+            [{"anchor": "r:c_small", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 12,
+              "head": "tiny content"}])
+        lines = cr.lookup("pg-t", "r:c_small", limit=3)
+        r = cr.format_recall_result(lines, "r:c_small", "pg-t")
+        self.assertIn("[恢复内容 (12 chars)]", r)
+        self.assertNotIn("续读", r)
+
+    def test_parse_query_offset(self):
+        self.assertEqual(cr.parse_query_offset("r:x@4000"), ("r:x", 4000))
+        self.assertEqual(cr.parse_query_offset("lists/model.py"), ("lists/model.py", 0))
+        self.assertEqual(cr.parse_query_offset("r:x@abc"), ("r:x@abc", 0))
 
 
 if __name__ == "__main__":

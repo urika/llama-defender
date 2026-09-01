@@ -37,7 +37,7 @@ TOOL_SCHEMA = {
         "类单元附带完整原文。会话约定：被折叠的内容一直保留在本会话存储中，"
         "随时可查——当你发现自己缺少早前工作过的信息（改过哪些文件、当时的结论、"
         "读过的内容）时先查这里，不要直接重读文件；若折叠提示中给出了锚点"
-        "（如 r:call_xxx），直接把锚点作为 query 可精确取回。"
+        "（如 r:call_xxx），直接把锚点作为 query 可精确取回；大文件原文分页披露——续读用 锚点@偏移（如 r:call_x@4000）。"
     ),
     "input_schema": {
         "type": "object",
@@ -65,9 +65,13 @@ _FTS_BUILD_LOCK = threading.Lock()
 # 锚点直查模式: "r:tool_use_id" / "u:tool_use_id"(tool description 承诺语义)
 import re as _re
 _ANCHOR_RE = _re.compile(r'^[ru]:[A-Za-z0-9_\-]+$')
+# 分页续读(借鉴 skill 协议按任务粒度披露): "r:xxx@4000" = 从 4000 字节续读
+_ANCHOR_OFFSET_RE = _re.compile(r'^([ru]:[A-Za-z0-9_\-]+)@(\d{1,9})$')
 # PDC §5 护栏: 单次 pull 结果总体积上限(路径 A 改写此前无上限,
 # limit=8 × 恢复 4K/条 最高可回填 ~32K chars; 微轮路径本有 2000 截断)
 RESULT_TOTAL_MAX_CHARS = 4000
+# 分页恢复页大小(借鉴 skill 按任务粒度披露; 单页内语义尽量完整)
+RECOVERY_PAGE_CHARS = 4000
 
 
 # ============================================================================
@@ -159,6 +163,21 @@ def _query_tokens(query, max_tokens=8):
     return toks
 
 
+
+def parse_query_offset(query):
+    """解析 "r:xxx@4000" 分页语法 → (base_query, offset)。
+
+    借鉴 skill 协议按任务粒度披露: 大单元不再 4000 字节硬截断(语义
+    中间砍断且截掉部分永久丢失), 而是分页续读——截断提示给出下一页
+    的精确 query。非分页语法返回 (原查询, 0)。
+    """
+    q = (query or "").strip()
+    m = _ANCHOR_OFFSET_RE.match(q)
+    if m:
+        return m.group(1), int(m.group(2))
+    return q, 0
+
+
 def fts_search(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     """L2 FTS5 trigram 全文检索；<3 字符或索引异常 → L1 降级。
 
@@ -178,7 +197,9 @@ def fts_search(session_key, query, kind=None, limit=DEFAULT_LIMIT):
         return []
     # 锚点直查(tool description 承诺"锚点可精确取回"; 2026-09-01 review
     # 发现为虚假承诺——FTS 只索引 text 列不含 anchor, 此前必然 miss)
-    if _ANCHOR_RE.match(q):
+    # 含分页: "r:xxx@4000" → base "r:xxx"(offset 由 format 层消费)
+    if _ANCHOR_RE.match(q) or _ANCHOR_OFFSET_RE.match(q):
+        q = _ANCHOR_OFFSET_RE.match(q).group(1) if _ANCHOR_OFFSET_RE.match(q) else q
         kind_map = {"r": "tool_result", "u": "tool_use"}
         want_kind = kind or kind_map.get(q[0])
         for line in memory_stores.MANIFEST.lines(session_key):
@@ -283,12 +304,13 @@ def lookup(session_key, query, kind=None, limit=DEFAULT_LIMIT):
 # Archive 全文恢复(MVP 增强): manifest 索引行 → archive 完整 tool_result
 # ============================================================================
 
-def recover_full_content(session_key, anchor, turn, max_chars=4000):
-    """从 manifest 索引行恢复完整被丢弃的内容。
+def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
+    """从 manifest 索引行恢复完整被丢弃的内容(支持分页续读)。
 
     数据流: manifest(地址: anchor+turn) → archive(内容: payload) → 完整 tool_result。
     anchor "r:t1" → tool_use_id "t1"; "u:t1" → 搜索 tool_use 块的 input(不适合恢复全文)。
     回退链尾部: orig/<sid>.jsonl(压缩时寄存的原文)——压缩标记 key=r:x 的兑现。
+    offset>0 时返回原文的 [offset : offset+max_chars] 窗口(分页续读协议)。
     返回 str 或 None(未找到/archive 不存在)。
     """
     if not session_key or not anchor:
@@ -335,18 +357,25 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000):
                             else:
                                 text = ""
                             if text:
-                                return text[:max_chars]
+                                window = (text[offset:offset + max_chars]
+                                          if max_chars else text[offset:])
+                                return window or None
     except (FileNotFoundError, OSError):
         pass
     # 回退链尾部: 压缩时寄存的原文(标记 key=r:x 的兑现)
     try:
         import memory_stores
-        return memory_stores.read_orig_content(session_key, anchor)
+        full = memory_stores.read_orig_content(session_key, anchor)
+        if full:
+            window = (full[offset:offset + max_chars]
+                      if max_chars else full[offset:])
+            return window or None
     except Exception:
         return None
+    return None
 
 
-def format_recall_result(lines, query, session_key=None):
+def format_recall_result(lines, query, session_key=None, offset=0):
     """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。"""
     if not lines:
         # S1(2026-09-01): 空结果附存储概况——模型需要区分"换词重查有意义"
@@ -401,11 +430,25 @@ def format_recall_result(lines, query, session_key=None):
             l.get("reason"), l.get("size_chars"), l.get("anchor"))
 
         # Archive 全文恢复: tool_result 单元尝试恢复完整内容
+        # 分页披露(借鉴 skill 协议): 单条 >RECOVERY_PAGE_CHARS 时按页给,
+        # 页尾附续读指令(锚点@下一offset), 不再从语义中间永久砍断
         if session_key and l.get("kind") == "tool_result":
-            full = recover_full_content(
-                session_key, l.get("anchor"), l.get("turn"))
+            anchor = l.get("anchor") or ""
+            page = RECOVERY_PAGE_CHARS
+            full = recover_full_content(session_key, anchor, l.get("turn"),
+                                        max_chars=None)
             if full:
-                basic += "\n  [恢复内容 (%d chars)]:\n%s" % (len(full), full)
+                total = len(full)
+                use_offset = offset if len(lines) == 1 else 0
+                chunk = full[use_offset:use_offset + page] or full[:page]
+                end = use_offset + len(chunk)
+                if total <= page and use_offset == 0:
+                    basic += "\n  [恢复内容 (%d chars)]:\n%s" % (total, full)
+                else:
+                    cont = ("" if end >= total else
+                            f"; 续读: query=\"{anchor}@{end}\"")
+                    basic += (f"\n  [恢复内容 第{end - len(chunk)}-{end}/"
+                              f"{total} chars{cont}]:\n{chunk}")
             elif l.get("head"):
                 basic += "\n  [摘录]: %s" % l["head"]
 
@@ -463,7 +506,7 @@ def build_follow_up_messages(session_key, tool_calls):
         args = json.loads(tc["function"]["arguments"])
         query = str(args.get("query", "")).strip()
         if not query:
-            result = "ctx_recall: 缺少 query 参数。用法: {\"query\": \"文件路径/工具名/关键词\", \"kind\": \"tool_use|tool_result|text\", \"limit\": 8}"
+            result = "ctx_recall: 缺少 query 参数。用法: {\"query\": \"文件路径/工具名/关键词/锚点(可加@偏移分页)\", \"kind\": \"tool_use|tool_result|text\", \"limit\": 8}"
         else:
             try:
                 kind = args.get("kind") or None
@@ -473,8 +516,10 @@ def build_follow_up_messages(session_key, tool_calls):
                     limit = max(1, min(int(args.get("limit") or 8), 20))
                 except (TypeError, ValueError):
                     limit = 8
-                lines = lookup(session_key, query, kind=kind, limit=limit)
-                result = format_recall_result(lines, query, session_key)
+                base_q, paged_off = parse_query_offset(query)
+                lines = lookup(session_key, base_q, kind=kind, limit=limit)
+                result = format_recall_result(lines, base_q, session_key,
+                                              offset=paged_off)
             except Exception as e:  # 检索失败 → 结果性错误文本(非 fail-open:
                 # 模型需要知道拉取失败, 与路径 A 的 error result 语义一致)
                 result = "ctx_recall: 检索失败(%s)。" % e

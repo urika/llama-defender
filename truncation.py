@@ -147,8 +147,15 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
                     try:
                         import memory_stores
                         rec_key = "r:" + tool_use_id
+                        # 原文干净文本提取(block content 可能是 list 结构)
+                        if isinstance(block["content"], list):
+                            orig_text = "\n".join(
+                                b.get("text", "") for b in block["content"]
+                                if isinstance(b, dict))
+                        else:
+                            orig_text = str(block["content"])
                         memory_stores.record_orig_content(
-                            session_id, rec_key, result["original"])
+                            session_id, rec_key, orig_text)
                         turn = _ps._SESSION_REQUEST_COUNT.get(session_id, 0) or 0
                         memory_stores.MANIFEST.record_units(
                             session_id, turn, "compressed",

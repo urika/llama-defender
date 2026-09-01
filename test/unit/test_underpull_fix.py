@@ -297,9 +297,12 @@ class TestRecoverableCompression(unittest.TestCase):
             # 锚点直查(与工具描述承诺对齐)
             lines = cr.lookup(sid, "r:call_orig9", limit=5)
             self.assertTrue(lines and lines[0]["anchor"] == "r:call_orig9")
-            # 原文取回(orig 寄存回退链)
-            txt = cr.recover_full_content(sid, "r:call_orig9", 5)
-            self.assertTrue(txt and "TAILORIG9" in txt)
+            # 原文取回(orig 寄存回退链, 分页: 首页含开头, 末页含结尾)
+            txt0 = cr.recover_full_content(sid, "r:call_orig9", 5)
+            self.assertTrue(txt0 and "data row 0" in txt0)
+            txt_last = cr.recover_full_content(sid, "r:call_orig9", 5,
+                                               offset=12000)
+            self.assertTrue(txt_last and "TAILORIG9" in txt_last)
         finally:
             _ps.PROXY_CLEAR_ENABLED = orig_clear
             _ps.PROXY_COMPRESS_ENABLED = orig_comp
