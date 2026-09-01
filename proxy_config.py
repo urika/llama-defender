@@ -462,6 +462,14 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Minimum char length of tool_result to trigger semantic compression.",
     },
+    "PROXY_TRUNCATE_REPLAYABLE_DROP": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Skill-L4 borrowing: file-read (replayable) tool_results bypass BM25 "
+               "keep and drop to a regen pointer (source + orig registered for "
+               "ctx_recall). Guard: per-session per-path count — second drop of "
+               "the same path keeps the original (anti re-read death spiral).",
+    },
     "PROXY_COMPRESS_MODE": {
         "defaults": {"all": "semantic"},
         "type": "str", "scope": "reloadable",

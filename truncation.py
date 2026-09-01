@@ -113,6 +113,7 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
             mime_hint = None
             tool_use_id = block.get("tool_use_id", "")
             tool_name = ""
+            fp = None
             for m_idx in range(msg_idx - 1, -1, -1):
                 m = messages[m_idx]
                 if m.get("role") == "assistant":
@@ -129,6 +130,51 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
                                             mime_hint = fp.lower().split(".")[-1] if "." in fp else None
                                 break
                     break
+
+            # §3.2 可再生分档(skill-L4 借鉴, 2026-09-01): BM25 keep 之前先判
+            # 可再生——Read 结果可无损再生, 降为再生命令指针 + 原文寄存。
+            # dup 守卫(防 08-29 重读死循环): 同路径第二次丢弃 → 保留原文。
+            content_len = (sum(len(b.get("text", "")) for b in content
+                               if isinstance(b, dict))
+                           if isinstance(content, list) else len(content))
+            if (_ps.PROXY_TRUNCATE_REPLAYABLE_DROP and session_id
+                    and tool_name == "Read" and fp
+                    and content_len >= _ps.PROXY_COMPRESS_THRESHOLD):
+                fp_key = (session_id, fp)
+                prior = _ps._REPLAYABLE_DROP_COUNT.get(fp_key, 0)
+                if prior >= 1:
+                    continue  # dup 守卫: 保留原文, 不再丢弃
+                try:
+                    import memory_stores
+                    rec_key = "r:" + tool_use_id
+                    if isinstance(block["content"], list):
+                        orig_text = "\n".join(
+                            b.get("text", "") for b in block["content"]
+                            if isinstance(b, dict))
+                    else:
+                        orig_text = str(block["content"])
+                    memory_stores.record_orig_content(session_id, rec_key, orig_text)
+                    turn = _ps._SESSION_REQUEST_COUNT.get(session_id, 0) or 0
+                    memory_stores.MANIFEST.record_units(
+                        session_id, turn, "replayable_drop",
+                        [{"anchor": rec_key, "kind": "tool_result", "role": "user",
+                          "tool": "Read", "handle": {"type": "path", "value": fp},
+                          "size_chars": len(orig_text), "head": orig_text[:240]}])
+                    _ps._REPLAYABLE_DROP_COUNT[fp_key] = 1
+                    block["content"] = (
+                        f"[ctx:replayable 来源: Read {fp} | "
+                        f"key={rec_key}] 原文已折叠。重读此文件或用 "
+                        f"ctx_recall(query='{rec_key}') 取回全文。")
+                    compress_stats_list.append({
+                        "msg_idx": msg_idx, "block_idx": block_idx,
+                        "content_type": "replayable", "strategy": "replayable_drop",
+                        "audit_pass": True, "ratio": 0.05,
+                        "original_len": len(content),
+                        "compressed_len": len(block["content"]),
+                    })
+                except Exception:
+                    pass  # 寄存失败 → 保留原文(fail-open)
+                continue
 
             result = compress_tool_result(
                 content, mime_hint=mime_hint,

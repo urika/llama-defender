@@ -141,6 +141,12 @@ _SESSION_TOOL_FREQ: dict[str, dict[str, int]] = {}
 PROXY_COMPRESS_ENABLED = os.environ.get("PROXY_COMPRESS_ENABLED", _default("PROXY_COMPRESS_ENABLED", "false", "true")).lower() in ("1", "true", "yes")
 PROXY_COMPRESS_THRESHOLD = int(os.environ.get("PROXY_COMPRESS_THRESHOLD", "4096"))
 PROXY_COMPRESS_MODE = os.environ.get("PROXY_COMPRESS_MODE", "semantic")
+# §3.2 可再生分档(skill-L4 借鉴, 2026-09-01): Read 类结果绕过 BM25 keep
+# 直接降为再生命令指针; 同路径第二次丢弃自动保留原文(防重读死循环)
+PROXY_TRUNCATE_REPLAYABLE_DROP = os.environ.get(
+    "PROXY_TRUNCATE_REPLAYABLE_DROP", get_default("PROXY_TRUNCATE_REPLAYABLE_DROP")).lower() in ("1", "true", "yes")
+# 同路径丢弃计数(进程内, dup 守卫状态)
+_REPLAYABLE_DROP_COUNT = {}
 PROXY_SCRUB_ANSI = os.environ.get("PROXY_SCRUB_ANSI", "true").lower() in ("1", "true", "yes")
 PROXY_SIEVE_JSON_MAX_ITEMS = int(os.environ.get("PROXY_SIEVE_JSON_MAX_ITEMS", "10"))
 PROXY_SIEVE_JSON_MAX_STR_LEN = int(os.environ.get("PROXY_SIEVE_JSON_MAX_STR_LEN", "200"))
@@ -989,6 +995,7 @@ _RELOAD_SPEC = [
     # Semantic compression (Phase 2)
     ("PROXY_COMPRESS_ENABLED", "PROXY_COMPRESS_ENABLED", "bool", "false", "true"),
     ("PROXY_COMPRESS_THRESHOLD", "PROXY_COMPRESS_THRESHOLD", "int", "4096", "4096"),
+    ("PROXY_TRUNCATE_REPLAYABLE_DROP", "PROXY_TRUNCATE_REPLAYABLE_DROP", "bool", "false", "false"),
     ("PROXY_COMPRESS_MODE", "PROXY_COMPRESS_MODE", "str", "semantic", "semantic"),
     ("PROXY_SCRUB_ANSI", "PROXY_SCRUB_ANSI", "bool", "true", "true"),
     ("PROXY_SIEVE_JSON_MAX_ITEMS", "PROXY_SIEVE_JSON_MAX_ITEMS", "int", "10", "10"),
