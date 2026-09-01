@@ -342,7 +342,28 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000):
 def format_recall_result(lines, query, session_key=None):
     """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。"""
     if not lines:
-        return "ctx_recall: 无匹配的已折叠单元（query=%s）。该信息可能从未被丢弃，或在本会话开始前。" % query
+        # S1(2026-09-01): 空结果附存储概况——模型需要区分"换词重查有意义"
+        # 还是"存储里根本没有"; 空结果是最需要给线索的时刻(压召回 churn)。
+        hint = ""
+        if session_key:
+            try:
+                all_lines = memory_stores.MANIFEST.lines(session_key)
+                if all_lines:
+                    from collections import Counter
+                    hv = Counter()
+                    for l in all_lines:
+                        h = l.get("handle") or {}
+                        v = h.get("value") if isinstance(h, dict) else ""
+                        if v:
+                            hv[v[:60]] += 1
+                    top = ", ".join(f"{k}({n})" for k, n in hv.most_common(3))
+                    hint = (f" 当前存储共 {len(all_lines)} 条折叠单元"
+                            + (f"，高频句柄: {top}" if top else "")
+                            + "。可改用上述路径/关键词重查。")
+            except Exception:
+                pass
+        return ("ctx_recall: 无匹配的已折叠单元（query=%s）。该信息可能从未被丢弃，"
+                "或在本会话开始前。%s" % (query, hint))
     out = ["ctx_recall: 命中 %d 条已折叠上下文索引:" % len(lines)]
 
     # 收集需要补充的配对 tool_result 行(tool_use 命中时拉取对应的 result)
@@ -384,8 +405,12 @@ def format_recall_result(lines, query, session_key=None):
         out.append(basic)
     result = "\n".join(out)
     if len(result) > RESULT_TOTAL_MAX_CHARS:
+        # S2(2026-09-01): 截断带计数——模型需知道还有多少条没看到
+        total = len(out) - 1  # out[0] 是标题行
+        shown = result[:RESULT_TOTAL_MAX_CHARS].count("- turn ")
         result = (result[:RESULT_TOTAL_MAX_CHARS]
-                  + "\n…(结果过长已截断; 可用更具体的 query 或减小 limit 重查)")
+                  + f"\n…(已截断: 仅显示 {shown}/{total} 条; "
+                    "可用更具体的 query 或减小 limit 重查)")
     return result
 
 

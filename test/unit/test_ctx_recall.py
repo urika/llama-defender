@@ -372,5 +372,57 @@ class TestConcurrencyAndLatency(unittest.TestCase):
         self.assertLess(p50_ms, 100, f"2000 行 manifest 查询 p50={p50_ms:.1f}ms 超 100ms 预算")
 
 
+
+
+class TestSemanticHints(unittest.TestCase):
+    """S1/S2 语义补全(2026-09-01): 空结果线索 + 截断计数。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="qs_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_empty_result_carries_storage_overview(self):
+        """空结果附存储概况——模型可据此决定换词重查或放弃。"""
+        for i in range(3):
+            ms.MANIFEST.record_units(
+                "s-emp", i + 1, "fifo_drop",
+                [{"anchor": "r:e%d" % i, "kind": "tool_result", "role": "user",
+                  "tool": "", "handle": {"type": "path",
+                                         "value": "/src/lists/model.py"},
+                  "size_chars": 100, "head": "content"}])
+        r = cr.format_recall_result([], "nonexistent query", "s-emp")
+        self.assertIn("3 条折叠单元", r)
+        self.assertIn("lists/model.py", r)  # 高频句柄线索
+        self.assertIn("重查", r)
+
+    def test_empty_result_without_session_stays_simple(self):
+        r = cr.format_recall_result([], "q", None)
+        self.assertIn("无匹配", r)
+        self.assertNotIn("条折叠单元", r)  # 概况线索仅在有会话时附加
+
+    def test_truncation_message_carries_counts(self):
+        from test.lib import state_fixture as sf
+        for i in range(8):
+            sf.plant_archive_tool_result("s-c2", turn=1,
+                                         tool_use_id="c%d" % i,
+                                         content="R" * 5000, diag_dir=self._diag)
+            sf.plant_manifest_line("s-c2", turn=1, anchor="r:c%d" % i,
+                                   head="hit", diag_dir=self._diag)
+        lines = [{"turn": 1, "kind": "tool_result", "tool": "",
+                  "handle": None, "anchor": "r:c%d" % i,
+                  "reason": "fifo_drop", "size_chars": 5000,
+                  "head": "hit"} for i in range(8)]
+        r = cr.format_recall_result(lines, "q", "s-c2")
+        self.assertIn("仅显示", r)
+        self.assertIn("/8 条", r)
+
+
 if __name__ == "__main__":
     unittest.main()
