@@ -147,6 +147,9 @@ PROXY_TRUNCATE_REPLAYABLE_DROP = os.environ.get(
     "PROXY_TRUNCATE_REPLAYABLE_DROP", get_default("PROXY_TRUNCATE_REPLAYABLE_DROP")).lower() in ("1", "true", "yes")
 # 同路径丢弃计数(进程内, dup 守卫状态)
 _REPLAYABLE_DROP_COUNT = {}
+# §3.5 前缀破碎计数(2026-09-01): fifo/紧急截断每发生一次, 该会话前缀
+# 即整体失效(全量冷 prefill)——计数让 85-102s 冷峰在指标上可见
+_PREFIX_BREAK_COUNT = {}
 PROXY_SCRUB_ANSI = os.environ.get("PROXY_SCRUB_ANSI", "true").lower() in ("1", "true", "yes")
 PROXY_SIEVE_JSON_MAX_ITEMS = int(os.environ.get("PROXY_SIEVE_JSON_MAX_ITEMS", "10"))
 PROXY_SIEVE_JSON_MAX_STR_LEN = int(os.environ.get("PROXY_SIEVE_JSON_MAX_STR_LEN", "200"))

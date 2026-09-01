@@ -448,6 +448,14 @@ def _build_status_json():
             "feedback_injection_enabled": False,  # 合成负反馈 Phase 2 落地后接线
             "epoch_S": _ctx_engine_values()[0],
             "window_K": _ctx_engine_values()[1],
+            # §3.5 KV 可观测(2026-09-01): 前缀破碎计数(每会话 fifo/紧急截断
+            # 次数——每次破碎 = 下一次请求全量冷 prefill 85-102s)
+            "prefix_breaks_by_session": dict(
+                getattr(_ps, "_PREFIX_BREAK_COUNT", {}) or {}),
+            "prefix_breaks_total": sum(
+                (getattr(_ps, "_PREFIX_BREAK_COUNT", {}) or {}).values()),
+            "replayable_drops_enabled": bool(getattr(
+                _ps, "PROXY_TRUNCATE_REPLAYABLE_DROP", False)),
         },
     }
 

@@ -356,6 +356,7 @@ class RequestParser(PipelineStage):
     Extracts model, stream, tools, session_id, and character counts.
     Logs REQ_SUMMARY and populates initial metrics.
     """
+    # kv: safe
 
     name = "request_parser"
 
@@ -484,6 +485,7 @@ class ContextEngineStage(ConditionalStage):
     ContentCompressor(7)/ContextTruncator(14)/OOMSafetyFIFO(17) 跳过
     (should_run 联动), 前缀缓存不被回溯改写击穿(Phase 0 §12.3 结论 4)。
     """
+    # kv: append
 
     name = "context_engine"
 
@@ -556,6 +558,7 @@ class LifecycleClassifier(PipelineStage):
     Calls _classify_lifecycle_stage() from lifecycle.py, which also increments
     _SESSION_REQUEST_COUNT as a side effect (session continuation detection).
     """
+    # kv: safe
 
     name = "lifecycle_stage"
 
@@ -591,6 +594,7 @@ class DynamicMaxTokens(ConditionalStage):
 
     Condition: PROXY_DYNAMIC_MAX_TOKENS_ENABLED or PROXY_MAX_TOKENS_OVERRIDE > 0.
     """
+    # kv: safe
 
     name = "dynamic_max_tokens"
 
@@ -765,6 +769,7 @@ class SmartRouter(PipelineStage):
     priority decision.  Model ID preference adjusts thresholds but
     does NOT force route direction (safety always overrides).
     """
+    # kv: safe
 
     name = "smart_router"
 
@@ -1060,6 +1065,7 @@ class RouteNotification(PipelineStage):
     so the model sees the switch.  Differentiates first-route vs emergency-fallback.
     Each session is notified at most once.
     """
+    # kv: safe
 
     name = "route_notification"
 
@@ -1166,6 +1172,7 @@ class ErrorTranslator(PipelineStage):
     Calls _translate_tool_result_errors() from tool_filter.py.
     Mutates ctx.messages in-place.
     """
+    # kv: safe
 
     name = "error_translator"
 
@@ -1200,6 +1207,7 @@ class BlockerDetector(ConditionalStage):
     Condition: PROXY_BLOCKER_ENABLED is true.
     When triggered, appends a [BLOCKER] user message to ctx.messages.
     """
+    # kv: append
 
     name = "blocker_detect"
 
@@ -1244,6 +1252,7 @@ class SystemNormalizer(PipelineStage):
     the first system message and converts the rest to [System update]: user
     messages.  Calls _normalize_system_messages() from lifecycle.py.
     """
+    # kv: one-shot
 
     name = "system_normalizer"
 
@@ -1268,6 +1277,7 @@ class CacheAligner(ConditionalStage):
 
     Skipped when routing to cloud (no local KV cache to align).
     """
+    # kv: one-shot
 
     name = "cache_aligner"
 
@@ -1309,6 +1319,7 @@ class ContentCompressor(ConditionalStage):
 
     Skipped when routing to cloud (cloud has ample context window, no need to compress).
     """
+    # kv: breaking-soft
 
     name = "content_compressor"
 
@@ -1427,6 +1438,7 @@ class ToolLoopDetector(PipelineStage):
     Populates ctx.max_run, ctx.consecutive, and ctx.pattern_tool_name.
     These are consumed by LoopIntervention (stage 11).
     """
+    # kv: safe
 
     name = "tool_loop_detector"
 
@@ -1496,6 +1508,7 @@ class TextLoopDetector(ConditionalStage):
     Uses bigram Jaccard similarity to detect text loops.
     Merges results with ToolLoopDetector's max_run.
     """
+    # kv: safe
 
     name = "text_loop_detector"
 
@@ -1535,6 +1548,7 @@ class SessionLoopState(PipelineStage):
     If the session was previously at loop level 2+ but current max_run is below
     threshold, inject a warning asking the model to change approach.
     """
+    # kv: safe
 
     name = "session_loop_state"
 
@@ -1579,6 +1593,7 @@ class LoopIntervention(PipelineStage):
 
     Mutates ctx.messages, ctx.body["tools"], and _LOOP_SESSION_STATE.
     """
+    # kv: append
 
     name = "loop_detect"
 
@@ -1678,6 +1693,7 @@ class RereadDetector(PipelineStage):
     When detected, injects a HARD BLOCK user message asking the model to
     use existing knowledge instead of re-reading unchanged files.
     """
+    # kv: append
 
     name = "re_read"
 
@@ -1757,6 +1773,7 @@ class DateNormalizer(PipelineStage):
     Replaces 'Today's date is YYYY/MM/DD.' with 'Today's date is DATE_PLACEHOLDER.'
     in msg0 to stabilize the prefix for KV cache hits across requests on different days.
     """
+    # kv: one-shot
 
     name = "date_normalizer"
 
@@ -1802,6 +1819,7 @@ class ContextTruncator(ConditionalStage):
     Calls truncate_messages_if_needed() from truncation.py. Supports multiple
     strategies: rounds, fifo, smart, char.
     """
+    # kv: breaking
 
     name = "truncate"
 
@@ -1921,6 +1939,7 @@ class HighDropRatioNotice(ConditionalStage):
     DEF-107: Prevents silent context loss that degrades response quality.
     Skipped when routing to cloud (no truncation occurs on cloud path).
     """
+    # kv: append
 
     name = "high_drop_ratio_notice"
 
@@ -1981,6 +2000,7 @@ class OOMSafetyFIFO(ConditionalStage):
 
     Condition: stage_config["oom_safety"] is True, not cloud, not rounds strategy.
     """
+    # kv: breaking
 
     name = "oom_safety"
 
@@ -2056,6 +2076,7 @@ class MessageHashDebug(PipelineStage):
 
     Diagnostic-only.  No mutation.  Helps with prefix-stability debugging.
     """
+    # kv: safe
 
     name = "message_hash_debug"
 
@@ -2082,6 +2103,7 @@ class PrefixRatioComputer(PipelineStage):
 
     Calls _compute_common_prefix_ratio() from message_converter.py.
     """
+    # kv: safe
 
     name = "common_prefix_ratio"
 
@@ -2129,6 +2151,7 @@ class ToolPairingRepair(PipelineStage):
     pipeline modifications that could create orphaned pairs (truncation, loop
     intervention, compression).
     """
+    # kv: one-shot
 
     name = "tool_pairing_repair"
 
@@ -2155,6 +2178,7 @@ class FormatConverter(PipelineStage):
 
     Output: ctx.openai_messages + ctx.openai_body (consumed by BackendDispatcher).
     """
+    # kv: safe
 
     name = "format_converter"
 
@@ -2209,7 +2233,10 @@ class FormatConverter(PipelineStage):
         # cached_tokens(验收门禁 1 主口径)。rapid-mlx 默认即复用前缀缓存,
         # cache_prompt 是计量开关不改行为;云端臂不加(无计量需求, 个别云端
         # 后端可能拒收未知字段)。
-        if _ctx_engine_on() and getattr(ctx, '_route_target', 'local') != 'cloud':
+        # KV 可观测(§3.5, 2026-09-01): 计量与 ctx_engine 解耦——本地臂始终
+        # 请求 usage/timings(cache_prompt 是计量开关不改行为), 否则
+        # hit_ratio/prompt_sent 永远 null(生产实测 10063 轮全 null)。
+        if getattr(ctx, '_route_target', 'local') != 'cloud':
             openai_body["cache_prompt"] = True
             if ctx.is_stream:
                 openai_body["stream_options"] = {"include_usage": True}
@@ -2348,6 +2375,7 @@ class BackendDispatcher(PipelineStage):
       - cloud_lock: threading.Semaphore for cloud concurrency
       - handler: the Handler instance for writing the HTTP response
     """
+    # kv: safe
 
     name = "backend_dispatcher"
 

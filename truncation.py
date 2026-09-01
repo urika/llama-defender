@@ -1133,6 +1133,12 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
             except Exception:
                 pass
         if getattr(_ps, "PROXY_PD_ENABLED", True) and dropped and session_id:
+            # §3.5 前缀破碎计数: fifo 头截断 = 该会话前缀整体失效(全量冷算)
+            try:
+                _ps._PREFIX_BREAK_COUNT[session_id] = (
+                    _ps._PREFIX_BREAK_COUNT.get(session_id, 0) + 1)
+            except Exception:
+                pass
             try:
                 import memory_stores
                 memory_stores.record_dropped_messages(

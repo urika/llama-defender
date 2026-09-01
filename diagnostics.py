@@ -395,6 +395,8 @@ def finalize_request(mc):
         "epoch_triggered": None,
         "is_epoch_turn": None,
         "feedback_injected": peek_injections(),
+        "prefix_ratio": ((mc or {}).get("pipeline", {})
+                         .get("common_prefix_ratio", {}) or {}).get("ratio"),
         "canonical_mismatch": bool(getattr(ctx, "canonical_mismatch", False)),
         "compression": {
             "mode": ((mc or {}).get("pipeline", {}).get("truncate", {}) or {}).get("strategy"),
