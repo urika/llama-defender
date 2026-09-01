@@ -1,0 +1,565 @@
+{
+ "session": "gatece9",
+ "rows": [
+  {
+   "turn": 1,
+   "duration_ms": 1039.8,
+   "prompt_tokens": 1051,
+   "cached_tokens": 0,
+   "hit_ratio": 0.0
+  },
+  {
+   "turn": 2,
+   "duration_ms": 912.0,
+   "prompt_tokens": 2030,
+   "cached_tokens": 1024,
+   "hit_ratio": 0.5044
+  },
+  {
+   "turn": 3,
+   "duration_ms": 721.5,
+   "prompt_tokens": 3009,
+   "cached_tokens": 1920,
+   "hit_ratio": 0.6381
+  },
+  {
+   "turn": 4,
+   "duration_ms": 1115.6,
+   "prompt_tokens": 3997,
+   "cached_tokens": 2944,
+   "hit_ratio": 0.7366
+  },
+  {
+   "turn": 5,
+   "duration_ms": 753.6,
+   "prompt_tokens": 4976,
+   "cached_tokens": 3968,
+   "hit_ratio": 0.7974
+  },
+  {
+   "turn": 6,
+   "duration_ms": 871.7,
+   "prompt_tokens": 5954,
+   "cached_tokens": 4864,
+   "hit_ratio": 0.8169
+  },
+  {
+   "turn": 7,
+   "duration_ms": 917.8,
+   "prompt_tokens": 6933,
+   "cached_tokens": 5888,
+   "hit_ratio": 0.8493
+  },
+  {
+   "turn": 8,
+   "duration_ms": 1213.5,
+   "prompt_tokens": 7923,
+   "cached_tokens": 6912,
+   "hit_ratio": 0.8724
+  },
+  {
+   "turn": 9,
+   "duration_ms": 1041.2,
+   "prompt_tokens": 8902,
+   "cached_tokens": 7808,
+   "hit_ratio": 0.8771
+  },
+  {
+   "turn": 10,
+   "duration_ms": 774.4,
+   "prompt_tokens": 9881,
+   "cached_tokens": 8832,
+   "hit_ratio": 0.8938
+  },
+  {
+   "turn": 11,
+   "duration_ms": 794.8,
+   "prompt_tokens": 10871,
+   "cached_tokens": 9856,
+   "hit_ratio": 0.9066
+  },
+  {
+   "turn": 12,
+   "duration_ms": 987.5,
+   "prompt_tokens": 11860,
+   "cached_tokens": 10752,
+   "hit_ratio": 0.9066
+  },
+  {
+   "turn": 13,
+   "duration_ms": 1163.6,
+   "prompt_tokens": 12839,
+   "cached_tokens": 11776,
+   "hit_ratio": 0.9172
+  },
+  {
+   "turn": 14,
+   "duration_ms": 854.9,
+   "prompt_tokens": 13828,
+   "cached_tokens": 12800,
+   "hit_ratio": 0.9257
+  },
+  {
+   "turn": 15,
+   "duration_ms": 1152.4,
+   "prompt_tokens": 14817,
+   "cached_tokens": 13824,
+   "hit_ratio": 0.933
+  },
+  {
+   "turn": 16,
+   "duration_ms": 988.5,
+   "prompt_tokens": 15796,
+   "cached_tokens": 14720,
+   "hit_ratio": 0.9319
+  },
+  {
+   "turn": 17,
+   "duration_ms": 819.7,
+   "prompt_tokens": 16775,
+   "cached_tokens": 15744,
+   "hit_ratio": 0.9385
+  },
+  {
+   "turn": 18,
+   "duration_ms": 1152.7,
+   "prompt_tokens": 17754,
+   "cached_tokens": 16768,
+   "hit_ratio": 0.9445
+  },
+  {
+   "turn": 19,
+   "duration_ms": 1282.6,
+   "prompt_tokens": 18732,
+   "cached_tokens": 17664,
+   "hit_ratio": 0.943
+  },
+  {
+   "turn": 20,
+   "duration_ms": 1003.1,
+   "prompt_tokens": 19711,
+   "cached_tokens": 18688,
+   "hit_ratio": 0.9481
+  },
+  {
+   "turn": 21,
+   "duration_ms": 1308.3,
+   "prompt_tokens": 20690,
+   "cached_tokens": 19584,
+   "hit_ratio": 0.9465
+  },
+  {
+   "turn": 22,
+   "duration_ms": 962.1,
+   "prompt_tokens": 21669,
+   "cached_tokens": 20608,
+   "hit_ratio": 0.951
+  },
+  {
+   "turn": 23,
+   "duration_ms": 844.6,
+   "prompt_tokens": 22648,
+   "cached_tokens": 21632,
+   "hit_ratio": 0.9551
+  },
+  {
+   "turn": 24,
+   "duration_ms": 987.4,
+   "prompt_tokens": 23627,
+   "cached_tokens": 22528,
+   "hit_ratio": 0.9535
+  },
+  {
+   "turn": 25,
+   "duration_ms": 1286.3,
+   "prompt_tokens": 24615,
+   "cached_tokens": 23552,
+   "hit_ratio": 0.9568
+  },
+  {
+   "turn": 26,
+   "duration_ms": 1293.3,
+   "prompt_tokens": 25594,
+   "cached_tokens": 24576,
+   "hit_ratio": 0.9602
+  },
+  {
+   "turn": 27,
+   "duration_ms": 1225.5,
+   "prompt_tokens": 26573,
+   "cached_tokens": 25472,
+   "hit_ratio": 0.9586
+  },
+  {
+   "turn": 28,
+   "duration_ms": 1483.8,
+   "prompt_tokens": 27552,
+   "cached_tokens": 26496,
+   "hit_ratio": 0.9617
+  },
+  {
+   "turn": 29,
+   "duration_ms": 905.3,
+   "prompt_tokens": 28542,
+   "cached_tokens": 27520,
+   "hit_ratio": 0.9642
+  },
+  {
+   "turn": 30,
+   "duration_ms": 885.0,
+   "prompt_tokens": 29521,
+   "cached_tokens": 28416,
+   "hit_ratio": 0.9626
+  },
+  {
+   "turn": 31,
+   "duration_ms": 881.3,
+   "prompt_tokens": 30500,
+   "cached_tokens": 29440,
+   "hit_ratio": 0.9652
+  },
+  {
+   "turn": 32,
+   "duration_ms": 1293.0,
+   "prompt_tokens": 31479,
+   "cached_tokens": 30464,
+   "hit_ratio": 0.9678
+  },
+  {
+   "turn": 33,
+   "duration_ms": 868.8,
+   "prompt_tokens": 32468,
+   "cached_tokens": 31360,
+   "hit_ratio": 0.9659
+  },
+  {
+   "turn": 34,
+   "duration_ms": 939.2,
+   "prompt_tokens": 11591,
+   "cached_tokens": 0,
+   "hit_ratio": 0.0
+  },
+  {
+   "turn": 35,
+   "duration_ms": 981.9,
+   "prompt_tokens": 12570,
+   "cached_tokens": 11520,
+   "hit_ratio": 0.9165
+  },
+  {
+   "turn": 36,
+   "duration_ms": 653.1,
+   "prompt_tokens": 13549,
+   "cached_tokens": 12544,
+   "hit_ratio": 0.9258
+  },
+  {
+   "turn": 37,
+   "duration_ms": 686.4,
+   "prompt_tokens": 14528,
+   "cached_tokens": 13440,
+   "hit_ratio": 0.9251
+  },
+  {
+   "turn": 38,
+   "duration_ms": 811.6,
+   "prompt_tokens": 15507,
+   "cached_tokens": 14464,
+   "hit_ratio": 0.9327
+  },
+  {
+   "turn": 39,
+   "duration_ms": 773.3,
+   "prompt_tokens": 16486,
+   "cached_tokens": 15488,
+   "hit_ratio": 0.9395
+  },
+  {
+   "turn": 40,
+   "duration_ms": 722.4,
+   "prompt_tokens": 17476,
+   "cached_tokens": 16384,
+   "hit_ratio": 0.9375
+  },
+  {
+   "turn": 41,
+   "duration_ms": 790.0,
+   "prompt_tokens": 18455,
+   "cached_tokens": 17408,
+   "hit_ratio": 0.9433
+  },
+  {
+   "turn": 42,
+   "duration_ms": 790.8,
+   "prompt_tokens": 19434,
+   "cached_tokens": 18432,
+   "hit_ratio": 0.9484
+  },
+  {
+   "turn": 43,
+   "duration_ms": 778.7,
+   "prompt_tokens": 20424,
+   "cached_tokens": 19328,
+   "hit_ratio": 0.9463
+  },
+  {
+   "turn": 44,
+   "duration_ms": 1461.4,
+   "prompt_tokens": 21403,
+   "cached_tokens": 20352,
+   "hit_ratio": 0.9509
+  },
+  {
+   "turn": 45,
+   "duration_ms": 1420.0,
+   "prompt_tokens": 22382,
+   "cached_tokens": 21376,
+   "hit_ratio": 0.9551
+  },
+  {
+   "turn": 46,
+   "duration_ms": 1217.3,
+   "prompt_tokens": 23361,
+   "cached_tokens": 22272,
+   "hit_ratio": 0.9534
+  },
+  {
+   "turn": 47,
+   "duration_ms": 827.8,
+   "prompt_tokens": 24340,
+   "cached_tokens": 23296,
+   "hit_ratio": 0.9571
+  },
+  {
+   "turn": 48,
+   "duration_ms": 1074.8,
+   "prompt_tokens": 25319,
+   "cached_tokens": 24320,
+   "hit_ratio": 0.9605
+  },
+  {
+   "turn": 49,
+   "duration_ms": 1058.7,
+   "prompt_tokens": 26298,
+   "cached_tokens": 25216,
+   "hit_ratio": 0.9589
+  },
+  {
+   "turn": 50,
+   "duration_ms": 944.1,
+   "prompt_tokens": 27277,
+   "cached_tokens": 26240,
+   "hit_ratio": 0.962
+  },
+  {
+   "turn": 51,
+   "duration_ms": 1347.6,
+   "prompt_tokens": 28267,
+   "cached_tokens": 27264,
+   "hit_ratio": 0.9645
+  },
+  {
+   "turn": 52,
+   "duration_ms": 1401.7,
+   "prompt_tokens": 29246,
+   "cached_tokens": 28160,
+   "hit_ratio": 0.9629
+  },
+  {
+   "turn": 53,
+   "duration_ms": 1018.9,
+   "prompt_tokens": 30225,
+   "cached_tokens": 29184,
+   "hit_ratio": 0.9656
+  },
+  {
+   "turn": 54,
+   "duration_ms": 1256.1,
+   "prompt_tokens": 31204,
+   "cached_tokens": 30208,
+   "hit_ratio": 0.9681
+  },
+  {
+   "turn": 55,
+   "duration_ms": 938.5,
+   "prompt_tokens": 32183,
+   "cached_tokens": 31104,
+   "hit_ratio": 0.9665
+  },
+  {
+   "turn": 56,
+   "duration_ms": 750.0,
+   "prompt_tokens": 12277,
+   "cached_tokens": 0,
+   "hit_ratio": 0.0
+  },
+  {
+   "turn": 57,
+   "duration_ms": 1130.8,
+   "prompt_tokens": 13256,
+   "cached_tokens": 12160,
+   "hit_ratio": 0.9173
+  },
+  {
+   "turn": 58,
+   "duration_ms": 616.6,
+   "prompt_tokens": 14235,
+   "cached_tokens": 13184,
+   "hit_ratio": 0.9262
+  },
+  {
+   "turn": 59,
+   "duration_ms": 1216.0,
+   "prompt_tokens": 15225,
+   "cached_tokens": 14208,
+   "hit_ratio": 0.9332
+  },
+  {
+   "turn": 60,
+   "duration_ms": 1930.3,
+   "prompt_tokens": 16204,
+   "cached_tokens": 15104,
+   "hit_ratio": 0.9321
+  },
+  {
+   "turn": 61,
+   "duration_ms": 1232.9,
+   "prompt_tokens": 17194,
+   "cached_tokens": 16128,
+   "hit_ratio": 0.938
+  },
+  {
+   "turn": 62,
+   "duration_ms": 1184.3,
+   "prompt_tokens": 18173,
+   "cached_tokens": 17152,
+   "hit_ratio": 0.9438
+  },
+  {
+   "turn": 63,
+   "duration_ms": 664.2,
+   "prompt_tokens": 19152,
+   "cached_tokens": 18048,
+   "hit_ratio": 0.9424
+  },
+  {
+   "turn": 64,
+   "duration_ms": 671.9,
+   "prompt_tokens": 20131,
+   "cached_tokens": 19072,
+   "hit_ratio": 0.9474
+  },
+  {
+   "turn": 65,
+   "duration_ms": 1163.9,
+   "prompt_tokens": 21110,
+   "cached_tokens": 20096,
+   "hit_ratio": 0.952
+  },
+  {
+   "turn": 66,
+   "duration_ms": 1336.5,
+   "prompt_tokens": 22089,
+   "cached_tokens": 20992,
+   "hit_ratio": 0.9503
+  },
+  {
+   "turn": 67,
+   "duration_ms": 900.3,
+   "prompt_tokens": 23068,
+   "cached_tokens": 22016,
+   "hit_ratio": 0.9544
+  },
+  {
+   "turn": 68,
+   "duration_ms": 1361.6,
+   "prompt_tokens": 24047,
+   "cached_tokens": 23040,
+   "hit_ratio": 0.9581
+  },
+  {
+   "turn": 69,
+   "duration_ms": 1215.1,
+   "prompt_tokens": 25026,
+   "cached_tokens": 23936,
+   "hit_ratio": 0.9564
+  },
+  {
+   "turn": 70,
+   "duration_ms": 846.9,
+   "prompt_tokens": 26005,
+   "cached_tokens": 24960,
+   "hit_ratio": 0.9598
+  },
+  {
+   "turn": 71,
+   "duration_ms": 1272.4,
+   "prompt_tokens": 26984,
+   "cached_tokens": 25984,
+   "hit_ratio": 0.9629
+  },
+  {
+   "turn": 72,
+   "duration_ms": 813.5,
+   "prompt_tokens": 27963,
+   "cached_tokens": 26880,
+   "hit_ratio": 0.9613
+  },
+  {
+   "turn": 73,
+   "duration_ms": 1017.5,
+   "prompt_tokens": 28942,
+   "cached_tokens": 27904,
+   "hit_ratio": 0.9641
+  },
+  {
+   "turn": 74,
+   "duration_ms": 1700.1,
+   "prompt_tokens": 29921,
+   "cached_tokens": 28928,
+   "hit_ratio": 0.9668
+  },
+  {
+   "turn": 75,
+   "duration_ms": 747.7,
+   "prompt_tokens": 30910,
+   "cached_tokens": 29824,
+   "hit_ratio": 0.9649
+  },
+  {
+   "turn": 76,
+   "duration_ms": 1620.0,
+   "prompt_tokens": 31889,
+   "cached_tokens": 30848,
+   "hit_ratio": 0.9674
+  },
+  {
+   "turn": 77,
+   "duration_ms": 1465.4,
+   "prompt_tokens": 12962,
+   "cached_tokens": 0,
+   "hit_ratio": 0.0
+  },
+  {
+   "turn": 78,
+   "duration_ms": 768.9,
+   "prompt_tokens": 13951,
+   "cached_tokens": 12928,
+   "hit_ratio": 0.9267
+  },
+  {
+   "turn": 79,
+   "duration_ms": 592.8,
+   "prompt_tokens": 14940,
+   "cached_tokens": 13824,
+   "hit_ratio": 0.9253
+  },
+  {
+   "turn": 80,
+   "duration_ms": 1273.3,
+   "prompt_tokens": 15919,
+   "cached_tokens": 14848,
+   "hit_ratio": 0.9327
+  }
+ ]
+}
