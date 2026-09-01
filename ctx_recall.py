@@ -62,6 +62,9 @@ TOOL_SCHEMA = {
 
 DEFAULT_LIMIT = 8
 _FTS_BUILD_LOCK = threading.Lock()
+# PDC §5 护栏: 单次 pull 结果总体积上限(路径 A 改写此前无上限,
+# limit=8 × 恢复 4K/条 最高可回填 ~32K chars; 微轮路径本有 2000 截断)
+RESULT_TOTAL_MAX_CHARS = 4000
 
 
 # ============================================================================
@@ -366,7 +369,11 @@ def format_recall_result(lines, query, session_key=None):
                 basic += "\n  [摘录]: %s" % l["head"]
 
         out.append(basic)
-    return "\n".join(out)
+    result = "\n".join(out)
+    if len(result) > RESULT_TOTAL_MAX_CHARS:
+        result = (result[:RESULT_TOTAL_MAX_CHARS]
+                  + "\n…(结果过长已截断; 可用更具体的 query 或减小 limit 重查)")
+    return result
 
 
 # ============================================================================
@@ -411,7 +418,7 @@ def build_follow_up_messages(session_key, tool_calls):
         args = json.loads(tc["function"]["arguments"])
         query = str(args.get("query", "")).strip()
         if not query:
-            result = "ctx_recall: 缺少 query 参数。用法: {\"query\": \"文件路径/工具名/关键词\", \"kind\": \"file_edit|tool_use|tool_result|message\", \"limit\": 8}"
+            result = "ctx_recall: 缺少 query 参数。用法: {\"query\": \"文件路径/工具名/关键词\", \"kind\": \"tool_use|tool_result|text\", \"limit\": 8}"
         else:
             try:
                 kind = args.get("kind") or None

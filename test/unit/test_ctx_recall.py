@@ -165,5 +165,54 @@ class TestQueryTokenization(unittest.TestCase):
         self.assertEqual(cr.lookup("qrt-none", "zzzqqqxxx", limit=5), [])
 
 
+
+
+class TestReviewFixes(unittest.TestCase):
+    """ctx_recall review 修复(2026-09-01): kind 提示一致/head 240 端到端/总量护栏。"""
+
+    def test_follow_up_hint_matches_schema_enum(self):
+        import inspect
+        src = inspect.getsource(cr.build_follow_up_messages)
+        self.assertNotIn("file_edit", src)
+        self.assertIn("tool_use|tool_result|text", src)
+
+    def test_head_240_survives_manifest_write(self):
+        """端到端: unit_anchors head 240 不被 manifest 写入层 [:120] 抵消。"""
+        body = "A" * 200 + "QUANTUMUNIQUE" + "B" * 30
+        msg = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "ch1",
+             "content": [{"type": "text", "text": body}]}]}
+        ms.MANIFEST.reset()
+        try:
+            ms.record_dropped_messages("s-hd", 1, "fifo_drop", [msg])
+            line = ms.MANIFEST.lines("s-hd")[0]
+            self.assertIn("QUANTUMUNIQUE", line["head"])
+        finally:
+            ms.MANIFEST.reset()
+
+    def test_result_total_cap(self):
+        tmp = tempfile.mkdtemp(prefix="cap_")
+        orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = tmp
+        try:
+            from test.lib import state_fixture as sf
+            for i in range(8):
+                sf.plant_archive_tool_result("s-cap", turn=1,
+                                             tool_use_id="c%d" % i,
+                                             content="R" * 5000, diag_dir=tmp)
+                sf.plant_manifest_line("s-cap", turn=1, anchor="r:c%d" % i,
+                                       head="hit marker", diag_dir=tmp)
+            lines = [{"turn": 1, "kind": "tool_result", "tool": "",
+                      "handle": None, "anchor": "r:c%d" % i,
+                      "reason": "fifo_drop", "size_chars": 5000,
+                      "head": "hit marker"} for i in range(8)]
+            r = cr.format_recall_result(lines, "q", "s-cap")
+            self.assertLessEqual(len(r), cr.RESULT_TOTAL_MAX_CHARS + 120)
+            self.assertIn("已截断", r)
+        finally:
+            _ps._DIAG_DIR = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
