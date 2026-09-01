@@ -134,7 +134,13 @@ rapid-mlx 前缀缓存对 hybrid GDN 架构 non-trimmable——前缀必须精�
 
 - **可恢复压缩**（指针化）= 一次性破坏：每单元只指针化一次，其后前缀重新稳定——比 fifo 每轮滑动温和一个量级
 - **折叠占位符/实体行/召回 follow-up** = 尾部追加或稳定文案 = 缓存安全
-- **ctx_engine（append-only canonical）** = 这些纪律的终极形态：把追加变成数据结构性质，管线想破坏都破坏不了（验证窗口待 A/B 后排期）
+- **ctx_engine（append-only canonical）** = 这些纪律的终极形态：把追加变成数据结构性质，管线想破坏都破坏不了
+  - **9B 机制验证已通过（2026-09-01，gate_test 80 轮，logs/gate-ctx-engine-9b.json）**：
+    G1 非 epoch P90=1.36s（门禁 15s）✓；G2 epoch 重置轮 P90=1.47s（门禁 60s，9B 上 4 次重置均 <2s）✓；
+    G3 零断连 ✓；G4 三次 epoch 后首轮 hit=0.916/0.917/0.927（门禁 >0.8）✓；
+    非 epoch 命中率 p50=0.948——append-only 的『每轮只付增量』得到机制级实证
+  - 35B 数字确认（G2 的 60s 门禁按 35B prefill 速率）待 A/B 完成后的窗口
+  - 备注：S=60000 下 epoch 实际触发于 prompt≈32K——触发算式（est 口径）与 prompt tokens 的对应需单独核对
 - **会话亲和**（PROXY_ROUTE_STICKY，已有）：同会话同引擎 → KV 池不跨引擎
 
 ### 3.5.4 命中率之外的 TTFT 手段
