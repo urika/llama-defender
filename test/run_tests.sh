@@ -214,6 +214,15 @@ run_integration() {
     record "integration" "ok" "micro-turn: all cases passed"
   fi
 
+  rh_out=$(bash "$SCRIPT_DIR/integration/test_recall_hint_integration.sh" 2>&1)
+  rh_rc=$?
+  echo "$rh_out" | tail -10
+  if [[ $rh_rc -ne 0 ]]; then
+    record "integration" "fail" "test_recall_hint_integration.sh exited $rh_rc"
+  else
+    record "integration" "ok" "recall-hint: all cases passed"
+  fi
+
   lock_out=$(bash "$SCRIPT_DIR/integration/test_manage_lock.sh" 2>&1)
   lock_rc=$?
   echo "$lock_out" | tail -10
