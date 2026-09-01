@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 import proxy_state as _ps
@@ -212,6 +213,163 @@ class TestReviewFixes(unittest.TestCase):
         finally:
             _ps._DIAG_DIR = orig
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+
+class TestAdversarialQueries(unittest.TestCase):
+    """对抗性查询——模型可发出任意字符串, 检索不得崩溃或静默降级为空。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="qa_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+        ms.MANIFEST.record_units(
+            "qa-s", 1, "fifo_drop",
+            [{"anchor": "r:qa1", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 100,
+              "head": "readme contains FTS operators NEAR( OR NOT seed data"}])
+        self._queries_must_not_raise = [
+            'NEAR(seed OR "unclosed',      # FTS5 操作符注入
+            '"unclosed quote',             # 未闭合双引号
+            "seed NOT (a OR b)",           # 操作符词
+            "*", "?", "^:",                # 通配/前缀符
+            "x" * 10000,                   # 超长
+            "seed 🎉 emoji 中文混排",  # emoji/CJK
+            "   ",                         # 空白
+            "a",                           # 单字符(走 L1)
+        ]
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_adversarial_queries_never_raise(self):
+        for q in self._queries_must_not_raise:
+            try:
+                lines = cr.lookup("qa-s", q, limit=5)
+                self.assertIsInstance(lines, list)
+            except Exception as e:
+                self.fail(f"query {q[:30]!r} raised {e!r}")
+
+    def test_operator_injection_still_finds_verbatim(self):
+        # 真实词查询在操作符噪声旁仍工作
+        lines = cr.lookup("qa-s", "seed", limit=5)
+        self.assertEqual(len(lines), 1)
+
+
+class TestQueryParaphraseBattery(unittest.TestCase):
+    """查询改述组: 已知植入单元 × 模型风格查询 → 锁定必中/已知限制。
+
+    背景: 31 次 0 命中事故的本质是自然语言改述 miss。本 battery 把
+    "哪些说法必须能查到"固化为回归契约。
+    """
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="qb_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+        content = ("1	from openlibrary.core.lists.model import Seed\n"
+                   "2\tclass List:\n" + "x" * 200)
+        ms.MANIFEST.record_units(
+            "qb-s", 42, "fifo_drop",
+            [{"anchor": "r:call_list42", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 32355,
+              "head": content}])
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def _hit(self, q):
+        lines = cr.lookup("qb-s", q, limit=5)
+        return any(l.get("anchor") == "r:call_list42" for l in lines)
+
+    def test_must_hit_queries(self):
+        # 每条 = 一次真实事故场景或模型实测查询风格; miss 即回归
+        must_hit = [
+            "openlibrary/core/lists/model.py",   # 完整路径(逐字子串)
+            "lists/model.py",                    # 部分路径
+            "Seed class List",                   # 模型实测查询(31 次事故原句)
+            "lists model seed",                  # 空格分词小写
+            "r:call_list42",                     # 锚点直查
+            "from openlibrary.core.lists.model import Seed",  # 代码行逐字
+        ]
+        for q in must_hit:
+            self.assertTrue(self._hit(q), f"必中查询 miss: {q!r}")
+
+    def test_anchor_direct_query(self):
+        """锚点直查: tool description 的承诺必须有实现。"""
+        self.assertTrue(self._hit("r:call_list42"))
+        # 不存在的锚点 → 空而非崩
+        self.assertFalse(self._hit("r:ghost_anchor"))
+
+    def test_known_limitation_queries(self):
+        # 概念词不在 head 文本中 → 当前确定性管线已知限制(gist 阶段解决)
+        self.assertFalse(self._hit("annotate public notes"), "gist 落地后此断言需翻转")
+
+
+class TestConcurrencyAndLatency(unittest.TestCase):
+    """并发查询 + 折叠期重建 + 延迟预算(PDC §5 护栏)。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="qc_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+        # 2000 行真实量级 manifest(生产实测 1081-3133 行)
+        for batch in range(40):
+            units = [{"anchor": f"r:c{batch}_{i}", "kind": "tool_result",
+                      "role": "user", "tool": "Read", "handle": None,
+                      "size_chars": 500,
+                      "head": f"file content batch{batch} item{i} lists model seed"} for i in range(50)]
+            ms.MANIFEST.record_units("qc-s", batch + 1, "fifo_drop", units)
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_concurrent_queries_with_live_drops(self):
+        errors = []
+        def querier():
+            try:
+                for i in range(25):
+                    lines = cr.lookup("qc-s", f"lists model item{i % 50}", limit=5)
+                    self.assertIsInstance(lines, list)
+            except Exception as e:
+                errors.append(e)
+        def dropper():
+            try:
+                for b in range(40, 55):
+                    ms.MANIFEST.record_units("qc-s", b + 1, "fifo_drop",
+                        [{"anchor": f"r:late{b}_{i}", "kind": "tool_result",
+                          "role": "user", "tool": "Read", "handle": None,
+                          "size_chars": 100,
+                          "head": f"late drop {b} {i} lists seed"} for i in range(10)])
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=querier) for _ in range(4)] + \
+                  [threading.Thread(target=dropper)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
+    def test_latency_budget_on_full_manifest(self):
+        import time
+        # 预热(首次建索引)
+        cr.lookup("qc-s", "lists model", limit=5)
+        t0 = time.perf_counter()
+        for i in range(20):
+            cr.lookup("qc-s", f"lists model item{i}", limit=5)
+        p50_ms = (time.perf_counter() - t0) / 20 * 1000
+        self.assertLess(p50_ms, 100, f"2000 行 manifest 查询 p50={p50_ms:.1f}ms 超 100ms 预算")
 
 
 if __name__ == "__main__":

@@ -62,6 +62,9 @@ TOOL_SCHEMA = {
 
 DEFAULT_LIMIT = 8
 _FTS_BUILD_LOCK = threading.Lock()
+# 锚点直查模式: "r:tool_use_id" / "u:tool_use_id"(tool description 承诺语义)
+import re as _re
+_ANCHOR_RE = _re.compile(r'^[ru]:[A-Za-z0-9_\-]+$')
 # PDC §5 护栏: 单次 pull 结果总体积上限(路径 A 改写此前无上限,
 # limit=8 × 恢复 4K/条 最高可回填 ~32K chars; 微轮路径本有 2000 截断)
 RESULT_TOTAL_MAX_CHARS = 4000
@@ -172,6 +175,16 @@ def fts_search(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     """
     q = (query or "").strip()
     if not q:
+        return []
+    # 锚点直查(tool description 承诺"锚点可精确取回"; 2026-09-01 review
+    # 发现为虚假承诺——FTS 只索引 text 列不含 anchor, 此前必然 miss)
+    if _ANCHOR_RE.match(q):
+        kind_map = {"r": "tool_result", "u": "tool_use"}
+        want_kind = kind or kind_map.get(q[0])
+        for line in memory_stores.MANIFEST.lines(session_key):
+            if line.get("anchor") == q and (not want_kind
+                                            or line.get("kind") == want_kind):
+                return [line]
         return []
     if len(q) < 3:
         return _memory_filter(session_key, q, kind, limit)
