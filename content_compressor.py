@@ -487,6 +487,8 @@ def _structured_compress(original, mime_hint=None, mode=None):
     return compressed, content_type, strategy, audit_pass
 
 
+
+
 def compress_tool_result(content, mime_hint=None, threshold=None, mode=None,
                          bm25_score=None,
                          bm25_drop_threshold=None,

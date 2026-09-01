@@ -11,6 +11,7 @@ from test.lib import state_fixture as sf
 
 import ctx_recall as cr
 import memory_stores as ms
+import ifc_metrics
 
 
 def _seed(session_key):
@@ -146,6 +147,20 @@ class TestQueryTokenization(unittest.TestCase):
         self.assertIn("tool_result", kinds, "r: 内容行必须优先命中")
         self.assertEqual(lines[0]["kind"], "tool_result", "首行应为内容行")
         self.assertNotEqual(lines[0]["anchor"], "u:call_f0", "首行不得为自引用行")
+
+    def test_triggers_field_indexed(self):
+        """§3.1: 正文深处的指称性实体(>240 区间)经 triggers 字段可检索。"""
+        msg = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "ct1",
+             "content": [{"type": "text",
+                          "text": "A" * 400
+                                  + " /var/log/session_9aa.json crashed "
+                                  + "B" * 50}]}]}
+        units = ifc_metrics.unit_anchors(msg)
+        self.assertTrue(units[0].get("triggers"), "triggers 字段缺失")
+        ms.MANIFEST.record_units("qt-s", 1, "fifo_drop", units)
+        lines = cr.lookup("qt-s", "session_9aa.json", limit=5)
+        self.assertTrue(any(l.get("anchor") == units[0]["anchor"] for l in lines))
 
     def test_phrase_miss_falls_to_tokens(self):
         """整句短语 miss(自然语言描述) → token 聚合命中。"""

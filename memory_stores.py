@@ -62,6 +62,7 @@ class ManifestStore(object):
                 "handle": u.get("handle"),
                 "size_chars": u.get("size_chars", 0),
                 "head": (u.get("head") or "")[:240],  # PDC 索引扩容: 与 ifc_metrics head 240 对齐(此前 120 截断抵消扩容)
+                "triggers": (u.get("triggers") or "")[:240],  # §3.1: 指称性实体入索引词表
                 "ts": now_iso,
             })
         if not lines:

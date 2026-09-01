@@ -20,6 +20,7 @@ IFC/PDC 数据架构定位: 本模块是 Handle 词汇表的唯一源头,后续 
 """
 import hashlib
 import json
+import re
 
 # 句柄参数键(优先级序): "重新取得该内容的充分信息"(Manus 可恢复原则, 上游设计 §4.3)
 # = ledger 版四键 + ctx_engine 版扩展键(command/pattern),对齐后单一来源。
@@ -155,3 +156,51 @@ __all__ = [
     "text_str", "msg_hash", "msg_text_hash",
     "iter_blocks", "result_chars", "result_text",
 ]
+
+
+# ============================================================================
+# 关键实体提取(PDC 语义补全, 2026-09-01): 指称性内容(路径/命令/ID/数字/
+# URL)是寻址词汇表——压缩可丢描述, 不可丢指称。确定性正则, 无 LLM。
+# ============================================================================
+
+_ENTITY_PATTERNS = (
+    # 注意: 第二分支需 (?<![\w\-./]) 防从长词中间起配(否则 400 个 A 的
+    # 填充 + 路径粘连会整段吞为一个"实体", 2026-09-01 单测实测)
+    ("path", re.compile(r"(?:/[\w.\-]+){2,}|(?<![\w\-./])[\w\-]+(?:/[\w\-]+)+\.[a-z]{1,5}\b")),
+    ("url", re.compile(r"https?://\S{4,120}")),
+    ("id", re.compile(r"\b(?:id|ID|uuid|key|token|session)['\": =]+[\w\-]{4,40}")),
+    ("hash", re.compile(r"\b[0-9a-f]{8,64}\b")),
+    ("num", re.compile(r"\b\d+(?:\.\d+)?(?:ms|s|kb|mb|gb|%|rows?|lines?)\b")),
+    ("code", re.compile(r"\b(?:ERR|ERROR|E)\d{3,}\b")),
+)
+
+
+def extract_key_entities(text, max_items=12, max_chars=300):
+    """提取指称性实体(路径/URL/ID/哈希/带单位数字/错误码), 去重保序。
+
+    语义: 这些是压缩/截断后必须存活的"寻址词汇"——模型引用与
+    ctx_recall 检索都依赖它们。返回带类别前缀的字符串列表。
+    """
+    if not text or not isinstance(text, str):
+        return []
+    out, seen = [], set()
+    for kind, pat in _ENTITY_PATTERNS:
+        for m in pat.finditer(text):
+            v = m.group(0).strip()
+            k = v.lower()
+            if k not in seen:
+                seen.add(k)
+                out.append(f"{v}")
+            if len(out) >= max_items:
+                return out
+    return out
+
+
+def entity_line(entities):
+    """实体列表 → 追加到压缩产物尾部的实体行(超长截断)。"""
+    if not entities:
+        return ""
+    line = "[关键实体] " + " | ".join(entities)
+    if len(line) > 300:
+        line = line[:297] + "..."
+    return line

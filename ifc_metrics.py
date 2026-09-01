@@ -122,6 +122,11 @@ def unit_anchors(msg):
                     # 过短, 概念词只存在于 head 之后的正文。manifest 行 +240
                     # chars/条, 总量 MB 级可忽略。
                     "head": _um.result_text(b, 240),
+                    # §3.1 触发词(2026-09-01): 前 1200 字符的指称性实体
+                    # (路径/ID/数字)入独立字段——line_text 索引后模型可用
+                    # 正文深处的实体词命中折叠单元
+                    "triggers": " ".join(_um.extract_key_entities(
+                        _um.result_text(b, 1200), max_items=8)),
                 })
     tool_calls = msg.get("tool_calls")
     if isinstance(tool_calls, list):

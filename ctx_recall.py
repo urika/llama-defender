@@ -88,6 +88,7 @@ def line_text(line):
         line.get("head") or "",
         line.get("kind") or "",
         line.get("reason") or "",
+        line.get("triggers") or "",  # §3.1: 指称性实体入索引词表
     ] if x)
 
 

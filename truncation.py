@@ -5,6 +5,7 @@ import urllib.request
 import proxy_state as _ps
 from content_compressor import compress_tool_result, _generate_tool_summary, _text_str
 from lifecycle import _classify_lifecycle_stage
+import unit_model as _um
 from loop_detection import _build_tool_use_map
 from message_converter import _estimate_message_chars, _strip_thinking_from_msg
 from tool_filter import _extract_keywords, _inject_keyword_context
@@ -188,18 +189,20 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
                 # ctx_recall 锚点直查即可取回原文(压缩从有损变可恢复)。
                 # 无会话作用域时降级为无 key 标记(原文即逝, 诚实声明)。
                 compressed_body = result["compressed"]
+                # 原文干净文本(list 块拼接)——实体提取与 orig 寄存共用
+                if isinstance(block["content"], list):
+                    orig_text = "\n".join(
+                        b.get("text", "") for b in block["content"]
+                        if isinstance(b, dict))
+                else:
+                    orig_text = str(block["content"])
+                _ents = [e for e in _um.extract_key_entities(orig_text)
+                         if e not in compressed_body]
                 rec_key = None
                 if tool_use_id and session_id:
                     try:
                         import memory_stores
                         rec_key = "r:" + tool_use_id
-                        # 原文干净文本提取(block content 可能是 list 结构)
-                        if isinstance(block["content"], list):
-                            orig_text = "\n".join(
-                                b.get("text", "") for b in block["content"]
-                                if isinstance(b, dict))
-                        else:
-                            orig_text = str(block["content"])
                         memory_stores.record_orig_content(
                             session_id, rec_key, orig_text)
                         turn = _ps._SESSION_REQUEST_COUNT.get(session_id, 0) or 0
@@ -209,7 +212,8 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
                               "role": "user", "tool": tool_name,
                               "handle": None,
                               "size_chars": result["original_len"],
-                              "head": compressed_body[:240]}])
+                              "head": compressed_body[:240],
+                              "triggers": " ".join(_ents)[:240]}])
                     except Exception:
                         rec_key = None  # 寄存失败 → 无 key 诚实标记
                 if rec_key:
@@ -219,7 +223,11 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None,
                 else:
                     marker = (f"[ctx:{result['content_type']} "
                               f"~{result['original_len']}→{result['compressed_len']} chars]")
-                block["content"] = f"{marker}\n{compressed_body}"
+                # 关键实体行: 指称性内容(路径/ID/数字)不因压缩丢失——
+                # 只列压缩文本中已不可见的实体(去重), 追加在压缩体之后
+                _eline = _um.entity_line(_ents)
+                block["content"] = (f"{marker}\n{compressed_body}"
+                                    + (f"\n{_eline}" if _eline else ""))
                 compress_stats_list.append({
                     "msg_idx": msg_idx,
                     "block_idx": block_idx,

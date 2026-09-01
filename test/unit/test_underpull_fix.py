@@ -309,6 +309,40 @@ class TestRecoverableCompression(unittest.TestCase):
             _ps.PROXY_COMPRESS_THRESHOLD = orig_thr
             _ps._SESSION_REQUEST_COUNT.pop(sid, None)
 
+    def test_entity_line_survives_mid_truncation(self):
+        """压缩截掉中段时, 指称性实体(路径/ID/毫秒)进实体行保活。"""
+        import truncation
+        orig_clear, orig_comp, orig_thr = (_ps.PROXY_CLEAR_ENABLED,
+                                           _ps.PROXY_COMPRESS_ENABLED,
+                                           _ps.PROXY_COMPRESS_THRESHOLD)
+        _ps.PROXY_CLEAR_ENABLED = False
+        _ps.PROXY_COMPRESS_ENABLED = True
+        _ps.PROXY_COMPRESS_THRESHOLD = 100
+        try:
+            big = (chr(10).join(f"ok row {i}" for i in range(150))
+                   + chr(10) + "ERROR: /var/log/app/session_9aa.json crashed after 13769ms"
+                   + chr(10) + chr(10).join(f"ok row {i}" for i in range(150, 300)))
+            msgs = [{"role": "user", "content": "q"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "c9", "name": "Read",
+                         "input": {"file_path": "/tmp/app.log"}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "c9",
+                         "content": [{"type": "text", "text": big}]}]},
+                    {"role": "user", "content": "go"}]
+            res = truncation._compress_content_pass(
+                [dict(m) for m in msgs],
+                stage_config={"frozen_head": 0}, session_id="s-ent")
+            c = str(res[0][2]["content"])
+            eline = [l for l in c.split(chr(10)) if "关键实体" in l]
+            self.assertTrue(eline, "实体行缺失")
+            self.assertIn("session_9aa.json", eline[0])
+            self.assertIn("13769ms", eline[0])
+        finally:
+            _ps.PROXY_CLEAR_ENABLED = orig_clear
+            _ps.PROXY_COMPRESS_ENABLED = orig_comp
+            _ps.PROXY_COMPRESS_THRESHOLD = orig_thr
+
     def test_keyless_marker_without_session(self):
         """无会话作用域 → 无 key 诚实标记(不承诺无法兑现的恢复)。"""
         import truncation
