@@ -101,6 +101,52 @@
 
 **核心结论：F2（前缀稳定性）的权重高于 F1×F3 之和。** 256K 档的可行性完全建立在「会话内前缀永不破碎」之上——碎一次 = 重付 8-10 分钟。
 
+
+---
+
+## 3.5 KV cache 命中率与代理层管线的一等约束（2026-09-01 补）
+
+rapid-mlx 前缀缓存对 hybrid GDN 架构 non-trimmable——前缀必须精确匹配。因此 TTFT 的两峰（暖轮 10–17s / 冷轮 85–102s）由一个变量决定：**本轮请求的前缀是否与缓存精确延续**。管理命中率 = 管理管线对前缀的破坏。
+
+### 3.5.1 24 个管线 stage 的 KV 影响分类
+
+| 类别 | 语义 | Stage |
+|---|---|---|
+| 纯读/元数据 | 零影响 | RequestParser、LifecycleClassifier、DynamicMaxTokens*、SmartRouter、RouteNotification、ErrorTranslator、ToolLoopDetector、TextLoopDetector、SessionLoopState、MessageHashDebug、PrefixRatioComputer、FormatConverter、BackendDispatcher |
+| 尾部追加 | 缓存安全 | BlockerDetector、RereadDetector(HARD BLOCK)、HighDropRatioNotice、LoopIntervention |
+| 头部冻结区 | 一次性稳定 | SystemNormalizer、CacheAligner |
+| 就地改写(一次性) | 改后自愈 | DateNormalizer(同日期改出同值)、ToolPairingRepair(只修补破损对) |
+| 就地改写(持续性) | **每轮破坏** | ContentCompressor(TS-4 压缩)——一次性 per 单元，但会持续产生新压缩 |
+| 头截断 | **每轮破坏** | ContextTruncator(fifo 滑动)、OOMSafetyFIFO(紧急) |
+
+*DynamicMaxTokens 改 body 的 max_tokens，不在 messages 前缀内。
+
+**关键区分**：「一次性破坏」（改一次后前缀重新稳定）与「持续破坏」（每轮滑动每轮失配）差一个数量级——fifo 头截断是唯一的持续破坏者。
+
+### 3.5.2 与既有基础设施的接线（四点，全部小改动）
+
+1. **PrefixRatioComputer 升级为一等命中观测**：stage 21 已每请求计算公共前缀占比（日志可见），补两件事——写入 sessions.jsonl 结构化字段 + 修复后端 timings 管道（生产 hit_ratio 当前 100% null，R13 探测已就绪）。得到「前缀代理侧预估 + 引擎侧实测」双视图。
+2. **CacheAligner 扩展为前缀契约执行者**：任何 stage 想改 system/tools 区必须经它审计；变化 = 一次显式「前缀失效事件」（计数+告警），不再静默。
+3. **fifo 截断 = 显式前缀失效事件**：截断发生时递增 session 级「前缀破碎计数」并暴露 /api/status——让 85–102s 冷峰在指标上可见。batch 档 keep=512 使该计数恒 0。
+4. **stage docstring 声明 KV 语义**：`kv: safe | append | one-shot | breaking` 四值标签——防止未来新 stage 无意破坏前缀。
+
+### 3.5.3 与压缩/召回的衔接
+
+- **可恢复压缩**（指针化）= 一次性破坏：每单元只指针化一次，其后前缀重新稳定——比 fifo 每轮滑动温和一个量级
+- **折叠占位符/实体行/召回 follow-up** = 尾部追加或稳定文案 = 缓存安全
+- **ctx_engine（append-only canonical）** = 这些纪律的终极形态：把追加变成数据结构性质，管线想破坏都破坏不了（验证窗口待 A/B 后排期）
+- **会话亲和**（PROXY_ROUTE_STICKY，已有）：同会话同引擎 → KV 池不跨引擎
+
+### 3.5.4 命中率之外的 TTFT 手段
+
+| 手段 | 适用 | 说明 |
+|---|---|---|
+| 9B interactive 档 | 小上下文高频交互 | prefill 快 3–5×，20K@<10s（影子实例已验证） |
+| 分页拉取代替全文驻留 | 大文件 | `@offset` 每页 4K prefill，不驻留 37KB 全文 |
+| epoch 折叠一次性重置 | 长会话必超窗 | 把「每轮滑动失配」变「低频一次性重置」（ctx_engine） |
+
+**一句话**：命中率不靠缓存调优，靠上下文的「只追加、不回头」纪律——fifo 头截断是命中率的头号敌人，append-only（或足够大的窗口让它永不触发）是 TTFT 的根本解。
+
 ---
 
 ## 4. 三档配置方案
@@ -170,6 +216,9 @@ PROXY_BACKEND_TIMEOUT="1200"           # 20min > 10min 冷 prefill + 生成
 | KV bytes/token 实测校准 | ⏳ §6 验证路径第一步 | — |
 | catalog 单一真相源（chars_limit 派生） | ⏳ ~30 行 | `proxy_config.py` + `models.json` |
 | R10 透传 context_tokens | ⏳ ~10 行 | `anthropic_proxy.py` R10 段 |
+| hit_ratio 可观测（后端 timings 管道修复） | ⏳ 半天（§3.5.2-1） | `diagnostics.probe_timings` 已就绪 |
+| PrefixRatioComputer 值入结构化指标 + 破碎计数 | ⏳ ~40 行（§3.5.2-2/3） | `pipeline.py` stage 21 + truncation |
+| stage KV 语义标签（safe/append/one-shot/breaking） | ⏳ 注释级 | `pipeline.py` 24 个 stage docstring |
 | catalog 修正 262K（35B/9B 原生值） | ⏳ 数据修正 | `models.json` |
 | 压缩头标记 `[ctx:...]` 协议 | ⏳ ~40 行 | `content_compressor.py` |
 | 接近限额分级提示 | ⏳ 复用 HighDropRatioNotice 模式 | `pipeline.py` Stage 15 |
