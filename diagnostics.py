@@ -26,6 +26,7 @@ JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 与 proxy_metrics.jsonl 同策略
 # R9 实验前置①: 配置指纹——数据自带产生条件。信息域关键参数快照入每轮
 # 记录,治疗分派变成可查询(config.keep_messages==12)而非依赖外部记忆;
 # conf_hash 相等 = 同一信息域(队列识别)。缺参记 None(未注册本身是信息)。
+# PD 两项(2026-09-01): 微轮重派改变模型可见面, 属信息域参数——下次重启生效。
 _FINGERPRINT_KEYS = (
     ("truncate_strategy", "PROXY_CTX_TRUNCATE_STRATEGY"),
     ("keep_messages", "PROXY_CTX_KEEP_MESSAGES"),
@@ -35,6 +36,8 @@ _FINGERPRINT_KEYS = (
     ("compress_mode", "PROXY_COMPRESS_MODE"),
     ("ctx_engine_enabled", "PROXY_CTX_ENGINE_ENABLED"),
     ("clear_enabled", "PROXY_CLEAR_ENABLED"),
+    ("pd_enabled", "PROXY_PD_ENABLED"),
+    ("pd_micro_turn", "PROXY_PD_MICRO_TURN_ENABLED"),
     ("hbe_enabled", "PROXY_HBE_ENABLED"),
     ("hbe_sample_every", "PROXY_HBE_SAMPLE_EVERY"),
     ("hbe_min_chars", "PROXY_HBE_MIN_CHARS"),
