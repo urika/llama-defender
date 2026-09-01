@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import memory_stores
+import memory_stores as ms
+import ctx_recall as cr
 import proxy_state as _ps
 
 
@@ -239,6 +241,109 @@ class TestL3BatchRotation(unittest.TestCase):
             [{"anchor": "r:n", "kind": "tool_result", "role": "user",
               "tool": "", "handle": None, "size_chars": 1, "head": "x"}])
         self.assertEqual(len(memory_stores.MANIFEST.lines("s-bad")), 1)
+
+
+
+
+class TestRecoverableCompression(unittest.TestCase):
+    """可恢复压缩(2026-09-01): 压缩标记带 key, 原文寄存可取回。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="rc_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_marker_carries_key_and_orig_recoverable(self):
+        import truncation
+        orig_clear, orig_comp, orig_thr = (_ps.PROXY_CLEAR_ENABLED,
+                                           _ps.PROXY_COMPRESS_ENABLED,
+                                           _ps.PROXY_COMPRESS_THRESHOLD)
+        _ps.PROXY_CLEAR_ENABLED = False
+        _ps.PROXY_COMPRESS_ENABLED = True
+        _ps.PROXY_COMPRESS_THRESHOLD = 100
+        sid = "rc-demo"
+        _ps._SESSION_REQUEST_COUNT[sid] = 5
+        try:
+            big = chr(10).join(f"data row {i} value={i*7} status=ok"
+                               for i in range(400)) + chr(10) + "TAILORIG9"
+            msgs = [{"role": "user", "content": "q"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call_orig9", "name": "Read",
+                         "input": {"file_path": "/tmp/data.log"}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_orig9",
+                         "content": [{"type": "text", "text": big}]}]},
+                    {"role": "user", "content": "analyze"}]
+            res = truncation._compress_content_pass(
+                [dict(m) for m in msgs],
+                stage_config={"frozen_head": 0}, session_id=sid)
+            out_msgs = res[0] if isinstance(res, tuple) else res
+            marker = ""
+            for m in out_msgs:
+                c = m.get("content")
+                if isinstance(c, list):
+                    for b in c:
+                        if b.get("type") == "tool_result":
+                            t = str(b.get("content"))
+                            if t.startswith("[ctx:"):
+                                marker = t.split(chr(10))[0]
+            self.assertIn("key=r:call_orig9", marker, f"标记缺 key: {marker}")
+            # 锚点直查(与工具描述承诺对齐)
+            lines = cr.lookup(sid, "r:call_orig9", limit=5)
+            self.assertTrue(lines and lines[0]["anchor"] == "r:call_orig9")
+            # 原文取回(orig 寄存回退链)
+            txt = cr.recover_full_content(sid, "r:call_orig9", 5)
+            self.assertTrue(txt and "TAILORIG9" in txt)
+        finally:
+            _ps.PROXY_CLEAR_ENABLED = orig_clear
+            _ps.PROXY_COMPRESS_ENABLED = orig_comp
+            _ps.PROXY_COMPRESS_THRESHOLD = orig_thr
+            _ps._SESSION_REQUEST_COUNT.pop(sid, None)
+
+    def test_keyless_marker_without_session(self):
+        """无会话作用域 → 无 key 诚实标记(不承诺无法兑现的恢复)。"""
+        import truncation
+        orig_clear, orig_comp, orig_thr = (_ps.PROXY_CLEAR_ENABLED,
+                                           _ps.PROXY_COMPRESS_ENABLED,
+                                           _ps.PROXY_COMPRESS_THRESHOLD)
+        _ps.PROXY_CLEAR_ENABLED = False
+        _ps.PROXY_COMPRESS_ENABLED = True
+        _ps.PROXY_COMPRESS_THRESHOLD = 100
+        try:
+            big = chr(10).join(f"row {i} status=ok" for i in range(400))
+            msgs = [{"role": "user", "content": "q"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "tm2", "name": "Read",
+                         "input": {"file_path": "/tmp/d.log"}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "tm2",
+                         "content": [{"type": "text", "text": big}]}]},
+                    {"role": "user", "content": "go"}]
+            res = truncation._compress_content_pass(
+                [dict(m) for m in msgs],
+                stage_config={"frozen_head": 0}, session_id=None)
+            out_msgs = res[0] if isinstance(res, tuple) else res
+            marker = ""
+            for m in out_msgs:
+                c = m.get("content")
+                if isinstance(c, list):
+                    for b in c:
+                        if b.get("type") == "tool_result":
+                            t = str(b.get("content"))
+                            if t.startswith("[ctx:"):
+                                marker = t.split(chr(10))[0]
+            self.assertTrue(marker.startswith("[ctx:"), marker)
+            self.assertNotIn("key=", marker)
+        finally:
+            _ps.PROXY_CLEAR_ENABLED = orig_clear
+            _ps.PROXY_COMPRESS_ENABLED = orig_comp
+            _ps.PROXY_COMPRESS_THRESHOLD = orig_thr
 
 
 if __name__ == "__main__":

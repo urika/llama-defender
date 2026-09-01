@@ -249,5 +249,63 @@ def record_dropped_messages(session_key, turn, reason, messages, msg_index_base=
     return MANIFEST.record_units(session_key, turn, reason, units)
 
 
+# ============================================================================
+# 原文寄存(可恢复压缩, 2026-09-01): 压缩标记带 key 的前提是原文有处可查。
+# 压缩时把原文写入 orig/<sid>.jsonl, 锚点直查/ctx_recall 均可取回——
+# 压缩从"有损"变"可恢复", [ctx:...key=r:x] 的承诺才有实现。
+# ============================================================================
+
+ORIG_MAX_LINES_PER_SESSION = 500  # 每会话上限(FIFO), 防大文本寄存失控
+
+
+def record_orig_content(session_key, anchor, content, diag_dir=None):
+    """寄存压缩前原文(锚点 → 原文)。fail-open。"""
+    from session_ledger import sanitize_session_key
+    from datetime import datetime as _dt
+    d = diag_dir or getattr(_ps, "_DIAG_DIR", os.path.join("logs", "diag"))
+    try:
+        od = os.path.join(d, "orig")
+        os.makedirs(od, exist_ok=True)
+        path = os.path.join(od, sanitize_session_key(session_key)[:8] + ".jsonl")
+        lines = []
+        if os.path.exists(path):
+            try:
+                lines = open(path, encoding="utf-8").readlines()
+            except OSError:
+                lines = []
+        lines.append(json.dumps({"anchor": anchor,
+                                 "content": content,
+                                 "ts": _dt.now().isoformat(timespec="seconds")},
+                                ensure_ascii=False) + "\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-ORIG_MAX_LINES_PER_SESSION:])
+    except (OSError, ValueError):
+        pass
+
+
+def read_orig_content(session_key, anchor, diag_dir=None):
+    """按锚点读回压缩前原文; 未找到返回 None。"""
+    from session_ledger import sanitize_session_key
+    d = diag_dir or getattr(_ps, "_DIAG_DIR", os.path.join("logs", "diag"))
+    path = os.path.join(d, "orig", sanitize_session_key(session_key)[:8] + ".jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            best = None
+            for raw in f:
+                try:
+                    rec = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if rec.get("anchor") == anchor:
+                    best = rec  # 取最后一条(最新)
+            if best is not None:
+                return best.get("content")
+    except OSError:
+        pass
+    return None
+
+
 __all__ = ["ManifestStore", "MANIFEST", "record_dropped_messages",
-           "MAX_LINES_PER_SESSION", "MANIFEST_MAX_SESSIONS", "MANIFEST_MAX_MB"]
+           "MAX_LINES_PER_SESSION", "MANIFEST_MAX_SESSIONS", "MANIFEST_MAX_MB",
+           "record_orig_content", "read_orig_content",
+           "ORIG_MAX_LINES_PER_SESSION"]

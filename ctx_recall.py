@@ -288,6 +288,7 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000):
 
     数据流: manifest(地址: anchor+turn) → archive(内容: payload) → 完整 tool_result。
     anchor "r:t1" → tool_use_id "t1"; "u:t1" → 搜索 tool_use 块的 input(不适合恢复全文)。
+    回退链尾部: orig/<sid>.jsonl(压缩时寄存的原文)——压缩标记 key=r:x 的兑现。
     返回 str 或 None(未找到/archive 不存在)。
     """
     if not session_key or not anchor:
@@ -333,10 +334,16 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000):
                                 text = content
                             else:
                                 text = ""
-                            return text[:max_chars] if text else None
+                            if text:
+                                return text[:max_chars]
     except (FileNotFoundError, OSError):
+        pass
+    # 回退链尾部: 压缩时寄存的原文(标记 key=r:x 的兑现)
+    try:
+        import memory_stores
+        return memory_stores.read_orig_content(session_key, anchor)
+    except Exception:
         return None
-    return None
 
 
 def format_recall_result(lines, query, session_key=None):

@@ -14,7 +14,8 @@ def _log(msg, level="INFO"):
     pass
 
 # --- _compress_content_pass ---
-def _compress_content_pass(messages, tools_list=None, stage_config=None):
+def _compress_content_pass(messages, tools_list=None, stage_config=None,
+                           session_id=None):
     """
     Single-pass content compression: combines L2 tool-result clearing and
     L4 thinking block stripping into one traversal.
@@ -111,6 +112,7 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
             # Guess mime hint from tool name when possible.
             mime_hint = None
             tool_use_id = block.get("tool_use_id", "")
+            tool_name = ""
             for m_idx in range(msg_idx - 1, -1, -1):
                 m = messages[m_idx]
                 if m.get("role") == "assistant":
@@ -136,11 +138,34 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
             )
             if result["ratio"] < 1.0:
                 # PDC 协议(2026-09-01): 压缩头标记——模型可感知"这是摘要"。
-                # 最小诚实版: 只声明压缩事实, 不承诺恢复(原地压缩原文即逝,
-                # 不在 manifest/archive, ctx_recall 查不到)。~30 token/条。
+                # 可恢复压缩: 原文寄存 orig/<sid>.jsonl, 标记带 key=r:锚点,
+                # ctx_recall 锚点直查即可取回原文(压缩从有损变可恢复)。
+                # 无会话作用域时降级为无 key 标记(原文即逝, 诚实声明)。
                 compressed_body = result["compressed"]
-                marker = (f"[ctx:{result['content_type']} "
-                          f"~{result['original_len']}→{result['compressed_len']} chars]")
+                rec_key = None
+                if tool_use_id and session_id:
+                    try:
+                        import memory_stores
+                        rec_key = "r:" + tool_use_id
+                        memory_stores.record_orig_content(
+                            session_id, rec_key, result["original"])
+                        turn = _ps._SESSION_REQUEST_COUNT.get(session_id, 0) or 0
+                        memory_stores.MANIFEST.record_units(
+                            session_id, turn, "compressed",
+                            [{"anchor": rec_key, "kind": "tool_result",
+                              "role": "user", "tool": tool_name,
+                              "handle": None,
+                              "size_chars": result["original_len"],
+                              "head": compressed_body[:240]}])
+                    except Exception:
+                        rec_key = None  # 寄存失败 → 无 key 诚实标记
+                if rec_key:
+                    marker = (f"[ctx:{result['content_type']} "
+                              f"~{result['original_len']}→{result['compressed_len']} chars "
+                              f"key={rec_key}]")
+                else:
+                    marker = (f"[ctx:{result['content_type']} "
+                              f"~{result['original_len']}→{result['compressed_len']} chars]")
                 block["content"] = f"{marker}\n{compressed_body}"
                 compress_stats_list.append({
                     "msg_idx": msg_idx,
@@ -1105,14 +1130,18 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         # ctx_recall 零调用; DEF-107 占位符是现成的失忆感知通道, 只差
         # 指引句。指引为静态文本, 不破坏 prefix-cache 稳定性约束。
         drop_ratio = dropped_count / n if n > 0 else 0
+        anchor_hint = (f". sample anchors: {', '.join(drop_anchors[:3])}"
+                       if drop_anchors else "")
         if drop_ratio > 0.7 and (tool_count > 0 or file_mentions):
             parts = ["[Context folded: earlier messages omitted."]
             if tool_count > 0:
                 parts.append(f" {tool_count} tool calls were removed")
             if file_mentions:
                 parts.append(f" referenced files: {', '.join(sorted(file_mentions)[:8])}")
-            parts.append(". Use ctx_recall tool with the file path or keyword "
-                         "to recover folded content instead of re-reading files]")
+            parts.append(anchor_hint
+                         + ". Use ctx_recall tool with the file path, keyword "
+                           "or anchor to recover folded content instead of "
+                           "re-reading files]")
             compressed_text = "".join(parts)
         elif drop_ratio > 0.7 and drop_anchors:
             # 无文件提及但有锚点 → 给锚点查询键

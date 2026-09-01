@@ -1336,6 +1336,7 @@ class ContentCompressor(ConditionalStage):
                 cache_dynamic,
                 tools_list=ctx.tools_list,
                 stage_config=dynamic_stage_config,
+                session_id=getattr(ctx, 'session_id', '') or None,
             )
 
         # Reassemble: prefix + compressed dynamic
@@ -2439,6 +2440,10 @@ class BackendDispatcher(PipelineStage):
         creds = model_registry.get_model_credentials(model_name, env_lookup=_ps._env_lookup)
         if creds and creds.get("base_url"):
             lock = _ps._provider_locks.get(creds["name"]) or self._cloud_lock
+            # api_model 来自模型目录条目(目录 id 与请求码解耦, 如 glm-5.3-flash-cn → glm-5.3-flash)。
+            # get_model_credentials 返回 provider 凭据不含 api_model——必须从模型条目读。
+            _m_entry = model_registry.get_model(model_name) or {}
+            _api_model = (_m_entry.get("api_model") or "").strip() or model_name
             return {
                 "model": model_name,
                 "provider": creds["name"],
@@ -2447,7 +2452,7 @@ class BackendDispatcher(PipelineStage):
                 "api_key": creds.get("api_key", ""),
                 "key_env": creds.get("key_env", ""),
                 "lock": lock,
-                "api_model": creds.get("api_model") or model_name,
+                "api_model": _api_model,
             }
         return {
             "model": model_name,
@@ -3120,8 +3125,10 @@ class BackendDispatcher(PipelineStage):
         except Exception:
             pass
 
-        # Accumulate daily route cost if cloud succeeded
-        if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
+        # Accumulate daily route cost if cloud succeeded (including fallback:
+        # glm/kimi subscription (0 价) 失败后降级到付费 deepseek 也必须记账——
+        # 2026-08-31 实测 ¥64 账单因 `not self._route_fallback` 被跳过而 route_cost 恒 0)
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
             self._accumulate_daily_cost(ctx)
 
     def _do_dispatch_anthropic(self, ctx, cand):
@@ -3254,7 +3261,7 @@ class BackendDispatcher(PipelineStage):
                     "cloud", collections.deque(maxlen=100)).append(dispatch_ms)
         except Exception:
             pass
-        if getattr(ctx, '_route_target', 'local') == 'cloud' and not self._route_fallback:
+        if getattr(ctx, '_route_target', 'local') == 'cloud':
             self._accumulate_daily_cost(ctx)
 
     def _record_cloud_failure(self, ctx, exc):

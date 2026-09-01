@@ -26,6 +26,7 @@ diag_cleanup() {
           "$repo/logs/diag/index/$sid.db.prev" \
           "$repo/logs/diag/archive/$sid.jsonl" \
           "$repo/logs/diag/archive/$sid.jsonl.prev" \
+          "$repo/logs/diag/orig/$sid.jsonl" \
           "$repo/logs/diag/ledger/$sid.jsonl"
   done
   if [[ "${ITEST_KEEP:-}" == "1" ]]; then
