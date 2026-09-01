@@ -117,7 +117,11 @@ def unit_anchors(msg):
                     "role": role, "kind": "tool_result", "tool": "",
                     "handle": None,
                     "size_chars": _um.result_chars(b),
-                    "head": _um.result_text(b, 120),
+                    # PDC 索引扩容(2026-09-01): head 120→240——检索词汇覆盖。
+                    # 实测 lookup('annotate') 类概念词 miss 的根因是 head 截断
+                    # 过短, 概念词只存在于 head 之后的正文。manifest 行 +240
+                    # chars/条, 总量 MB 级可忽略。
+                    "head": _um.result_text(b, 240),
                 })
     tool_calls = msg.get("tool_calls")
     if isinstance(tool_calls, list):

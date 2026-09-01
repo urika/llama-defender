@@ -135,7 +135,13 @@ def _compress_content_pass(messages, tools_list=None, stage_config=None):
                 bm25_keep_threshold=_ps.PROXY_BM25_KEEP_THRESHOLD,
             )
             if result["ratio"] < 1.0:
-                block["content"] = result["compressed"]
+                # PDC 协议(2026-09-01): 压缩头标记——模型可感知"这是摘要"。
+                # 最小诚实版: 只声明压缩事实, 不承诺恢复(原地压缩原文即逝,
+                # 不在 manifest/archive, ctx_recall 查不到)。~30 token/条。
+                compressed_body = result["compressed"]
+                marker = (f"[ctx:{result['content_type']} "
+                          f"~{result['original_len']}→{result['compressed_len']} chars]")
+                block["content"] = f"{marker}\n{compressed_body}"
                 compress_stats_list.append({
                     "msg_idx": msg_idx,
                     "block_idx": block_idx,
@@ -1024,6 +1030,22 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         dropped_count = len(dropped)
 
         # R10.1 manifest: 丢弃单元留索引行(页表/索引永不丢;fail-open 不影响截断)
+        drop_anchors = []
+        # PDC-L1+(2026-09-01): 提取前 3 个丢弃单元锚点嵌入占位符——
+        # 给模型精确查询键(anchor 可被 ctx_recall 内存层子串命中),
+        # 替代"只能凭文件名猜"。纯字符串提取不依赖会话; fail-open。
+        if dropped:
+            try:
+                import ifc_metrics
+                for m in dropped:
+                    for u in ifc_metrics.unit_anchors(m):
+                        if u.get("anchor") and u.get("kind") in (
+                                "tool_use", "tool_result"):
+                            drop_anchors.append(u["anchor"])
+                    if len(drop_anchors) >= 3:
+                        break
+            except Exception:
+                pass
         if getattr(_ps, "PROXY_PD_ENABLED", True) and dropped and session_id:
             try:
                 import memory_stores
@@ -1091,6 +1113,15 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
                 parts.append(f" referenced files: {', '.join(sorted(file_mentions)[:8])}")
             parts.append(". Use ctx_recall tool with the file path or keyword "
                          "to recover folded content instead of re-reading files]")
+            compressed_text = "".join(parts)
+        elif drop_ratio > 0.7 and drop_anchors:
+            # 无文件提及但有锚点 → 给锚点查询键
+            parts = ["[Context folded: earlier messages omitted."]
+            if tool_count > 0:
+                parts.append(f" {tool_count} tool calls were removed")
+            parts.append(f". sample anchors: {', '.join(drop_anchors[:3])}"
+                         ". Use ctx_recall tool to recover folded content "
+                         "instead of re-reading files]")
             compressed_text = "".join(parts)
         else:
             compressed_text = ("[Context folded: earlier messages omitted. "
