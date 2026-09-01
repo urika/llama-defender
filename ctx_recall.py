@@ -133,43 +133,122 @@ def _memory_filter(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     return out
 
 
+def _query_tokens(query, max_tokens=8):
+    """自然语言查询 → 可检索 token 列表(≥3 字符, 截断防炸)。
+
+    模型实际发的查询是描述性长句(实测 "openlibrary/core/lists/model.py
+    Seed class List"), 整句短语匹配永不命中。拆成 token 后按"命中 token
+    数"聚合排序, 才能命中包含部分词汇的索引行。
+    """
+    import re
+    toks = []
+    seen = set()
+    for t in re.split(r'[\s/\\,;:()\[\]{}\'"_.\-]+', query or ""):
+        t = t.strip().lower()
+        if len(t) >= 3 and t not in seen:
+            seen.add(t)
+            toks.append(t)
+        if len(toks) >= max_tokens:
+            break
+    return toks
+
+
 def fts_search(session_key, query, kind=None, limit=DEFAULT_LIMIT):
-    """L2 FTS5 trigram 全文检索；<3 字符或索引异常 → L1 降级。"""
+    """L2 FTS5 trigram 全文检索；<3 字符或索引异常 → L1 降级。
+
+    检索三级穿透(2026-09-01, 修复自然语言查询零命中 + 自引用洪泛):
+      1. 整句短语精确匹配(模型复述路径/锚点原文时精度最高)
+      2. 短语无 primary → token 分查聚合, SQL 层仅取 r: 锚点
+         (tool_result, 有原文可恢复), 按锚点去重
+      3. 无 r: 命中 → token 全量(含 u: 索引行, 仅可寻址性)
+
+    生产依据: 模型 30+ 次重复查询的同锚点自引用行在 bm25 top-N 层洪泛,
+    r: 偏好不下推到 SQL 则内容行永远进不了窗口; 且无匹配消息会原样
+    记录查询文本, 短语命中可能全部是自查询行——故以 primary 为准
+    逐级穿透, 而非"行数非零即接受"。
+    """
     q = (query or "").strip()
     if not q:
         return []
     if len(q) < 3:
         return _memory_filter(session_key, q, kind, limit)
-    # FTS5 MATCH 语法元字符转义：查询按字面短语处理（双引号包裹）
     phrase = '"' + q.replace('"', '""') + '"'
     conn = None
     try:
         conn = _ensure_fts(session_key)
         if conn is None:
             return _memory_filter(session_key, q, kind, limit)
-        rows = conn.execute(
-            "SELECT turn, anchor FROM manifest_fts WHERE manifest_fts MATCH ? "
-            "ORDER BY bm25(manifest_fts) LIMIT ?",
-            (phrase, max(limit * 3, limit))).fetchall()
-        if not rows:
-            return []
+
+        def _collect(match_text, want, anchor_prefix=None):
+            sql = ("SELECT turn, anchor FROM manifest_fts "
+                   "WHERE manifest_fts MATCH ? ")
+            if anchor_prefix:
+                sql += f"AND anchor LIKE '{anchor_prefix}%' "
+            sql += f"ORDER BY bm25(manifest_fts) LIMIT {want}"
+            return conn.execute(sql, (match_text,)).fetchall()
+
         by_anchor = {}
         for line in memory_stores.MANIFEST.lines(session_key):
             by_anchor[(line.get("turn"), line.get("anchor"))] = line
-        out = []
-        seen = set()
-        for turn, anchor in rows:
-            line = by_anchor.get((turn, anchor))
-            if line is None or (kind and line.get("kind") != kind):
-                continue
-            key = (turn, anchor)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(line)
-            if len(out) >= limit:
-                break
-        return out
+
+        def _classify(rows):
+            """行分类: primary=可恢复内容, secondary=仅可寻址(自查询等)。"""
+            primary, secondary = [], []
+            seen = set()
+            for turn, anchor in rows:
+                line = by_anchor.get((turn, anchor))
+                if line is None or (kind and line.get("kind") != kind):
+                    continue
+                if anchor in seen:  # 同锚点多轮副本 → 只留一份
+                    continue
+                seen.add(anchor)
+                if (line.get("tool") == "ctx_recall"
+                        and line.get("kind") == "tool_use"):
+                    secondary.append(line)  # 自引用: 查询记录非内容
+                    continue
+                (primary if line.get("kind") == "tool_result"
+                 else secondary).append(line)
+            return primary, secondary
+
+        # 策略 1: 整句短语精确匹配
+        primary, secondary = _classify(_collect(
+            phrase, max(limit * 3, limit)))
+        if primary:
+            return (primary + secondary)[:limit]
+
+        toks = _query_tokens(q)
+
+        # 策略 2: token 分查, SQL 层仅取 r: 内容行, 按锚点去重聚合
+        token_rows = {}
+        for i, t in enumerate(toks):
+            tp = '"' + t.replace('"', '""') + '"'
+            for turn, anchor in _collect(tp, limit * 10, "r:"):
+                cnt, fi, bturn = token_rows.get(anchor, (0, 999, -1))
+                token_rows[anchor] = (cnt + 1, min(fi, i), max(bturn, turn))
+        if token_rows:
+            ranked = sorted(token_rows.items(),
+                            key=lambda kv: (-kv[1][0], kv[1][1]))
+            p2, s2 = _classify([(bturn, anchor) for anchor,
+                                (_c, _i, bturn) in ranked[:limit]])
+            if p2:
+                return (p2 + secondary)[:limit]
+            secondary = (s2 or []) + secondary
+
+        # 策略 3: 回落全量(含 u: 索引行, 仅可寻址性)
+        token_rows = {}
+        for i, t in enumerate(toks):
+            tp = '"' + t.replace('"', '""') + '"'
+            for turn, anchor in _collect(tp, limit * 3):
+                key = (turn, anchor)
+                cnt, fi = token_rows.get(key, (0, 999))
+                token_rows[key] = (cnt + 1, min(fi, i))
+        if not token_rows:
+            return secondary[:limit]
+        ranked = sorted(token_rows.items(),
+                        key=lambda kv: (-kv[1][0], kv[1][1]))
+        p3, s3 = _classify([(turn, anchor) for (turn, anchor), _ in
+                            ranked[:max(limit * 3, limit)]])
+        return (p3 + s3 + secondary)[:limit]
     except sqlite3.Error:
         return _memory_filter(session_key, q, kind, limit)
     finally:

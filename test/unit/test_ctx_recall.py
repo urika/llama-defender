@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """test_ctx_recall.py — R10.2 召回核心测试(FTS5 trigram/中文/短查询降级/kind 过滤)。"""
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -99,6 +100,69 @@ class TestCtxRecall(unittest.TestCase):
         self.assertEqual(cr.TOOL_SCHEMA["name"], "ctx_recall")
         self.assertIn("query", cr.TOOL_SCHEMA["input_schema"]["properties"])
         self.assertEqual(cr.TOOL_SCHEMA["input_schema"]["required"], ["query"])
+
+
+
+
+class TestQueryTokenization(unittest.TestCase):
+    """自然语言查询 token 化 + 多级检索策略(2026-09-01 欠拉根因修复)。"""
+
+    def setUp(self):
+        self._diag = tempfile.mkdtemp(prefix="qrt_")
+        self._orig = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._diag
+        ms.MANIFEST.reset()
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._diag, ignore_errors=True)
+
+    def test_query_tokens_split_and_filter(self):
+        toks = cr._query_tokens("openlibrary/core/lists/model.py Seed class List")
+        self.assertIn("openlibrary", toks)
+        self.assertIn("model", toks)
+        self.assertIn("seed", toks)
+        self.assertNotIn("py", toks)  # <3 字符被滤
+
+    def test_token_aggregation_hits_content_rows(self):
+        """多 token 查询应命中 r: 内容行(非 u: 自引用洪泛)。"""
+        # 植入: 30 条自引用 u: 行(洪泛) + 1 条 r: 内容行
+        for i in range(30):
+            ms.MANIFEST.record_units(
+                "qrt-flood", i + 1, "fifo_drop",
+                [{"anchor": f"u:call_f{i}", "kind": "tool_use", "role": "assistant",
+                  "tool": "ctx_recall", "handle": {"type": "query", "value": "alpha beta"},
+                  "size_chars": 60, "head": "ctx_recall alpha beta"}])
+        ms.MANIFEST.record_units(
+            "qrt-flood", 99, "fifo_drop",
+            [{"anchor": "r:call_content", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 3000,
+              "head": "alpha implementation beta details deep content"}])
+        lines = cr.lookup("qrt-flood", "alpha beta", limit=5)
+        kinds = [l.get("kind") for l in lines]
+        self.assertIn("tool_result", kinds, "r: 内容行必须优先命中")
+        self.assertEqual(lines[0]["kind"], "tool_result", "首行应为内容行")
+        self.assertNotEqual(lines[0]["anchor"], "u:call_f0", "首行不得为自引用行")
+
+    def test_phrase_miss_falls_to_tokens(self):
+        """整句短语 miss(自然语言描述) → token 聚合命中。"""
+        ms.MANIFEST.record_units(
+            "qrt-desc", 1, "fifo_drop",
+            [{"anchor": "r:d1", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 500,
+              "head": "the QuickBrownFox jumps over lazy dogs"}])
+        # 查询是描述性变体, 非逐字子串
+        lines = cr.lookup("qrt-desc", "quickbrownfox jumps", limit=5)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["anchor"], "r:d1")
+
+    def test_total_miss_returns_empty(self):
+        ms.MANIFEST.record_units(
+            "qrt-none", 1, "fifo_drop",
+            [{"anchor": "r:x1", "kind": "tool_result", "role": "user",
+              "tool": "", "handle": None, "size_chars": 10, "head": "totally unrelated"}])
+        self.assertEqual(cr.lookup("qrt-none", "zzzqqqxxx", limit=5), [])
 
 
 if __name__ == "__main__":
