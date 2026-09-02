@@ -526,11 +526,13 @@
     "params": [
       "messages",
       "tools_list",
-      "stage_config"
+      "stage_config",
+      "session_id"
     ],
     "defaults": {
       "tools_list": null,
-      "stage_config": null
+      "stage_config": null,
+      "session_id": null
     }
   },
   "_compress_log": {
@@ -1403,6 +1405,14 @@
     "defaults": {
       "tool_name_hint": ""
     }
+  },
+  "rewrite_ctx_recall_results": {
+    "name": "rewrite_ctx_recall_results",
+    "params": [
+      "messages",
+      "session_key"
+    ],
+    "defaults": {}
   },
   "strip_old_thinking_blocks": {
     "name": "strip_old_thinking_blocks",

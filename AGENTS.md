@@ -74,7 +74,21 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`tool_filter.py`](tool_filter.py) | 动态工具定义过滤，降低长工具列表的 token 开销 |
 | [`admin_server.py`](admin_server.py) | `/status` 状态页、`/api/*` 结构化 JSON 端点、系统内存/进程信息、指标聚合与 `/metrics/history`、请求快照清理、并发统计 |
 | [`proxy_logging.py`](proxy_logging.py) | 结构化 JSONL 日志、敏感头脱敏 |
-| [`hbe_probe.py`](hbe_probe.py) | H_BE shadow 探针（2026-08-29，**默认关**，`PROXY_HBE_*` 均 reloadable）：成功本地响应后搭 prefix cache 便车追加双探针锚定提问，top_logprobs（默认 20）截断熵估计信念熵，落盘 `logs/diag/hbe.jsonl`（10MB 轮转）。只测不动——不改任何路由/截断/压缩决策；仅本地路径触发；引擎锁等待有界（`LOCK_WAIT_S` 超时自动放弃），fail-open。冒烟实测：cache 便车 16K tokens 探针仅 1.2s |
+| [`hbe_probe.py`](hbe_probe.py) | H_BE shadow 探针（2026-08-29，`PROXY_HBE_*` 均 reloadable，active 配置已开）：成功本地响应后搭 prefix cache 便车追加双探针锚定提问，top_logprobs（默认 20）截断熵估计信念熵，落盘 `logs/diag/hbe.jsonl`（10MB 轮转）。只测不动——不改任何路由/截断/压缩决策；仅本地路径触发；引擎锁等待有界（`LOCK_WAIT_S` 超时自动放弃），fail-open。冒烟实测：cache 便车 16K tokens 探针仅 1.2s |
+| [`unit_model.py`](unit_model.py) | 消息原子化统一词汇表（叶子模块，**禁止 import 其他仓库模块**）：Handle（TypedDict `{"type","value"}`）词汇表唯一源头（对齐 context_engine/session_ledger/pipeline 三处漂移）、`msg_hash`/`msg_text_hash` 指纹、`text_str`/`iter_blocks`/`result_text` 内容原子化遍历。后续 `unit_id` 分配器（IFC 数据架构 §3.1 Unit 实体）在此扩展 |
+| [`ifc_metrics.py`](ifc_metrics.py) | IFC Tier-0 结构指标（信号层，`PROXY_IFC_ENABLED` 默认开，纯函数 + 有界会话基线）：**锚点差分法**——相邻两轮发送视图差分 + 台账动作序列派生 `retention`/`rationale_ratio`/`action_div`（工具序列归一化 bigram 熵，双端检测循环坍缩/游走）/`reread_pressure`。不触碰管线 stage（无 per-stage 钩子），见 `docs/02-architecture-design/information-fidelity-control-design-20260829.md` |
+| [`memory_stores.py`](memory_stores.py) | PDC 披露清单（manifest）存储：被丢弃上下文单元的可寻址索引行（会话页表，`R10.1`「索引永不丢」），`logs/diag/manifest/<sid>.jsonl` 增量落盘 + MB 上限 + 跨批隔离（`SESSION_GAP_SECONDS` 轮转 `.prev`）。写入方：truncation fifo/OOMSafetyFIFO 与 context_engine epoch 折叠 |
+| [`ctx_recall.py`](ctx_recall.py) | PDC 渐进披露检索核心（`R10.2`，已挂载）：L1 内存子串过滤 + L2 FTS5 trigram 全文（`logs/diag/index/<sid>.db`）+ archive 全文恢复（`recover_full_content`）+ **IFC-3 微轮自答**（`build_follow_up_messages` 同请求自答 ctx_recall 并重派，客户端透明）；`TOOL_SCHEMA` 工具定义；三级穿透检索（整句短语→token 聚合 r: 内容行→全量） |
+| [`queue_manager.py`](queue_manager.py) | 请求优先级队列：按 total_chars 分桶（interactive/standard/large/huge），heapq 最小堆，叠加在 `_llama_lock` 之上；`acquire(timeout)` 排队超时出队；`stats()` 供 `/api/queue`。默认关 `PROXY_QUEUE_ENABLED=false`（active 配置已开） |
+| [`signal_types.py`](signal_types.py) | Signal Layer 数据契约（叶子）：`ViewSummary`/`DiffResult`/`ReconcileResult`/`IFCSection` 4 个类型；字段全 Optional（fail-open：信号层故障时协议层以默认值运行） |
+| [`protocol_types.py`](protocol_types.py) | Protocol Layer 数据契约：五协议（P1-P5）+ 编排器 8 个核心类型（`Task`/`SubTask`/`VerificationRule`/`Citation`/`Patch`/`Verdict`/`EscalationDecision` 等），依赖 signal_types |
+| [`contract_registry.py`](contract_registry.py) | 契约注册表（叶子元数据）：所有数据契约的元数据管理 + 运行时验证（fail-open 返回错误列表，不抛异常）；`join_keys`/`sla`/`producer`/`consumers` 描述数据血缘 |
+| [`idempotency.py`](idempotency.py) | 幂等管理器：对 decompose/verify/recall 三类纯计算做内容寻址缓存（线程安全 LRU + TTL），同任务同会话不重复计算 |
+| [`decompose.py`](decompose.py) | P1 分解协议：双判据递归分解（容量判据按 token 预算拆文件等），将大任务拆为输入集在预算内的原子子任务 |
+| [`verification_chain.py`](verification_chain.py) | P3 验证协议：三级验证链（职责链 CoR）L1 机械 → L2 语义 → L3 台账 |
+| [`escalate.py`](escalate.py) | P5 升级协议：验证失败后的策略切换决策（决策表 + 幂等闸 + 熔断器 + `TaskState` 有限状态机） |
+| [`post_governance.py`](post_governance.py) | 后治理基础版 + 数据质量监控：入场层校准（`EntryLayerCalibrator` 按历史推荐入场层 0-3）、模式编译（`PatternCompiler` 成功模式 ≥3 次下沉为 Skill）、数据质量 SLA（`DataQualityMonitor`）；对齐 L0-rules/L1-prompts/L2-memory/L3-control 分层语义 |
+| [`protocol_orchestrator.py`](protocol_orchestrator.py) | 五协议编排器（P1 Decompose→P2 Execute→P3 Verify→P4 Recall→P5 Escalate 闭环）：`TaskState` 状态机跟踪 + 非法转换抛异常 + 幂等 + 死循环防御（全局迭代上限 + 单子任务重试上限）；执行器/召回器为注入 callable（Phase 1 stub / Phase 2 接 pipeline 真实模型调用） |
 
 ### 3.2 数据流
 
@@ -113,6 +127,14 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
   → 流式或非流式响应返回 Client
 ```
 
+**旁路观测/信号层（不改变主数据流，只读或失败静默）**：
+- **H_BE 探针**（`hbe_probe.py`）：成功本地响应后，搭 prefix cache 便车追加双探针锚定提问，`top_logprobs` 截断熵落盘 `logs/diag/hbe.jsonl`；只测不动。
+- **IFC 信号层**（`ifc_metrics.py` + `diagnostics.py` + `memory_stores.py`）：相邻轮发送视图差分 + 台账动作序列派生 `retention`/`rationale_ratio`/`action_div`/`reread_pressure`；无 per-stage 钩子。
+- **PDC 披露召回**（`ctx_recall.py` + `memory_stores.py`）：被 fifo/epoch 丢弃的单元写入 manifest（可寻址索引行），模型经 `ctx_recall` 工具查询（L1 内存子串 + L2 FTS5 trigram + archive 全文恢复），微轮自答同请求重派。
+- **队列**（`queue_manager.py`）：`PROXY_QUEUE_ENABLED` 时叠加在 `_llama_lock` 之上按 interactive/standard/large/huge 分桶排队。
+
+> **认知编排器 / Protocol Layer（P1-P5，`post_governance.py`/`escalate.py`/`decompose.py`/`verification_chain.py`/`idempotency.py`/`protocol_orchestrator.py`/`protocol_types.py`/`signal_types.py`/`contract_registry.py`）**：按三层架构规范（`docs/02-architecture-design/three-layer-architecture-spec-20260830.md`）与认知编排器设计（`cognitive-orchestrator-design-doc-20260830.md`）实现，**当前为 Phase 1 独立模块 + 单元测试，尚未接入运行时 pipeline**（Phase 2 接真实模型调用）。Signal 层（ifc_metrics/diagnostics/hbe_probe/memory_stores）已生产挂载；Protocol 层（decompose/verify/escalate/recall）为编排闭环的待接线部分。
+
 ### 3.3 配置文件
 
 配置放在 `configs/*.conf`，是 Bash 可 source 的 `KEY="value"` 文件。
@@ -121,11 +143,8 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 |------|------|
 | `configs/active.conf` | 指向当前激活配置的符号链接（当前 → `ornith-oq4e.conf`） |
 | `configs/ornith-oq4e.conf` | rapid-mlx + Ornith-1.5-35B-A3B-oQ4e-fixed-mtp（**当前激活**，oQ4e imatrix 混合精度 20.1GB，质量优于均匀 4-bit；基于 Qwen3.5 hybrid 架构，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off，decode ~80 tok/s，prefix cache 增量轮秒级；见 docs/05-operations-changelog/ornith-15-integration-20260826.md） |
-| `configs/ornith-35b.conf` | rapid-mlx + Ornith-1.5-35B-A3B-MLX-4bit（均匀 4-bit 19.5GB，decode ~87 tok/s 更快；同 Qwen3.5 hybrid，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off） |
 | `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
-| `configs/ornith-dflash-35b.conf` | dflash-mlx + Ornith-1.5-35B-A3B-MLX-4bit + Qwen3.6-DFlash 草稿头（官方 MTP 头随机初始化不可用；实测 decode ~91 tok/s 与纯 rapid-mlx 持平，无显著增益） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
-| `configs/rapid-mlx-35b-opt.conf` | rapid-mlx + Qwen3.6-35B-A3B-4bit（标准 4-bit，GPU=70% 必须，prefix cache + KV q4 + `--hybrid-cache-entries 8`） |
 | `configs/qwen3.8-27b-4bit.conf` | rapid-mlx + Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80，prefix cache 增量轮秒级） |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
@@ -381,7 +400,6 @@ git commit --no-verify               # 绕过所有钩子
 ### 8.3 KV-cache / prefix-cache turboquant
 
 - Rapid-MLX 如果需要跨重启保留 prefix cache，**不要**使用 `--kv-cache-turboquant`。
-- 见 `configs/rapid-mlx-35b-opt.conf` 说明。
 - Prefix cache 现状：rapid-mlx **0.11.5** 起重新启用跨请求 prefix cache（active 配置 `RAPID_MLX_ENABLE_PREFIX_CACHE=true`）；旧的 0.6.71 BatchedEngine 不支持（PagedCache 仅提供请求内 KV 管理）。KV 量化用 `RAPID_MLX_KV_QUANTIZATION=true` + 4 bits。
 
 ### 8.4 工具结果清除死亡循环

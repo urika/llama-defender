@@ -415,7 +415,7 @@
         "glm-5.3",
         "kimi-for-coding",
         "glm-5.3-flash",
-        "deepseek-v4-pro"
+        "deepseek-v4-flash"
       ],
       "behavior": "force_fallback",
       "threshold_factor": 0.8,
@@ -431,6 +431,19 @@
       ],
       "behavior": "force",
       "local_model": "local-default",
+      "threshold_factor": 2.0,
+      "memory_bias": 0
+    },
+    "ornith-9b": {
+      "route_bias": "prefer_local",
+      "cloud_model": [
+        "glm-5.3-flash-cn",
+        "glm-5.3-flash",
+        "kimi-for-coding-highspeed",
+        "deepseek-v4-flash"
+      ],
+      "behavior": "prefer",
+      "local_model": "ornith-9b",
       "threshold_factor": 2.0,
       "memory_bias": 0
     }

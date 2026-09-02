@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "weread": {
+      "source": "shiquda/weread-cli",
+      "sourceType": "github",
+      "skillPath": "skills/weread/SKILL.md",
+      "computedHash": "6cdb6426d6685750f0656856d14a4f9ff28f247553e9575a3a97f5d4f4ca3529"
+    }
+  }
+}

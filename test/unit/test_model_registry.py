@@ -415,7 +415,7 @@ class TestProxyStateIntegration(unittest.TestCase):
                          ["glm-5.3-flash", "kimi-for-coding-highspeed", "deepseek-v4-flash"])
         self.assertEqual(prefs["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(prefs["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
 
     def test_catalog_file_actually_loaded(self):
         import proxy_state
@@ -425,7 +425,10 @@ class TestProxyStateIntegration(unittest.TestCase):
 
     def test_alias_surface_unchanged(self):
         import proxy_state
-        self.assertEqual(proxy_state.get_model_aliases(), LEGACY_ALIASES)
+        # 2026-09-01 目录演化: local-9b 路由入册 → 别名 surface +ornith-9b
+        # (真实目录专属; 合成 _minimal_catalog 无此路由)
+        expected = LEGACY_ALIASES + ["ornith-9b"]
+        self.assertEqual(proxy_state.get_model_aliases(), expected)
 
     def test_catalog_models_present(self):
         import proxy_state
@@ -515,7 +518,7 @@ class TestRoutePoliciesJson(unittest.TestCase):
         # opus routed to glm-5.3 (Z.ai subscription) with glm-5.3-flash + deepseek chain backup
         self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(pj["preferences"]["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
         # 订阅零边际优先: sonnet/haiku 首发 glm-5.3-flash
         self.assertEqual(pj["preferences"]["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(pj["preferences"]["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash-cn")
@@ -559,7 +562,7 @@ class TestV1ModelsMetadata(unittest.TestCase):
         self.assertEqual(meta["price"]["input"], 0)   # subscription marginal cost
         # 2026-08-29: 国内站(zhipu-cn)置首, 链上备援 glm-5.3 + kimi-for-coding + glm-5.3-flash, deepseek 兜底
         self.assertEqual(meta["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-pro"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
         self.assertTrue(meta["direct_capable"])       # zhipu has an Anthropic endpoint
 
     def test_sonnet_flash_metadata(self):
