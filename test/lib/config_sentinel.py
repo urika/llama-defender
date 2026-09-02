@@ -27,7 +27,8 @@ def main():
     sentinel = ConfigRestoreSentinel().capture()
 
     suite = unittest.defaultTestLoader.discover(unit_dir, pattern="test_*.py")
-    runner = unittest.TextTestRunner(verbosity=1)
+    # verbosity=2: 逐用例行(test_x .. ok)——run_tests.sh run_unit 据此 grep 计数
+    runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 
     drifted = sentinel.verify()

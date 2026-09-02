@@ -231,6 +231,8 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/session/<key>/ledger` | 会话台账（R14）：actions（dup/last_dup_turn）/ dup_queries / materials；404 未知、410 已驱逐 |
 | GET | `/api/session/<key>/archive?view=sent` | sent_view 档案（R15）：默认索引模式，`include_payload=true` 拉正文；canonical 视图 Phase 1 前 501 |
 | GET | `/api/session/<key>/metrics` | 会话诊断聚合（R16）：hit_ratio 分位、epoch/非 epoch 延迟分档、per-turn 时序 |
+| GET | `/api/session/<key>/signals` | 会话信号快照（R17，契约 v1 已冻结）：SignalSnapshot——IFC 五指标 + H_BE 熵/趋势，全 Optional fail-open；404/410 对齐 R14/R15 |
+| GET | `/api/session/<key>/hbe` | R17 附属：H_BE shadow 探针原始记录透传（schema v2 含 `completion_budget` 等；支持 `?since=`） |
 | GET | `/api/backend/props` / `/api/backend/slots` | llama-server 原生端点只读反代；后端不支持时 501 结构化降级 |
 | POST | `/admin/route/force-local` / `force-cloud` | 会话级路由覆盖 |
 | POST | `/admin/reload` | HTTP 热重载（R12，等效 `manage.sh reload`，含模型目录重载） |
@@ -265,7 +267,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | 层级 | 命令 | 依赖 | 说明 |
 |------|------|------|------|
-| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，25 个文件约 979 个用例，<1s |
+| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，51 个文件 1504 个用例（2026-09-02 实测），<15s |
 | 集成 | `bash test/run_tests.sh --integration` | 启动 mock backend | `test/integration/*.sh` + `mock_backend.py`，约 60s |
 | Promptfoo | `bash test/run_tests.sh --promptfoo` | 运行中的代理 | 固定 prompt 回归测试（9 个用例） |
 | E2E | `bash test/run_tests.sh --e2e` | 运行中的代理 + 后端 | `test/e2e/*` |

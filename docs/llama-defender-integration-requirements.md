@@ -298,6 +298,86 @@ L4 只读访问 `GET /api/session/<key>/archive`——从 Phase 3 降级形态**
 - **批跑 harness 必须显式发送 `X-Claude-Code-Session-Id`**（会话 key 契约，见 R14；无头回退 key 会按天合并会话，污染台账与档案）。
 - 形态学复盘以 `archive?view=sent`（代理 sent_view）为准，不以 claude CLI 客户端转录为准（视角错位）。
 
+## 3.3 信号/召回服务面增补需求（R17-R19，2026-09-02 **已冻结 FROZEN**）
+
+> **状态与流程（contract-first，2026-09-02 双端约定，见 agent_go 反馈 §六）**：~~草案~~ → **agent_go 评审确认无异议（2026-09-02），契约冻结**——LD-1/LD-2/LD-3 据此动工；后续字段变更走 `CONTRACT_VERSION` 递增 + 双端漂移检测测试同步，不做静默变更。依据：`protocol-layer-ownership-review-20260902.md`（v1.2）§3.5 交互面 ⑤⑥、M3/M4/M5。
+
+### R17（P1，草案）：会话信号快照端点 `GET /api/session/<key>/signals`
+
+- **生产方**：代理（`ifc_metrics` / `hbe_probe` / `diagnostics` 聚合）；**消费方**：agent_go（P5 升级决策、AG-3 replan 决策表软依赖）、HealthGate 观测出口
+- **响应体**：`signal_types.SignalSnapshot`（`contract_version=1`，全字段 Optional，fail-open——信号计算失败对应字段 null，不 500）：
+
+| 字段 | 类型 | 来源 | 语义 |
+|---|---|---|---|
+| `contract_version` | int | `signal_types.CONTRACT_VERSION` | 契约版本，双端漂移检测键 |
+| `h_be` / `h_be_trend` | float? | `hbe_probe`（top_logprobs 截断熵） | 信念熵及趋势；未采样轮 null |
+| `d_ledger` | float? | `ifc_metrics.reconcile` | 探针答案 vs 台账 ground truth 偏差 |
+| `retention` | float? | `ifc_metrics` 锚点差分 | 相邻轮发送视图保留率；首见会话 null |
+| `rationale_ratio` | float? | `ifc_metrics` | 理由内容占比 |
+| `action_diversity` | float? | `ifc_metrics`（bigram 熵） | 工具序列多样性；持续低位=坍缩/游走双端告警 |
+| `reread_pressure` | int | `ifc_metrics` | 重读压力 |
+| `ile` / `ile_kinds` | bool / list[str] | `ifc_metrics.infer_ile_kinds` | 信息损失事件及类别 |
+| `view_reset` | bool | `ifc_metrics` | 视图重置标记 |
+| `cognitive_load` | float | 预留（默认 0.0） | 认知负荷 |
+| `config_fingerprint` | str | proxy_state | 配置指纹（双端对齐） |
+| `session_key` / `turn` | str / int | 诊断上下文 | 关联键（与 R14/R16 同源） |
+
+- **降级语义**：会话未知 → 404；已驱逐 → 410（对齐 R14/R15 先例）。
+- **验收**：全字段 JSON 可得；数值与 `logs/diag/sessions.jsonl` 末轮 `ifc` 段抽样一致。
+
+### R18（P1，草案）：任务上下文证据包 `POST /api/task-context`
+
+- **方向**：agent_go → 代理；**语义封装原则**（review §3.6）：对外暴露能力（"给任务描述，拿上下文证据"），`recall`/`manifest`/`orig` 机制面降级 admin/debug（经 agent_go 核对 `diag.py` 不消费，无影响）
+- **请求**：
+
+```json
+{
+  "task_descriptor": {
+    "description": "修复 auth 模块登录超时",
+    "input_files": ["src/auth.py"],
+    "keywords": ["登录", "timeout"]
+  },
+  "session_key": "k8chars",
+  "budget_chars": 6000
+}
+```
+
+  `session_key` 可选（缺省=仅做跨会话检索，不做本会话台账/archive 关联）；`budget_chars` 可选（默认 6000，上限 20000）。
+- **响应**：
+
+```json
+{
+  "bundle_id": "b-xxxx",
+  "items": [
+    {
+      "unit_id": "u-...",
+      "source": "manifest|archive|semantic",
+      "trigger_why": "命中关键词: 登录/timeout",
+      "preview_chars": 800,
+      "content": "...",
+      "full_available": true
+    }
+  ],
+  "total_chars": 4200,
+  "budget_remaining": 1800
+}
+```
+
+  `unit_id` 为 manifest 单元锚点（二跳地址，取全量走既有 R15 admin 面 `?include_payload=true`，不新增端点）；`trigger_why` 为索引行触发语义（description 工程，skill 借鉴 §3.1）；`full_available=false` = 优雅缺页（仅索引）；`source: "semantic"` 为 SEM 语义卡预留扩展点。
+- **降级语义**：无命中 → 200 + 空 `items`（不 404）；存储故障 → 503 + `Retry-After`。
+- **验收**：AG-4 对冻结契约开发可直连 mock；`budget_chars` 裁剪生效。
+
+### R19（P2，草案）：上下文钉扎请求头 `X-Proxy-Pin-Context`
+
+- **方向**：agent_go → 代理（reload 重试请求携带）；**语义**：pinned 锚点在压缩/截断 stage 跳过（review M5）
+- **格式**：`X-Proxy-Pin-Context: <unit_id>[,<unit_id>...]`（UTF-8，总长 ≤2KB）
+- **三约束**（v1.1 M5，2026-09-02 措辞修正：存储层记账 + 注入点 stage 强制）：
+  1. **预算**：pin 总量 ≤5% 上下文（`memory-storage-requirements-selection` §E），超限按 LRU 降级最旧 pin，回响应头 `X-Proxy-Pin-Demoted: <unit_id>`；
+  2. **OOM 语义**：`OOMSafetyFIFO`（stage 17）默认**不豁免** pinned 锚点——oom_danger 档 pin 挂起，回 `X-Proxy-Pin-Suspended: oom_danger`（豁免与否为 Phase 0 显式决策项，此为草案默认）；
+  3. **append-only**：禁注历史区，仅工作集/尾部。
+- **总开关**：`PROXY_PIN_ENABLED`（默认 false，reloadable）——关闭时请求头被忽略并回 `X-Proxy-Pin-Disabled: true`。
+- **验收**：pin 后多轮对话目标内容不被 fifo 驱逐；超预算降级可观测；开关关闭时零行为。
+
 ## 4. 接口协议要求汇总
 
 | 维度 | 要求 |
@@ -330,6 +410,9 @@ L4 只读访问 `GET /api/session/<key>/archive`——从 Phase 3 降级形态**
 | R13 诊断响应头扩展 | P1 | metering 采集 Prompt-Processed-N / Epoch-Count / Feedback-Injected（R8 解析模式扩展） |
 | R14 会话台账端点 | P1 | 轮级看门狗消费 dup / last_dup_turn / 材料清单 |
 | R15 L4 档案查询 | P2 | 压缩后行为复盘以代理档案为准（L4 只读） |
+| R17 信号快照端点 | P1（**已冻结** 2026-09-02） | AG-3 replan 决策表消费 reread_pressure；HealthGate 观测出口 |
+| R18 task-context 证据包 | P1（**已冻结** 2026-09-02） | AG-4 reload 重试路径消费；语义封装、机制面降 admin/debug |
+| R19 pin 请求头 | P2（**已冻结** 2026-09-02） | AG-5 reload 重试防二次压缩；三约束（预算/ OOM 语义/append-only）落地 |
 | R16 /metrics 会话维度 | P1 | 每轮 jsonl 落盘 + session 聚合时序，A/B 出数 |
 
 ## 6. 兼容策略

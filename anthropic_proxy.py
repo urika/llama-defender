@@ -2137,7 +2137,7 @@ class Handler(BaseHTTPRequestHandler):
     # diagnostics-dataplane-design-20260819.md §4）
     # ------------------------------------------------------------------
     def _handle_diag_session_endpoint(self):
-        """R14/R15/R16: /api/session/<key>/{ledger,archive,metrics} 分发。
+        """R14/R15/R16/R17: /api/session/<key>/{ledger,archive,metrics,hbe,signals} 分发。
 
         错误语义（集成契约 §4 fail-open）：未知 key → 404 JSON；已驱逐 → 410 +
         evicted_at；canonical 视图 Phase 1 前未启用 → 501。
@@ -2243,6 +2243,24 @@ class Handler(BaseHTTPRequestHandler):
                 "count": len(records),
                 "records": records,
             })
+            return True
+
+        if tail == "signals":
+            # R17: 会话信号快照（SignalSnapshot 契约 v1，集成契约 §3.3 冻结版）。
+            # 全字段 Optional fail-open；会话已知但无诊断记录 → 全 null 快照。
+            records = diagnostics.read_session_metrics(key)
+            hbe_records = diagnostics.read_session_hbe(key)
+            if not records and not hbe_records:
+                evicted = session_ledger.LEDGER.evicted_at(key)
+                if evicted:
+                    self._respond_json(
+                        {"error": {"type": "session_evicted", "evicted_at": evicted}}, 410)
+                    return True
+                if not session_ledger.LEDGER.session_alive(key):
+                    self._respond_json({"error": {"type": "session_not_found"}}, 404)
+                    return True
+            self._respond_json(
+                diagnostics.build_session_signals(key, records, hbe_records))
             return True
 
         return False

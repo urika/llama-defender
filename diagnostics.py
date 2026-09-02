@@ -495,6 +495,50 @@ def read_session_hbe(session_key, max_lines=50000):
     return records
 
 
+def build_session_signals(session_key, records=None, hbe_records=None):
+    """R17: 聚合某会话最新信号为 SignalSnapshot（契约 v1，集成契约 §3.3 冻结版）。
+
+    records/hbe_records 可注入（单测/调用方已持有数据时免重读）；缺省内部
+    读取。字段口径（全 Optional fail-open，信号缺失 → null）：
+    - IFC 五指标取 sessions.jsonl 末轮 `ifc` 段；无记录时 reread_pressure 按
+      契约默认 0、ile False、ile_kinds []，其余 null。
+    - h_be = 末条成功探针 h_mean_bits；h_be_trend = 末两条成功探针之差
+      （bits/turn，负值=熵降）；成功探针不足两条 → null。
+    - d_ledger 恒 null：对账仅探针轮产生、未入 per-turn 记录（口径诚实）。
+    - cognitive_load 契约默认 0.0（预留位，非测量值）。
+    """
+    if records is None:
+        records = read_session_metrics(session_key)
+    if hbe_records is None:
+        hbe_records = read_session_hbe(session_key)
+    last = records[-1] if records else {}
+    ifc = last.get("ifc") or {}
+    ok_hbe = [r for r in hbe_records
+              if r.get("result") == "ok"
+              and isinstance(r.get("h_mean_bits"), (int, float))]
+    h_be = ok_hbe[-1].get("h_mean_bits") if ok_hbe else None
+    trend = None
+    if len(ok_hbe) >= 2:
+        trend = round(ok_hbe[-1]["h_mean_bits"] - ok_hbe[-2]["h_mean_bits"], 4)
+    import signal_types
+    return signal_types.build_signal_snapshot(
+        h_be=h_be,
+        h_be_trend=trend,
+        d_ledger=None,
+        retention=ifc.get("retention"),
+        rationale_ratio=ifc.get("rationale_ratio"),
+        ile=bool(ifc.get("ile", False)),
+        ile_kinds=list(ifc.get("ile_kinds") or []),
+        view_reset=bool(ifc.get("view_reset", False)),
+        reread_pressure=int(ifc.get("reread_pressure") or 0),
+        action_diversity=ifc.get("action_div"),
+        cognitive_load=0.0,
+        config_fingerprint=str(last.get("conf_hash") or ""),
+        session_key=session_key,
+        turn=int(last.get("turn") or 0),
+    )
+
+
 __all__ = [
     "DIAG_SCHEMA_VERSION",
     "compute_hit_ratio", "sse_tail_line", "diag_headers",
@@ -503,5 +547,5 @@ __all__ = [
     "reset_timings_probe", "warn_suppressed",
     "set_prompt_tokens", "build_diag_payload", "capture_sent_view",
     "log_session_diag", "log_lifecycle_event", "finalize_request",
-    "read_session_metrics", "read_session_hbe",
+    "read_session_metrics", "read_session_hbe", "build_session_signals",
 ]

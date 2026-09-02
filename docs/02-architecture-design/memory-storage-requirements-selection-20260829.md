@@ -39,7 +39,7 @@
 
 ### E. 钉生命周期（驻留集的存储语义）
 
-钉集合需要带元数据的存储：来源、体积、**最近被引用轮次**（anti-windup 降级判据）、预算占比；**持久化**（重启后驻留集必须恢复，否则每次重启等于"页表清空"）；上限 ≤5% 上下文由存储层强制，而非仅靠生成端自律。
+钉集合需要带元数据的存储：来源、体积、**最近被引用轮次**（anti-windup 降级判据）、预算占比；**持久化**（重启后驻留集必须恢复，否则每次重启等于"页表清空"）；上限 ≤5% 上下文强制执行——**存储层记账 + pin 注入点（管线 stage）强制**（2026-09-02 措辞修正：JSONL append-only 只能记账，强制语义落在 stage），而非仅靠生成端自律。
 
 ### F. 安全与隐私（IFC 探针引入的新面）
 
@@ -94,7 +94,7 @@ WAL ：AVAILABLE（PRAGMA journal_mode=WAL 实测成功）
 | 五个小存储 | 事件溯源库、内容寻址库 | **自研薄存储（A3 JSONL 模式）** | 寻址/对账/优雅缺页语义无现成件；hashlib + OrderedDict + json 全 stdlib |
 | 五流离线 join | DuckDB（read_json_auto 直接 SQL 查 JSONL） | **DuckDB（仅 tools/ 侧）** | 单二进制 pip 包不碰核心；替代 trace_query 手写解析 |
 | BM25 排序（Warm 层） | bm25s / rank-bm25 | **复用仓库自有 BM25**（content_compressor TS-4） | 零依赖原则下已有实现即最优选 |
-| 语义/向量检索（远期） | sqlite-vec（FTS5+vec+RRF [混合范式](https://alexgarcia.xyz/blog/2024/sqlite-vec-hybrid-search/index.html)） | **预留可选加载** | C 扩展非 stdlib：`load_extension` 可选增强，缺失时降级 FTS5-only |
+| 语义/向量检索（远期） | sqlite-vec（FTS5+vec+RRF [混合范式](https://alexgarcia.xyz/blog/2024/sqlite-vec-hybrid-search/index.html)） | **三级降级链预留**（2026-09-01 修订，见 §3.4③ 与 [rag-kv-storage-fit-survey](rag-kv-storage-fit-survey-20260901.md)） | 上游 asg017 已停滞；FTS5-only → 纯 Python 暴力余弦（会话级规模）→ 社区 fork `load_extension` |
 | 生成式长期记忆 | mem0 / Letta / Zep·Graphiti / Cognee | **不引入，只取概念** | 见 §3.5 |
 
 ### 3.4 三个关键工程判断
@@ -103,7 +103,13 @@ WAL ：AVAILABLE（PRAGMA journal_mode=WAL 实测成功）
 
 **② FTS5 中文分词是必须提前处理的坑。** 默认 unicode61 分词器把连续汉字串切成单一大 token（无词切分），"上下文"查不到"管理上下文存储"。方案：trigram tokenizer（3 字滑窗、支持子串匹配、CJK 友好）+ 短查询（2 字词如"压缩""截断"）在候选集内 LIKE 兜底。列入 D1 设计任务。
 
-**③ sqlite-vec 以可选增强形态预留。** 远期语义检索（embedding 向量 + RRF 融合）走 `load_extension` 动态加载，扩展缺失时自动降级 FTS5-only——核心零依赖不被破坏，升级路径不断。
+**③ sqlite-vec 以可选增强形态预留（2026-09-01 修订：三级降级链）。** 原"单点预留 sqlite-vec 可选加载"经 [RAG/KV 存储匹配度调研](rag-kv-storage-fit-survey-20260901.md) 修订——上游 asg017 仓库 2025 年中起实质停滞（issue #226，关键 issue 无人处理），社区 fork 已接棒（v0.2.0-alpha）。修订后的向量检索路径按成本递增三级降级：
+
+1. **FTS5-only**（现状，默认）：词面 trigram + LIKE 兜底；
+2. **纯 Python 暴力余弦**（零依赖）：会话级规模（≤2K 单元 × 768d ≈ 0.1-0.3s）对召回路径可接受，float blob 存 SQLite、`array` 模块计算；
+3. **社区 fork `load_extension`**（可选增强）：向量量级超阈值时启用，缺失时自动回落 2→1，核心零依赖不被破坏。
+
+同时明确：**语义召回的真瓶颈是 embedding 生产方式而非向量库**——llama-server sidecar（`--embedding --pooling`）需新增进程/端口违反演进不变式、云端 API 有成本/隐私代价、LLM 蒸馏触发词（skill 借鉴路线）零新增基础设施；在 SEM-P2（注入）之前必须就此显式决策（详见调研文档 §4）。
 
 ### 3.5 记忆框架参考层（问题域相邻但不重合）
 
