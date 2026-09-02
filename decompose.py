@@ -29,26 +29,66 @@ class DecompositionCriterion:
 
 
 class CapacityCriterion(DecompositionCriterion):
-    """容量判据——估算输入集 token 超预算时按文件拆分。"""
+    """容量判据——输入集 est tokens 超预算时按内容大小贪心打包拆分。
+
+    尺寸度量(2026-09-01 wiki 匹配修正): 真实文件 stat 字节数优先
+    (路径字符串长度不反映内容量——232 页 wiki 曾因此全塞进一个子任务),
+    文件不存在时退化为路径串长。
+    """
 
     def __init__(self, budget_tokens: int = 30000, chars_per_token: int = 4):
         self.budget = budget_tokens
         self.ratio = chars_per_token
 
+    def _input_chars(self, files):
+        import os
+        total = 0
+        for f in files:
+            try:
+                total += os.path.getsize(f)
+            except OSError:
+                total += len(str(f))
+        return total
+
     def should_split(self, task: Task, signal: SignalSnapshot) -> bool:
-        est = sum(len(str(f)) for f in task.get("input_files", [])) // self.ratio
-        # 加上描述本身的估算
+        est = self._input_chars(task.get("input_files", [])) // self.ratio
         est += len(task.get("description", "")) // self.ratio
         return est > self.budget
 
-    def split(self, task: Task) -> List[Task]:
-        """按 input_files 拆分——每个文件一个子任务。"""
-        return [
-            {**task, "id": f"{task.get('id', 'task')}:f{i}",
-             "input_files": [f], "depth": task.get("depth", 0) + 1,
-             "parent_task_id": task.get("id")}
-            for i, f in enumerate(task.get("input_files", []))
-        ]
+    def split(self, task: Task):
+        """贪心打包: 按预算字符数(budget×ratio)装箱 input_files,
+        每箱一个子任务(保持原顺序)。"""
+        budget_chars = self.budget * self.ratio
+        batches, cur, cur_sz = [], [], 0
+        for f in task.get("input_files", []):
+            try:
+                import os
+                sz = os.path.getsize(f)
+            except OSError:
+                sz = len(str(f))
+            if cur and cur_sz + sz > budget_chars:
+                batches.append(cur)
+                cur, cur_sz = [], 0
+            cur.append(f)
+            cur_sz += sz
+        if cur:
+            batches.append(cur)
+        out = []
+        for i, batch in enumerate(batches):
+            t = {**task, "id": f"{task.get('id', 'task')}:b{i}",
+                 "input_files": batch, "depth": task.get("depth", 0) + 1,
+                 "parent_task_id": task.get("id")}
+            # 单文件超预算 → 标记分页(执行者用 paged disclosure @offset 读,
+            # decompose 层不切内容——切内容是读取器的职责)
+            if len(batch) == 1:
+                try:
+                    import os
+                    if os.path.getsize(batch[0]) > budget_chars:
+                        t["paged"] = True
+                except OSError:
+                    pass
+            out.append(t)
+        return out
 
 
 class EntropyCriterion(DecompositionCriterion):

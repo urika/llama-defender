@@ -52,8 +52,8 @@ class TestCapacityCriterion(unittest.TestCase):
         # 每个子任务只含一个文件
         for s in subs:
             self.assertEqual(len(s["input_files"]), 1)
-        # id 带文件序号
-        self.assertIn(":f0", subs[0]["id"])
+        # id 带批序号(2026-09-01 贪心打包后 :b 前缀)
+        self.assertIn(":b0", subs[0]["id"])
         # depth 递增
         self.assertEqual(subs[0].get("depth", 0), 1)
 
