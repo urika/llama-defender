@@ -140,6 +140,7 @@ rapid-mlx 前缀缓存对 hybrid GDN 架构 non-trimmable——前缀必须精�
     G3 零断连 ✓；G4 三次 epoch 后首轮 hit=0.916/0.917/0.927（门禁 >0.8）✓；
     非 epoch 命中率 p50=0.948——append-only 的『每轮只付增量』得到机制级实证
   - 35B 数字确认（G2 的 60s 门禁按 35B prefill 速率）待 A/B 完成后的窗口
+  - **64K 带宽验证（2026-09-02，9B + 真实仓库内容，29 轮）**：上下文 2.5K→81K tok 爬升，turn 时长全程 1.3–2.5s 平坦（append-only 增量 prefill 实证——时长与总长无关）；81K 触发折叠一次重置；est 偏差随内容浮动（实测 0.54–0.675）
   - 备注：S=60000 下 epoch 实际触发于 prompt≈32K——触发算式（est 口径）与 prompt tokens 的对应需单独核对
 - **会话亲和**（PROXY_ROUTE_STICKY，已有）：同会话同引擎 → KV 池不跨引擎
 

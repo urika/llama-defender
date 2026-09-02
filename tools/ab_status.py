@@ -14,7 +14,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SWE = os.path.join(os.path.dirname(REPO), "swe-eval")
-ARM_TS = "2026-09-01T14:43"  # 治疗臂批跑启动(台账留痕)
+ARM_TS = "2026-09-01T17:00"  # 治疗臂 v2 窗口(589d778 修复后重启; v1 窗口 14:43-17:00 供给端断裂已作废)
 
 
 def load_jsonl(path):
