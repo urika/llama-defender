@@ -1007,12 +1007,16 @@ def _apply_smart_truncation(messages, budget_chars=None, session_id=None,
     }
 # --- truncate_messages_if_needed ---
 def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
-                                strategy=None, budget_chars=None):
+                                strategy=None, budget_chars=None,
+                                pinned_anchors=None):
     """
     Proxy-side message truncation with dual strategy support.
 
     P4 Recall MVP: 在截断前拦截 ctx_recall error result → 改写为真实检索结果。
     (必须在截断前——确保模型能在当前轮"看到"召回信息后再做决策)
+
+    R19: pinned_anchors 非空时, fifo 中段命中的消息保留不逐出（预算已在
+    stage 0 强制; OOMSafetyFIFO 不豁免——stage 17 自行处理）。
     """
     if getattr(_ps, "PROXY_PD_ENABLED", True) and session_id:
         try:
@@ -1113,6 +1117,43 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         tail_count = keep_total - _ps.PROXY_CTX_KEEP_HEAD
         tail = messages[-tail_count:]
         dropped = messages[_ps.PROXY_CTX_KEEP_HEAD : n - tail_count]
+
+        # R19: pinned 锚点命中的中段消息保留(并入 head 尾部, 原顺序不变)。
+        # 预算已在 stage 0 强制(≤5%), 此处只做跳过; fail-open 不影响截断。
+        # TS-2 交互: 命中扩展到原子对友邻(r:X↔u:X)——否则孤儿 tool_result
+        # 会被 _fix_tool_pairings 二次裁掉, pin 形同虚设。
+        _pinned = set(pinned_anchors or [])
+        if _pinned and dropped:
+            try:
+                import ifc_metrics as _ifm
+                _anchor_cache = {
+                    id(m): [u.get("anchor") for u in _ifm.unit_anchors(m)]
+                    for m in dropped
+                }
+                _hits = {id(m) for m in dropped
+                         if any(a in _pinned for a in _anchor_cache[id(m)])}
+            except Exception:
+                _anchor_cache, _hits = {}, set()
+            if _hits:
+                _siblings = set()
+                for m in dropped:
+                    if id(m) in _hits:
+                        for a in _anchor_cache.get(id(m), []):
+                            if isinstance(a, str):
+                                if a.startswith("r:"):
+                                    _siblings.add("u:" + a[2:])
+                                elif a.startswith("u:"):
+                                    _siblings.add("r:" + a[2:])
+                _expand = set(_hits)
+                for m in dropped:
+                    if id(m) in _expand:
+                        continue
+                    if any(a in _siblings for a in _anchor_cache.get(id(m), [])):
+                        _expand.add(id(m))
+                kept_mid = [m for m in dropped if id(m) in _expand]
+                dropped = [m for m in dropped if id(m) not in _expand]
+                head = head + kept_mid
+
         dropped_count = len(dropped)
 
         # R10.1 manifest: 丢弃单元留索引行(页表/索引永不丢;fail-open 不影响截断)
@@ -1515,6 +1556,7 @@ def _fix_tool_pairings(messages):
                     valid_tool_use_ids.add(tid)
 
     answered_tool_use_ids = set()
+    duplicate_result_ids = set()
     for m in messages:
         if m.get("role") != "user":
             continue
@@ -1525,7 +1567,29 @@ def _fix_tool_pairings(messages):
             if isinstance(b, dict) and b.get("type") == "tool_result":
                 tid = b.get("tool_use_id", "")
                 if tid:
-                    answered_tool_use_ids.add(tid)
+                    if tid in answered_tool_use_ids:
+                        duplicate_result_ids.add(tid)
+                    else:
+                        answered_tool_use_ids.add(tid)
+
+    # Similarly deduplicate assistant tool_use ids (rare, but possible after
+    # context_engine canonical rebuild or retry loops).
+    seen_tool_use_ids = set()
+    duplicate_use_ids = set()
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                tid = b.get("id", "")
+                if tid:
+                    if tid in seen_tool_use_ids:
+                        duplicate_use_ids.add(tid)
+                    else:
+                        seen_tool_use_ids.add(tid)
 
     result = []
     removed_results = 0
@@ -1542,6 +1606,9 @@ def _fix_tool_pairings(messages):
                     if tid not in valid_tool_use_ids:
                         removed_results += 1
                         continue
+                    if tid in duplicate_result_ids:
+                        removed_results += 1
+                        continue
                 new_blocks.append(b)
             if not new_blocks:
                 continue
@@ -1554,6 +1621,9 @@ def _fix_tool_pairings(messages):
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tid = b.get("id", "")
                     if tid and tid not in answered_tool_use_ids:
+                        removed_uses += 1
+                        continue
+                    if tid in duplicate_use_ids:
                         removed_uses += 1
                         continue
                 new_blocks.append(b)
@@ -1571,6 +1641,37 @@ def _fix_tool_pairings(messages):
     result = _reorder_tool_results(result)
 
     return result
+def _split_multi_tool_result_messages(messages):
+    """Split user messages that contain multiple tool_result blocks.
+
+    Anthropic allows several tool_result blocks in one user message, but the
+    downstream reordering logic assumes a 1:1 mapping between a tool_result
+    block and its containing user message.  Splitting up-front prevents a
+    multi-result user message from being placed next to the wrong assistant
+    tool_use, which would violate OpenAI's "tool_call_id must reference a
+    prior assistant tool_call" rule.
+    """
+    result = []
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if role != "user" or not isinstance(content, list):
+            result.append(m)
+            continue
+        tool_blocks = [b for b in content
+                       if isinstance(b, dict) and b.get("type") == "tool_result"]
+        if len(tool_blocks) <= 1:
+            result.append(m)
+            continue
+        non_tool_blocks = [b for b in content
+                           if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+        if non_tool_blocks:
+            result.append({**m, "content": non_tool_blocks})
+        for tb in tool_blocks:
+            result.append({**m, "content": [tb]})
+    return result
+
+
 # --- _reorder_tool_results ---
 def _reorder_tool_results(messages):
     """Ensure tool_result messages immediately follow their tool_use.
@@ -1582,6 +1683,7 @@ def _reorder_tool_results(messages):
     Only reorders when needed: if tool_result already immediately follows
     its tool_use, no change is made.
     """
+    messages = _split_multi_tool_result_messages(messages)
     tool_result_msg_idx = {}
     for i, m in enumerate(messages):
         if m.get("role") != "user":
