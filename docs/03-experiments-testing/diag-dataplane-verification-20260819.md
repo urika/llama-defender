@@ -2,7 +2,7 @@
 
 > 状态：v1.0（2026-08-19，随 R13-R16 交付同步建立；L0-L2 已全绿，L3 待 agent_go 接入）
 > 被测对象：[diagnostics-dataplane-design-20260819.md](../02-architecture-design/diagnostics-dataplane-design-20260819.md)（commit `37937ce`）
-> 验收基线：[llama-defender-integration-requirements.md §3.2/§5](../llama-defender-integration-requirements.md)
+> 验收基线：[llama-defender-integration-requirements.md §3.2/§5](../01-requirements-product/llama-defender-integration-requirements.md)
 > 环境：rapid-mlx + Qwen3.8-27B-4bit（active.conf），`PROXY_DIAG_ENABLED=true` 默认开
 
 ---

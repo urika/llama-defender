@@ -57,7 +57,7 @@ export PROXY_HBE_SAMPLE_EVERY=2        # 4→2: ILE 邻接采样加密(批跑延
 3 出场   恢复三参数 → reload → experiment_ledger.py end --id exp-1-amnesia --conclusion <报告路径>
 4 分析   当天: trace_query ifc --verdicts ~/APP/swe-eval/results/runs.jsonl \
              --cohort keep_messages=12 --limit 200
-         报告 → docs/04-analysis-diagnosis/amnesia-experiment-2026083X.md
+         报告 → ../04-analysis-diagnostics/amnesia-experiment-report-20260830.md
          台账写结论指针; 按 E2 判定更新 PRD R9.3 状态
 ```
 

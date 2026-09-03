@@ -5,11 +5,11 @@
 > **分析视角**: 产品经理（用户需求场景）  
 > **输入材料**:
 > - `AGENTS.md`（系统定位、架构、已知问题）
-> - `docs/DEFECT-LIST.md`（30 项缺陷，7 P0 + 8 P1 + 10 P2 + 5 P3）
+> - `../04-analysis-diagnostics/DEFECT-LIST.md`（30 项缺陷，7 P0 + 8 P1 + 10 P2 + 5 P3）
 > - `docs/02-architecture-design/use-cases.md`（目标场景用例）
-> - `docs/architecture-review-2026-06-21.md`（架构审查）
+> - `../02-architecture-design/architecture-review-2026-06-21.md`（架构审查）
 > - `CHANGELOG.md`（v0.5.0 → v0.5.7 迭代记录）
-> - `proxy_pain_points_analysis.md` / `proxy_solutions_mapping.md` / `research_kompact_tokensieve_pm.md`
+> - `../04-analysis-diagnostics/proxy_pain_points_analysis.md` / `../02-architecture-design/proxy_solutions_mapping.md` / `../research-context-optimization/research_kompact_tokensieve_pm.md`
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **状态**：设计研究记录（未实施）｜**日期**：2026-08-30
 > **来源**：exp-1-amnesia 实验窗口期间的理论推演 + 两轮业界调研（主流 agent 上下文工程 / harness+RL 后训练）。
-> **关联**：[IFC](information-fidelity-control-design-20260829.md) · [PDC](progressive-disclosure-context-serving-design-20260829.md) · [架构演进总览](context-architecture-evolution-20260829.md) · [熵改善研究计划(对话定稿,IFC-6)](docs/07-project-board/v0.7.0-information-plane.md)
+> **关联**：[IFC](information-fidelity-control-design-20260829.md) · [PDC](progressive-disclosure-context-serving-design-20260829.md) · [架构演进总览](context-architecture-evolution-20260829.md) · [熵改善研究计划(对话定稿,IFC-6)](../07-project-board/v0.7.0-information-plane.md)
 > **一句话**：本会话建成的度量体系（ILE/retention/H_BE/D_ledger/压缩汇率）不止服务于本代理——它是 harness 算法的通用审计仪、任务分解的停止判据、以及 RL 后训练的奖励组件空位；本文记录这条推广线的推理与业界对证。
 
 ---

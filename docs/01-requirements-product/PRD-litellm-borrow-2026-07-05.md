@@ -412,7 +412,7 @@ DEF-107 (#14) 直接归到本 PRD W2 退出条件内,M1 不再单独闭门 (从 
 - [`docs/01-requirements-product/PRD-anthropic-proxy.md`](PRD-anthropic-proxy.md) 主 PRD
 - [`docs/01-requirements-product/PM-evaluation-and-schedule-2026-06-22.md`](PM-evaluation-and-schedule-2026-06-22.md) 路由模块排期参考
 - [`docs/07-project-board/v0.6.0.md`](../07-project-board/v0.6.0.md) v0.6.0 项目板
-- [`docs/DEFECT-LIST.md`](../DEFECT-LIST.md) 缺陷全表
+- [`docs/04-analysis-diagnostics/DEFECT-LIST.md`](../04-analysis-diagnostics/DEFECT-LIST.md) 缺陷全表
 - [`AGENTS.md`](../../AGENTS.md) §6.2 / §7 / §9 修改检查清单 (本 PRD 完结时必须同步)
 - [`CLAUDE.md`](../../CLAUDE.md) 同步更新
 

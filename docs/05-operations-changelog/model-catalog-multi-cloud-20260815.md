@@ -2,7 +2,7 @@
 
 > 日期：2026-08-15
 > 关联设计：[multi-cloud-model-catalog-design-20260815.md](../02-architecture-design/multi-cloud-model-catalog-design-20260815.md)
-> 关联需求：[llama-defender-integration-requirements.md](../llama-defender-integration-requirements.md)（R1-R12 全部交付）
+> 关联需求：[llama-defender-integration-requirements.md](../01-requirements-product/llama-defender-integration-requirements.md)（R1-R12 全部交付）
 > 提交范围：`e350e33 → df6aeb7` 共 11 个 commit（另含用户前期工作 `b9b3074`）
 > 一句话：**新增一个云端模型从"改 5-6 处代码+发版"变为"models.json 加条目 + secret 配 key + reload，零代码"；三家云提供商（deepseek/kimi/zhipu）全部真实调用验证通过。**
 

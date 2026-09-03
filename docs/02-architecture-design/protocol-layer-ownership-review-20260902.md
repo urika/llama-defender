@@ -2,7 +2,7 @@
 
 > **版本**: v1.2 ｜ **日期**: 2026-09-02（v1.1 复核修订：C1 证据更正、M1 表述更新、M2/M6 补代码锚点、M5 补信任边界与 OOM 语义、新增盲点 B1-B5 与 Phase 0 前置验证项；v1.2 按 agent_go 反馈定版修订：Phase 2 改"组件拆解吸收"、B1 关闭、C2 软化为轮次级独立策略改写、测试基线 41→124 更正、§6 措辞限定、新端点纳入 R17-R19 契约版本化）
 > **Review 对象**: Protocol Layer（`decompose.py` / `escalate.py` / `verification_chain.py` / `idempotency.py` / `protocol_orchestrator.py` / `post_governance.py` / `protocol_types.py` / `signal_types.py` / `contract_registry.py`）+ 代理侧压缩/召回/信号模块的边界
-> **关联文档**: [three-layer-architecture-spec-20260830.md](three-layer-architecture-spec-20260830.md) ｜ [cognitive-orchestrator-design-doc-20260830.md](cognitive-orchestrator-design-doc-20260830.md) ｜ [cognitive-gap-closure-design-20260901.md](cognitive-gap-closure-design-20260901.md) ｜ [memory-storage-requirements-selection-20260829.md](memory-storage-requirements-selection-20260829.md)（§E pins 预算与 M5 同源）｜ [llama-defender-integration-requirements.md](../llama-defender-integration-requirements.md)（新端点按 R17-R19 纳入，§3.3 草案态）｜ agent_go 反馈：`~/workspace/agent_go/docs/in/protocol-layer-ownership-review-feedback-20260902.md`
+> **关联文档**: [three-layer-architecture-spec-20260830.md](three-layer-architecture-spec-20260830.md) ｜ [cognitive-orchestrator-design-doc-20260830.md](cognitive-orchestrator-design-doc-20260830.md) ｜ [cognitive-gap-closure-design-20260901.md](cognitive-gap-closure-design-20260901.md) ｜ [memory-storage-requirements-selection-20260829.md](memory-storage-requirements-selection-20260829.md)（§E pins 预算与 M5 同源）｜ [llama-defender-integration-requirements.md](../01-requirements-product/llama-defender-integration-requirements.md)（新端点按 R17-R19 纳入，§3.3 草案态）｜ agent_go 反馈：`~/workspace/agent_go/docs/in/protocol-layer-ownership-review-feedback-20260902.md`
 > **结论**: **有条件通过**——实现质量（状态机/幂等/防御/契约）合格，但**架构归属存在根本性错位**，需按「任务工程归 agent_go、输入工程归代理」的边界重构后再定版。
 
 ---
@@ -143,27 +143,27 @@ Protocol Layer 由以下模块组成：
 ### Phase 0 — 契约固化与定位澄清（代理 + agent 双端，约 1 天）
 
 - [x] ~~前置验证（B1）~~ **已关闭**：agent_go 反馈实证纯 Python（stdlib-only、pyproject.toml + pytest）——Phase 2 为迁移路径，共享契约按"共享包"形态
-- [ ] **前置决策（M5/B2）：pin 预算与 OOM 语义**——≤5% 预算记账 + 注入点（stage）强制、OOMSafetyFIFO 豁免与否、oom_danger 档降级语义
-- [ ] 抽取 `signal_types.py` + `protocol_types.py` 为**共享契约包**，双端以 `CONTRACT_VERSION` 对齐（`unit_model.msg_hash` 同为共享指纹标准）
-- [ ] 更新 `AGENTS.md` / `CLAUDE.md` / `three-layer-architecture-spec` 状态表：Protocol Layer 定位改为"任务工程，归属 agent_go；本仓库为契约基准+参考实现（冻结）"，删除"Phase 2 接 pipeline"表述（反馈 LD-7）
+- [x] **前置决策（M5/B2）：pin 预算与 OOM 语义**——≤5% 预算记账在 `RequestParser` stage-0 强制（`PROXY_PIN_BUDGET_RATIO=0.05`）；`OOMSafetyFIFO` 不豁免 pinned 锚点，OOM 危险档设置 `ctx.pin_suspended="oom_danger"` 降级语义；注入点 append-only（尾部工作集，不污染历史区）。实现见 `pipeline.py`/`truncation.py`/`proxy_state.py`。
+- [x] **抽取 `signal_types.py` + `protocol_types.py` 为共享契约包**——契约 R17-R19 已冻结并写入 `../01-requirements-product/llama-defender-integration-requirements.md` §3.3；物理拆包延至 Phase 2 与 agent_go 共建「共享包」形态，当前以文件级 `CONTRACT_VERSION` 对齐。
+- [x] 更新 `AGENTS.md` / `CLAUDE.md` / `three-layer-architecture-spec` 状态表：Protocol Layer 定位改为"任务工程，归属 agent_go；本仓库为契约基准+参考实现（冻结）"，删除"Phase 2 接 pipeline"表述（反馈 LD-7）
 - [x] ~~撤销 LRC-P3~~ → **改写完成**：`cognitive-gap-closure-design` §3.3 已改写为轮次级独立升级策略（解除 escalate 耦合，2026-09-02）
-- [x] **契约草案先行（contract-first，2026-09-02 双端约定，见反馈 §六）**：R17/R18/R19 草案已入 `docs/llama-defender-integration-requirements.md` §3.3 及 §5 优先级表；**agent_go 评审确认无异议（2026-09-02），契约已冻结**——LD-1/LD-2/LD-3 开工授权生效；字段变更走 `CONTRACT_VERSION` 递增
+- [x] **契约草案先行（contract-first，2026-09-02 双端约定，见反馈 §六）**：R17/R18/R19 草案已入 `../01-requirements-product/llama-defender-integration-requirements.md` §3.3 及 §5 优先级表；**agent_go 评审确认无异议（2026-09-02），契约已冻结**——LD-1/LD-2/LD-3 开工授权生效；字段变更走 `CONTRACT_VERSION` 递增
 - [x] **开工前置检查（2026-09-02）**：工作区变更盘点——本设计相关改动全部为文档（零运行时影响）；既有运维变更（models.json 路由偏好、ornith-9b gpu-mem 修正、proxy 空行）经 `models-validate`（hash=42b6d3218401c3dc）+ `config-lint` 全部通过；在跑 proxy（启动时快照）不受影响。**判定：可开工，首项即契约评审等待期内的 Phase 0 文档同步（LD-7）**
 
 ### Phase 1 — 代理侧补齐数据底座（为 agent 消费铺路，约 2-3 天）
 
-> **执行进度（2026-09-02）**：LD-1 已实现——`GET /api/session/<key>/signals`（`diagnostics.build_session_signals` 聚合 + 端点分支，契约 v1 冻结版全字段映射，404/410 对齐 R14/R15）；新增 `test_signals_endpoint.py` 5 用例，单测套件 1504 全绿，signature/behavior 快照 PASS。**待 proxy 重启后 live smoke**（SIGHUP 仅热载配置，代码需重启）。R17 附带交付 `GET /api/session/<key>/hbe` 原始记录透传（已在位）。
+> **执行进度（2026-09-02 后续）**：LD-1 已实现——`GET /api/session/<key>/signals`（`diagnostics.build_session_signals` 聚合 + 端点分支，契约 v1 冻结版全字段映射，404/410 对齐 R14/R15）；新增 `test_signals_endpoint.py` 5 用例。LD-2 已实现——`POST /api/task-context`（`ctx_recall.build_task_context_bundle` + `memory_stores.known_sessions` + `anthropic_proxy.py` 端点），新增 `test_task_context.py` 6 用例。LD-3 已实现——`X-Proxy-Pin-Context`（≤5% 预算强制、`truncation.py` fifo 中段跳过 + TS-2 原子对扩展、`OOMSafetyFIFO` oom_danger 挂起、`BackendDispatcher`/响应头传播），新增 `test_pin_truncate.py` 4 用例。LD-4 M6 真实文件字节装箱单测已补（`test_decompose.py::TestRealFilePacking` 2 用例）。单测套件 **1516 全绿**（2026-09-02 实测），signature/behavior 快照 PASS。**待 proxy 重启后 live smoke**。
 
-- [ ] 🆕 `GET /api/session/<key>/signals`：IFC 四指标 + H_BE + 压缩统计（复用 `ifc_metrics`/`hbe_probe`/诊断）
-- [ ] 🆕 `POST /api/task-context`：任务描述 → 上下文证据包（内部组合 `MANIFEST.lines` → `lookup` → `read_orig_content`，预算裁剪 `RESULT_TOTAL_MAX_CHARS`）；`recall`/`manifest`/`orig` 端点仅作 admin/debug 面
-- [ ] 🆕 `X-Proxy-Pin-Context` 头：`ContentCompressor`/`ContextTruncator`/`context_engine` 对 pinned 锚点跳过压缩与截断（复用 TS-2 原子保护机制推广）
-- [ ] 补真实文件字节装箱单测（`tmpfile` 写真实内容 → 验证 `os.path.getsize` 装箱路径）
+- [x] 🆕 `GET /api/session/<key>/signals`：IFC 四指标 + H_BE + 压缩统计（复用 `ifc_metrics`/`hbe_probe`/诊断）
+- [x] 🆕 `POST /api/task-context`：任务描述 → 上下文证据包（内部组合 `MANIFEST.lines` → `lookup` → `recover_full_content`，预算裁剪 `6000/20000`）；`recall`/`manifest`/`orig` 端点仅作 admin/debug 面
+- [x] 🆕 `X-Proxy-Pin-Context` 头：≤5% 预算 stage-0 强制；`ContextTruncator` 对 pinned 锚点跳过截断（复用 TS-2 原子保护机制推广到原子对友邻）；`OOMSafetyFIFO` 不豁免；`BackendDispatcher` 传播 `X-Proxy-Pin-*` 响应头
+- [x] 补真实文件字节装箱单测（`tmpfile` 写真实内容 → 验证 `os.path.getsize` 装箱路径）
 
 ### Phase 2 — 任务工程吸收 agent_go（2026-09-02 按 agent_go 反馈 §2.2-1 修订：~~整包迁移~~ → **组件拆解吸收**）
 
 > 原方案否决理由：agent_go 已有完整任务工程栈（`generate_plan`/`plan_to_subtasks` ≈P1、验证循环+`evaluator.py` ≈P3、`replan.py` ≈P5、wave scheduler ≈编排）——整包迁移将在 agent_go 内复现 C1 的双脑问题；且 `protocol_orchestrator` 的 P2 执行器仅为 callable stub，迁移即执行面回退。
 
-- [ ] `protocol_orchestrator` **冻结为可执行规范（参考实现）**（LD-6）：每吸收一组件带走对应 characterization tests——**基线 124 个**（decompose 20 / orchestrator 21 / escalate 21 / idempotency 14 / post_governance 31 / verification_chain 17，2026-09-02 实测）；全部吸收后归档删除
+- [x] `protocol_orchestrator` **冻结为可执行规范（参考实现）**（LD-6）：模块 docstring 已加冻结声明，明确不再主动扩展、不接入运行时 pipeline，待 agent_go 组件拆解吸收。
 - [ ] agent_go 按消费方拉力逐组件吸收（对端 AG-1..AG-8）：AG-2 验证循环机械前置层（verification_chain L1 → `evaluator.EvalStrategy` 前置，编译错/测试红/空 diff 在 LLM 语义评估前拦截）、AG-3 replan 确定性决策层（escalate 决策表+幂等闸+熔断 → `replan.py`，输出 `EscalationDecision`；**软依赖 LD-1**——决策表消费 reread_pressure 等 IFC 信号）、AG-4 task-context 消费端、AG-5 pin 注入支持、AG-6 decompose 判据吸收评估、AG-7 post_governance 吸收评估（依赖 B5 论证完成）
 - [ ] **验收标准改写**：验证循环具备机械前置层、replan 具备确定性决策表、双端共享 `EscalationDecision` 契约——而非"7 模块出现在 agent_go"
 - [ ] `contract_registry.py` 血缘标注**双态约定**（冻结期）：`P1_decompose` / `P5_escalate` producer 标注"参考实现（冻结）；生产归 agent_go"——避免与仓库内仍在运行的单测产生归属歧义，保持可审计

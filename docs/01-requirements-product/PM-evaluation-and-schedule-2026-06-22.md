@@ -259,7 +259,7 @@ Week 1 (6/23 - 6/27)                    Week 2 (6/30 - 7/4)                    W
 | 3.4 | `/status` 成本趋势展示 + daily budget 显示 | `admin_server.py` | 2h | P2 |
 | 3.5 | `PROXY_ROUTE_DAILY_BUDGET` 实现（Phase 3） | `proxy_state.py` + `pipeline.py` | 1h | P2 |
 | 3.6 | A/B 测试：路由 vs 纯本地（5 个场景） | `tools/` | 4h | P2 |
-| 3.7 | 用户文档更新（CLAUDE.md / AGENTS.md / TROUBLESHOOTING.md） | `docs/` | 2h | P2 |
+| 3.7 | 用户文档更新（CLAUDE.md / AGENTS.md / ../06-reference-metrics/TROUBLESHOOTING.md） | `docs/` | 2h | P2 |
 
 > \* RouteNotification 是 P0 需求（FR-6.1），但可在 Phase 1 用简化版（仅日志），Phase 3 升级为完整消息注入。此处排入 Phase 3 是基于依赖关系（需要成本估算就绪后才能在通知中显示估算成本）。
 
@@ -357,7 +357,7 @@ Week 1 (6/23 - 6/27)                    Week 2 (6/30 - 7/4)                    W
 | 成本估算系统 | 功能 | M4 | pre + post request |
 | RouteNotification | 功能 | M4 | 消息流通知 |
 | A/B 测试报告 | 文档 | M4 | 5 场景对比 |
-| 用户文档更新 | 文档 | M4 | CLAUDE.md/AGENTS.md/TROUBLESHOOTING.md |
+| 用户文档更新 | 文档 | M4 | CLAUDE.md/AGENTS.md/../06-reference-metrics/TROUBLESHOOTING.md |
 | 配置示例文件 | 配置 | M2 | rapid-mlx-35b-opt.conf |
 
 ### 7.3 甘特图

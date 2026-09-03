@@ -2147,7 +2147,7 @@ CCR 的收益无法用单轮 TTFT 衡量——它消除的是**死亡循环的�
 - `docs/04-analysis-diagnostics/prefix-cache-analysis-20260605.md` — TurboQuant 配置测试 + KV 量化内存实测（§15.1.2 数据源）
 - `anthropic_proxy.py` — 当前项目的核心代理实现
 - `docs/02-architecture-design/proxy-pipeline-reference.md` — 8 层管线参考
-- `docs/DEFECT-LIST.md` — 30 缺陷记录（7 P0 + 8 P1 + 10 P2 + 5 P3）
+- `DEFECT-LIST.md` — 30 缺陷记录（7 P0 + 8 P1 + 10 P2 + 5 P3）
 
 ### 硬件约束分析数据源（§15）
 - `configs/rapid-mlx-35b.conf` — 生产配置（gpu-memory-utilization 0.75, 4-bit KV, cache-memory-mb 4096, MAX_CONCURRENT=1）

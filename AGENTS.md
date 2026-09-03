@@ -6,7 +6,7 @@
 
 ## 1. 项目概述
 
-**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。消费方 agent_go 项目把本服务称为 **llama-defender**（集成契约见 [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md)：R1-R12 已全部交付）。
+**这不是 llama.cpp 的 C++ 源码仓库。** 它是一个运行在 Python 与 Bash 之上的本地 LLM 推理编排层，核心职责是把下游的 `llama-server` 或 `rapid-mlx` 包装成一个 Anthropic 兼容的 API，供 Claude Code 等客户端使用。消费方 agent_go 项目把本服务称为 **llama-defender**（集成契约见 [`docs/01-requirements-product/llama-defender-integration-requirements.md`](docs/01-requirements-product/llama-defender-integration-requirements.md)：R1-R12 已全部交付）。
 
 运行模式：
 
@@ -133,7 +133,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 - **PDC 披露召回**（`ctx_recall.py` + `memory_stores.py`）：被 fifo/epoch 丢弃的单元写入 manifest（可寻址索引行），模型经 `ctx_recall` 工具查询（L1 内存子串 + L2 FTS5 trigram + archive 全文恢复），微轮自答同请求重派。
 - **队列**（`queue_manager.py`）：`PROXY_QUEUE_ENABLED` 时叠加在 `_llama_lock` 之上按 interactive/standard/large/huge 分桶排队。
 
-> **认知编排器 / Protocol Layer（P1-P5，`post_governance.py`/`escalate.py`/`decompose.py`/`verification_chain.py`/`idempotency.py`/`protocol_orchestrator.py`/`protocol_types.py`/`signal_types.py`/`contract_registry.py`）**：按三层架构规范（`docs/02-architecture-design/three-layer-architecture-spec-20260830.md`）与认知编排器设计（`cognitive-orchestrator-design-doc-20260830.md`）实现，**当前为 Phase 1 独立模块 + 单元测试，尚未接入运行时 pipeline**（Phase 2 接真实模型调用）。Signal 层（ifc_metrics/diagnostics/hbe_probe/memory_stores）已生产挂载；Protocol 层（decompose/verify/escalate/recall）为编排闭环的待接线部分。
+> **认知编排器 / Protocol Layer（P1-P5，`post_governance.py`/`escalate.py`/`decompose.py`/`verification_chain.py`/`idempotency.py`/`protocol_orchestrator.py`/`protocol_types.py`/`signal_types.py`/`contract_registry.py`）**：按三层架构规范（`docs/02-architecture-design/three-layer-architecture-spec-20260830.md`）与认知编排器设计（`cognitive-orchestrator-design-doc-20260830.md`）实现，**当前为 agent_go 集成契约 §3.3 R17/R18/R19 的参考实现冻结版**。Signal 层（ifc_metrics/diagnostics/hbe_probe/memory_stores/ctx_recall）已生产挂载；Protocol 层（decompose/verify/escalate/recall）为编排闭环的待接线部分，其任务工程 / 工具形态 / 是否接入运行时 pipeline 的决策归 agent_go。本仓库不再主动扩展编排器本体，仅吸收可拆解到已有组件的增强（如 PDC-L1/L2、ifc_metrics 信号口径）。
 
 ### 3.3 配置文件
 
@@ -267,7 +267,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 | 层级 | 命令 | 依赖 | 说明 |
 |------|------|------|------|
-| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，51 个文件 1504 个用例（2026-09-02 实测），<15s |
+| 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，51 个文件 1516 个用例（2026-09-02 实测），<15s |
 | 集成 | `bash test/run_tests.sh --integration` | 启动 mock backend | `test/integration/*.sh` + `mock_backend.py`，约 60s |
 | Promptfoo | `bash test/run_tests.sh --promptfoo` | 运行中的代理 | 固定 prompt 回归测试（9 个用例） |
 | E2E | `bash test/run_tests.sh --e2e` | 运行中的代理 + 后端 | `test/e2e/*` |
@@ -430,7 +430,7 @@ git commit --no-verify               # 绕过所有钩子
 ### 8.8 聊天模板兼容性
 
 - Claude Code 的 `mid-conversation-system` beta 会在对话中间插入 `system` 消息，Qwen 官方 chat template 要求所有 `system` 消息必须在最开头，否则会触发 `TemplateError: System message must be at the beginning`。
-- 修复方式：替换模型目录中的 `chat_template.jinja`（rapid-mlx）或使用 `--chat-template` 参数（llama-server）。详情见 `TROUBLESHOOTING.md`。
+- 修复方式：替换模型目录中的 `chat_template.jinja`（rapid-mlx）或使用 `--chat-template` 参数（llama-server）。详情见 `docs/06-reference-metrics/TROUBLESHOOTING.md`。
 
 ---
 
@@ -442,7 +442,7 @@ git commit --no-verify               # 绕过所有钩子
 - [ ] **如果修改 `anthropic_proxy.py` / `pipeline.py`**：运行 `bash test/run_tests.sh --all`；重点检查流式/非流式工具调用、阻塞检测、云端模式、双协议端点（`/v1/chat/completions`）。
 - [ ] **如果新增配置变量**：在 `manage.sh` 加默认值，在 `proxy_config.py` 的 `CONFIG_REGISTRY` 注册，并同步更新 `CLAUDE.md` 与本文件。
 - [ ] **如果新增后端/云服务商**：更新 `anthropic_proxy.py` 中的 `BACKEND_TYPE` 自动检测逻辑与 URL 模式文档。
-- [ ] **如果修改截断、循环检测、阻塞逻辑**：对照 `docs/DEFECT-LIST.md` 检查是否重新引入已知 P0 问题。
+- [ ] **如果修改截断、循环检测、阻塞逻辑**：对照 `docs/04-analysis-diagnostics/DEFECT-LIST.md` 检查是否重新引入已知 P0 问题。
 - [ ] **如果修改架构约定**：同步更新 `CLAUDE.md` 与 `AGENTS.md`。
 - [ ] **所有提交**：确保 `.githooks/pre-commit` 的 `--unit` 测试通过。
 
@@ -456,10 +456,10 @@ git commit --no-verify               # 绕过所有钩子
 | 上下文压缩策略 | [`docs/research-context-optimization/06-context-compression-strategy.md`](docs/research-context-optimization/06-context-compression-strategy.md) |
 | 上下文窗口/截断设计 | [`docs/02-architecture-design/proxy-context-window-design.md`](docs/02-architecture-design/proxy-context-window-design.md) |
 | 智能模型路由 | [`docs/02-architecture-design/intelligent-model-routing-design.md`](docs/02-architecture-design/intelligent-model-routing-design.md) |
-| agent_go 集成契约（R1-R12） | [`docs/llama-defender-integration-requirements.md`](docs/llama-defender-integration-requirements.md) |
-| 已知缺陷列表 | [`docs/DEFECT-LIST.md`](docs/DEFECT-LIST.md) |
-| 故障记录与 workaround | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) |
-| 性能基线 | [`BENCHMARK.md`](BENCHMARK.md) |
+| agent_go 集成契约（R1-R12） | [`docs/01-requirements-product/llama-defender-integration-requirements.md`](docs/01-requirements-product/llama-defender-integration-requirements.md) |
+| 已知缺陷列表 | [`docs/04-analysis-diagnostics/DEFECT-LIST.md`](docs/04-analysis-diagnostics/DEFECT-LIST.md) |
+| 故障记录与 workaround | [`docs/06-reference-metrics/TROUBLESHOOTING.md`](docs/06-reference-metrics/TROUBLESHOOTING.md) |
+| 性能基线 | [`docs/06-reference-metrics/BENCHMARK.md`](docs/06-reference-metrics/BENCHMARK.md) |
 | 测试布局 | [`test/README.md`](test/README.md) |
 | 需求追踪 | [`docs/requirements.yaml`](docs/requirements.yaml) + [`tools/trace_requirements.py`](tools/trace_requirements.py) |
 | Claude Code 专用指南 | [`CLAUDE.md`](CLAUDE.md) |
@@ -569,7 +569,7 @@ git commit --no-verify               # 绕过所有钩子
 
 ## 12. 缺陷修复状态
 
-> 完整缺陷清单见 [`docs/DEFECT-LIST.md`](docs/DEFECT-LIST.md)。以下为截至 2026-07-12 的汇总。
+> 完整缺陷清单见 [`docs/04-analysis-diagnostics/DEFECT-LIST.md`](docs/04-analysis-diagnostics/DEFECT-LIST.md)。以下为截至 2026-07-12 的汇总。
 
 ### 12.1 总体统计
 

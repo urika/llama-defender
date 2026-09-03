@@ -259,4 +259,4 @@ Wave 4（接线与建设）             LRC-P3(轮次级升级策略·改写) + 
 - `skill-progressive-disclosure-insights-20260901.md`：Skill 渐进披露机制分析与压缩借鉴（索引行触发词工程与 §2 方案 A 的索引质量度量共用；可再生优先压缩为独立并行小增量）
 - `three-layer-architecture-spec-20260830.md`：Protocol 层规范（escalate 接线的契约依据）
 - `protocol-layer-ownership-review-20260902.md`（v1.2）+ agent_go 反馈（`~/workspace/agent_go/docs/in/protocol-layer-ownership-review-feedback-20260902.md`）：LRC-P3 由"接线 escalate"经"撤销"最终**改写为轮次级独立升级策略**（解除 escalate 耦合，吸收决策表/幂等闸/熔断三件模式）；任务工程归 agent_go；HG/LRC-P1/P2/TAC/SEM 不受影响
-- `docs/llama-defender-integration-requirements.md`：injection kind 计量契约（D6 先例）
+- `../01-requirements-product/llama-defender-integration-requirements.md`：injection kind 计量契约（D6 先例）

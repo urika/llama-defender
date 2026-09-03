@@ -2,7 +2,7 @@
 
 > **状态**：产品验证文档（v1.0）｜**日期**：2026-08-30
 > **来源**：三层架构规范 + 五协议设计 → 业务场景验证 → 确认架构可行性
-> **关联**：[三层架构规范](three-layer-architecture-spec-20260830.md) · [认知策略编排器](cognitive-strategies-orchestrator-design-20260830.md) · [exp-1 实验报告](../04-analysis-diagnosis/amnesia-experiment-report-20260830.md) · [分层理论框架](layered-theory-framework-20260830.md)
+> **关联**：[三层架构规范](../02-architecture-design/three-layer-architecture-spec-20260830.md) · [认知策略编排器](../02-architecture-design/cognitive-strategies-orchestrator-design-20260830.md) · [exp-1 实验报告](../04-analysis-diagnostics/amnesia-experiment-report-20260830.md) · [分层理论框架](../02-architecture-design/layered-theory-framework-20260830.md)
 > **一句话**：五个业务案例逐一推演三层架构+五协议的端到端解决方案——覆盖防死循环/wiki 维护/会话监控/代码修复/压缩评估，验证架构可行性并识别最高优先建设件。
 
 ---
@@ -277,4 +277,4 @@ python3 tools/trace_query.py ifc \
 
 ---
 
-*关联实验数据：[exp-1 报告](../04-analysis-diagnosis/amnesia-experiment-report-20260830.md) · B1 噪声底 · 压缩汇率拟合*
+*关联实验数据：[exp-1 报告](../04-analysis-diagnostics/amnesia-experiment-report-20260830.md) · B1 噪声底 · 压缩汇率拟合*

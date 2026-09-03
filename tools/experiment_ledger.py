@@ -13,7 +13,7 @@
       --batch "syn-text-30 --force"
   python3 tools/experiment_ledger.py note  --id exp-1-amnesia --text "pilot 2 任务通过"
   python3 tools/experiment_ledger.py end   --id exp-1-amnesia \
-      --conclusion "docs/04-analysis-diagnosis/amnesia-report.md E2 达标"
+      --conclusion "docs/04-analysis-diagnostics/amnesia-experiment-report-20260830.md E2 达标"
   python3 tools/experiment_ledger.py list  [--id exp-1-amnesia]
 
 状态机: begin(同 id 已 running → 拒绝) → note* → end。

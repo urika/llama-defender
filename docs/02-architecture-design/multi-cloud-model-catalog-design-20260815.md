@@ -7,7 +7,7 @@
 > **Phase C 已实施（2026-08-15）**：R9 `GET /api/route/policies`（admin_server `_build_route_policies_json`，脱敏 + catalog_hash）、R10 `/v1/models` 能力元数据（catalog 驱动）、R11 `/api/status` `route_config` 段、R12 `POST /admin/reload`（空 body 合法、_RELOAD_LOCK 串行化、幂等）、`manage.sh models`/`models-validate`；registry 无 getter 时 `$env` 回退读环境（CLI 场景）。973 unit + 10 integration 全绿。
 > **Phase D 已实施（2026-08-15）：Anthropic 协议云分发**。provider 增 `protocol(openai|anthropic)` + `anthropic_key_env`（双端点双 key 体系）；anthropic 候选经 `_do_dispatch_anthropic` 发 `{anthropic_base_url}/v1/messages`——请求体复用管线 openai_body 经 `convert_openai_request_to_anthropic` 回转（与 /v1/chat/completions 入口同一条已测转换链），响应 SSE 原样透传 / 非流式 JSON 直返 + `proxy_route` 注入；OpenAI 协议客户端自动跳过 anthropic 候选（响应格式不兼容，沿 fallback 链降级）。zhipu provider 标记 protocol=anthropic → **Z.ai Coding Plan 订阅额度可被代理路由消耗**（真实调用验证：非流式 200 + usage 归因、流式 69 SSE 事件透传）；glm 价格改订阅边际 0（按量参考价移入 note，避免虚拟计费误触日预算闸门）。979 unit 全绿。
 > 背景：未来需新增云端模型选择（glm5.2 / glm5.3 / K3 / deepseek-v4-pro 等），当前架构围绕单一云提供商（DeepSeek）硬编码，扩展需要改动多处代码。
-> 关联：[llama-defender-integration-requirements.md](../llama-defender-integration-requirements.md)（v2，R8-R12）、[intelligent-model-routing-design.md](intelligent-model-routing-design.md)、agent_go 侧模型实体三层设计（① 模型固有 / ② 角色绑定 / ③ 部署拓扑）
+> 关联：[llama-defender-integration-requirements.md](../01-requirements-product/llama-defender-integration-requirements.md)（v2，R8-R12）、[intelligent-model-routing-design.md](intelligent-model-routing-design.md)、agent_go 侧模型实体三层设计（① 模型固有 / ② 角色绑定 / ③ 部署拓扑）
 > 目标：**新增一个云端模型 = 改一个声明式配置文件 + 配一个 API Key，零代码改动，SIGHUP 热生效。**
 
 ---

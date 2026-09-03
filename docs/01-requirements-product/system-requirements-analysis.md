@@ -251,7 +251,7 @@
 | **合计** | **23** | **23** | **100%** | **6 个缺陷已修复** |
 
 > **注**: 功能覆盖率 100% 不代表零缺陷。上表列出各领域在实现过程中发现并已修复的缺陷。
-> 详见 [`DEFECT-LIST.md`](../DEFECT-LIST.md)。
+> 详见 [`DEFECT-LIST.md`](../04-analysis-diagnostics/DEFECT-LIST.md)。
 
 ---
 

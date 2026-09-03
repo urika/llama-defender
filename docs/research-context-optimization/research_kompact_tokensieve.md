@@ -366,4 +366,4 @@ def is_base64_blob(s: str) -> bool:
 
 *研究完成时间：2026-06-18*  
 *源码路径：/Users/jinsongwang/APP/research/{kompact,tokensieve}*  
-*报告路径：/Users/jinsongwang/APP/llama.cpp/research_kompact_tokensieve.md*
+*报告路径：/Users/jinsongwang/APP/llama.cpp/docs/research-context-optimization/research_kompact_tokensieve.md*

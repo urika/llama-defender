@@ -1,6 +1,6 @@
 # 代理层可解痛点与 Kompact/TokenSieve 改进方案映射
 
-> 承接 `proxy_pain_points_analysis.md`，进一步回答：哪些痛点可以通过代理层解决？参考 Kompact 和 TokenSieve 的源码，可以推导出哪些具体可落地的改进方案？
+> 承接 `../04-analysis-diagnostics/proxy_pain_points_analysis.md`，进一步回答：哪些痛点可以通过代理层解决？参考 Kompact 和 TokenSieve 的源码，可以推导出哪些具体可落地的改进方案？
 
 ---
 
@@ -433,4 +433,4 @@ PROXY_COMPRESSION_PROFILE = os.environ.get("PROXY_COMPRESSION_PROFILE", "balance
 
 ---
 
-*文档路径：/Users/jinsongwang/APP/llama.cpp/proxy_solutions_mapping.md*
+*文档路径：/Users/jinsongwang/APP/llama.cpp/docs/02-architecture-design/proxy_solutions_mapping.md*

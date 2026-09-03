@@ -1523,7 +1523,7 @@ if _is_sensitive_request(ctx):
 | X-* Response Header 注入（`X-Actual-Model`/`X-Route-Target`/`X-Route-Reason`，含 SSE 时序处理） | 0.5h |
 | /status 成本趋势展示 + daily budget 状态 | 2h |
 | A/B 测试：路由 vs 纯本地 (5 cases) | 4h |
-| 用户文档更新（CLAUDE.md / AGENTS.md / TROUBLESHOOTING.md） | 2h |
+| 用户文档更新（CLAUDE.md / AGENTS.md / ../06-reference-metrics/TROUBLESHOOTING.md） | 2h |
 | **合计** | **~10.5h** |
 
 ### 总工作量

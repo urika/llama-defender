@@ -281,9 +281,9 @@ Backend :8081  (rapid-mlx / llama-server / Cloud API)
 1. `docs/01-requirements-product/PRD-anthropic-proxy.md` - 产品需求文档 v3.0
 2. `docs/02-architecture-design/proxy-pipeline-reference.md` - 8 层管线参考文档
 3. `docs/02-architecture-design/proxy-context-window-design.md` - 上下文窗口设计文档
-4. `docs/DEFECT-LIST.md` - 30 个已知缺陷清单
-5. `docs/PM-ANALYSIS-FUTURE-ROADMAP.md` - PM 分析与未来路线图
-6. `docs/OSS-REPLACEMENT-EVALUATION.md` - OSS 替代方案评估
+4. `../04-analysis-diagnostics/DEFECT-LIST.md` - 30 个已知缺陷清单
+5. `../01-requirements-product/PM-ANALYSIS-FUTURE-ROADMAP.md` - PM 分析与未来路线图
+6. `../01-requirements-product/OSS-REPLACEMENT-EVALUATION.md` - OSS 替代方案评估
 7. `AGENTS.md` - 项目编码规范
 8. `CHANGELOG.md` - 版本变更记录
 

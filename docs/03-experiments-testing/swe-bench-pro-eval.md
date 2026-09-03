@@ -53,4 +53,4 @@ python3 scripts/report.py
 
 ## 结果回灌
 
-Pilot 完成后，结果摘要回灌本仓库 `BENCHMARK.md`（与 bench_quality.py 质量对比并列），本文档更新状态与结论。
+Pilot 完成后，结果摘要回灌本仓库 `../06-reference-metrics/BENCHMARK.md`（与 bench_quality.py 质量对比并列），本文档更新状态与结论。

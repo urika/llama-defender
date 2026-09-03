@@ -4,7 +4,7 @@
 > **输入材料**:
 > - Kimi 关于 Agent 调试/开源工具链/自优化训练的 4 轮讨论
 > - `docs/PRD-anthropic-proxy.md` v3.0 (688 行, 7 域 23 需求)
-> - `docs/DEFECT-LIST.md` v1.0 (30 项缺陷, 含 7 个 P0)
+> - `../04-analysis-diagnostics/DEFECT-LIST.md` v1.0 (30 项缺陷, 含 7 个 P0)
 > - `anthropic_proxy.py` 实际代码 (3,589 行, 63 函数, 31 env vars)
 > - Git 提交历史 (28 commits / 16.8 天, +6,224/-2,635 行)
 

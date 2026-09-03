@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """context_engine.py — 上下文工程 Phase 1 核心引擎（R8.1-R8.3，stdlib only）。
 
-设计依据: docs/llama-defender-context-engineering-design.md §4.3/§4.9/§11/§12
+设计依据: docs/02-architecture-design/llama-defender-context-engineering-design.md §4.3/§4.9/§11/§12
   - 前缀纪律（append-only）: canonical 历史一经写入永不改写——每轮只对
     客户端新到达的 observation 做一次写入期压缩并冻结（§4.3），历史区
     不再回溯重写（旧 ContentCompressor 的每轮改写 = 前缀缓存击穿元凶，
@@ -258,9 +258,12 @@ class CanonicalSession(object):
         self.canonical = []           # 发送视图(冻结消息, append-only)
         self.sent_set = set()         # 已发送客户端消息 hash(新观测判定)
         self.sent_order = []          # 发送视图对应的客户端指纹序(尾部检查/折叠同步)
-        self.turn = 0
+        # user_msgs = canonical 累计 user 消息条数（引擎内部口径, 与请求轮错开:
+        # tool_result 亦为 user role → 每请求轮可 +2）。EPOCH 日志用它, 台账/
+        # 诊断的 turn = 客户端请求序号——两者语义不同, 排查时勿混用。
+        self.user_msgs = 0
         self.epoch_count = 0
-        self.last_epoch_turn = 0
+        self.last_epoch_user_msgs = 0
         self.compression_region = []  # L3 压缩区文本行（epoch 收编产物）
         self.last_sent_tokens = 0     # 后端 usage 回填(验收门禁 1 计量)
         self.last_cached_tokens = 0
@@ -314,9 +317,9 @@ class CanonicalSession(object):
         hints = {id(b): hint for b, hint in _pair_tool_hints(client_messages or [])}
         for msg in new_items:
             self.canonical.append(_frozen_copy(_transform_message(msg, hints)))
-        new_turns = sum(1 for m in new_items if m.get("role") == "user")
-        if new_turns:
-            self.turn += max(1, new_turns)
+        new_user_msgs = sum(1 for m in new_items if m.get("role") == "user")
+        if new_user_msgs:
+            self.user_msgs += max(1, new_user_msgs)
         return self.canonical, mismatch, len(new_items)
 
     # ------------------------------------------------------------------ %
@@ -375,7 +378,7 @@ class CanonicalSession(object):
         if self._trigger_scale() <= trigger_tokens:
             return False, list(self.canonical)
         self.epoch_count += 1
-        self.last_epoch_turn = self.turn
+        self.last_epoch_user_msgs = self.user_msgs
         # 每次回退尝试都从同一基线重算压缩区——_collapse 会就地追加
         # self.compression_region, 不重置会把 K=24 失败尝试的台账行重复
         # 累计进 K=4 的产物(重复行膨胀 → 误触硬上限)。
@@ -417,7 +420,7 @@ class CanonicalSession(object):
             try:
                 import memory_stores
                 memory_stores.record_dropped_messages(
-                    self.session_key, self.turn, "epoch_collapse",
+                    self.session_key, self.user_msgs, "epoch_collapse",
                     [m for rnd in collect for m in rnd])
             except Exception:
                 pass

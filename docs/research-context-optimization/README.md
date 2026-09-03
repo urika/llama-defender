@@ -17,14 +17,14 @@
 
 ## 参考文档
 
-以下原始调研文档保留在项目根目录，作为本目录的详细技术依据：
+以下原始调研文档已归入本目录，作为详细技术依据：
 
 | 文档 | 内容 |
 |------|------|
-| `/Users/jinsongwang/APP/llama.cpp/research_kompact_tokensieve.md` | Kompact 与 TokenSieve 源码级技术分析、benchmark 数据、关键类与函数说明 |
-| `/Users/jinsongwang/APP/llama.cpp/research_kompact_tokensieve_pm.md` | 产品经理视角的目标、判断维度、投入产出评估 |
-| `/Users/jinsongwang/APP/llama.cpp/proxy_pain_points_analysis.md` | 当前代理层 8 大痛点详细分析与根因拆解 |
-| `/Users/jinsongwang/APP/llama.cpp/proxy_solutions_mapping.md` | 痛点与调研产品的解决方案映射、优先级矩阵 |
+| `research_kompact_tokensieve.md` | Kompact 与 TokenSieve 源码级技术分析、benchmark 数据、关键类与函数说明 |
+| `research_kompact_tokensieve_pm.md` | 产品经理视角的目标、判断维度、投入产出评估 |
+| `../04-analysis-diagnostics/proxy_pain_points_analysis.md` | 当前代理层 8 大痛点详细分析与根因拆解 |
+| `../02-architecture-design/proxy_solutions_mapping.md` | 痛点与调研产品的解决方案映射、优先级矩阵 |
 
 ## 关键结论速览
 
@@ -39,4 +39,4 @@
 
 - **技术同学**从 `01-requirements.md` → `02-problems.md` → `03-analysis.md` → `04-solutions.md` 顺序阅读。
 - **产品/项目管理者**重点看 `01-requirements.md`、`03-analysis.md` 中的判断矩阵、`05-plan.md` 的路线图。
-- 如需深入源码实现细节，可回到根目录的 `research_kompact_tokensieve.md` 查阅类图、函数签名与 benchmark 命令。
+- 如需深入源码实现细节，可查阅本目录的 `research_kompact_tokensieve.md`。

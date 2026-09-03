@@ -4,7 +4,7 @@
 > 日期：2026-08-19
 > 修订记录：v0.1 初稿；v0.2 并入外部 review（Kimi）反馈；**v0.3 取消独立台账块**——复核发现 v0.2「台账置 L2 之后」仍违反布局不变式（L2 每轮增长位于台账之前 → 台账整体每轮被推移 ~15K 重算）。根本约束：每轮 append 增长区域必须唯一。台账改为三载体：原生流（epoch 间）+ 压缩区台账格式（epoch 时）+ 代理侧 canonical（复述块呈现聚合）
 > 输入依据：公开集本地臂批跑形态学观察（搜索兔子洞 / 代理每轮语义改写 / ~3min/轮）+ 业界调研（Manus / Anthropic / llama.cpp 官方文档与 tutorial）
-> 关联：[llama-defender-integration-requirements.md](llama-defender-integration-requirements.md)（接口需求基线）、[harness-driving-architecture.md](harness-driving-architecture.md)（智能化能力盘点）
+> 关联：[../01-requirements-product/llama-defender-integration-requirements.md](../01-requirements-product/llama-defender-integration-requirements.md)（接口需求基线）、`harness-driving-architecture.md`（智能化能力盘点）
 > 目标项目：`/Users/jinsongwang/APP/llama.cpp`（llama-defender 代理侧改造，不涉及 llama.cpp 内核修改）
 > 背景讨论：本设计同时回应两个问题——① 每轮语义改写导致响应时间随轮数恶化；② 改写销毁「重复行为」证据，削弱模型元认知（搜索兔子洞的放大器之一）。
 

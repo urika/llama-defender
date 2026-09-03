@@ -1,6 +1,6 @@
 # anthropic_proxy.py 代理层痛点分析（产品经理视角）
 
-> 基于 `DEFECT-LIST.md`、`CHANGELOG.md`、`TROUBLESHOOTING.md`、`dead-loop-analysis-report.md`、`prompt-instability-mechanism-analysis.md`、`prefix-cache-analysis-20260605.md` 等文档，以及 `anthropic_proxy.py` 源码注释，提炼代理层反复出现的核心痛点问题。
+> 基于 `DEFECT-LIST.md`、`CHANGELOG.md`、`../06-reference-metrics/TROUBLESHOOTING.md`、`dead-loop-analysis-report.md`、`prompt-instability-mechanism-analysis.md`、`prefix-cache-analysis-20260605.md` 等文档，以及 `anthropic_proxy.py` 源码注释，提炼代理层反复出现的核心痛点问题。
 
 ---
 
@@ -8,12 +8,12 @@
 
 | 来源 | 重点信息 |
 |---|---|
-| `docs/DEFECT-LIST.md` | 30 项缺陷（7 P0 + 8 P1 + 10 P2 + 5 P3），含根因、修复、遗留问题 |
+| `docs/04-analysis-diagnostics/DEFECT-LIST.md` | 30 项缺陷（7 P0 + 8 P1 + 10 P2 + 5 P3），含根因、修复、遗留问题 |
 | `CHANGELOG.md` | v0.5.0 → v0.5.3 的迭代路线、已知问题、配置变更 |
-| `TROUBLESHOOTING.md` | Qwen chat template 兼容性故障，含修复前后对比 |
-| `docs/dead-loop-analysis-report.md` | Read 死循环（219 次 Wasted call）与 Write 认知循环的完整案例 |
-| `docs/prompt-instability-mechanism-analysis.md` | 截断策略导致 prompt 共同前缀从 97% 跌至 24% 的机制 |
-| `docs/prefix-cache-analysis-20260605.md` | prefix cache 命中率 0% 的根因分析、TurboQuant 测试 |
+| `../06-reference-metrics/TROUBLESHOOTING.md` | Qwen chat template 兼容性故障，含修复前后对比 |
+| `docs/04-analysis-diagnostics/dead-loop-analysis-report.md` | Read 死循环（219 次 Wasted call）与 Write 认知循环的完整案例 |
+| `docs/04-analysis-diagnostics/prompt-instability-mechanism-analysis.md` | 截断策略导致 prompt 共同前缀从 97% 跌至 24% 的机制 |
+| `docs/04-analysis-diagnostics/prefix-cache-analysis-20260605.md` | prefix cache 命中率 0% 的根因分析、TurboQuant 测试 |
 | `anthropic_proxy.py` | 800+ 行注释直接记录了设计决策与 workaround |
 
 ---
@@ -376,4 +376,4 @@ Tool Clearing 是一个**教训深刻的反模式**：用"删除信息"解决"�
 ---
 
 *分析时间：2026-06-18*  
-*文档路径：/Users/jinsongwang/APP/llama.cpp/proxy_pain_points_analysis.md*
+*文档路径：/Users/jinsongwang/APP/llama.cpp/docs/04-analysis-diagnostics/proxy_pain_points_analysis.md*

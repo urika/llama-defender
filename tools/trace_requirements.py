@@ -24,7 +24,7 @@ file:LINE anchors, they are stable across unrelated code changes.
 
 Run:
     python3 tools/trace_requirements.py
-    python3 tools/trace_requirements.py --markdown docs/requirement-matrix.md
+    python3 tools/trace_requirements.py --markdown docs/01-requirements-product/requirement-matrix.md
     python3 tools/trace_requirements.py --strict      # exit 1 on any issue
 """
 import os

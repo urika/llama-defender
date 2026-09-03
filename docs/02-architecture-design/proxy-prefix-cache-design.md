@@ -985,10 +985,10 @@ llama.cpp 已支持 `--prompt-cache` 持久化。**未来**: 代理层可直接�
 ## 15. 关联文档
 
 - `docs/PRD-anthropic-proxy.md` — R3.2 当前定义
-- `docs/DEFECT-LIST.md` — DEF-003 (re_read_rate 失效) / DEF-102 (rounds 未生效) / DEF-202 (cleared dedup 反复触发)
+- `../04-analysis-diagnostics/DEFECT-LIST.md` — DEF-003 (re_read_rate 失效) / DEF-102 (rounds 未生效) / DEF-202 (cleared dedup 反复触发)
 - `docs/prefix-cache-analysis-20260605.md` — 后端 prefix cache 现状
-- `docs/PM-ANALYSIS-FUTURE-ROADMAP.md` — llama_defender 库化方向
-- `docs/OSS-REPLACEMENT-EVALUATION.md` — vLLM APC 作为参考的来源
+- `../01-requirements-product/PM-ANALYSIS-FUTURE-ROADMAP.md` — llama_defender 库化方向
+- `../01-requirements-product/OSS-REPLACEMENT-EVALUATION.md` — vLLM APC 作为参考的来源
 - vLLM 设计文档: https://docs.vllm.ai/en/latest/design/prefix_caching.html
 - SGLang RadixAttention 论文: https://arxiv.org/abs/2312.07104
 - Anthropic Prompt Caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching

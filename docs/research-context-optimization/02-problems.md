@@ -3,9 +3,9 @@
 ## 2.1 痛点提炼来源
 
 以下问题基于：
-- `docs/DEFECT-LIST.md`（30 项缺陷，7 P0 + 8 P1 + 10 P2 + 5 P3）
+- `../04-analysis-diagnostics/DEFECT-LIST.md`（30 项缺陷，7 P0 + 8 P1 + 10 P2 + 5 P3）
 - `CHANGELOG.md`（v0.5.0 → v0.5.3 迭代记录）
-- `TROUBLESHOOTING.md`（Qwen chat template 兼容性故障）
+- `../06-reference-metrics/TROUBLESHOOTING.md`（Qwen chat template 兼容性故障）
 - `docs/dead-loop-analysis-report.md`（Read 死循环完整案例）
 - `docs/prompt-instability-mechanism-analysis.md`（prefix cache 命中率分析）
 - `docs/prefix-cache-analysis-20260605.md`（Rapid-MLX cache 分析）

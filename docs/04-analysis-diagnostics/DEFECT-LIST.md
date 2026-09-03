@@ -10,7 +10,7 @@
 > - `logs/e2e_test.log` (端到端测试)
 > - `logs/unit_test.log` (单元测试)
 > - 28 条 git commit messages
-> - `TROUBLESHOOTING.md` / `BENCHMARK.md`
+> - `../06-reference-metrics/TROUBLESHOOTING.md` / `../06-reference-metrics/../06-reference-metrics/BENCHMARK.md`
 > - `docs/` 下 24 篇需求与设计文档
 
 ---
@@ -30,7 +30,7 @@
 
 ### DEF-001: 67 个请求返回 500 错误 (22% 错误率) — ✅ 已修复 (2026-07-12)
 
-> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 (W1-W2)
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](../01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 (W1-W2)
 > M1 走 WrapperGuard 热修 (防御性清理孤儿); M1.5 TS-2 通过 `_find_tool_pairs` + 配对原子保护从源头消除孤儿 tool_use/tool_result 切断问题。
 
 | 项 | 内容 |
@@ -48,7 +48,7 @@
 
 ### DEF-002: 循环注入率 37% — 模型仍频繁陷入循环 — ✅ 已修复 (2026-07-12)
 
-> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](../01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2
 > 截断切断配对是循环注入的诱因之一 (后端孤儿报错→模型 Defensive Read 重试)。M1.5 TS-2 消除此根因后,defensive re-read 触发率目标下降 ≥ 50%。
 
 | 项 | 内容 |
@@ -102,7 +102,7 @@
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `TROUBLESHOOTING.md` § 二.根本原因 |
+| **数据源** | `../06-reference-metrics/TROUBLESHOOTING.md` § 二.根本原因 |
 | **已实施修复** | 1) `manage.sh fix-template <model_dir>` 一键修复命令<br>2) `_start_rapid_mlx` 启动时自动检测: 扫描 HuggingFace 缓存中的 chat_template, 如缺少 `is_system_content` 标记则发出警告并提示修复命令 |
 
 ---
@@ -125,14 +125,14 @@
 
 ### DEF-103: Cleared Compression 触发率低 (代理层收益打折) — ⚪ 设计限制
 
-> **🔗 M1.5 替代路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-1 (W3)
+> **🔗 M1.5 替代路径**: 见 [`PRD-litellm-borrow-2026-07-05`](../01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-1 (W3)
 > 原 Cleared Compression 触发率不达预期;M1.5 TS-1 引入 BM25 评分驱动压缩决策,低分 tool_result 优先压,触发率目标 ≥ 60% (当前约 30%)。
 
 | 项 | 内容 |
 |------|------|
 | **数据源** | `logs/anthropic_proxy.log` |
 | **现状** | `Cleared compression` 日志条目较少,大多数情况下仅依赖 Rounds/FIFO 截断 |
-| **PRD 文档** | `optimization-log-20260603.md` 称 `compress_cleared_tool_results()` 每轮合并 1-21 个 cycles,节省 2-42 条消息 |
+| **PRD 文档** | `../05-operations-changelog/optimization-log-20260603.md` 称 `compress_cleared_tool_results()` 每轮合并 1-21 个 cycles,节省 2-42 条消息 |
 | **实际效果** | 在当前 fifo 策略下,cleared messages 已被截断,二次压缩空间有限 |
 | **影响** | Layer 4 的 `compress_cleared_tool_results` 价值降低 |
 | **不可修复原因** | 这不是 bug,而是 fifo 截断与 cleared compression 两种上下文管理策略的功能重叠。fifo 先行截断 cleared messages,导致 compression 阶段无内容可压。同时启用会产生冗余操作。选择 fifo 策略就意味着 compression 收益自然降低 |
@@ -165,7 +165,7 @@
 
 ### DEF-107: high_drop_ratio 21.6% — 上下文丢失率过高 — ✅ 已修复 (2026-07-12)
 
-> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 + TS-1
+> **🔗 M1.5 根治路径**: 见 [`PRD-litellm-borrow-2026-07-05`](../01-requirements-product/PRD-litellm-borrow-2026-07-05.md) §2 TS-2 + TS-1
 > 事后 `_fix_tool_pairings` 清理孤儿导致的"额外 drop"是 high_drop_ratio 偏高主因。M1.5 TS-2 事前预防消除额外 drop;TS-1 BM25 让低相关性 tool_result 优先压缩(而非整体 drop),双管齐下目标 < 10%。
 
 | 项 | 内容 |
@@ -263,7 +263,7 @@
 
 | 项 | 内容 |
 |------|------|
-| **数据源** | `optimization-log-20260603.md` § 4.2 + BENCHMARK.md |
+| **数据源** | `../05-operations-changelog/optimization-log-20260603.md` § 4.2 + ../06-reference-metrics/BENCHMARK.md |
 | **现象** | 运行 7 分钟后生成速度从 56 → 12 tok/s (衰减 78%) |
 | **修复** | 新增 `./manage.sh watchdog` 命令: 每 60s 检查后端健康 + 解析日志中 tok/s,低于阈值(默认 15 tok/s)时自动 `restart`。每小时最多重启 6 次,防止无限循环 |
 | **剩余** | watchdog 需在独立终端运行 (非 daemon);tok/s 解析依赖日志格式 |

@@ -61,7 +61,7 @@
 
 ### 3.1 agent_go 消费方需求核对（2026-08-20 补）
 
-集成契约（[`llama-defender-integration-requirements.md`](../llama-defender-integration-requirements.md) §3.2 + [`llama-defender-context-engineering-design.md`](../llama-defender-context-engineering-design.md) §9）已把日志数据列为 agent_go 的采集/分析/决策三级输入，本节核对本改进与其对应关系：
+集成契约（[`llama-defender-integration-requirements.md`](../01-requirements-product/llama-defender-integration-requirements.md) §3.2 + [`llama-defender-context-engineering-design.md`](llama-defender-context-engineering-design.md) §9）已把日志数据列为 agent_go 的采集/分析/决策三级输入，本节核对本改进与其对应关系：
 
 | agent_go 需求 | 契约位置 | 数据源 | 本改进对应 | 状态 |
 |---|---|---|---|---|
@@ -85,7 +85,7 @@
 
 ## 4. 验证与回灌
 
-- Phase A 落地后：重跑 click-06/rich-11（qwen3.8 配置），用 B2 diff 修复前后动作轨迹 → 回灌 `BENCHMARK.md`；
+- Phase A 落地后：重跑 click-06/rich-11（qwen3.8 配置），用 B2 diff 修复前后动作轨迹 → 回灌 `../06-reference-metrics/BENCHMARK.md`；
 - 台账持久化验收后，R14 端点 `410 session_evicted` 语义保留（内存驱逐 ≠ 档案删除）；
 - 本文档状态行随各 Phase 推进更新，完成后在 `docs/README.md` 索引登记。
 

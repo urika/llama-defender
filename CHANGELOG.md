@@ -319,7 +319,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 ### Status: Pre-OSS-migration baseline
 
 **Tag purpose**: 标记 Phase 1-5 完整实现快照,作为 llama_defender 库化 (路线图 B) 的起点。
-**不推荐生产部署**: 7 个 P0 缺陷未修复 (详见 `docs/DEFECT-LIST.md`)。
+**不推荐生产部署**: 7 个 P0 缺陷未修复 (详见 `docs/04-analysis-diagnostics/DEFECT-LIST.md`)。
 
 ### Added
 
@@ -344,11 +344,11 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - **19 个端到端测试** (含 12 case 集成矩阵)
 
 #### 设计文档 (本次提交新增)
-- `docs/PRD-anthropic-proxy.md` (688 行): 产品需求文档 v3.0
-- `docs/DEFECT-LIST.md` (509 行): 30 项缺陷清单 (7 P0 + 8 P1 + 10 P2 + 5 P3)
-- `docs/PM-ANALYSIS-FUTURE-ROADMAP.md` (377 行): 产品经理视角的核心功能取舍
-- `docs/OSS-REPLACEMENT-EVALUATION.md` (688 行): OSS 替代品深度评估
-- `docs/proxy-prefix-cache-design.md` (1001 行): 代理层 prefix cache 稳定化设计 v1.0
+- `docs/01-requirements-product/PRD-anthropic-proxy.md` (688 行): 产品需求文档 v3.0
+- `docs/04-analysis-diagnostics/DEFECT-LIST.md` (509 行): 30 项缺陷清单 (7 P0 + 8 P1 + 10 P2 + 5 P3)
+- `docs/01-requirements-product/PM-ANALYSIS-FUTURE-ROADMAP.md` (377 行): 产品经理视角的核心功能取舍
+- `docs/01-requirements-product/OSS-REPLACEMENT-EVALUATION.md` (688 行): OSS 替代品深度评估
+- `docs/02-architecture-design/proxy-prefix-cache-design.md` (1001 行): 代理层 prefix cache 稳定化设计 v1.0
 - `docs/README.md`: 文档目录导航
 
 #### 文档重构
@@ -357,7 +357,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ### Known Issues (P0, 7 项)
 
-来自 `docs/DEFECT-LIST.md`:
+来自 `docs/04-analysis-diagnostics/DEFECT-LIST.md`:
 - **DEF-001**: 22% 请求返回 500 错误 — **🟡 部分修复** (预截断 + 错误分类 + Retry-After)
 - **DEF-002**: 37% 请求触发循环注入 (R2.1 未根治跨请求循环)
 - **DEF-003**: re_read_rate 公式错误 (2,862%, 应 ≤ 100%)
@@ -368,7 +368,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 
 ### Roadmap (路向 v1.0)
 
-依据 `docs/PM-ANALYSIS-FUTURE-ROADMAP.md` 路线图 B:
+依据 `docs/01-requirements-product/PM-ANALYSIS-FUTURE-ROADMAP.md` 路线图 B:
 - **Phase 1 (0-3 月)**: 稳态化 + 引入旁路观测 (Langfuse)
 - **Phase 2 (3-6 月)**: OSS 替换 (LiteLLM 协议转换) + 提取 llama_defender 库
 - **Phase 3 (6-12 月)**: 业务转型 (llama_defender OSS 库 + DSPy/GEPA 提示词优化模板)
@@ -583,7 +583,7 @@ PROXY_TOOL_KEEP=8                   # 保持默认值
 - ~~DEF-006~~ 🟡 已缓解 — 建议升级 rapid-mlx v0.6.71
 - ~~DEF-007~~ ✅ 已修复
 - 部署 Langfuse sidecar (3000 端口)
-- 实施 `docs/proxy-prefix-cache-design.md` Phase 1-2
+- 实施 `docs/02-architecture-design/proxy-prefix-cache-design.md` Phase 1-2
 - 修复 DEF-107 (high_drop_ratio 干预)
 - 修复 DEF-104 (白名单自动扩展)
 - ~~DEF-204~~ ✅ 已修复

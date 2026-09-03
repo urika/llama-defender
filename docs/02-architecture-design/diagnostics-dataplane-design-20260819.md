@@ -1,8 +1,8 @@
 # llama-defender 诊断数据面设计（R13-R16：缓存 / 会话 / 行为复盘观测）
 
 > 状态：设计 v1.0 → **已实施（2026-08-19，D-Phase 0-2 合并交付）**。新增模块 `diagnostics.py` + `session_ledger.py`；`X-Proxy-Epoch-Count`、`is_epoch_turn`、archive `canonical` 视图按计划预留 null/501，待上下文工程 Phase 1 落地后点亮。单元测试 45 个（`test_diagnostics.py` + `test_session_ledger.py`）。
-> 需求来源：[llama-defender-integration-requirements.md §3.2](../llama-defender-integration-requirements.md)（R13-R16）
-> 上游设计：[llama-defender-context-engineering-design.md §10](../llama-defender-context-engineering-design.md)（数据面缺口与分层）
+> 需求来源：[llama-defender-integration-requirements.md §3.2](../01-requirements-product/llama-defender-integration-requirements.md)（R13-R16）
+> 上游设计：[llama-defender-context-engineering-design.md §10](llama-defender-context-engineering-design.md)（数据面缺口与分层）
 > 目标：为上下文工程改造（append-only + epoch 压缩）提供**观测先行**的数据面：缓存命中率 / 延迟分档 / 会话台账 / 压缩后行为复盘四域的结构化数据源，全部经「响应头 + 端点 + jsonl」供 agent_go / 批跑 harness 消费。
 > 边界：本设计**不改动任何请求处理行为**——诊断数据面是纯旁路观测层；上下文工程本体（canonical history / epoch 状态机 / 写入期压缩）不在本文档范围。
 
@@ -318,7 +318,7 @@ manage.sh 无需手工同步（`write_defaults_sh` 自动生成默认值、`conf
 
 ## 11. 需求文档回写记录（2026-08-19 已执行）
 
-对 `docs/llama-defender-integration-requirements.md` §3.2 的 5 处修订：
+对 `../01-requirements-product/llama-defender-integration-requirements.md` §3.2 的 5 处修订：
 1. R13 修正「复用 R8 头模式」表述 → 非流式 HTTP 头 + 流式 SSE 尾注 `: x-proxy-diag {...}` 双通道。
 2. 补 `X-Proxy-Diag-Request-Id` 头与 `request_id` 关联字段（metering ↔ R16 jsonl 对齐键）。
 3. 补 `GET /api/sessions` 发现端点与 turn 计数定义。

@@ -727,7 +727,7 @@ _extract_content_tool_calls (line 417)  # 非流式
 
 ## 12. 附录: 引用文档清单
 
-> 共 24 篇 `docs/` 文档 + 1 篇 `BENCHMARK.md` + 1 篇 `TROUBLESHOOTING.md`
+> 共 24 篇 `docs/` 文档 + 1 篇 `../06-reference-metrics/BENCHMARK.md` + 1 篇 `../06-reference-metrics/TROUBLESHOOTING.md`
 
 ### 12.1 核心架构文档
 

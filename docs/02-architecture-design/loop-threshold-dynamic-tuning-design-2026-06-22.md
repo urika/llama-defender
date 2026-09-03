@@ -310,7 +310,7 @@ metrics JSONL 输出新增字段：
 
 - `docs/02-architecture-design/intelligent-model-routing-design.md` v2.12（主设计）
 - `docs/04-analysis-diagnostics/dead-loop-analysis-report.md`（死循环分析）
-- `docs/DEFECT-LIST.md` P0 项 2/3/4（循环注入率 37%、re_read 公式错误等）
+- `../04-analysis-diagnostics/DEFECT-LIST.md` P0 项 2/3/4（循环注入率 37%、re_read 公式错误等）
 - `test/unit/test_loop_detection.py` / `test_text_loop.py` / `test_pipeline_stages.py:TestBlockerDetector`（现状测试）
 - `proxy_state.py:125` `_SESSION_REQUEST_COUNT` / `:246-291` 阈值常量
 
