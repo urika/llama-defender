@@ -358,6 +358,7 @@ _METRICS_V1_FIELDS = {
     "est_input_tokens", "est_output_tokens", "memory_rejected", "used_pct",
     "max_tokens_original", "max_tokens_dynamic", "snapshot_written",
     "dynamic_concurrent", "tools",
+    "trace_id", "root_span_id", "span_count", "spans",
 }
 
 # ---------------------------------------------------------------------------

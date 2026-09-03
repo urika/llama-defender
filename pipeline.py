@@ -135,6 +135,8 @@ def _log_cloud_error(ctx, status, response_body, exc_info=None):
             "ts": datetime.now().isoformat(),
             "session_id": getattr(ctx, '_session_id', '') or getattr(ctx, 'request_id', ''),
             "request_id": getattr(ctx, 'request_id', ''),
+            "trace_id": getattr(ctx, 'trace_id', ''),
+            "root_span_id": getattr(ctx, 'root_span_id', ''),
             "route_target": getattr(ctx, '_route_target', ''),
             "route_reason": getattr(ctx, '_route_reason', ''),
             "status": status,
@@ -168,6 +170,8 @@ class PipelineContext:
 
     # --- Immutable inputs ---
     request_id: str = ""
+    trace_id: str = ""
+    root_span_id: str = ""
     model: str = "unknown"
     is_stream: bool = False
     max_tokens_orig: int = 4096
@@ -288,6 +292,44 @@ class Pipeline:
         return ctx
 
 
+# ----------------------------------------------------------------------------
+# 追踪层单元引用（request-tracing-design-20260903.md §Context）
+# ----------------------------------------------------------------------------
+# span 只保存被压缩/丢弃单元的引用（anchor）与字符变化统计，不携带正文。
+# 正文仍由 snapshot/archive/manifest/orig 保存；anchor 词汇来自
+# ifc_metrics.unit_anchors（light=True：低成本，仅锚+kind+size）。
+_CONTEXT_TRACE_STAGES = frozenset({
+    "cache_aligner",
+    "content_compressor",
+    "context_truncator",
+    "oom_safety",
+})
+
+
+def _trace_unit_map(messages):
+    """返回 anchor → {kind, size_chars} 映射（fail-open → None 表示跳过）。
+
+    复用 ifc_metrics.unit_anchors(light=True) 保持单一锚词汇；system 消息不进
+    追踪（与 view_summary 口径一致）。
+    """
+    try:
+        import ifc_metrics as _ifm
+    except Exception:
+        return None
+    units = {}
+    try:
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            if (msg.get("role") or "") == "system":
+                continue
+            for u in _ifm.unit_anchors(msg, light=True):
+                units[u["anchor"]] = u
+    except Exception:
+        return None
+    return units
+
+
 class InstrumentedPipeline(Pipeline):
     """Pipeline with automatic timing, logging, and metrics per stage.
 
@@ -310,12 +352,28 @@ class InstrumentedPipeline(Pipeline):
                 continue
             executed += 1
             t0 = time.monotonic()
+            import trace_context
+            span = trace_context.start_span(stage.name)
+            trace_ctx_before = None
+            if span is not None and stage.name in _CONTEXT_TRACE_STAGES:
+                trace_ctx_before = _trace_unit_map(ctx.messages)
             try:
                 ctx = stage.process(ctx)
             except Exception as e:
+                trace_context.finish_span(span, status="error", error=e)
                 log(f"  -> PIPELINE FAILURE at stage '{stage.name}': {type(e).__name__}: {e}")
                 raise RuntimeError(f"Pipeline stage '{stage.name}' failed: {type(e).__name__}: {e}") from e
             elapsed = (time.monotonic() - t0) * 1000
+            trace_ctx_after = _trace_unit_map(ctx.messages)
+            if trace_ctx_before is not None and trace_ctx_after is not None:
+                trace_context.finish_span(
+                    span,
+                    attributes={"elapsed_ms": round(elapsed, 1)},
+                    context=trace_context.context_delta(trace_ctx_before, trace_ctx_after),
+                )
+            else:
+                trace_context.finish_span(
+                    span, attributes={"elapsed_ms": round(elapsed, 1)})
             total_ms += elapsed
             if elapsed > slowest_ms:
                 slowest_ms = elapsed
@@ -343,6 +401,17 @@ class InstrumentedPipeline(Pipeline):
             "slowest_stage": slowest_name,
             "slowest_ms": round(slowest_ms, 1),
         })
+        trace = trace_context.current()
+        if trace:
+            ctx.trace_id = trace["trace_id"]
+            ctx.root_span_id = trace["root_span_id"]
+            admin._mc_put("trace", {
+                "trace_id": trace["trace_id"],
+                "request_id": trace["request_id"],
+                "root_span_id": trace["root_span_id"],
+                "span_count": len(trace["spans"]),
+                "spans": trace["spans"],
+            })
         return ctx
 
 
@@ -1419,10 +1488,18 @@ class ContentCompressor(ConditionalStage):
                 "think_stripped": think_stats.get("stripped_count", 0),
                 "semantic_compressed": semantic.get("compressed_count", 0),
                 "semantic_saved_chars": semantic.get("saved_chars", 0),
+                "semantic_original_chars": semantic.get("original_chars", 0),
+                "semantic_compressed_chars": semantic.get("compressed_chars", 0),
+                "semantic_audit_failures": semantic.get("audit_failures", 0),
                 # TS-4 指标修复: 压缩阶段前后整个上下文的字符量
                 # (semantic_saved_chars 只统计 tool_result 本体,不含消息壳开销)
                 "context_before_chars": getattr(ctx, '_compress_ctx_before', 0),
                 "context_after_chars": getattr(ctx, '_compress_ctx_after', 0),
+                "context_savings_ratio": (
+                    round(1.0 - (getattr(ctx, '_compress_ctx_after', 0) /
+                                  getattr(ctx, '_compress_ctx_before', 1)), 4)
+                    if getattr(ctx, '_compress_ctx_before', 0) > 0 else 0.0
+                ),
             }
         }
 

@@ -881,6 +881,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not getattr(self, "_request_id", None):
                     self._request_id = f"req_{os.urandom(8).hex()}"
                 _req_id = self._request_id
+                import trace_context
+                _trace = trace_context.begin(
+                    _req_id,
+                    traceparent=self.headers.get("traceparent"),
+                    trace_id=self.headers.get("X-Proxy-Trace-Id"),
+                )
                 self._last_jsonl_token = _next_jsonl_token()
                 _jsonl_output_map[self._last_jsonl_token] = 0
                 # R13-R16: 本请求诊断累积态初始化(key_source 记录会话 key 来源,
@@ -894,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
                             mc["request_id"] = _req_id
+                            mc["trace_id"] = _trace["trace_id"]
+                            mc["root_span_id"] = _trace["root_span_id"]
                     except Exception as _e:
                         _warn_diag("begin_request", _e)
                 # Phase 3: request failure snapshot — save original body before processing
@@ -952,6 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                         start_time=_req_start_time,
                         session_id=raw_sid,
                         request_id=_req_id,
+                        trace_id=_trace["trace_id"],
                     )
                     _record_request_for_concurrency(_dur, _status)
                     if PROXY_METRICS_ENABLED:
@@ -986,6 +995,7 @@ class Handler(BaseHTTPRequestHandler):
                         start_time=_req_start_time,
                         session_id=raw_sid,
                         request_id=_req_id,
+                        trace_id=_trace["trace_id"],
                     )
                     _record_request_for_concurrency(_dur, status_code)
                     if PROXY_METRICS_ENABLED:
@@ -1051,16 +1061,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond_json({"detail": "Not found"}, 404)
         finally:
             _log_ctx.session_id = None
+            try:
+                import trace_context
+                trace_context.clear()
+            except Exception:
+                pass
             if PROXY_METRICS_ENABLED:
                 _metrics_ctx.mc = None
 
     def _handle_messages(self, body):
         """Pipeline-based message processing — 22 stages."""
+        import trace_context
         # Emergency rollback: set PROXY_PIPELINE_DISABLED=1 to use the old path
         # (requires reverting to a prior commit that still has the legacy code).
         ctx = PipelineContext(
             body=body,
             request_id=getattr(self, '_request_id', ''),
+            trace_id=(trace_context.current() or {}).get("trace_id", ""),
+            root_span_id=(trace_context.current() or {}).get("root_span_id", ""),
             client_type=_detect_client_type(self.headers.get('User-Agent', '')),
         )
         InstrumentedPipeline([
@@ -1810,6 +1828,14 @@ class Handler(BaseHTTPRequestHandler):
         diag_headers = getattr(self, '_diag_response_headers', None) or {}
         for hk, hv in diag_headers.items():
             self.send_header(hk, str(hv))
+        try:
+            import trace_context
+            trace = trace_context.current()
+            if trace:
+                self.send_header("X-Proxy-Trace-Id", trace["trace_id"])
+                self.send_header("X-Proxy-Span-Id", trace["root_span_id"])
+        except Exception:
+            pass
         self._diag_response_headers = None
 
     def _handle_anthropic_stream_passthrough(self, resp, anthropic_body):
