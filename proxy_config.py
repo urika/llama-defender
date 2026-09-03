@@ -935,6 +935,38 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Probe backend socket timeout in seconds (cache-warm prefill + short gen).",
     },
+    "PROXY_PIN_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R19 X-Proxy-Pin-Context master switch: pinned anchors skip "
+               "compression/truncation stages. Off = header ignored "
+               "(+X-Proxy-Pin-Disabled: true).",
+    },
+    "PROXY_PIN_BUDGET_RATIO": {
+        "defaults": {"all": "0.05"},
+        "type": "float", "scope": "reloadable",
+        "doc": "Pin budget as ratio of request chars (contract: <=5%). Excess "
+               "pins demoted from list tail with X-Proxy-Pin-Demoted header.",
+    },
+    "PROXY_FOLD_DENSE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Dense fold directory for fifo truncation (2026-09-03): replace the "
+               "one-line fold placeholder with a per-file/action index "
+               "(<=MAX_CHARS). Off = legacy one-line version. Shadow logging "
+               "always on regardless of this switch.",
+    },
+    "PROXY_FOLD_DENSE_MAX_FILES": {
+        "defaults": {"all": "10"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max file rows in the dense fold directory (first-seen turn order).",
+    },
+    "PROXY_FOLD_DENSE_MAX_CHARS": {
+        "defaults": {"all": "800"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Hard cap for the dense fold Files segment (chars); tail "
+               "RECALL_CUE sentence is never truncated.",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

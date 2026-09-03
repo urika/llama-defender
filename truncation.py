@@ -14,6 +14,142 @@ from message_converter import _estimate_message_chars
 def _log(msg, level="INFO"):
     pass
 
+
+def _build_dense_fold_text(dropped, tool_count=0, file_mentions=None,
+                           max_files=10, max_chars=800):
+    """Dense fold 目录纯函数（fifo A 路加密折叠 v1，确定性无 LLM 无 I/O）。
+
+    输入 dropped（已按原顺序的中段消息），输出 "Files… / Actions…" 两段
+    目录文本（不含外层方括号与 RECALL_CUE，由调用方拼装，保证尾句完整）。
+    fail-open：任何异常由调用方捕获，返回 ""。
+    排序：文件按首现顺序；工具按固定字母序，保证同 dropped 集字节稳定。
+    """
+    try:
+        max_files = max(1, int(max_files))
+    except Exception:
+        max_files = 10
+    try:
+        max_chars = max(100, int(max_chars))
+    except Exception:
+        max_chars = 800
+    file_mentions = file_mentions or set()
+    # --- Actions 行：统计 dropped 内 tool_use 名频次（双格式兼容） ---
+    freq = {}
+    order = []
+
+    def _bump(name):
+        if not name:
+            return
+        if name not in freq:
+            freq[name] = 0
+            order.append(name)
+        freq[name] += 1
+
+    for m in dropped or []:
+        content = m.get("content", []) if isinstance(m, dict) else []
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                _bump(b.get("name", ""))
+                fn = b.get("function") or {}
+                if isinstance(fn, dict) and fn.get("name"):
+                    _bump(fn.get("name"))
+    # --- Files 行：首现保序 + 计数 + 最后工具名 ---
+    # v1.1 归一化：剥 worktree 绝对前缀（…/repos/wt-xxx/ → ""），归一化后去重。
+    # 同一文件经绝对/相对两种写法引用时合并计数，字节稳定（确定性正则）。
+    _WT_RE = re.compile(r"^.*?/repos/wt-[^/]+/")
+
+    def _norm_path(p):
+        try:
+            if not isinstance(p, str):
+                return ""
+            p = p.strip()
+            p = _WT_RE.sub("", p)
+            return p
+        except Exception:
+            return p if isinstance(p, str) else ""
+
+    file_rows = {}
+    file_order = []
+    pat_list = [r'"path":\s*"([^"]+)"', r'"file_path":\s*"([^"]+)"',
+                r'"file":\s*"([^"]+)"',
+                r'"filePath":\s*"([^"]+)"', r'"directory":\s*"([^"]+)"']
+
+    def _reg_file(path, tool):
+        path = _norm_path(path)
+        if not path or len(path) > 200:
+            return
+        if path not in file_rows:
+            file_rows[path] = {"n": 0, "last": ""}
+            file_order.append(path)
+        file_rows[path]["n"] += 1
+        if tool:
+            file_rows[path]["last"] = str(tool)[:32]
+
+    for m in dropped or []:
+        content = m.get("content", []) if isinstance(m, dict) else []
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            tool = b.get("name", "") or ((b.get("function") or {}).get("name", "")
+                                         if isinstance(b.get("function"), dict) else "")
+            args = ""
+            fn = b.get("function") or {}
+            if isinstance(fn, dict):
+                args = fn.get("arguments", "")
+            if not args:
+                args = b.get("input", "")
+            if isinstance(args, dict):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args = str(args)
+            if not isinstance(args, str):
+                continue
+            for pat in pat_list:
+                try:
+                    for p in re.findall(pat, args):
+                        _reg_file(p, tool)
+                except Exception:
+                    continue
+    # file_mentions 兜底：正则漏检的路径仍进目录（计数 1，无 last；归一化后去重）
+    for p in sorted(file_mentions):
+        p = _norm_path(p)
+        if p not in file_rows:
+            file_rows[p] = {"n": 1, "last": ""}
+            file_order.append(p)
+    parts = []
+    if freq:
+        actions = " ".join("%s×%d" % (k, freq[k]) for k in sorted(freq))
+        parts.append("Actions: %s." % actions)
+    elif tool_count:
+        parts.append("Actions: %d tool calls." % int(tool_count))
+    if file_order:
+        rows = []
+        for p in file_order[:max_files]:
+            r = file_rows[p]
+            tail = " [last: %s]" % r["last"] if r["last"] else ""
+            rows.append("%s ×%d%s" % (p, r["n"], tail))
+        # v1.1 溢出紧凑行：超 MAX_FILES 的文件只列裸名（无计数/last），
+        # 保证目录全覆盖；总段仍受 max_chars 钳制。
+        _overflow = file_order[max_files:]
+        if _overflow:
+            rows.append("+%d more: %s" % (len(_overflow), ", ".join(_overflow)))
+        files_seg = "Files (%d): %s." % (len(file_order), "; ".join(rows))
+        if len(files_seg) > max_chars:
+            files_seg = files_seg[:max_chars] + "…"
+        parts.append(files_seg)
+    return " ".join(parts)
+
 # --- _compress_content_pass ---
 def _compress_content_pass(messages, tools_list=None, stage_config=None,
                            session_id=None):
@@ -1233,37 +1369,71 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
         # understand what was lost without needing to re-read files.
         # The text is still kept stable across requests sharing the same
         # truncation boundary (prefix cache compatible).
-        # PDC-L1(2026-08-31): 摘要附带 ctx_recall 召回指引——欠拉修复。
-        # 批跑日志分析(2026-08-31): 模型可见面无任何"信息曾丢失"信号导致
-        # ctx_recall 零调用; DEF-107 占位符是现成的失忆感知通道, 只差
-        # 指引句。指引为静态文本, 不破坏 prefix-cache 稳定性约束。
+        # 折叠召回线索统一口径（2026-09-03 folded-recall-cue 设计）：
+        # 指引句唯一源头 = ctx_recall.RECALL_CUE，与 B 路（epoch 面板）字节一致。
+        # fail-open：import 失败沿用 PDC-L1 旧文案，折叠不受影响。
+        try:
+            from ctx_recall import RECALL_CUE as _RECALL_CUE
+            from ctx_recall import recall_keys_line as _recall_keys_line
+            _cue_text = _RECALL_CUE
+            _keys_text = _recall_keys_line(drop_anchors)
+        except Exception:
+            _cue_text = ("Use ctx_recall tool with the file path, keyword "
+                         "or anchor to recover folded content instead of "
+                         "re-reading files")
+            _keys_text = (f"sample anchors: {', '.join(drop_anchors[:3])}"
+                          if drop_anchors else "")
         drop_ratio = dropped_count / n if n > 0 else 0
-        anchor_hint = (f". sample anchors: {', '.join(drop_anchors[:3])}"
-                       if drop_anchors else "")
         if drop_ratio > 0.7 and (tool_count > 0 or file_mentions):
             parts = ["[Context folded: earlier messages omitted."]
             if tool_count > 0:
                 parts.append(f" {tool_count} tool calls were removed")
             if file_mentions:
                 parts.append(f" referenced files: {', '.join(sorted(file_mentions)[:8])}")
-            parts.append(anchor_hint
-                         + ". Use ctx_recall tool with the file path, keyword "
-                           "or anchor to recover folded content instead of "
-                           "re-reading files]")
+            if _keys_text:
+                parts.append(" " + _keys_text)
+            parts.append(" " + _cue_text + "]")
             compressed_text = "".join(parts)
         elif drop_ratio > 0.7 and drop_anchors:
             # 无文件提及但有锚点 → 给锚点查询键
             parts = ["[Context folded: earlier messages omitted."]
             if tool_count > 0:
                 parts.append(f" {tool_count} tool calls were removed")
-            parts.append(f". sample anchors: {', '.join(drop_anchors[:3])}"
-                         ". Use ctx_recall tool to recover folded content "
-                         "instead of re-reading files]")
+            if _keys_text:
+                parts.append(" " + _keys_text)
+            parts.append(" " + _cue_text + "]")
             compressed_text = "".join(parts)
         else:
             compressed_text = ("[Context folded: earlier messages omitted. "
-                               "Use ctx_recall tool to recover folded content "
-                               "instead of re-reading files.]")
+                               + _cue_text + "]")
+
+        # 加密折叠 dense v1（2026-09-03）：影子字段常算（可观测，不影响行为），
+        # 开关开时把 Files/Actions 目录拼入方括号内、RECALL_CUE 之前。
+        # fail-open：组装异常 → 沿用现有一行版。
+        _dense_seg = ""
+        _dense_chars = 0
+        try:
+            _dense_seg = _build_dense_fold_text(
+                dropped, tool_count=tool_count, file_mentions=file_mentions,
+                max_files=getattr(_ps, "PROXY_FOLD_DENSE_MAX_FILES", 10),
+                max_chars=getattr(_ps, "PROXY_FOLD_DENSE_MAX_CHARS", 800))
+            _dense_chars = len(_dense_seg)
+        except Exception:
+            _dense_seg = ""
+            _dense_chars = 0
+        if _dense_seg and getattr(_ps, "PROXY_FOLD_DENSE_ENABLED", False):
+            try:
+                _core = compressed_text
+                if _core.endswith("]"):
+                    _core = _core[:-1]
+                # _cue_text 尾句完整保留：目录插到 cue 之前
+                if _cue_text and _cue_text in _core:
+                    _core = _core.replace(_cue_text, (_dense_seg + " " + _cue_text))
+                else:
+                    _core = _core + " " + _dense_seg
+                compressed_text = _core + "]" if not _core.endswith("]") else _core
+            except Exception:
+                pass
 
         if tail and tail[0].get("role") == "user":
             tail_content = tail[0].get("content", [])
@@ -1291,6 +1461,9 @@ def truncate_messages_if_needed(messages, session_id=None, keep_rounds=None,
             "kept_messages": len(result),
             "tool_count": tool_count,
             "file_mentions": len(file_mentions),
+            "fold_dense_shadow": _dense_seg,
+            "fold_dense_chars": _dense_chars,
+            "fold_dense_enabled": bool(getattr(_ps, "PROXY_FOLD_DENSE_ENABLED", False)),
             "protected_indices": list(_protected_pair_indices(messages, _ps.PROXY_CACHE_ALIGN_HEAD)),
             "dropped_indices": list(range(_ps.PROXY_CTX_KEEP_HEAD, n - tail_count)),
             "compressed_assistants": 0,

@@ -508,6 +508,21 @@ PROXY_PD_MICRO_TURN_ENABLED = os.environ.get(
 PROXY_PD_MICRO_TURN_MAX = int(os.environ.get(
     "PROXY_PD_MICRO_TURN_MAX", get_default("PROXY_PD_MICRO_TURN_MAX")))
 
+# R19 上下文钉扎（X-Proxy-Pin-Context，集成契约 §3.3 冻结版 2026-09-02）
+PROXY_PIN_ENABLED = os.environ.get(
+    "PROXY_PIN_ENABLED", get_default("PROXY_PIN_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_PIN_BUDGET_RATIO = float(os.environ.get(
+    "PROXY_PIN_BUDGET_RATIO", get_default("PROXY_PIN_BUDGET_RATIO")) or 0.05)
+
+# 加密折叠 dense fold（fifo A 路，2026-09-03）：31 轮→1 行提 dense 目录。
+# 默认关 = 现有一行版；影子期只写日志不注入。fail-open。
+PROXY_FOLD_DENSE_ENABLED = os.environ.get(
+    "PROXY_FOLD_DENSE_ENABLED", get_default("PROXY_FOLD_DENSE_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_FOLD_DENSE_MAX_FILES = int(os.environ.get(
+    "PROXY_FOLD_DENSE_MAX_FILES", get_default("PROXY_FOLD_DENSE_MAX_FILES")))
+PROXY_FOLD_DENSE_MAX_CHARS = int(os.environ.get(
+    "PROXY_FOLD_DENSE_MAX_CHARS", get_default("PROXY_FOLD_DENSE_MAX_CHARS")))
+
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
 # engineering-design §4.3/§4.9，Phase 0 §12 结论已坐实击穿根因为每轮回溯改写）
@@ -1134,6 +1149,11 @@ _RELOAD_SPEC = [
     ("PROXY_PD_ENABLED", "PROXY_PD_ENABLED", "bool", "true", "true"),
     ("PROXY_PD_MICRO_TURN_ENABLED", "PROXY_PD_MICRO_TURN_ENABLED", "bool", "false", "false"),
     ("PROXY_PD_MICRO_TURN_MAX", "PROXY_PD_MICRO_TURN_MAX", "int", "2", "2"),
+    ("PROXY_PIN_ENABLED", "PROXY_PIN_ENABLED", "bool", "false", "false"),
+    ("PROXY_PIN_BUDGET_RATIO", "PROXY_PIN_BUDGET_RATIO", "float", "0.05", "0.05"),
+    ("PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_ENABLED", "bool", "false", "false"),
+    ("PROXY_FOLD_DENSE_MAX_FILES", "PROXY_FOLD_DENSE_MAX_FILES", "int", "10", "10"),
+    ("PROXY_FOLD_DENSE_MAX_CHARS", "PROXY_FOLD_DENSE_MAX_CHARS", "int", "800", "800"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1302,6 +1322,8 @@ __all__ = [
     "PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_RECENT",
     "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD",
     "TOOL_ALWAYS_KEEP",
+    # Fold dense (fifo A 路加密折叠)
+    "PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_MAX_FILES", "PROXY_FOLD_DENSE_MAX_CHARS",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority
