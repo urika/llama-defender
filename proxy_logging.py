@@ -87,7 +87,7 @@ def _maybe_rotate_main_log(log_path):
 # --- log_request ---
 def log_request(model: str, input_chars: int, output_chars: int,
                 status: int, duration_ms: float, start_time: str = "",
-                session_id: str = "", request_id: str = ""):
+                session_id: str = "", request_id: str = "", trace_id: str = ""):
     """Append one JSON Lines record to proxy_requests.jsonl (thread-safe).
 
     A1(2026-08-20): 补 session_id/request_id 关联字段(此前按会话归因全部断裂)
@@ -107,6 +107,7 @@ def log_request(model: str, input_chars: int, output_chars: int,
         "duration_ms": round(duration_ms, 1),
         "session_id": session_id,
         "request_id": request_id,
+        "trace_id": trace_id,
     }
     line = json.dumps(record, ensure_ascii=False) + "\n"
     try:

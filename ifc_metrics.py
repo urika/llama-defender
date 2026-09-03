@@ -87,13 +87,16 @@ def _content_head(content, limit=120):
     return ""
 
 
-def unit_anchors(msg):
+def unit_anchors(msg, light=False):
     """一条消息 → 单元字典列表（锚点 + 分类，manifest 与视图差分共用词汇）。
 
     每个单元: {anchor, role, kind(tool_use|tool_result|text), tool, handle, size_chars}
     - Anthropic: content block 的 tool_use（含 name/input）与 tool_result（tool_use_id）
     - OpenAI:    assistant.tool_calls[].id 与 role=="tool" 的 tool_call_id
     - 无工具消息: 整条为一个 text 单元（锚 = 消息指纹）
+
+    light=True 时跳过 head/triggers 计算（低成本提取：仅锚 + kind + size_chars）。
+    供追踪层 per-stage 单元引用使用——同一锚词汇，避免再造一套单元识别规则。
     """
     role = msg.get("role") or ""
     content = msg.get("content")
@@ -112,22 +115,24 @@ def unit_anchors(msg):
                     "size_chars": len(_um.text_str(b.get("input", ""))),
                 })
             elif btype == "tool_result":
-                units.append({
+                entry = {
                     "anchor": "r:%s" % (b.get("tool_use_id") or _um.msg_hash(b)),
                     "role": role, "kind": "tool_result", "tool": "",
                     "handle": None,
                     "size_chars": _um.result_chars(b),
+                }
+                if not light:
                     # PDC 索引扩容(2026-09-01): head 120→240——检索词汇覆盖。
                     # 实测 lookup('annotate') 类概念词 miss 的根因是 head 截断
                     # 过短, 概念词只存在于 head 之后的正文。manifest 行 +240
                     # chars/条, 总量 MB 级可忽略。
-                    "head": _um.result_text(b, 240),
+                    entry["head"] = _um.result_text(b, 240)
                     # §3.1 触发词(2026-09-01): 前 1200 字符的指称性实体
                     # (路径/ID/数字)入独立字段——line_text 索引后模型可用
                     # 正文深处的实体词命中折叠单元
-                    "triggers": " ".join(_um.extract_key_entities(
-                        _um.result_text(b, 1200), max_items=8)),
-                })
+                    entry["triggers"] = " ".join(_um.extract_key_entities(
+                        _um.result_text(b, 1200), max_items=8))
+                units.append(entry)
     tool_calls = msg.get("tool_calls")
     if isinstance(tool_calls, list):
         for tc in tool_calls:
@@ -156,13 +161,15 @@ def unit_anchors(msg):
             "size_chars": _text_chars_of_content(content),
         })
     if not units:
-        units.append({
+        entry = {
             "anchor": "h:%s" % _um.msg_hash(msg),
             "role": role, "kind": "text", "tool": "",
             "handle": None,
             "size_chars": _text_chars_of_content(content) + len(_um.text_str(role)),
-            "head": _content_head(content),
-        })
+        }
+        if not light:
+            entry["head"] = _content_head(content)
+        units.append(entry)
     return units
 
 

@@ -71,11 +71,13 @@ class TestLogRequest(unittest.TestCase):
             try:
                 proxy_state._JSONL_PATH = os.path.join(tmp, "requests.jsonl")
                 pl.log_request("m", 1, 1, 200, 1.0,
-                               session_id="cli_AB12", request_id="req_abc")
+                               session_id="cli_AB12", request_id="req_abc",
+                               trace_id="tr_abc")
                 with open(proxy_state._JSONL_PATH) as f:
                     record = json.loads(f.readline())
                 self.assertEqual(record["session_id"], "cli_AB12")
                 self.assertEqual(record["request_id"], "req_abc")
+                self.assertEqual(record["trace_id"], "tr_abc")
             finally:
                 proxy_state._JSONL_PATH = original_path
 
@@ -90,8 +92,10 @@ class TestLogRequest(unittest.TestCase):
                     record = json.loads(f.readline())
                 self.assertIn("session_id", record)
                 self.assertIn("request_id", record)
+                self.assertIn("trace_id", record)
                 self.assertEqual(record["session_id"], "")
                 self.assertEqual(record["request_id"], "")
+                self.assertEqual(record["trace_id"], "")
             finally:
                 proxy_state._JSONL_PATH = original_path
 

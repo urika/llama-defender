@@ -2774,6 +2774,16 @@ loadTrends();
 # --- _finalize_metrics ---
 def _finalize_metrics(mc):
     pipeline = mc.get("pipeline", {})
+    try:
+        import trace_context
+        trace = trace_context.current()
+        if trace:
+            mc["trace_id"] = trace.get("trace_id")
+            mc["root_span_id"] = trace.get("root_span_id")
+            mc["span_count"] = len(trace.get("spans", []))
+            mc["spans"] = trace.get("spans", [])
+    except Exception:
+        pass
     quality_flags = []
     trunc = pipeline.get("truncate", {})
     if trunc.get("triggered"):

@@ -119,6 +119,14 @@ def begin_request(request_id, session_key, key_source="unknown"):
     _ps._diag_ctx.canonical_mismatch = False
     _ps._diag_ctx.backend_timings_note = None
     _ps._diag_ctx.ifc_view = None  # R9.1: 本轮发送视图摘要(capture 时填充)
+    try:
+        import trace_context
+        trace = trace_context.current()
+        _ps._diag_ctx.trace_id = trace.get("trace_id") if trace else None
+        _ps._diag_ctx.root_span_id = trace.get("root_span_id") if trace else None
+    except Exception:
+        _ps._diag_ctx.trace_id = None
+        _ps._diag_ctx.root_span_id = None
 
 
 def record_injection(kind):
@@ -234,6 +242,12 @@ def build_diag_payload():
     request_id = getattr(ctx, "request_id", None)
     if request_id:
         diag["request_id"] = request_id
+    trace_id = getattr(ctx, "trace_id", None)
+    root_span_id = getattr(ctx, "root_span_id", None)
+    if trace_id:
+        diag["trace_id"] = trace_id
+    if root_span_id:
+        diag["root_span_id"] = root_span_id
     session_key = getattr(ctx, "session_key", None)
     if session_key:
         diag["session_key"] = session_key
@@ -372,6 +386,8 @@ def finalize_request(mc):
         "schema_version": DIAG_SCHEMA_VERSION,
         "ts": datetime.now().isoformat(),
         "request_id": request_id,
+        "trace_id": getattr(ctx, "trace_id", None),
+        "root_span_id": getattr(ctx, "root_span_id", None),
         "session_key": session_key,
         "key_source": getattr(ctx, "key_source", "unknown"),
         "turn": turn,
@@ -402,6 +418,7 @@ def finalize_request(mc):
             "mode": ((mc or {}).get("pipeline", {}).get("truncate", {}) or {}).get("strategy"),
             "ratio": (mc or {}).get("compression_ratio"),
         },
+        "trace": None,
         # ① 配置指纹: 数据自带产生条件(队列识别/实验归因)
         "config": None,
         "conf_hash": None,
@@ -436,6 +453,12 @@ def finalize_request(mc):
             ifc_metrics.BASELINE.update(session_key, cur)
         except Exception as _e:
             warn_suppressed("ifc_finalize", _e)
+    try:
+        import trace_context
+        record["trace"] = trace_context.finish_request(
+            status="ok" if (mc or {}).get("status", 200) == 200 else "error")
+    except Exception as _e:
+        warn_suppressed("trace_finalize", _e)
     log_session_diag(record)
     if record["canonical_mismatch"]:
         log_lifecycle_event("canonical_mismatch",

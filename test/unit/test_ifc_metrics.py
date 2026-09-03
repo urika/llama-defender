@@ -51,6 +51,22 @@ class TestUnitAnchors(unittest.TestCase):
         self.assertEqual(units[0]["kind"], "text")
         self.assertTrue(units[0]["anchor"].startswith("h:"))
 
+    def test_light_mode_skips_head_and_triggers(self):
+        full = im.unit_anchors(_anth_msg("user", [_anth_tool_result("t1", "x" * 500)]))
+        self.assertIn("head", full[0])
+        light = im.unit_anchors(
+            _anth_msg("user", [_anth_tool_result("t1", "x" * 500)]), light=True)
+        self.assertEqual(light[0]["anchor"], "r:t1")
+        self.assertEqual(light[0]["kind"], "tool_result")
+        # 字符口径与完整版一致(list 块按 result_chars 计,含 JSON 壳)
+        self.assertEqual(light[0]["size_chars"], full[0]["size_chars"])
+        self.assertNotIn("head", light[0])
+        self.assertNotIn("triggers", light[0])
+        # text fallback 同样跳过 head
+        light_text = im.unit_anchors(
+            _anth_msg("user", [{"type": "text", "text": "hello" * 200}]), light=True)
+        self.assertNotIn("head", light_text[0])
+
 
 class TestViewDiff(unittest.TestCase):
     def _prev_view(self):
