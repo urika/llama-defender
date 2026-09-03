@@ -62,7 +62,8 @@ def post(endpoint, body, sid):
         endpoint.rstrip("/") + "/v1/messages", data=data, method="POST",
         headers={"Content-Type": "application/json",
                  "anthropic-version": "2023-06-01",
-                 "X-Claude-Code-Session-Id": sid})
+                 "X-Claude-Code-Session-Id": sid,
+                 "X-Proxy-Route-To": "local"})
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=300) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
