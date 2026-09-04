@@ -90,3 +90,55 @@ truncation 路径本有寄存（27B orig 199 行实证）；engine 路径曾是�
 - `rapidmlx-kvcache-mechanism-20260903.md`：KV/驱逐机制（§8.5 gate 验证）
 - `gate_test_ctx_engine.py`（tools/）：ctx_engine 门禁（force-local 版）
 - swe-eval results/runs.jsonl：本调查的 run 记录（verify-window80 / verify-27b）
+
+## 8. 追踪：engine-on 致死根因与透传基线（2026-09-04/05 补充）
+
+### 8.1 engine-on "1 轮 end_turn" 真相：aux/主 session key 污染
+
+复现实锤（09-04 22:21 run）：主任务请求（32K/40 tools）模型仅回 22 chars 即
+end_turn。链路：
+- claude SDK 内部 aux 调用（title 生成，haiku tier + tools=0）与主对话**共用
+  X-Claude-Code-Session-Id**（ANTHROPIC_CUSTOM_HEADERS 对 SDK 全部请求统一
+  注入，harness 无法区分——run_agent.py:405 单 sid 设计）
+- 代理按 sid[:8] 归会话 → aux 历史吸进主任务 canonical → `prefix mismatch —
+  canonical rebuilt` → 主对话形态错乱 → 模型 1 轮 end_turn
+- 09-03 的 400 死循环是同根源另一形态（aux 当日直连官方 API，被孤儿历史卡）
+- **9/3 engine-on 7 连败全部由此致**——engine-on 的 run 从未真正跑长过
+
+**修复（pipeline.py ContextEngineStage.should_run）**：haiku tier + tools=0
+请求的会话 key 追加 `::aux-haiku` 域后缀，aux 与主 canonical 互不可见。
+单测覆盖（aux 分域 + 主 canonical 不被污染），1544 tests OK。
+
+### 8.2 SDK 轮间历史改写（性能噪音，非致死）
+
+engine-on 修复后复现轮：archive 逐轮 diff 发现 claude SDK headless 每轮把
+**上一轮工具结果替换为占位符** `{"error": "Tool result was not provided..."}`——
+工具结果单轮生命周期。后果：engine 每轮必然 prefix mismatch → canonical
+rebuild → 前缀缓存命中反复重建（性能损失，正确性无损——canonical 跟随客户端
+历史）。透传组（8.3）该现象未出现，疑似与 resume/引擎形态叠加相关，待后续
+自然会话再证。
+
+### 8.3 纯透传基线 + 轮数预算：0B 的另一半真相
+
+对照组（engine off + 压缩/过滤/清除/HBE 全关 + KEEP 80 + 干净
+SWE_SESSION_SALT）：
+
+| run | max_turns | 结果 |
+|---|---|---|
+| passthrough3 | 25 | 0B——25 轮全在探索（13R+12B），max_turns 截停 |
+| **passthrough-100t** | 100 | **5822B patch ✓**——51 轮自然收敛（end_turn） |
+
+- 51 轮构成：探索 ~30（Read/Bash/Grep）→ Edit×13 → Bash 验证 → end_turn
+- 速度 ~15s/轮（后端 fetch 143 HIT/0 MISS、命中 98.5%——增量 prefill 仅
+  几百 tokens；decode 20-25 tok/s）
+- **max_turns=25 对全栈任务偏紧**（转折点在 20-50 轮间波动）——9/3 的
+  4054B 与本次 5822B 都是 ~50 轮预算下的产出
+- 行为方差教训：旧会话 key 复用（历史包袱）曾诱发 23 连败路径循环 +
+  BLOCKER——同任务重跑必须换 SWE_SESSION_SALT（run_agent docstring 已记）
+
+### 8.4 结论修订（对 §3 根因的补充）
+
+fifo 窗口浅（24 条）仍是重要约束（§3 成立），但同实例完整判定需要三条件
+同时满足：**窗口够深（80）+ 轮数预算够（≥50）+ aux 隔离（engine on 时）**。
+三者缺一即 0B。纯透传 + 80 窗口 + 100 轮预算是最稳健的当前基线
+（5822B，27 分钟，$0.15）。

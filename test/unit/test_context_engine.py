@@ -300,6 +300,48 @@ class TestPipelineWiring(unittest.TestCase):
         finally:
             _ps.PROXY_CTX_ENGINE_ENABLED = saved
 
+
+    def test_aux_request_isolated_from_main_canonical(self):
+        """aux(haiku+tools=0)请求 key 分域——不污染主对话 canonical
+        (2026-09-04 复现: SDK title 调用与主任务共用 sid → 污染 → 空patch)。"""
+        from pipeline import ContextEngineStage, PipelineContext
+        saved = _ps.PROXY_CTX_ENGINE_ENABLED
+        try:
+            _ps.PROXY_CTX_ENGINE_ENABLED = True
+            stage = ContextEngineStage()
+            # 主对话: sonnet + tools
+            main = PipelineContext(body={"model": "claude-sonnet-4-6",
+                                         "messages": [_tu("task")]}, request_id="r")
+            main.session_id = "s-aux1"
+            main.tools_list = [{"name": "Bash"}]
+            main._agent_model_tier = "sonnet"
+            main.messages = _tu("task")
+            self.assertTrue(stage.should_run(main))
+            self.assertEqual(main.session_id, "s-aux1")  # key 不变
+            # aux: haiku + tools=0 → key 分域
+            aux = PipelineContext(body={"model": "claude-haiku-4-5",
+                                        "messages": [_tu("gen title")]},
+                                  request_id="r2")
+            aux.session_id = "s-aux1"
+            aux.tools_list = []
+            aux._agent_model_tier = "haiku"
+            aux.messages = _tu("gen title")  # RequestParser 通常负责; 此处显式
+            self.assertTrue(stage.should_run(aux))
+            self.assertEqual(aux.session_id, "s-aux1::aux-haiku")
+            # 两者 canonical 独立(aux 不进主会话)
+            ce.ENGINE._sessions.pop("s-aux1", None)
+            ce.ENGINE._sessions.pop("s-aux1::aux-haiku", None)
+            stage.process(aux)
+            stage.process(main)
+            self.assertNotIn("[gen title]",
+                             str(ce.ENGINE.get_or_create("s-aux1").canonical))
+            self.assertIn("gen title",
+                          str(ce.ENGINE.get_or_create("s-aux1::aux-haiku").canonical))
+        finally:
+            _ps.PROXY_CTX_ENGINE_ENABLED = saved
+            ce.ENGINE._sessions.pop("s-aux1", None)
+            ce.ENGINE._sessions.pop("s-aux1::aux-haiku", None)
+
     def test_stage_process_swaps_messages(self):
         import pipeline as pl
         saved = _ps.PROXY_CTX_ENGINE_ENABLED
@@ -474,6 +516,81 @@ class TestRealTokenTrigger(unittest.TestCase):
         self.assertIsNotNone(final)
         self.assertLessEqual(
             int(self.sess.est_tokens(final) * ce.EST_REAL_RATIO), 40000)
+
+
+class TestCompressRegistryPDC(unittest.TestCase):
+    """写入期压缩的 PDC 寄存（2026-09-03 补齐: engine 压缩曾无寄存漏网）。
+
+    压缩丢弃原文 → orig/<sid>.jsonl + manifest 索引行（anchor=r:<tool_use_id>），
+    ctx_recall 锚点直查可兑现——与 truncation 压缩寄存协议字段一致。
+    """
+
+    def _sess(self, key="s-regtest"):
+        return ce.CanonicalSession(key)
+
+    def test_transform_registers_orig_and_manifest(self):
+        import memory_stores
+        # 指向临时 diag 目录, 不污染 logs/diag
+        tmp = tempfile.mkdtemp()
+        _old_diag = getattr(_ps, "_DIAG_DIR", None)
+        _ps._DIAG_DIR = tmp          # orig 寄存路径(record_orig_content 解析)
+        memory_stores.MANIFEST.diag_dir = tmp
+        self.addCleanup(lambda: setattr(_ps, "_DIAG_DIR", _old_diag))
+        sess = self._sess()
+        big = "x" * 20000  # > generic budget 6000 → 必压缩
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tcall1",
+             "content": big}]}]
+        # absorb 内部走 _transform_message(session_key) → 压缩 + 寄存
+        canon, mismatch, n = sess.absorb(msgs)
+        self.assertEqual(n, 1)
+        # 压缩发生了(20000 > budget 6000)
+        out_text = ""
+        for m in canon:
+            for b in m.get("content", []):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, str):
+                        out_text = c
+                    elif isinstance(c, list):
+                        out_text = " ".join(
+                            x.get("text", "") for x in c
+                            if isinstance(x, dict) and x.get("text"))
+        self.assertIn("[ctx-engine:", out_text)
+        # orig 寄存可读
+        orig = memory_stores.read_orig_content("s-regtest", "r:tcall1",
+                                               diag_dir=tmp)
+        self.assertEqual(orig, big)
+        # manifest 索引行存在(anchor 可查)
+        mrows = []
+        for l in open(os.path.join(tmp, "manifest", "s-regtest.jsonl"),
+                     errors="replace"):
+            try:
+                import json as _j
+                mrows.append(_j.loads(l))
+            except Exception:
+                pass
+        self.assertTrue(any(
+            r.get("anchor") == "r:tcall1" and r.get("reason") == "compressed"
+            for r in mrows), "manifest 应含 compressed 索引行")
+
+    def test_no_session_key_no_register(self):
+        # 无 session_key(纯函数路径) → 压缩但不寄存(旧行为兼容)
+        import memory_stores
+        tmp = tempfile.mkdtemp()
+        _old_diag = getattr(_ps, "_DIAG_DIR", None)
+        _ps._DIAG_DIR = tmp
+        memory_stores.MANIFEST.diag_dir = tmp
+        self.addCleanup(lambda: setattr(_ps, "_DIAG_DIR", _old_diag))
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tcall2",
+             "content": "y" * 20000}]}]
+        ce._transform_message(msgs[0], {})
+        import os as _os
+        self.assertFalse(_os.path.exists(
+            _os.path.join(tmp, "manifest", "s-regtest.jsonl")))
 
 
 if __name__ == "__main__":

@@ -493,6 +493,54 @@ class RequestParser(PipelineStage):
         route_override = body.get("_x_proxy_route_to", "")
         ctx._route_header_override = route_override if route_override in ("local", "cloud") else ""
 
+        # R19: X-Proxy-Pin-Context —— pinned 锚点在 stage 14(fifo)跳过、
+        # stage 17(OOM)不豁免（集成契约 §3.3 冻结版）。三约束落地:
+        # ①预算 = PROXY_PIN_BUDGET_RATIO × total_chars, 锚点大小取 manifest
+        #   size_chars, 超限按列表序从尾降级(LRU) → X-Proxy-Pin-Demoted;
+        # ②OOM 挂起语义在 stage 17 检测 → X-Proxy-Pin-Suspended;
+        # ③append-only: 锚点仅对本批消息的"保留"生效, 历史永不回溯改写。
+        ctx.pinned_anchors = []
+        ctx.pin_demoted = ""
+        ctx.pin_disabled = False
+        _pin_raw = str(body.get("_x_proxy_pin_context") or "").strip()
+        if _pin_raw:
+            if not getattr(_ps, "PROXY_PIN_ENABLED", False):
+                ctx.pin_disabled = True
+            else:
+                _seen, _ordered = set(), []
+                for _tok in _pin_raw.split(","):
+                    _tok = _tok.strip()
+                    if _tok and _tok not in _seen:
+                        _seen.add(_tok)
+                        _ordered.append(_tok)
+                if _ordered:
+                    try:
+                        _budget = max(0.0, float(getattr(
+                            _ps, "PROXY_PIN_BUDGET_RATIO", 0.05))) * max(1, ctx.total_chars)
+                    except Exception:
+                        _budget = 0.05 * max(1, ctx.total_chars)
+                    _sizes = {}
+                    if ctx.session_id:
+                        try:
+                            import memory_stores as _ms
+                            for _ln in _ms.MANIFEST.lines(ctx.session_id):
+                                _a = _ln.get("anchor")
+                                if _a in _seen:
+                                    _sizes[_a] = _sizes.get(_a, 0) + int(_ln.get("size_chars") or 0)
+                        except Exception:
+                            _sizes = {}
+                    _kept, _acc, _demoted = [], 0, []
+                    for _a in _ordered:            # 列表序=优先级; 首锚必保, LRU 从尾降级
+                        _sz = _sizes.get(_a, 0)
+                        if not _kept or _acc + _sz <= _budget:
+                            _kept.append(_a)
+                            _acc += _sz
+                        else:
+                            _demoted.append(_a)
+                    ctx.pinned_anchors = _kept
+                    ctx.pin_demoted = ",".join(_demoted)
+            # 响应头由 BackendDispatcher（唯一持 handler 的 stage）从 ctx 旗标传播
+
         # 客户端声明超时 (X-Stainless-Timeout) —— 主动 504 上限推导输入
         _ct_raw = body.get("_x_client_timeout_s", "")
         try:
@@ -559,7 +607,19 @@ class ContextEngineStage(ConditionalStage):
     name = "context_engine"
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return _ctx_engine_on() and bool(ctx.session_id)
+        if not _ctx_engine_on() or not ctx.session_id:
+            return False
+        # aux(辅助模型)请求隔离: claude SDK 的 title 生成等内部辅助调用
+        # (haiku tier + tools=0)与主对话共用 session id(ANTHROPIC_CUSTOM_
+        # HEADERS 对 SDK 全部请求统一注入, harness 无法区分)——若并入同一
+        # canonical, aux 历史污染主对话形态 → prefix mismatch rebuild →
+        # 主任务 1 轮 end_turn 空 patch(2026-09-04 复现实锤)。haiku tier
+        # 的 tools=0 请求按独立会话处理: key 加 model 域后缀, 与主对话
+        # canonical 互不可见。
+        if (getattr(ctx, "_agent_model_tier", "sonnet") == "haiku"
+                and not (ctx.tools_list or [])):
+            ctx.session_id = ctx.session_id + "::aux-haiku"
+        return True
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         if not _ctx_engine_on() or not ctx.session_id:
@@ -586,8 +646,11 @@ class ContextEngineStage(ConditionalStage):
                     diagnostics.record_injection("epoch_collapse")
                 except Exception as _e:
                     _warn_diag("inject_epoch", _e)
+            # turn 语义注意: sess.user_msgs = canonical 累计 user 消息条数
+            # (引擎内部口径, tool_result 亦为 user role → 与请求轮错开);
+            # 台账/diagnostics 的 turn = 客户端请求序号(mark_epoch_turn 对齐)。
             log(f"  -> [context_engine] EPOCH #{sess.epoch_count} triggered "
-                f"(turn={sess.turn}, K={context_engine.effective_window_k()})")
+                f"(user_msgs={sess.user_msgs}, K={context_engine.effective_window_k()})")
         if final is None:
             # §4.9 回退保护硬上限: 代理无权把历史压到失真假装放得下
             raise context_engine.ContextOverflowError(
@@ -1915,6 +1978,7 @@ class ContextTruncator(ConditionalStage):
             ctx.messages,
             session_id=ctx.session_id,
             keep_rounds=ctx.stage_config.get("truncate_rounds") if ctx.stage_config else None,
+            pinned_anchors=getattr(ctx, "pinned_anchors", None),
         )
         ctx.messages = messages
         ctx.trunc_stats = trunc_stats
@@ -2129,6 +2193,22 @@ class OOMSafetyFIFO(ConditionalStage):
 
         ctx.oom_iterations = iteration
         ctx.oom_dropped = original_msg_count - len(raw_messages)
+
+        # R19 约束②: OOMSafetyFIFO 默认不豁免 pin——oom_danger 档 pinned
+        # 消息可被逐出; 发生即挂起并回 X-Proxy-Pin-Suspended: oom_danger。
+        _pinned = getattr(ctx, "pinned_anchors", None) or []
+        if _pinned and iteration > 0:
+            try:
+                import ifc_metrics as _ifm
+                _surviving = set()
+                for m in raw_messages:
+                    for u in _ifm.unit_anchors(m):
+                        if u.get("anchor"):
+                            _surviving.add(u["anchor"])
+                if any(a not in _surviving for a in _pinned):
+                    ctx.pin_suspended = "oom_danger"
+            except Exception:
+                pass
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
@@ -2635,6 +2715,17 @@ class BackendDispatcher(PipelineStage):
         self._route_fallback = False
         self._emergency_fallback = False
         self._fallback_reason = ""
+        # R19: pin 响应头传播——旗标由 stage 0(禁用/降级)与 stage 17(OOM 挂起)
+        # 写入 ctx; 此处(唯一持 handler 的 stage)统一转成响应头。
+        _pin_hdrs = {}
+        if getattr(ctx, "pin_disabled", False):
+            _pin_hdrs["X-Proxy-Pin-Disabled"] = "true"
+        if getattr(ctx, "pin_demoted", ""):
+            _pin_hdrs["X-Proxy-Pin-Demoted"] = ctx.pin_demoted[:180]
+        if getattr(ctx, "pin_suspended", ""):
+            _pin_hdrs["X-Proxy-Pin-Suspended"] = str(ctx.pin_suspended)
+        if _pin_hdrs:
+            self._handler._pin_response_headers = _pin_hdrs
         self._sensitive_blocked = False
         self._input_tokens = 0
         self._output_tokens = 0
@@ -3189,6 +3280,11 @@ class BackendDispatcher(PipelineStage):
                     pass
                 wrapped = _BytesIOResponse(resp.status, body_bytes)
                 self._handler._handle_non_streaming_response(wrapped, ctx.body)
+                # REQ_USAGE: 记录 usage 信息（修复日志截断导致 usage 丢失的问题）
+                if usage:
+                    log(f"  [REQ_USAGE] input={usage.get('prompt_tokens', 0)} "
+                        f"output={usage.get('completion_tokens', 0)} "
+                        f"model={getattr(ctx, '_route_cloud_model', '') or ctx.model}")
         except (BrokenPipeError, ConnectionResetError):
             self._client_disconnected = True
             self._handler._client_disconnected = True
