@@ -176,5 +176,49 @@ class TestContractAlignment(unittest.TestCase):
         self.assertEqual(len(subs), 1)
 
 
+class TestRealFilePacking(unittest.TestCase):
+    """M6: 真实文件字节装箱路径——os.path.getsize 主路径此前从未被验证
+    (单测全用伪路径, 恒走 OSError→路径串长降级)。评审 LD-4 第一步。
+    """
+
+    def test_real_file_greedy_packing_and_paged_flag(self):
+        import tempfile
+        from decompose import CapacityCriterion
+        with tempfile.TemporaryDirectory() as td:
+            big = os.path.join(td, "big.txt")
+            small = os.path.join(td, "small.txt")
+            with open(big, "w", encoding="utf-8") as f:
+                f.write("x" * 5000)
+            with open(small, "w", encoding="utf-8") as f:
+                f.write("y" * 100)
+            # budget_chars = 1000 tokens × 4 = 4000
+            crit = CapacityCriterion(budget_tokens=1000, chars_per_token=4)
+            task = build_task(task_id="TR", description="装箱",
+                              input_files=[small, big],
+                              expected_output_type="patch")
+            # 真实字节 est = (5000+100)//4 = 1275 > 1000 → 应拆
+            self.assertTrue(crit.should_split(task, build_signal_snapshot()))
+            subs = crit.split(task)
+            # 贪心按真实字节: small(100B)+big(5000B) 不同箱 → 各一箱
+            self.assertEqual(len(subs), 2)
+            self.assertEqual(subs[0]["input_files"], [small])
+            self.assertEqual(subs[1]["input_files"], [big])
+            # 单文件超预算 → 真实 getsize 判定分页(读侧 paged disclosure)
+            self.assertTrue(subs[1].get("paged"))
+            self.assertFalse(subs[0].get("paged", False))
+
+    def test_small_real_files_stay_single_task(self):
+        import tempfile
+        from decompose import CapacityCriterion
+        with tempfile.TemporaryDirectory() as td:
+            f1 = os.path.join(td, "a.txt")
+            with open(f1, "w", encoding="utf-8") as f:
+                f.write("tiny")
+            crit = CapacityCriterion(budget_tokens=1000, chars_per_token=4)
+            task = build_task(task_id="TS", description="d",
+                              input_files=[f1], expected_output_type="patch")
+            self.assertFalse(crit.should_split(task, build_signal_snapshot()))
+
+
 if __name__ == "__main__":
     unittest.main()

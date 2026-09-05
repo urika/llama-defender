@@ -395,6 +395,15 @@
     }
   },
   "routes": {
+    "claude-sonnet-4-6-k3": {
+      "route_bias": "prefer_cloud",
+      "cloud_model": [
+        "k3"
+      ],
+      "behavior": "force_fallback",
+      "threshold_factor": 1.0,
+      "memory_bias": 0
+    },
     "claude-sonnet-4-6": {
       "route_bias": "auto",
       "cloud_model": [

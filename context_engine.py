@@ -131,8 +131,14 @@ def _frozen_copy(msg):
     return out
 
 
-def _transform_message(msg, hints):
-    """写入期压缩一条客户端消息（只动 tool_result 内容；不修改入参、不泄漏内部键）。"""
+def _transform_message(msg, hints, session_key=None):
+    """写入期压缩一条客户端消息（只动 tool_result 内容；不修改入参、不泄漏内部键）。
+
+    session_key 非空时, 压缩丢弃的原文按 PDC 协议寄存 orig/<sid>.jsonl +
+    manifest 索引行（anchor=r:<tool_use_id>）——压缩从有损变可恢复, ctx_recall
+    锚点直查可取回（与 truncation.py 压缩寄存协议字段一致, 2026-09-03 补齐:
+    engine 写入期压缩曾是无寄存的漏网路径）。fail-open: 寄存失败不影响请求。
+    """
     content = msg.get("content")
     if not isinstance(content, list):
         return msg
@@ -148,6 +154,27 @@ def _transform_message(msg, hints):
                 continue
             compressed, handle, kind = compress_observation(hint[0], hint[1], text)
             if compressed is not text:
+                # PDC 寄存: 压缩即丢弃——原文寄存 orig, 索引行落 manifest,
+                # 标记里的句柄从此可兑现（与 truncation 压缩同协议）。
+                if session_key and block.get("tool_use_id"):
+                    try:
+                        import memory_stores
+                        rec_key = "r:" + str(block.get("tool_use_id"))
+                        memory_stores.record_orig_content(
+                            session_key, rec_key, text)
+                        turn = _ps._SESSION_REQUEST_COUNT.get(session_key, 0) or 0
+                        _ents = [e for e in _um.extract_key_entities(text)
+                                 if e not in compressed]
+                        memory_stores.MANIFEST.record_units(
+                            session_key, turn, "compressed",
+                            [{"anchor": rec_key, "kind": "tool_result",
+                              "role": "user", "tool": str(hint[0] or ""),
+                              "handle": None,
+                              "size_chars": len(text),
+                              "head": compressed[:240],
+                              "triggers": " ".join(_ents)[:240]}])
+                    except Exception:
+                        pass  # 寄存失败 → 无 key 标记（原文即逝, 诚实声明）
                 nb = dict(block)
                 if isinstance(nb.get("content"), list):
                     nb["content"] = [{"type": "text", "text": compressed}]
@@ -316,7 +343,8 @@ class CanonicalSession(object):
             new_items.append(msg)
         hints = {id(b): hint for b, hint in _pair_tool_hints(client_messages or [])}
         for msg in new_items:
-            self.canonical.append(_frozen_copy(_transform_message(msg, hints)))
+            self.canonical.append(_frozen_copy(
+                _transform_message(msg, hints, self.session_key)))
         new_user_msgs = sum(1 for m in new_items if m.get("role") == "user")
         if new_user_msgs:
             self.user_msgs += max(1, new_user_msgs)
@@ -433,6 +461,32 @@ class CanonicalSession(object):
             # 记忆(§4.4 近期窗口是元认知主作用区)——留头丢尾会记远古忘刚才。
             region = region[-max(10, len(region) // 2):]
         self.compression_region = region
+        # 折叠召回线索（2026-09-03 folded-recall-cue 设计）：与 A 路同 cue
+        # （ctx_recall.RECALL_CUE 唯一源头）；键取被收编轮次 anchor（复用
+        # truncation pin 跳过的 unit_anchors 写法）。fail-open：失败则无 cue
+        # 后缀，面板主体不受影响。
+        try:
+            from ctx_recall import RECALL_CUE as _RECALL_CUE
+            from ctx_recall import recall_keys_line as _recall_keys_line
+            import ifc_metrics as _ifm
+            _fold_anchors = []
+            for rnd in collect:
+                for m in rnd:
+                    try:
+                        _units = _ifm.unit_anchors(m)
+                    except Exception:
+                        _units = []
+                    for u in _units:
+                        a = u.get("anchor", "") if isinstance(u, dict) else ""
+                        if (isinstance(a, str) and a[:2] in ("r:", "u:")
+                                and a not in _fold_anchors):
+                            _fold_anchors.append(a)
+            _cue_suffix = "\n" + _RECALL_CUE
+            _keys_suffix = _recall_keys_line(_fold_anchors)
+            if _keys_suffix:
+                _cue_suffix += "\n" + _keys_suffix
+        except Exception:
+            _cue_suffix = ""
         out = []
         for r in system_rounds:
             out.extend(r)
@@ -442,9 +496,9 @@ class CanonicalSession(object):
                 "content": [{
                     "type": "text",
                     "text": "[context-engine epoch %d: %d earlier rounds collapsed "
-                            "to action ledger below; handles preserved]\n%s" % (
+                            "to action ledger below; handles preserved]\n%s%s" % (
                                 self.epoch_count + 1, len(collect),
-                                "\n".join(region)),
+                                "\n".join(region), _cue_suffix),
                 }],
                 "_ctx_engine_epoch": True,
             })

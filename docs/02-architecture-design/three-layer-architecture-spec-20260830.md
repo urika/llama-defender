@@ -438,9 +438,9 @@ class ProtocolOrchestrator:
 | Execute（小步协议） | harness 设计文档 | 🟡 设计完成 |
 | Verify L1（机械） | 集成测试中的断言 | 🟡 零散存在,需整合 |
 | Verify L3（对账） | `ifc_metrics.reconcile()` | ✅ 已实现 |
-| Decompose | `ifc_metrics` 中的熵判据概念 | 🔴 未实现 |
-| Escalate | 幂等闸设计 | 🔴 未实现 |
-| ProtocolOrchestrator | — | 🔴 未实现（核心待建件） |
+| Decompose | `decompose.py::CapacityCriterion` / `EntropyCriterion` | ✅ 已实现（冻结：参考实现，待 agent_go 决定是否接线） |
+| Escalate | `escalate.py::Escalator` / `TaskState` FSM | ✅ 已实现（冻结：参考实现，待 agent_go 决定是否接线） |
+| ProtocolOrchestrator | `protocol_orchestrator.py` | ✅ 已实现（冻结：参考实现，待 agent_go 决定是否接线） |
 
 ---
 

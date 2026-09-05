@@ -90,7 +90,7 @@ class TestL1FoldedPlaceholder(unittest.TestCase):
         finally:
             _ps.PROXY_CTX_KEEP_HEAD = orig_head
             _ps.PROXY_CTX_KEEP_MESSAGES = orig_keep
-        self.assertIn("sample anchors", text)
+        self.assertIn("Folded keys:", text)  # 统一口径（2026-09-03）：原 "sample anchors"
         self.assertIn("u:call_anch1", text)  # 锚点即查询键
 
 

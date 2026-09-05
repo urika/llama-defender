@@ -734,3 +734,48 @@ Phase 1 验收门禁 1 与 R16 落盘字段建议统一改用此口径。
 
 **判定**：必要性 P0（不做的話 M2.1 等于没验收）；可行性中（五道坎均有现成缓解，
 唯一硬依赖是先收尾并行在地代码并把引擎打开）。
+
+---
+
+## 14. 召回缺位实测（2026-09-05，swe-eval 方差验证 v4 三轮）
+
+> 来源：swe-eval Phase 1 方差验证（本地 Ornith-1.5-35B × ansible psrp 实例 × 3 次独立会话，ctx_engine 全程开启）。这是引擎在真实 SWE 任务上的首次多轮重复实测。
+
+### 14.1 事实
+
+| run | 会话 | epoch 触发 | 台账 dup_max | 结局 |
+|---|---|---|---|---|
+| 1 | s380566e | #1 @ user_msgs=117 | 29（`psrp.py` 重复 Read） | failed, f2p 0/11, 2.0h |
+| 2 | s3835b80 | #1 @ user_msgs=105 | 14 | failed, f2p 0/11, 1.8h |
+| 3 | s3804ddd | **#1 @ msgs=43 + #2 @ msgs=101（两次）** | 51 | failed, f2p 0/11, 3.3h |
+
+三轮 classify 全部命中 swe-eval 规则 R-F08 exploration_loop（排除链确认非 harness/基建故障，归因为模型过程病理）。
+
+**核心事实：三轮共 4 次 epoch 压缩，`ctx_recall` 调用次数为 0。** 压缩发生了，召回没发生，信息净丢失。
+
+### 14.2 机制链条（日志证据）
+
+1. 积累期健康：prompt 真实 token 涨至 ~55.6K，prefix cache 命中率 88%
+2. `EPOCH #1 triggered (user_msgs=117, K=24)`：190,937 chars 会话历史 → 18,019 chars（10.6× 压缩），agent 已读文件内容与已做分析被抹为摘要
+3. 重置后 agent 保留"psrp.py 相关"线索但丢失内容与"已读过"状态 → 重复 Read 同一文件 29 次（run 1）→ 无思考模式（thinking off）下无法从内容跳到根因 → 探索循环
+4. epoch 负担与循环严重度同向：run 3 两次 epoch → dup 51、耗时最长
+
+### 14.3 缺口定性：压缩主动、召回被动
+
+召回链路本身是完整部署且可用的（IFC-3 方案 B 微轮重派，anthropic_proxy.py:1470；FTS 索引 fts_search/recover_full_content；此前 cuet1new/cuet1hea 会话有真实调用与 200 响应）。缺的是**触发侧**：
+
+- 任务提示词未告知 ctx_recall 的存在与用途，模型不会自发使用陌工具
+- epoch 折叠对 agent 无感：无任何信号告知"上下文刚被压缩、哪些可回收"
+- loop_detect / re_read / watchdog 均观测到重复读取（dup 入台账），但无 stage 把"重复读取"转化为"召回"动作
+
+### 14.4 改进假设（EXP-2 候选臂，判读指标：dup_max_count + f2p）
+
+| 假设 | 层级 | 改动 | 验证方式 |
+|---|---|---|---|
+| H-a | 提示词 | 任务提示词增加"历史可能被折叠，用 ctx_recall 找回" | 召回调用率 0 → >0；dup 下降 |
+| H-b | 引擎信号 | epoch 触发后下一响应注入召回可用性提示（复用 X-Proxy-Feedback-Injected / route_notice 机制） | 同上，且无需改 harness |
+| H-c | 检测联动 | loop_detect 发现同一文件重复 Read ≥N 次时代理自动执行 recall 并注入结果 | dup 转召回率；f2p 改善 |
+
+### 14.5 与 M3 的关系
+
+§13.7 的 M3 最小可行序列以"0 截断/0 超时/0 断连 + hit_ratio"为硬判据——本次实测显示**引擎稳定运行 ≠ 任务成功**：三轮全部稳定跑完（无截断/断连事故），但全部 failed 且呈现 epoch 诱发的探索循环。M3 验收建议补充行为判据：dup_max_count 不显著高于引擎关闭基线，召回机制至少被触发一次（H-a/b/c 之一落地后）。

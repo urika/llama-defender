@@ -107,6 +107,22 @@ class ManifestStore(object):
             out = list(entry or [])
         return out if limit is None else out[-limit:]
 
+    def known_sessions(self):
+        """已知会话 key 列表（内存 ∪ 磁盘 manifest 文件名，跨会话检索用，R18）。
+
+        上限 MANIFEST_MAX_SESSIONS——与内存驱逐上限对齐，防无界枚举。
+        """
+        keys = set(self._sessions.keys())
+        try:
+            d = self._manifest_dir()
+            if os.path.isdir(d):
+                for fn in os.listdir(d):
+                    if fn.endswith(".jsonl"):
+                        keys.add(fn[:-len(".jsonl")])
+        except OSError:
+            pass
+        return sorted(keys)[:MANIFEST_MAX_SESSIONS]
+
     def count(self, session_key):
         return len(self.lines(session_key))
 

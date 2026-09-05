@@ -653,12 +653,17 @@ class Handler(BaseHTTPRequestHandler):
             # local. The local size guard now lives in BackendDispatcher just
             # before forwarding to the local backend.
             body = self.rfile.read(content_len).decode("utf-8")
+            self._post_body = body  # admin 端点复用, 避免二次读取 rfile 为空
             log(f"POST {self.path}")
             log(f"  Headers: {_mask_sensitive(dict(self.headers))}")
             # Admin: HTTP hot-reload (R12) — checked before JSON parsing so an
             # empty-body POST is valid. Idempotent, serialized by _RELOAD_LOCK.
             if self.path == "/admin/reload":
                 self._handle_admin_reload()
+                return
+            # R18: 任务上下文证据包（契约冻结版; 语义封装面, 机制面走 admin/debug）
+            if self.path == "/api/task-context":
+                self._handle_task_context()
                 return
             if _check_dedup(body):
                 log(f"  -> Duplicate request detected (body hash match within {PROXY_DEDUP_WINDOW}s), skipping", level="WARN")
@@ -675,6 +680,9 @@ class Handler(BaseHTTPRequestHandler):
                 # 客户端超时（stainless SDK 的 X-Stainless-Timeout）——用于非流式
                 # 主动 504 与流式空闲看门狗的上限推导；缺省则退回后端超时。
                 parsed["_x_client_timeout_s"] = self.headers.get("X-Stainless-Timeout", "")
+                # R19: X-Proxy-Pin-Context —— pinned 锚点列表(stage 14 跳过,
+                # stage 17 不豁免; 预算/降级语义见集成契约 §3.3 冻结版)
+                parsed["_x_proxy_pin_context"] = self.headers.get("X-Proxy-Pin-Context", "")
             except json.JSONDecodeError:
                 log(f"  Body (invalid JSON): {body[:500]}", level="WARN")
                 self._respond_json(
@@ -1578,6 +1586,10 @@ class Handler(BaseHTTPRequestHandler):
                 mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
+        # REQ_USAGE: 记录流式响应 usage 信息
+        if input_tokens > 0 or output_tokens > 0:
+            log(f"  [REQ_USAGE] input={input_tokens} output={output_tokens} "
+                f"model={getattr(_log_ctx, '_route_cloud_model', '') or _log_ctx.model if hasattr(_log_ctx, 'model') else ''}")
 
 
     def _send_sse_stream_headers(self):
@@ -1599,6 +1611,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R19 pin 响应头（X-Proxy-Pin-*），与 queue headers 同机制
+        pin_headers = getattr(self, '_pin_response_headers', None) or {}
+        for hk, hv in pin_headers.items():
+            self.send_header(hk, str(hv))
+        self._pin_response_headers = None
         # R13 诊断归因头
         self._send_diag_headers()
         self.end_headers()
@@ -1706,6 +1723,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R19 pin 响应头（X-Proxy-Pin-*），与 queue headers 同机制
+        pin_headers = getattr(self, '_pin_response_headers', None) or {}
+        for hk, hv in pin_headers.items():
+            self.send_header(hk, str(hv))
+        self._pin_response_headers = None
         # R13 诊断归因头
         self._send_diag_headers()
         self.end_headers()
@@ -1781,6 +1803,36 @@ class Handler(BaseHTTPRequestHandler):
         log(f"  -> [admin] Session {session_id} route forced to {target} (user_manual)")
         self._respond_json({"ok": True, "session_id": session_id, "route_target": target})
 
+    def _handle_task_context(self):
+        """R18: POST /api/task-context — 任务描述 → 上下文证据包（契约 §3.3 冻结版）。
+
+        语义封装原则（review §3.6）: 暴露能力不暴露机制——recall/manifest/orig
+        降 admin/debug 面。无命中 → 200 空 items（契约: 不 404）；存储故障 →
+        503 + Retry-After（fail-open）。
+        """
+        try:
+            import ctx_recall as _cr
+            raw = getattr(self, "_post_body", "") or "{}"
+            body = json.loads(raw) if raw.strip() else {}
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+            descriptor = body.get("task_descriptor")
+            session_key = body.get("session_key")
+            session_key = session_key[:64] if isinstance(session_key, str) and session_key else None
+            bundle = _cr.build_task_context_bundle(
+                descriptor if isinstance(descriptor, dict) else {},
+                session_key=session_key,
+                budget_chars=body.get("budget_chars") or 6000)
+            self._respond_json(bundle)
+        except (ValueError, json.JSONDecodeError) as e:
+            self._respond_json(
+                {"error": {"type": "bad_request", "message": str(e)[:200]}}, 400)
+        except Exception as e:
+            log(f"  <- [task-context] failed: {e}", level="ERROR")
+            self._respond_json(
+                {"error": {"type": "storage_fault", "message": str(e)[:200]}},
+                503, extra_headers={"Retry-After": "5"})
+
     def _handle_admin_reload(self):
         """R12: POST /admin/reload — HTTP equivalent of `manage.sh reload` (SIGHUP).
 
@@ -1819,6 +1871,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R19 pin 响应头（X-Proxy-Pin-*），与 queue headers 同机制
+        pin_headers = getattr(self, '_pin_response_headers', None) or {}
+        for hk, hv in pin_headers.items():
+            self.send_header(hk, str(hv))
+        self._pin_response_headers = None
         # R13 诊断归因头（X-Proxy-Diag-*），与 route headers 同机制
         self._send_diag_headers()
 
@@ -1934,6 +1991,11 @@ class Handler(BaseHTTPRequestHandler):
         for hk, hv in queue_headers.items():
             self.send_header(hk, str(hv))
         self._queue_response_headers = None
+        # R19 pin 响应头（X-Proxy-Pin-*），与 queue headers 同机制
+        pin_headers = getattr(self, '_pin_response_headers', None) or {}
+        for hk, hv in pin_headers.items():
+            self.send_header(hk, str(hv))
+        self._pin_response_headers = None
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, str(v))

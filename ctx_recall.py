@@ -75,6 +75,38 @@ RECOVERY_PAGE_CHARS = 4000
 
 
 # ============================================================================
+# 折叠召回线索 RECALL_CUE（2026-09-03 folded-recall-cue 设计）
+# 唯一源头：两条折叠路径（truncation fifo/DEF-107 = A 路、
+# context_engine epoch 面板 = B 路）的召回指引句均引用此处，
+# 字节级一致（跨路径/跨会话利于 prefix-cache）。fail-open：
+# 引用方 deferred import，失败用 inline 字面量兜底。
+# ============================================================================
+RECALL_CUE = (
+    "Full text of folded content is preserved in this session store — "
+    "use ctx_recall to recover instead of re-reading files, "
+    "e.g. ctx_recall(query='<file-path-or-keyword>') or "
+    "ctx_recall(query='<anchor>'). "
+    "Recall first; re-read only if ctx_recall returns nothing."
+)
+
+# 面板附带查询键上限（精确 anchor 优先；多了费 token 且无收益）
+FOLDED_KEYS_LIMIT = 6
+
+
+def recall_keys_line(anchors, limit=FOLDED_KEYS_LIMIT):
+    """查询键行纯函数：去重保序截断；空输入返回 ""（调用方自行决定是否拼装）。"""
+    seen = []
+    for a in anchors or []:
+        if isinstance(a, str) and a and a not in seen:
+            seen.append(a)
+        if len(seen) >= limit:
+            break
+    if not seen:
+        return ""
+    return "Folded keys: %s." % ", ".join(seen)
+
+
+# ============================================================================
 # 索引行文本化（FTS 可检索体）
 # ============================================================================
 
@@ -141,6 +173,38 @@ def _memory_filter(session_key, query, kind=None, limit=DEFAULT_LIMIT):
             out.append(line)
             if len(out) >= limit:
                 break
+    return out
+
+
+def _manifest_search(session_key, queries, kind=None, limit=DEFAULT_LIMIT):
+    """R18: task-context 轻量检索路径（避免 FTS 建索引开销）。
+
+    只读 MANIFEST 行一次, 在 head/handle/tool/anchor 上做子串匹配。
+    无命中 → []；存储故障 → []（fail-open）。
+    """
+    if not session_key:
+        return []
+    qset = [q.strip().lower() for q in (queries or []) if q and q.strip()]
+    if not qset:
+        return []
+    out, seen = [], set()
+    try:
+        for line in memory_stores.MANIFEST.lines(session_key):
+            if kind and line.get("kind") != kind:
+                continue
+            anchor = line.get("anchor") or ""
+            if anchor in seen:
+                continue
+            haystack = line_text(line).lower()
+            for q in qset:
+                if q in haystack or q in anchor.lower():
+                    seen.add(anchor)
+                    out.append(line)
+                    break
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
     return out
 
 
@@ -447,6 +511,96 @@ def auto_recall_for_target(session_key, target, max_chars=None):
                 "chars": len(content), "content": content}
     except Exception:
         return None
+
+
+def build_task_context_bundle(task_descriptor, session_key=None,
+                              budget_chars=6000, max_budget=20000,
+                              max_items=12):
+    """R18: 任务描述 → 上下文证据包（集成契约 §3.3 R18 冻结版，stdlib only）。
+
+    检索面: session_key 给定 → 本会话 manifest FTS + 逐关键词二级查询；
+    缺省 → 跨会话（MANIFEST.known_sessions 逐一 lookup，上限 64 会话）。
+    内容面: anchor "r:*" 经 recover_full_content 取正文（预算内裁剪，
+    单条 ≤4000）；不可恢复锚 → full_available=False 仅索引（优雅缺页）。
+    纯检索无副作用；无命中返回空 items（契约: 不 404）。source 恒
+    "manifest"——"semantic" 为 SEM 语义卡预留扩展点（gap-closure §2）。
+    """
+    import hashlib
+    try:
+        budget = int(budget_chars or 6000)
+    except (TypeError, ValueError):
+        budget = 6000
+    budget = max(0, min(budget, max_budget))
+    if not isinstance(task_descriptor, dict):
+        task_descriptor = {}
+    desc = str(task_descriptor.get("description") or "")
+    keywords = [str(k) for k in (task_descriptor.get("keywords") or []) if str(k)]
+    files = [os.path.basename(str(f)) for f in (task_descriptor.get("input_files") or []) if str(f)]
+    queries = []
+    base_q = " ".join(([desc] if desc else []) + keywords + files)[:400]
+    if base_q.strip():
+        queries.append(base_q)
+    queries.extend(dict.fromkeys(keywords))
+
+    def _search(sid):
+        return _manifest_search(sid, queries, limit=max_items * 3)
+
+    if session_key:
+        sessions = [session_key]
+    else:
+        try:
+            sessions = memory_stores.MANIFEST.known_sessions()
+        except Exception:
+            sessions = []
+
+    candidates = []
+    for sid in sessions:
+        for ln in _search(sid):
+            candidates.append((sid, ln))
+            if len(candidates) >= max_items * 3:
+                break
+        if len(candidates) >= max_items * 3:
+            break
+
+    items, total = [], 0
+    for sid, ln in candidates[:max_items]:
+        anchor = ln.get("anchor") or ""
+        turn = ln.get("turn")
+        recoverable = isinstance(anchor, str) and anchor.startswith("r:")
+        remaining = budget - total
+        content = ""
+        if recoverable and remaining >= 200:
+            try:
+                content = recover_full_content(
+                    sid, anchor, turn,
+                    max_chars=min(remaining, 4000)) or ""
+            except Exception:
+                content = ""
+        used = len(content)
+        if used == 0:
+            head = (ln.get("head") or "")[:max(0, remaining)] if remaining > 0 else ""
+            content = head
+            used = len(content)
+        matched = [t for t in dict.fromkeys(keywords + ([desc.strip()[:60]] if desc.strip() else []))
+                   if t and t in line_text(ln)]
+        trigger_why = ("命中: " + ", ".join(matched[:4])) if matched else "语义匹配"
+        items.append({
+            "unit_id": anchor or "u:{}:{}".format(sid, ln.get("turn")),
+            "source": "manifest",
+            "trigger_why": trigger_why,
+            "preview_chars": len(ln.get("head") or ""),
+            "content": content,
+            "full_available": bool(recoverable),
+        })
+        total += used
+        if total >= budget:
+            break
+    bundle_id = "b-" + hashlib.md5(json.dumps(
+        {"q": base_q, "s": session_key or "",
+         "a": [i["unit_id"] for i in items[:4]]},
+        sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+    return {"bundle_id": bundle_id, "items": items,
+            "total_chars": total, "budget_remaining": max(0, budget - total)}
 
 
 def format_recall_result(lines, query, session_key=None, offset=0):

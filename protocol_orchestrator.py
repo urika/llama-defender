@@ -6,6 +6,12 @@ P1 Decompose → P2 Execute → P3 Verify → P4 Recall → P5 Escalate 的闭�
 设计依据: 三层架构规范 §3 / PRD v4.0 R11 / Spec-C
 依赖: decompose.py + escalate.py + verification_chain.py + idempotency.py + protocol_types.py
 
+冻结声明 (LD-6 / 2026-09-02):
+- 当前为 agent_go 集成契约 §3.3 R17/R18/R19 的「参考实现冻结版」。
+- 五协议闭环比价 / 任务工程 / 工具形态的接入决策归 agent_go，本仓库不再扩展。
+- 可拆解到已有组件的增强（PDC-L1/L2、ifc_metrics、ctx_recall）已在 Signal/Protocol
+  边界内持续迭代；编排器本体保持 Phase 1 独立模块，不主动接运行时 pipeline。
+
 关键设计:
 - 执行器/召回器为注入的 callable（依赖注入）——Phase 1 用 stub 测试,
   Phase 2 接 pipeline 的真实模型调用
