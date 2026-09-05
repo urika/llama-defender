@@ -1590,12 +1590,8 @@ class Handler(BaseHTTPRequestHandler):
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
         # REQ_USAGE: 记录流式响应 usage 信息（归因=实际响应引擎模型码，TC04 契约）
         if input_tokens > 0 or output_tokens > 0:
-            _attribution = getattr(_log_ctx, "model", "")
-            try:
-                _attribution = ((_log_ctx.openai_body or {}).get("model")
-                                or _attribution)
-            except AttributeError:
-                pass
+            _attribution = (getattr(_log_ctx, "response_model_code", "")
+                            or getattr(_log_ctx, "model", ""))
             log(f"  [REQ_USAGE] input={input_tokens} output={output_tokens} "
                 f"model={_attribution}")
 

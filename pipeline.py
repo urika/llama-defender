@@ -3302,6 +3302,12 @@ class BackendDispatcher(PipelineStage):
         """
         # P0: enforce per-backend payload size guard just before forwarding.
         body_bytes = json.dumps(ctx.openai_body, ensure_ascii=False).encode("utf-8")
+        # 归因 stash(TC04)：流式 REQ_USAGE 无 PipelineContext 可用，把实际
+        # 响应引擎模型码挂到线程本地 _log_ctx 供 anthropic_proxy 读取
+        try:
+            _ps._log_ctx.response_model_code = (ctx.openai_body or {}).get("model", "")
+        except Exception:
+            pass
         target = getattr(ctx, '_route_target', 'local')
         max_bytes = _ps.PROXY_CLOUD_MAX_REQUEST_BYTES if target == 'cloud' else _ps.PROXY_MAX_REQUEST_BYTES
         if len(body_bytes) > max_bytes:
