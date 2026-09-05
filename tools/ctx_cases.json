@@ -1049,7 +1049,8 @@
    "log_contains": [
     "[MICRO_TURN]"
    ]
-  }
+  },
+  "requires": "real_backend"
  },
  {
   "id": "TC25",

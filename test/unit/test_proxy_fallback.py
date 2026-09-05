@@ -1252,13 +1252,14 @@ class TestToolFilter(unittest.TestCase):
         }
 
     def test_below_max_is_passthrough(self):
-        """R3.3: when len(tools) <= PROXY_TOOL_FILTER_MAX, no filter
-        is applied — the full list is returned unchanged."""
+        """R3.3 + TC02(2026-09-05): below_max 不裁剪但仍追加 ctx_recall
+        注入——召回入口不依赖裁剪是否发生（D1 裁决）。"""
         tools = self._tools(["Read", "Write", "Edit"])  # 3 < 5
         result, stats = proxy._filter_tools(tools, [])
-        self.assertEqual(result, tools)
         self.assertFalse(stats["filtered"])
         self.assertEqual(stats["reason"], "below_max")
+        self.assertEqual(result[:-1], tools)  # 原列表逐字保留
+        self.assertEqual(result[-1]["name"], "ctx_recall")  # 末尾注入
 
     def test_above_max_keeps_whitelist_and_recent(self):
         """R3.3: with 10 tools, the filter keeps TOOL_ALWAYS_KEEP
@@ -1318,10 +1319,13 @@ class TestToolFilter(unittest.TestCase):
         recent_msgs = [self._asst(["Custom3", "Custom4"])]
         with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist), patch.object(proxy_state, "TOOL_ALWAYS_KEEP", small_whitelist):
             result, stats = proxy._filter_tools(tools, recent_msgs)
-        # Too_few_after_filter: kept would be {Read, Bash, Custom3, Custom4} = 4 < 5.
-        self.assertFalse(stats["filtered"])
-        self.assertEqual(stats["reason"], "too_few_after_filter")
-        self.assertEqual(result, tools)  # returned full list
+        # 2026-09-05(TC01): too_few 早退已移除——kept 不足由 filler 补足到
+        # MAX（全部 7 个原始工具保留），并追加 ctx_recall 注入。
+        self.assertTrue(stats["filtered"])
+        # MAX=5：kept 4 → filler 补 Custom1 到 5；Custom2/Custom5 超出 MAX 被裁
+        self.assertEqual({t["name"] for t in result[:-1]},
+                         {"Read", "Bash", "Custom1", "Custom3", "Custom4"})
+        self.assertEqual(result[-1]["name"], "ctx_recall")
 
     def test_recent_rounds_scans_only_last_n_assistant_messages(self):
         """R3.3: recent_rounds=5 means the filter walks BACKWARDS through

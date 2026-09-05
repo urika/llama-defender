@@ -258,11 +258,33 @@ def record_dropped_messages(session_key, turn, reason, messages, msg_index_base=
     fail-open：任何异常吞掉由调用方 warn（manifest 故障不得影响请求路径）。
     """
     import ifc_metrics
+    import unit_model as _um
     units = []
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
-        units.extend(ifc_metrics.unit_anchors(msg))
+        _msg_units = ifc_metrics.unit_anchors(msg)
+        # 2026-09-05(TC17/D3): unit_anchors 不产 triggers 的单元（tool_result
+        # 等）按消息文本做实体提取补齐——检索关键词面的登记侧兜底。fail-open
+        try:
+            _text = _um.result_text(msg) or _um.text_str(msg.get("content"))
+            _ents = _um.extract_key_entities(_text) if _text else []
+            if _ents:
+                for u in _msg_units:
+                    if not (u.get("triggers") or "").strip():
+                        u["triggers"] = " ".join(_ents)[:240]
+        except Exception:
+            pass
+        units.extend(_msg_units)
+    # 2026-09-05(TC16/D2): 登记幂等——同会话已存在的锚点不再重复登记
+    # （fifo 无状态：客户端每轮重发全量历史，同一批老消息每轮被重复裁剪，
+    # 生产实测 3x 膨胀即此因）。检索侧锚点去重仍保留作存量兜底。
+    try:
+        _existing = {r.get("anchor") for r in MANIFEST.lines(session_key)}
+        if _existing:
+            units = [u for u in units if u.get("anchor") not in _existing]
+    except Exception:
+        pass
     return MANIFEST.record_units(session_key, turn, reason, units)
 
 

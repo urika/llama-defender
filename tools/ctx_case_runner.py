@@ -614,6 +614,13 @@ def main():
     if args.suite:
         want = set(args.suite)
         cases = [c for c in cases if c["suite"] in want]
+    # requires 门：未满足运行条件的案例跳过而非假失败（如 real_backend）
+    _skipped = [c for c in cases
+                if c.get("requires") == "real_backend" and not args.real_backend]
+    if _skipped:
+        cases = [c for c in cases if c not in _skipped]
+        print("跳过（需 --real-backend）:",
+              ", ".join(c["id"] for c in _skipped))
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     root = os.path.join(RUN_ROOT, "run-%s" % ts)

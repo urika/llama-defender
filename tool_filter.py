@@ -3,9 +3,27 @@ import re
 import proxy_state as _ps
 
 # --- _filter_tools ---
+def _inject_ctx_recall(tools_list):
+    """P4 Recall(MVP): ctx_recall 工具注入——独立于任何过滤护栏。
+
+    below_max / too_few_after_filter 早退分支同样注入（TC01/TC02 契约：
+    注入只依赖 PROXY_PD_ENABLED，不依赖裁剪是否发生）。幂等：已在列不
+    重复。fail-open：ctx_recall 不可导入时原样返回。
+    """
+    if not tools_list or not getattr(_ps, "PROXY_PD_ENABLED", True):
+        return tools_list
+    try:
+        from ctx_recall import TOOL_SCHEMA as _CTX_RECALL_TOOL
+        if _CTX_RECALL_TOOL["name"] not in {t.get("name") for t in tools_list if isinstance(t, dict)}:
+            return tools_list + [_CTX_RECALL_TOOL]
+    except ImportError:
+        pass
+    return tools_list
+
+
 def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, session_id=""):
     if not tools or len(tools) <= _ps.PROXY_TOOL_FILTER_MAX:
-        return tools, {"filtered": False, "reason": "below_max"}
+        return _inject_ctx_recall(tools), {"filtered": False, "reason": "below_max"}
 
     recent_tools = set()
     assistant_count = 0
@@ -54,8 +72,9 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, sessi
         key=_tool_sort_key
     )
 
-    if len(kept) < 5:
-        return tools, {"filtered": False, "reason": "too_few_after_filter"}
+    # 2026-09-05(TC01): 移除 too_few_after_filter 早退——keep 集不足时
+    # 原样放行会连 ctx_recall 注入一并放弃（零触发链第一环）；饥饿由
+    # 下方 filler 补足到 MAX 解决，同序稳定性不受影响。
 
     kept_names = {t.get("name", "") for t in kept if isinstance(t, dict)}
     if len(kept) < _ps.PROXY_TOOL_FILTER_MAX:
@@ -81,13 +100,7 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, sessi
 
     # P4 Recall(MVP): 注入 ctx_recall 工具——渐进披露的拉取接口。
     # 无论过滤与否都追加到列表末尾(不占 PROXY_TOOL_FILTER_MAX 名额)。
-    if getattr(_ps, "PROXY_PD_ENABLED", True):
-        try:
-            from ctx_recall import TOOL_SCHEMA as _CTX_RECALL_TOOL
-            if _CTX_RECALL_TOOL["name"] not in {t.get("name") for t in kept if isinstance(t, dict)}:
-                kept.append(_CTX_RECALL_TOOL)
-        except ImportError:
-            pass
+    kept = _inject_ctx_recall(kept)
 
     return kept, {
         "filtered": True,

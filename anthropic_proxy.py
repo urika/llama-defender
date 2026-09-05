@@ -677,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
                 parsed = json.loads(body)
                 # Extract X-Proxy-Route-To header for single-request route override
                 parsed["_x_proxy_route_to"] = self.headers.get("X-Proxy-Route-To", "")
+                # per-route 上下文管理豁免的 per-request 头（§10.1，TC25/27）
+                parsed["_x_proxy_context_managed_by"] = self.headers.get("X-Proxy-Context-Managed-By", "")
                 # 客户端超时（stainless SDK 的 X-Stainless-Timeout）——用于非流式
                 # 主动 504 与流式空闲看门狗的上限推导；缺省则退回后端超时。
                 parsed["_x_client_timeout_s"] = self.headers.get("X-Stainless-Timeout", "")
@@ -1586,10 +1588,16 @@ class Handler(BaseHTTPRequestHandler):
                 mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed text={len(total_text)} chars, tools={len(tool_calls_buffer)}")
-        # REQ_USAGE: 记录流式响应 usage 信息
+        # REQ_USAGE: 记录流式响应 usage 信息（归因=实际响应引擎模型码，TC04 契约）
         if input_tokens > 0 or output_tokens > 0:
+            _attribution = getattr(_log_ctx, "model", "")
+            try:
+                _attribution = ((_log_ctx.openai_body or {}).get("model")
+                                or _attribution)
+            except AttributeError:
+                pass
             log(f"  [REQ_USAGE] input={input_tokens} output={output_tokens} "
-                f"model={getattr(_log_ctx, '_route_cloud_model', '') or _log_ctx.model if hasattr(_log_ctx, 'model') else ''}")
+                f"model={_attribution}")
 
 
     def _send_sse_stream_headers(self):

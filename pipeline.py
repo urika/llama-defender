@@ -568,8 +568,29 @@ class RequestParser(PipelineStage):
 # Stage 0.5: ContextEngine — 上下文工程 Phase 1（R8.1-R8.3）
 # ============================================================================
 
-def _ctx_engine_on():
-    return bool(getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False))
+def _ctx_engine_on():    return bool(getattr(_ps, "PROXY_CTX_ENGINE_ENABLED", False))
+
+
+def _context_exempt(ctx):
+    """per-route 上下文管理豁免（设计 §10.1，TC25/26/27）。
+
+    解析优先级：per-request 头 X-Proxy-Context-Managed-By > 目录元数据
+    context_managed_by > 路由目标默认（cloud=client / local=proxy）。
+    返回 True 时内容改写类 stage（0.5/7/14/17）全部跳过，报文逐字透传；
+    横切观测类（诊断/IFC/PDC/归因头）不豁免。
+    """
+    v = ((ctx.body or {}).get("_x_proxy_context_managed_by") or "").strip().lower()
+    if v in ("client", "proxy"):
+        return v == "client"
+    try:
+        import model_registry
+        entry = model_registry.get_model(ctx.body.get("model") or "") or {}
+        cm = (entry.get("context_managed_by") or "").strip().lower()
+        if cm in ("client", "proxy"):
+            return cm == "client"
+    except Exception:
+        pass
+    return getattr(ctx, '_route_target', 'local') == 'cloud'
 
 
 def _ctx_record_usage(ctx, usage):
@@ -580,6 +601,8 @@ def _ctx_record_usage(ctx, usage):
     """
     if not (_ctx_engine_on() and getattr(ctx, 'session_id', None)):
         return
+    if _context_exempt(ctx):
+        return  # client 管理路由：引擎未参与本轮，记账与日志均不适用
     try:
         import context_engine
         _u = usage or {}
@@ -608,6 +631,8 @@ class ContextEngineStage(ConditionalStage):
     name = "context_engine"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if _context_exempt(ctx):
+            return False
         if not _ctx_engine_on() or not ctx.session_id:
             return False
         # aux(辅助模型)请求隔离: claude SDK 的 title 生成等内部辅助调用
@@ -1457,6 +1482,8 @@ class ContentCompressor(ConditionalStage):
     name = "content_compressor"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if _context_exempt(ctx):
+            return False
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
         # 上下文工程引擎接管压缩(写入期,append-only)时跳过回溯压缩——
@@ -2080,6 +2107,8 @@ class ContextTruncator(ConditionalStage):
     name = "truncate"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if _context_exempt(ctx):
+            return False
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
         # 引擎接管预算控制(epoch 状态机)时跳过 fifo/rounds 截断——
@@ -2262,6 +2291,8 @@ class OOMSafetyFIFO(ConditionalStage):
     name = "oom_safety"
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if _context_exempt(ctx):
+            return False
         if getattr(ctx, '_route_target', 'local') == 'cloud':
             return False
         if _ctx_engine_on():
@@ -2290,6 +2321,7 @@ class OOMSafetyFIFO(ConditionalStage):
         iteration = 0
         raw_messages = ctx.messages
         original_msg_count = len(raw_messages)
+        _oom_dropped_msgs = []
         while True:
             est_chars = msg_converter._estimate_message_chars(raw_messages) + static_chars
             est_tokens = msg_converter._estimate_tokens_dynamic(raw_messages) + int(
@@ -2301,6 +2333,8 @@ class OOMSafetyFIFO(ConditionalStage):
             keep = max(_ps.PROXY_CTX_KEEP_HEAD + _ps.PROXY_CTX_KEEP_TAIL, 4)
             if len(raw_messages) > keep:
                 dropped = len(raw_messages) - keep
+                _oom_dropped_msgs.extend(
+                    raw_messages[_ps.PROXY_CTX_KEEP_HEAD: len(raw_messages) - (keep - _ps.PROXY_CTX_KEEP_HEAD)])
                 raw_messages[:] = raw_messages[:_ps.PROXY_CTX_KEEP_HEAD] + raw_messages[-(keep - _ps.PROXY_CTX_KEEP_HEAD):]
                 log(f"  -> OOM safety (iter {iteration}): est_chars={est_chars}, est_tokens={est_tokens}, "
                     f"dropped {dropped} msgs, kept {len(raw_messages)}")
@@ -2309,6 +2343,34 @@ class OOMSafetyFIFO(ConditionalStage):
 
         ctx.oom_iterations = iteration
         ctx.oom_dropped = original_msg_count - len(raw_messages)
+
+        # 2026-09-05(TC11/17/19): OOM 内联裁剪路径补 PDC 登记 + 召回线索——
+        # 此前该路径丢弃的内容"丢了且模型不知道丢了"（登记调用点全在
+        # truncation.py 未被执行的路径上）。登记与 cue 均 fail-open。
+        if iteration > 0 and _oom_dropped_msgs and getattr(ctx, "session_id", ""):
+            try:
+                import memory_stores
+                memory_stores.record_dropped_messages(
+                    ctx.session_id,
+                    _ps._SESSION_REQUEST_COUNT.get(ctx.session_id, 0) or 0,
+                    "oom_drop", _oom_dropped_msgs)
+            except Exception:
+                pass
+            try:
+                from ctx_recall import RECALL_CUE as _RC
+                from ctx_recall import recall_keys_line as _RKL
+                import ifc_metrics as _ifm
+                _anchors = []
+                for m in _oom_dropped_msgs:
+                    for u in _ifm.unit_anchors(m):
+                        a = u.get("anchor") if isinstance(u, dict) else None
+                        if isinstance(a, str) and a[:2] in ("r:", "u:") and a not in _anchors:
+                            _anchors.append(a)
+                raw_messages.append({"role": "user", "content":
+                    "[context-engine oom: %d 条早期消息已被截断保存，可寻址恢复。%s\n%s]"
+                    % (len(_oom_dropped_msgs), _RC, _RKL(_anchors))})
+            except Exception:
+                pass
 
         # R19 约束②: OOMSafetyFIFO 默认不豁免 pin——oom_danger 档 pinned
         # 消息可被逐出; 发生即挂起并回 X-Proxy-Pin-Suspended: oom_danger。
@@ -2459,6 +2521,17 @@ class FormatConverter(PipelineStage):
         msg_converter = _import_message_converter()
         tool_filter = _import_tool_filter()
 
+        # 2026-09-05(TC21b): engine-on 时 stage 14 被跳过，路径A改写钩子
+        # （ctx_recall 的 error tool_result → 真实检索结果）在此补偿——
+        # 否则模型收到永不兑现的 error result 会弃用召回（自增强死锁）。
+        if _ctx_engine_on() and getattr(_ps, "PROXY_PD_ENABLED", True):
+            try:
+                from content_compressor import rewrite_ctx_recall_results
+                ctx.messages = rewrite_ctx_recall_results(
+                    ctx.messages, ctx.session_id or "")
+            except Exception:
+                pass
+
         # 1. Convert messages
         messages = msg_converter.convert_anthropic_messages_to_openai(ctx.messages)
 
@@ -2562,8 +2635,10 @@ class FormatConverter(PipelineStage):
                 tool_choice_name=tc_name,
                 session_id=ctx.session_id,
             )
+            # 2026-09-05(TC01/02): 无条件回写——below_max 未过滤路径也可能
+            # 追加了 ctx_recall 注入，只在 filtered 时写回会丢失注入
+            body["tools"] = raw_tools
             if tf_stats.get("filtered"):
-                body["tools"] = raw_tools
                 recent_names = tf_stats.get("recent_tools", [])
                 recent_info = f", recent_names={recent_names}" if recent_names else ""
                 filtered_out = tf_stats.get("filtered_out", [])
@@ -3397,10 +3472,11 @@ class BackendDispatcher(PipelineStage):
                 wrapped = _BytesIOResponse(resp.status, body_bytes)
                 self._handler._handle_non_streaming_response(wrapped, ctx.body)
                 # REQ_USAGE: 记录 usage 信息（修复日志截断导致 usage 丢失的问题）
+                # 归因=实际响应引擎模型码（TC04：不再优先 _route_cloud_model）
                 if usage:
                     log(f"  [REQ_USAGE] input={usage.get('prompt_tokens', 0)} "
                         f"output={usage.get('completion_tokens', 0)} "
-                        f"model={getattr(ctx, '_route_cloud_model', '') or ctx.model}")
+                        f"model={(ctx.openai_body or {}).get('model') or ctx.model}")
         except (BrokenPipeError, ConnectionResetError):
             self._client_disconnected = True
             self._handler._client_disconnected = True

@@ -9,15 +9,16 @@ import proxy_state as _ps
 import memory_stores as ms
 
 
-def _dropped_msgs():
+def _dropped_msgs(batch=None):
+    """batch 参数使每批锚点唯一——D2 登记幂等后，同锚重发不再产生新行。"""
     return [
-        {"role": "user", "content": [{"type": "text", "text": "早期任务说明" + "x" * 300}]},
+        {"role": "user", "content": [{"type": "text", "text": "早期任务说明%s" % (batch if batch is not None else "") + "x" * 300}]},
         {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "t1", "name": "Read",
-             "input": {"file_path": "/src/a.py"}}]},
+            {"type": "tool_use", "id": "t1%s" % (batch if batch is not None else ""), "name": "Read",
+             "input": {"file_path": "/src/a%s.py" % (batch if batch is not None else "")}}]},
         {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1",
-             "content": [{"type": "text", "text": "file body" * 100}]}]},
+            {"type": "tool_result", "tool_use_id": "t1%s" % (batch if batch is not None else ""),
+             "content": [{"type": "text", "text": ("file body%s " % (batch if batch is not None else "")) * 100}]}]},
     ]
 
 
@@ -68,9 +69,9 @@ class TestManifestStore(unittest.TestCase):
         old_cap = ms.MAX_LINES_PER_SESSION
         ms.MAX_LINES_PER_SESSION = 4
         try:
-            for _ in range(3):  # 每批 3 行 → 共 9,只留最后 4
+            for b in range(3):  # 每批 3 行(锚点唯一) → 共 9,只留最后 4
                 ms.record_dropped_messages("sess_m4", turn=1, reason="fifo_drop",
-                                           messages=_dropped_msgs())
+                                           messages=_dropped_msgs(batch=b))
             self.assertEqual(ms.MANIFEST.count("sess_m4"), 4)
         finally:
             ms.MAX_LINES_PER_SESSION = old_cap
