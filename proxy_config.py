@@ -967,6 +967,32 @@ CONFIG_REGISTRY = {
         "doc": "Hard cap for the dense fold Files segment (chars); tail "
                "RECALL_CUE sentence is never truncated.",
     },
+    "PROXY_AUTO_RECALL_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "ctx_recall auto closed-loop (2026-09-05 design): on repeated-read "
+               "dup detection (session ledger) + folded confirmation (manifest), "
+               "the proxy itself recalls the folded content and appends it as a "
+               "tail user message. Off = model-initiated ctx_recall only.",
+    },
+    "PROXY_AUTO_RECALL_DUP_THRESHOLD": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Cumulative dup count per Read target (ledger dup_queries) that "
+               "arms auto-recall for that target.",
+    },
+    "PROXY_AUTO_RECALL_MAX_CHARS": {
+        "defaults": {"all": "4000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Per-injection char cap for recalled content (paging anchor is "
+               "kept so the model can continue via ctx_recall anchor@offset).",
+    },
+    "PROXY_AUTO_RECALL_PER_SESSION": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Max injections per session (anti injection-loop guard; also "
+               "deduped per target).",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

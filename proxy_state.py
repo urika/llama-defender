@@ -135,6 +135,11 @@ _SESSION_REQUEST_COUNT = {}
 # Maps session_id → {tool_name: count}. Updated by _filter_tools after each request.
 _SESSION_TOOL_FREQ: dict[str, dict[str, int]] = {}
 
+# ctx_recall 自闭环 auto-recall：会话 → {"count": 注入次数, "targets": {目标: 锚点}}。
+# 有界：写入方（pipeline.AutoRecallStage）超 _AUTO_RECALL_STATE_MAX 会话时 FIFO 驱逐。
+_AUTO_RECALL_STATE: dict[str, dict] = {}
+_AUTO_RECALL_STATE_MAX = 128
+
 # ---------------------------------------------------------------------------
 # Semantic content compression (Phase 2)
 # ---------------------------------------------------------------------------
@@ -522,6 +527,17 @@ PROXY_FOLD_DENSE_MAX_FILES = int(os.environ.get(
     "PROXY_FOLD_DENSE_MAX_FILES", get_default("PROXY_FOLD_DENSE_MAX_FILES")))
 PROXY_FOLD_DENSE_MAX_CHARS = int(os.environ.get(
     "PROXY_FOLD_DENSE_MAX_CHARS", get_default("PROXY_FOLD_DENSE_MAX_CHARS")))
+
+# ctx_recall 自闭环 auto-recall（2026-09-05 设计，默认关，实验臂/灰度开）：
+# 台账 dup 检测 + manifest 折叠确认 → ctx_recall 取回 → 尾部注入。
+PROXY_AUTO_RECALL_ENABLED = os.environ.get(
+    "PROXY_AUTO_RECALL_ENABLED", get_default("PROXY_AUTO_RECALL_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_AUTO_RECALL_DUP_THRESHOLD = int(os.environ.get(
+    "PROXY_AUTO_RECALL_DUP_THRESHOLD", get_default("PROXY_AUTO_RECALL_DUP_THRESHOLD")))
+PROXY_AUTO_RECALL_MAX_CHARS = int(os.environ.get(
+    "PROXY_AUTO_RECALL_MAX_CHARS", get_default("PROXY_AUTO_RECALL_MAX_CHARS")))
+PROXY_AUTO_RECALL_PER_SESSION = int(os.environ.get(
+    "PROXY_AUTO_RECALL_PER_SESSION", get_default("PROXY_AUTO_RECALL_PER_SESSION")))
 
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
@@ -1154,6 +1170,11 @@ _RELOAD_SPEC = [
     ("PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_ENABLED", "bool", "false", "false"),
     ("PROXY_FOLD_DENSE_MAX_FILES", "PROXY_FOLD_DENSE_MAX_FILES", "int", "10", "10"),
     ("PROXY_FOLD_DENSE_MAX_CHARS", "PROXY_FOLD_DENSE_MAX_CHARS", "int", "800", "800"),
+    # ctx_recall 自闭环 auto-recall（默认关，实验臂/灰度开；SIGHUP 可热开）
+    ("PROXY_AUTO_RECALL_ENABLED", "PROXY_AUTO_RECALL_ENABLED", "bool", "false", "false"),
+    ("PROXY_AUTO_RECALL_DUP_THRESHOLD", "PROXY_AUTO_RECALL_DUP_THRESHOLD", "int", "3", "3"),
+    ("PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_MAX_CHARS", "int", "4000", "4000"),
+    ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1324,6 +1345,9 @@ __all__ = [
     "TOOL_ALWAYS_KEEP",
     # Fold dense (fifo A 路加密折叠)
     "PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_MAX_FILES", "PROXY_FOLD_DENSE_MAX_CHARS",
+    # ctx_recall 自闭环 auto-recall
+    "PROXY_AUTO_RECALL_ENABLED", "PROXY_AUTO_RECALL_DUP_THRESHOLD",
+    "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority

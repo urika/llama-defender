@@ -1,4 +1,9 @@
 {
+  "AutoRecallStage": {
+    "name": "AutoRecallStage",
+    "params": [],
+    "defaults": {}
+  },
   "BackendDispatcher": {
     "name": "BackendDispatcher",
     "params": [
@@ -137,6 +142,7 @@
       "loop_level",
       "loop_tool_name",
       "re_read_info",
+      "auto_recall_info",
       "trunc_stats",
       "common_prefix_ratio",
       "openai_messages",
@@ -186,6 +192,7 @@
       "loop_level": 0,
       "loop_tool_name": null,
       "re_read_info": null,
+      "auto_recall_info": null,
       "trunc_stats": null,
       "common_prefix_ratio": 0.0,
       "openai_messages": null,

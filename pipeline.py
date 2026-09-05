@@ -200,6 +200,7 @@ class PipelineContext:
     loop_level: int = 0
     loop_tool_name: Optional[str] = None
     re_read_info: Optional[dict] = None
+    auto_recall_info: Optional[dict] = None
     trunc_stats: Optional[dict] = None
     common_prefix_ratio: float = 0.0
     openai_messages: Optional[list] = None
@@ -1901,6 +1902,121 @@ class RereadDetector(PipelineStage):
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         return ctx.re_read_info
+
+
+# ============================================================================
+# Stage 12.5: AutoRecallStage — ctx_recall 自闭环（auto-recall，默认关）
+# ============================================================================
+
+class AutoRecallStage(ConditionalStage):
+    """Stage 12.5: ctx_recall auto closed-loop (2026-09-05 design, off by default).
+
+    五环：① 台账 session_ledger.dup_queries 跨轮累计检测（同 Read 目标
+    count ≥ PROXY_AUTO_RECALL_DUP_THRESHOLD，与 swe-eval dup_max_count 同
+    口径；ToolLoopDetector 的 run-length 仅兜底，A→B→A 交替抓不到）；
+    ② manifest 折叠索引确认（目标确已丢失才注入，防误注入）；③
+    ctx_recall.auto_recall_for_target 取回（长度上限 + 分页锚点保留）；
+    ④ [System: …] user 尾消息注入（append-only，prefix-cache 友好）；
+    ⑤ diagnostics.record_injection("auto_recall") 记账 + 日志行 + per-session
+    内存计数（采纳率由 swe-eval 侧对台账 last_dup_turn 差分）。
+
+    与 stage 12 RereadDetector 同构（该 stage 针对 stage 7 清除路径、注入
+    「模型自调 ctx_recall」的被动指引；本 stage 是 epoch/fifo 折叠域的主动
+    兜底——实测模型主动召回 0 调用）。fail-open：任一环失败原样转发。
+    """
+    # kv: append
+
+    name = "auto_recall"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        return (getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False)
+                and bool(getattr(ctx, "session_id", ""))
+                and not ctx.session_id.endswith("::aux-haiku"))
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        try:
+            self._process_inner(ctx)
+        except Exception as e:
+            _warn_diag("auto_recall", e)
+        return ctx
+
+    def _process_inner(self, ctx: PipelineContext) -> None:
+        ctx.auto_recall_info = {"injected": 0}
+        import session_ledger
+        ledger = session_ledger.LEDGER.build_ledger_json(ctx.session_id)
+        if not ledger:
+            return
+        try:
+            threshold = max(2, int(getattr(
+                _ps, "PROXY_AUTO_RECALL_DUP_THRESHOLD", 3)))
+            per_cap = max(1, int(getattr(
+                _ps, "PROXY_AUTO_RECALL_PER_SESSION", 5)))
+        except (TypeError, ValueError):
+            threshold, per_cap = 3, 5
+
+        state = _ps._AUTO_RECALL_STATE
+        sess_state = state.get(ctx.session_id)
+        if sess_state is None:
+            # 有界：超上限 FIFO 驱逐最老会话（proxy_state 注释约定）
+            if len(state) >= getattr(_ps, "_AUTO_RECALL_STATE_MAX", 128):
+                state.pop(next(iter(state)), None)
+            sess_state = state[ctx.session_id] = {"count": 0, "targets": {}}
+        if sess_state["count"] >= per_cap:
+            return
+
+        import ctx_recall as _cr
+        dup_queries = ledger.get("dup_queries") or []
+        dup_queries.sort(key=lambda d: -d.get("count", 0))
+        for dq in dup_queries:
+            tool = (dq.get("tool") or "").lower()
+            target = (dq.get("target") or "").strip()
+            # 只看 Read 类文件目标：写入类重写不适用召回，fetch 类目标
+            # 口径含 URL 归一化另议（v1 收敛在探索循环主病灶 Read 上）
+            if "read" not in tool or not target:
+                continue
+            if dq.get("count", 0) < threshold:
+                break  # 降序排列，后面只会更小
+            if target in sess_state["targets"]:
+                continue  # 同目标每会话只注入一次（防注入抖动）
+            # ② 决策 + ③ 执行（包装内含 manifest 确认与 fail-open）
+            rec = _cr.auto_recall_for_target(ctx.session_id, target)
+            if not rec:
+                continue
+            reason_tag = "epoch/fifo" if not rec.get("reason") else rec["reason"]
+            text = (
+                "[System: AUTO-RECALL — you are about to re-read %s for the "
+                "%d-th time, but its earlier content was folded away "
+                "(%s) and is preserved in this session store. Use the "
+                "content below directly; do NOT read the file again.\n"
+                "%s\n[anchor: %s — if truncated, continue with "
+                "ctx_recall query=\"%s@<offset>\"]]"
+                % (target, dq.get("count", 0), reason_tag,
+                   rec["content"], rec["anchor"], rec["anchor"])
+            )
+            ctx.messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            })
+            # ⑤ 记账（顺序无回退需求：注入已发生）
+            sess_state["count"] += 1
+            sess_state["targets"][target] = rec["anchor"]
+            log(f"  -> [auto_recall] injected target={target} "
+                f"anchor={rec['anchor']} chars={rec['chars']} "
+                f"(session count={sess_state['count']}/{per_cap})")
+            if _ps.PROXY_DIAG_ENABLED:
+                try:
+                    import diagnostics
+                    diagnostics.record_injection("auto_recall")
+                except Exception as _e:
+                    _warn_diag("inject_auto_recall", _e)
+            ctx.auto_recall_info = {
+                "injected": 1, "target": target, "anchor": rec["anchor"],
+                "chars": rec["chars"], "dup_count": dq.get("count", 0),
+            }
+            return  # 每轮至多注入一条（克制窗口挤占）
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return getattr(ctx, "auto_recall_info", None)
 
 
 # ============================================================================

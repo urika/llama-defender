@@ -376,6 +376,79 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
     return None
 
 
+def auto_recall_for_target(session_key, target, max_chars=None):
+    """auto-recall 执行器（ctx-recall 自闭环设计 2026-09-05 §4③）：按目标取回折叠原文。
+
+    数据源优先级：
+      ① manifest 两段式精确匹配——unit_anchors 只给 tool_use 行带 handle
+         (Read→file value)，tool_result 行 handle=None，故先找 handle.value
+         == target 的 u: 行（取最新 turn），再配对同 tool_use_id 的 r: 行
+         （r: 行才有正文可恢复）；
+      ② 回落 fts_search(target, kind=tool_result)（head/triggers 模糊命中）。
+    命中后 recover_full_content 取回（上限 max_chars，缺省
+    PROXY_AUTO_RECALL_MAX_CHARS；分页锚点保留，续读由模型经 ctx_recall
+    query="锚点@偏移" 完成）。
+    总开关关闭 / 无命中 / 恢复失败 → None（fail-open，调用方原样转发）。
+    返回 {"anchor","turn","reason","chars","content"} 或 None。
+    """
+    if not session_key or not (target or "").strip():
+        return None
+    if not getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False):
+        return None
+    tgt = target.strip()
+    if max_chars:
+        try:
+            limit = max(200, int(max_chars))
+        except (TypeError, ValueError):
+            limit = 4000
+    else:
+        try:
+            limit = max(200, int(getattr(_ps, "PROXY_AUTO_RECALL_MAX_CHARS", 4000)))
+        except (TypeError, ValueError):
+            limit = 4000
+    try:
+        cand = None
+        lines = memory_stores.MANIFEST.lines(session_key)
+        # ①a: u: 行按 handle 精确匹配 → 同 id r: 行（取最新 turn 语义）
+        best_turn = -1
+        uids = {}
+        for line in lines:
+            if line.get("kind") != "tool_use":
+                continue
+            handle = line.get("handle") or {}
+            hval = handle.get("value", "") if isinstance(handle, dict) else ""
+            if hval and hval.rstrip("/") == tgt.rstrip("/"):
+                anchor = line.get("anchor") or ""
+                if anchor.startswith("u:"):
+                    uids[anchor[2:]] = line.get("turn") or 0
+        if uids:
+            for line in lines:
+                anchor = line.get("anchor") or ""
+                if (line.get("kind") == "tool_result"
+                        and anchor.startswith("r:")
+                        and anchor[2:] in uids):
+                    t = line.get("turn") or 0
+                    if t >= best_turn:
+                        cand, best_turn = line, t
+        # ②: 回落全文检索（head/triggers 含路径片段即命中）
+        if cand is None:
+            for line in fts_search(session_key, tgt, kind="tool_result", limit=3):
+                if (line.get("anchor") or "").startswith("r:"):
+                    cand = line
+                    break
+        if cand is None:
+            return None
+        content = recover_full_content(session_key, cand["anchor"],
+                                       cand.get("turn"), max_chars=limit)
+        if not content:
+            return None
+        return {"anchor": cand["anchor"], "turn": cand.get("turn"),
+                "reason": cand.get("reason") or "",
+                "chars": len(content), "content": content}
+    except Exception:
+        return None
+
+
 def format_recall_result(lines, query, session_key=None, offset=0):
     """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。"""
     if not lines:
@@ -536,4 +609,5 @@ __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
     "line_text", "recover_full_content", "DEFAULT_LIMIT",
     "build_follow_up_messages", "MICRO_TURN_RESULT_MAX_CHARS",
+    "auto_recall_for_target",
 ]

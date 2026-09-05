@@ -80,6 +80,7 @@ from pipeline import (
     SessionLoopState,
     LoopIntervention,
     RereadDetector,
+    AutoRecallStage,
     DateNormalizer,
     ContextTruncator,
     HighDropRatioNotice,
@@ -1098,6 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
             SessionLoopState(),           # 10
             LoopIntervention(),           # 11
             RereadDetector(),             # 12
+            AutoRecallStage(),            # 12.5 — ctx_recall 自闭环(默认关;台账 dup 检测→manifest 确认→召回尾部注入)
             DateNormalizer(),             # 13
             ContextTruncator(),           # 14
             HighDropRatioNotice(),        # 15
