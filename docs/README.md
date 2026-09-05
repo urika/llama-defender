@@ -118,6 +118,10 @@ docs/
 | `local-model-hard-tasks-test-20260812.md` | 本地模型困难任务测试 |
 | `promptfoo-migration.md` | promptfoo 迁移文档 |
 | `amnesia-experiment-protocol-20260830.md` | Amnesia 实验协议 |
+| `ctx-single-step-case-debug-design-20260905.md` | ctx-case 单步报文调试框架设计（影子环境/mock 后端/四出口断言） |
+| `ctx-single-step-case-set-20260905.md` | ctx-case 案例集规格 TC01-TC21（六字段/案例 + 日志问题追溯附录 + 首轮实测红绿表） |
+| `ctx-case-behavioral-extension-design-20260905.md` | ctx-case 行为层扩展（B-suite：模型在环测试 + 闭环问答探针 + 定量评估设计） |
+| `system-behavior-testing-methodology-20260905.md` | 系统行为类测试与评估方法论（分层金字塔/断环矩阵/金标准探针/小样本统计） |
 
 ---
 
@@ -130,6 +134,8 @@ docs/
 | `DEFECT-LIST.md` | 功能缺陷清单（DEF-001…，30 项缺陷含根因、修复、遗留问题） |
 | `dead-loop-analysis-report.md` | Claude Code 死循环分析与代理层优化报告 |
 | `message-analysis-20260602.md` | 报文深度分析报告（197K chars / 56K tokens 膨胀晚期诊断） |
+| `swe-empty-patch-rootcause-20260903.md` | swe 实例空 patch 根因调查与窗口深度验证（fifo 24→80 判定实验） |
+| `ctx-swe-correlation-analysis-20260905.md` | 上下文管理条件与 swe 测试结果相关性分析（单实例 24 run 纵向 + 定性结论） |
 | `message-analysis-20260604.md` | 报文情况与处理性能分析报告 |
 | `claude-behavior-semantic-analysis-v2.md` | Claude Code 语义行为深度分析（v2） |
 | `rapid-mlx-cache-analysis.md` | Rapid-MLX Prefix Cache 命中问题分析报告 |

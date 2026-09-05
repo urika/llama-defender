@@ -1,0 +1,1144 @@
+[
+ {
+  "id": "TC01",
+  "suite": "prod",
+  "session": "t01",
+  "name": "工具过滤+ctx_recall注入（异常A判定）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 25
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "Tool filter: 25"
+   ],
+   "backend_tools_last": {
+    "count_max": 15,
+    "last": "ctx_recall"
+   },
+   "backend_model_last": "mock-local-35b"
+  }
+ },
+ {
+  "id": "TC02",
+  "suite": "prod",
+  "session": "t02",
+  "name": "below_max 注入（D1裁决：≤MAX 也注入）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 5
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_not_contains": [
+    "Tool filter:"
+   ],
+   "backend_tools_last": {
+    "count_exact": 6,
+    "last": "ctx_recall"
+   }
+  }
+ },
+ {
+  "id": "TC03",
+  "suite": "prod",
+  "session": "t03",
+  "name": "幂等注入：已含 ctx_recall 不重复",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 25,
+    "$ctx_recall": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "backend_tools_last": {
+    "count_name_eq": {
+     "ctx_recall": 1
+    }
+   }
+  }
+ },
+ {
+  "id": "TC04",
+  "suite": "prod",
+  "session": "t04",
+  "name": "派发模型码+归因一致性（异常B回归）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "resp_header": {
+    "X-Proxy-Route-Target": "local"
+   },
+   "backend_model_last": "mock-local-35b",
+   "log_contains": [
+    "[REQ_USAGE] input=100 output=20 model=mock-local-35b"
+   ]
+  }
+ },
+ {
+  "id": "TC05",
+  "suite": "prod",
+  "session": "t05",
+  "name": "aux 分域烟囱：haiku+无工具",
+  "body": {
+   "model": "claude-3-5-haiku-20241022",
+   "max_tokens": 128,
+   "messages": [
+    {
+     "role": "user",
+     "content": "title this"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 1
+  }
+ },
+ {
+  "id": "TC07",
+  "suite": "prod",
+  "session": "t07",
+  "name": "MICRO off：ctx_recall 调用透传（路径A前半）",
+  "seed_manifest": [
+   {
+    "session": "t07",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx7",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/seed7.py"
+      },
+      "size_chars": 200,
+      "head": "SECRET-CONTENT-XYZ alpha beta gamma",
+      "triggers": "secret seed alpha",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "SECRET"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 1,
+   "resp_tool_use_names": {
+    "contains": [
+     "ctx_recall"
+    ]
+   },
+   "log_not_contains": [
+    "[MICRO_TURN]"
+   ]
+  }
+ },
+ {
+  "id": "TC13",
+  "suite": "bigbody",
+  "session": "t13",
+  "name": "超大请求 413 硬拒（dispatch 门）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 64,
+   "$big": 150000
+  },
+  "expect": {
+   "resp_status": 413,
+   "dispatch_count": 0
+  }
+ },
+ {
+  "id": "TC14",
+  "suite": "prod",
+  "session": "t14",
+  "name": "engine-on stage 跳过联动",
+  "body": {
+   "model": "$client",
+   "max_tokens": 128,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "[context_engine]"
+   ],
+   "log_not_contains": [
+    "[content_compressor]"
+   ]
+  }
+ },
+ {
+  "id": "TC15",
+  "suite": "prod",
+  "session": "t15",
+  "name": "usage 计量透传",
+  "body": {
+   "model": "$client",
+   "max_tokens": 128,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "[REQ_USAGE] input=100 output=20"
+   ]
+  }
+ },
+ {
+  "id": "TC21b",
+  "suite": "prod",
+  "session": "t21b",
+  "name": "路径A兑现·engine-on（D环：预期钩子失效）",
+  "seed_manifest": [
+   {
+    "session": "t21b",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx21b",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/seed21b.py"
+      },
+      "size_chars": 200,
+      "head": "SECRET-CONTENT-XYZ gamma delta",
+      "triggers": "secret seed gamma",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "SECRET"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "bodies": [
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     }
+    ]
+   },
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_ctxcase_0",
+        "name": "ctx_recall",
+        "input": {
+         "query": "SECRET"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_ctxcase_0",
+        "content": "Error: unknown tool ctx_recall"
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "SECRET-CONTENT-XYZ"
+   ]
+  }
+ },
+ {
+  "id": "TC06",
+  "suite": "micro",
+  "session": "t06",
+  "name": "微轮自答全链路",
+  "seed_manifest": [
+   {
+    "session": "t06",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx6",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/seed6.py"
+      },
+      "size_chars": 200,
+      "head": "SECRET-CONTENT-XYZ alpha beta",
+      "triggers": "secret seed alpha",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "SECRET"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "SECRET-CONTENT-XYZ"
+   ],
+   "log_contains": [
+    "[MICRO_TURN]"
+   ]
+  }
+ },
+ {
+  "id": "TC08",
+  "suite": "micro",
+  "session": "t08",
+  "name": "混合调用不自答",
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "SECRET"
+      }
+     },
+     {
+      "name": "DummyTool00",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 1,
+   "resp_tool_use_names": {
+    "contains": [
+     "ctx_recall",
+     "DummyTool00"
+    ]
+   }
+  }
+ },
+ {
+  "id": "TC09",
+  "suite": "micro",
+  "session": "t09",
+  "name": "锚点直查",
+  "seed_manifest": [
+   {
+    "session": "t09",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx9",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/seed9.py"
+      },
+      "size_chars": 200,
+      "head": "SECRET-CONTENT-XYZ beta gamma",
+      "triggers": "secret seed beta",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "r:seedx9"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "SECRET-CONTENT-XYZ"
+   ]
+  }
+ },
+ {
+  "id": "TC10",
+  "suite": "micro",
+  "session": "t10",
+  "name": "空库 hint（防召回 churn）",
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "nonexistent-xyz"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "无匹配的已折叠单元"
+   ]
+  }
+ },
+ {
+  "id": "TC18",
+  "suite": "micro",
+  "session": "t18",
+  "name": "检索 top-N 拥挤（规模回归）",
+  "seed_manifest": [
+   {
+    "session": "t18",
+    "$bulk": {
+     "keyword": "parserx",
+     "interference": 20,
+     "target_head": "TARGET-UNIQUE-123 parserx target content"
+    }
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "parserx",
+       "limit": 8
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "TARGET-UNIQUE-123"
+   ]
+  }
+ },
+ {
+  "id": "TC11",
+  "suite": "engineoff",
+  "session": "t11",
+  "name": "fifo 截断 + PDC 登记（二发触发）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 30,
+   "$turn_tag": "mark11"
+  },
+  "expect": {
+   "resp_status": 200,
+   "backend_msg_count_max": 12,
+   "manifest_count_min": [
+    {
+     "session": "t11",
+     "min": 1
+    }
+   ]
+  },
+  "repeat": 2,
+  "repeat_delay": 2.2
+ },
+ {
+  "id": "TC16",
+  "suite": "engineoff",
+  "session": "t16",
+  "name": "重复登记（同报文重发，D2裁决：登记幂等）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 30,
+   "$turn_tag": "mark16"
+  },
+  "repeat": 3,
+  "expect": {
+   "resp_status": 200,
+   "manifest_anchor_max_dup": [
+    {
+     "session": "t16",
+     "max": 1
+    }
+   ]
+  },
+  "repeat_delay": 2.2
+ },
+ {
+  "id": "TC17",
+  "suite": "engineoff",
+  "session": "t17",
+  "name": "登记 triggers 字段质量（D3裁决）（二发触发）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 30,
+   "$turn_text": "read /repo/src/parser.py then got ValueError: bad token at line %d"
+  },
+  "expect": {
+   "resp_status": 200,
+   "manifest_field_contains": [
+    {
+     "session": "t17",
+     "field": "triggers",
+     "any_of": [
+      "parser",
+      "valueerror"
+     ]
+    }
+   ]
+  },
+  "repeat": 2,
+  "repeat_delay": 2.2
+ },
+ {
+  "id": "TC19",
+  "suite": "engineoff",
+  "session": "t19",
+  "name": "fifo 截断后的召回线索（B环·A路）（二发触发）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 30,
+   "$turn_tag": "mark19"
+  },
+  "expect": {
+   "resp_status": 200,
+   "last_dispatch_contains": [
+    "use ctx_recall to recover"
+   ]
+  },
+  "repeat": 2,
+  "repeat_delay": 2.2
+ },
+ {
+  "id": "TC21a",
+  "suite": "engineoff",
+  "session": "t21a",
+  "name": "路径A兑现·engine-off（D环对照）",
+  "seed_manifest": [
+   {
+    "session": "t21a",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx21a",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/seed21a.py"
+      },
+      "size_chars": 200,
+      "head": "SECRET-CONTENT-XYZ delta epsilon",
+      "triggers": "secret seed delta",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "SECRET"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "bodies": [
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     }
+    ]
+   },
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_ctxcase_0",
+        "name": "ctx_recall",
+        "input": {
+         "query": "SECRET"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_ctxcase_0",
+        "content": "Error: unknown tool ctx_recall"
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "expect": {
+   "resp_status": 200,
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "SECRET-CONTENT-XYZ"
+   ]
+  }
+ },
+ {
+  "id": "TC12",
+  "suite": "epoch",
+  "session": "t12",
+  "name": "epoch 折叠（小预算）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark12"
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH"
+   ],
+   "backend_msg_count_max": 79,
+   "manifest_count_min": [
+    {
+     "session": "t12",
+     "min": 1
+    }
+   ]
+  }
+ },
+ {
+  "id": "TC20",
+  "suite": "epoch",
+  "session": "t20",
+  "name": "epoch 折叠面板的召回线索（B环·B路）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark20"
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH"
+   ],
+   "last_dispatch_contains": [
+    "use ctx_recall to recover"
+   ]
+  }
+ },
+ {
+  "id": "TC22",
+  "suite": "epoch",
+  "session": "t22",
+  "name": "engine-on 单请求折叠：事实入折叠区+cue暴露+原文不在发送视图",
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark",
+   "$fact": {
+    "turn_index": 10,
+    "text": "read /repo/ops/deploy.md: DEPLOY-KEY-7742 is the alpha host deploy key, memorize it"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH"
+   ],
+   "last_dispatch_contains": [
+    "use ctx_recall to recover"
+   ],
+   "last_dispatch_not_contains": [
+    "DEPLOY-KEY-7742"
+   ],
+   "manifest_count_min": [
+    {
+     "session": "t22",
+     "min": 1
+    }
+   ]
+  }
+ },
+ {
+  "id": "TC23",
+  "suite": "epochmicro",
+  "session": "t23",
+  "name": "engine-on 单请求全链：折叠后微轮召回把事实回填",
+  "mock_steps": [
+   {
+    "tool_calls": [
+     {
+      "name": "ctx_recall",
+      "arguments": {
+       "query": "DEPLOY-KEY"
+      }
+     }
+    ]
+   },
+   {
+    "text": "done"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark",
+   "$fact": {
+    "turn_index": 10,
+    "text": "read /repo/ops/deploy.md: DEPLOY-KEY-7742 is the alpha host deploy key, memorize it"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH",
+    "[MICRO_TURN]"
+   ],
+   "dispatch_count": 2,
+   "last_dispatch_contains": [
+    "DEPLOY-KEY-7742"
+   ]
+  }
+ },
+ {
+  "id": "TC24",
+  "suite": "micro",
+  "session": "t24",
+  "name": "真实模型单请求端到端召回探针（--real-backend）",
+  "seed_manifest": [
+   {
+    "session": "t24",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:seedx24",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/ops/deploy.md"
+      },
+      "size_chars": 200,
+      "head": "DEPLOY-KEY-8817 is the alpha host deploy key",
+      "triggers": "deploy key alpha",
+      "ts": "2026-09-05T00:00:00"
+     }
+    ]
+   }
+  ],
+  "mock_steps": [
+   {
+    "text": "unused"
+   }
+  ],
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$standard": [
+     "Read",
+     "Write",
+     "Edit",
+     "Bash",
+     "Grep"
+    ],
+    "$dummy": 20
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "之前会话里记录过一个部署密钥（deploy key），文件现在读不了。会话台账里有它的折叠记录，锚点 r:seedx24。请用 ctx_recall 工具查回它，并告诉我密钥的值。"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "resp_text_contains": [
+    "8817"
+   ],
+   "log_contains": [
+    "[MICRO_TURN]"
+   ]
+  }
+ },
+ {
+  "id": "TC25",
+  "suite": "epoch",
+  "session": "t25",
+  "name": "per-route豁免：client管理→引擎跳过+报文逐字透传（规格红灯）",
+  "headers": {
+   "X-Proxy-Context-Managed-By": "client"
+  },
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark",
+   "$fact": {
+    "turn_index": 10,
+    "text": "read /repo/ops/deploy.md: PEROUTE-FACT-5521 is the gamma host deploy key, memorize it"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_not_contains": [
+    "[context_engine]"
+   ],
+   "backend_msg_count_min": 100,
+   "last_dispatch_contains": [
+    "PEROUTE-FACT-5521"
+   ]
+  }
+ },
+ {
+  "id": "TC26",
+  "suite": "epoch",
+  "session": "t26",
+  "name": "per-route豁免：proxy管理（默认）→引擎照常（回归保护）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark",
+   "$fact": {
+    "turn_index": 10,
+    "text": "read /repo/ops/deploy.md: PEROUTE-FACT-5521 is the gamma host deploy key, memorize it"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "[context_engine]",
+    "EPOCH"
+   ],
+   "backend_msg_count_max": 20
+  }
+ },
+ {
+  "id": "TC27",
+  "suite": "epoch",
+  "session": "t27",
+  "name": "per-route豁免：横切观测类不豁免（client路由下R8头/诊断保留）",
+  "headers": {
+   "X-Proxy-Context-Managed-By": "client"
+  },
+  "body": {
+   "model": "$client",
+   "max_tokens": 128,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "resp_header": {
+    "X-Proxy-Route-Target": "local"
+   },
+   "log_contains": [
+    "[REQ_USAGE]"
+   ]
+  }
+ }
+]
