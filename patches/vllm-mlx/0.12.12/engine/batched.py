@@ -2435,13 +2435,25 @@ class BatchedEngine(BaseEngine):
                     if real_token != rendered_token:
                         break
                     lcp += 1
-                # 严格前缀守卫：lcp 必须恰好耗尽截断渲染（非稳定模板切点跳过）
-                if 0 < lcp < total and lcp == len(r_tokens):
+                # 正确性由 fetch 侧 B ≤ lcp 不变式保证（检查点状态在
+                # entry.tokens[0..B] 上构造，请求共享前缀 ≥ B 即合法），
+                # 此处只需位置落在 prompt 内部且有复用价值。
+                # 模板对截断渲染自动追加 assistant 标记时 lcp 会略小于
+                # rlen——标记在渲染尾部，lcp 仍精确指向消息边界。
+                if 256 < lcp < total:
                     candidates.append(lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
-            return select_checkpoint_positions(
+            boundaries = select_checkpoint_positions(
                 candidates, total, limit=limit, min_spacing=min_spacing_tokens
             )
-        except Exception:
+            logger.info(
+                "[lcp_boundaries] candidates=%d boundaries=%s total=%d msgs=%d",
+                len(candidates), boundaries, total, len(messages),
+            )
+            return boundaries
+        except Exception as exc:
+            logger.info(
+                "[lcp_boundaries] failed (fail-closed single-boundary): %r", exc
+            )
             return []
 
     def _compute_prefix_boundary(

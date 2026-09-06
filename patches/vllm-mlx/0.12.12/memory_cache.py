@@ -2190,19 +2190,25 @@ class MemoryAwarePrefixCache:
         # the nearest neighbor which likely shares the longest prefix.
         best_lcp_entry: _CacheEntry | None = None
         best_lcp_length = 0
+        # P1a：带检查点候选单独追踪——多会话混缓存时，全局最优 LCP 候选可能
+        # 来自别的会话且不带检查点（non-trimmable → 必然整条 MISS）；此时任何
+        # 带检查点的候选（哪怕 lcp 略小）都严格占优（snap-down ≥ 部分复用）。
+        best_ckpt_entry: _CacheEntry | None = None
+        best_ckpt_length = 0
 
         if sorted_keys:
             idx = bisect.bisect_left(sorted_keys, tokens_key)
             # Check neighbors around insertion point (they share the most
-            # common prefix due to lexicographic ordering).
-            for i in (idx - 1, idx):
+            # common prefix due to lexicographic ordering).  P1a: window
+            # ±4 而非紧邻 2 个——带检查点条目未必是紧邻。
+            for i in range(idx - 4, idx + 4):
                 if i < 0 or i >= len(sorted_keys):
                     continue
                 cached_key = sorted_keys[i]
                 if cached_key == tokens_key:
                     continue  # Skip exact (already handled)
                 min_len = min(len(cached_key), len(tokens_key))
-                if min_len <= best_lcp_length:
+                if min_len <= best_lcp_length and min_len <= best_ckpt_length:
                     continue
                 # Compute LCP length
                 lcp = 0
@@ -2210,13 +2216,38 @@ class MemoryAwarePrefixCache:
                     if cached_key[j] != tokens_key[j]:
                         break
                     lcp = j + 1
+                cand = self._entries[cached_key]
                 if lcp > best_lcp_length:
-                    best_lcp_entry = self._entries[cached_key]
+                    best_lcp_entry = cand
                     best_lcp_length = lcp
                     logger.debug(
                         f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
                         f"req_len={len(tokens_key)} lcp={lcp}"
                     )
+                if (
+                    getattr(cand, "linear_checkpoints", None)
+                    and lcp > best_ckpt_length
+                ):
+                    best_ckpt_entry = cand
+                    best_ckpt_length = lcp
+
+            # 决策：最优候选无法复用（non-trimmable 且无检查点）→ 换用带检查点候选
+            if (
+                best_ckpt_entry is not None
+                and best_lcp_entry is not None
+                and best_lcp_entry is not best_ckpt_entry
+                and best_lcp_entry.non_trimmable
+                and not best_lcp_entry.linear_checkpoints
+            ):
+                logger.debug(
+                    f"[cache_fetch] LCP: prefer checkpointed entry "
+                    f"(lcp={best_ckpt_length}) over bare best (lcp={best_lcp_length})"
+                )
+                best_lcp_entry = best_ckpt_entry
+                best_lcp_length = best_ckpt_length
+            elif best_lcp_entry is None and best_ckpt_entry is not None:
+                best_lcp_entry = best_ckpt_entry
+                best_lcp_length = best_ckpt_length
 
         if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length

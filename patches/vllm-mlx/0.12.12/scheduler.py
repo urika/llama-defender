@@ -3992,7 +3992,7 @@ class Scheduler:
                 if not _states:
                     continue
                 _req._linear_checkpoints[_abs] = _states
-                logger.debug(
+                logger.info(
                     "[lcp_checkpoint] request=%s B=%d layers=%d",
                     _req.request_id[:12],
                     _abs,
@@ -4056,6 +4056,9 @@ class Scheduler:
                     reconstructed,
                     evict_prefixes=False,
                     message_boundary=True,
+                    # P1a：边界条目同样挂载检查点（≤ 自身长度的位置才会被
+                    # fetch 选用；LCP 候选经常是边界条目，不挂载会漏复用）
+                    linear_checkpoints=getattr(request, "_linear_checkpoints", None),
                 )
             except Exception as exc:
                 logger.debug(
