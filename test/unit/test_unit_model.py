@@ -77,6 +77,30 @@ class TestMsgHash(unittest.TestCase):
         msg = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
         self.assertEqual(um.msg_hash(msg), sl._msg_hash(msg))
 
+    def test_cache_control_normalized(self):
+        # L-12(2026-09-06): cache_control 是传输层缓存断点提示(Claude Code
+        # 每轮把 ephemeral 断点前移到新末条并从旧末条摘除),非消息内容——
+        # 计入 hash 会让 tail 指纹每轮失配(mismatch WARN 系统性误报)。
+        base = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}
+        with_cc = {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "x",
+             "cache_control": {"type": "ephemeral"}}]}
+        self.assertEqual(um.msg_hash(base), um.msg_hash(with_cc))
+
+    def test_cache_control_normalized_nested(self):
+        # 嵌套/多层 cache_control 一并剔除; 其余字段差异仍须检出
+        a = {"role": "assistant", "content": [
+            {"type": "text", "text": "hello",
+             "cache_control": {"type": "ephemeral"}}],
+             "extra": {"cache_control": {"type": "ephemeral"}, "v": 1}}
+        b = {"role": "assistant", "content": [
+            {"type": "text", "text": "hello"}], "extra": {"v": 1}}
+        c = {"role": "assistant", "content": [
+            {"type": "text", "text": "changed"}], "extra": {"v": 1}}
+        self.assertEqual(um.msg_hash(a), um.msg_hash(b))
+        self.assertNotEqual(um.msg_hash(a), um.msg_hash(c))
+
 
 class TestMsgTextHashRegression(unittest.TestCase):
     """逐字节回归: 与原 pipeline MessageHashDebug 内联实现输出一致。"""

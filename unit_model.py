@@ -88,10 +88,24 @@ def text_str(value):
     return str(value)
 
 
+def _strip_cache_control(obj):
+    """递归摘除 cache_control（L-12，2026-09-06）：它是传输层缓存断点提示
+    （Claude Code 每轮把 ephemeral 断点前移到新末条并从旧末条摘除），非消息
+    内容——计入 hash 会让 tail 指纹每轮失配，mismatch WARN 系统性误报。"""
+    if isinstance(obj, dict):
+        return {k: _strip_cache_control(v) for k, v in obj.items()
+                if k != "cache_control"}
+    if isinstance(obj, list):
+        return [_strip_cache_control(v) for v in obj]
+    return obj
+
+
 def msg_hash(msg):
-    """全量消息指纹(前缀 diff 用)——sort_keys 保证 key 顺序不稳定不误判。"""
+    """全量消息指纹(前缀 diff 用)——sort_keys 保证 key 顺序不稳定不误判。
+    cache_control 归一化剔除（L-12：断点轮换不改变消息语义）。"""
     try:
-        raw = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+        raw = json.dumps(_strip_cache_control(msg), sort_keys=True,
+                         ensure_ascii=False)
     except (TypeError, ValueError):
         raw = repr(msg)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
