@@ -163,6 +163,33 @@ class TestCanonicalSession(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn("reply after epoch", canon2[-1]["content"][0]["text"])
 
+    def test_epoch_collapse_deposits_orig_for_recall(self):
+        """L-11/DEF-307: epoch 收编同步寄存 r: 单元原文——折叠域召回
+        数据面闭合(manifest 索引 ✓ + orig 原文 ✓ → recover 可达)。"""
+        import memory_stores
+        msgs = [{"role": "system", "content": "SYS"}]
+        body = "LOOP-CONTENT-" + ("x" * 4000)
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Read", {"file_path": "/src/f%d.py" % i}, body)
+        self.sess.absorb(msgs)
+        triggered, _final = self.sess.maybe_epoch(
+            self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        # 寄存可读(recover_full_content 的 orig 回退链可兑现)
+        got = memory_stores.read_orig_content("t", "r:t0")
+        self.assertIsNotNone(got)
+        self.assertIn("LOOP-CONTENT-", got)
+        # 端到端: manifest 索引行(anchor, turn=折叠时刻) + orig → 恢复成功
+        import ctx_recall
+        rows = [l for l in memory_stores.MANIFEST.lines("t")
+                if l.get("anchor") == "r:t0"]
+        self.assertTrue(rows)
+        rec = ctx_recall.recover_full_content(
+            "t", "r:t0", rows[0].get("turn"), max_chars=100)
+        self.assertIsNotNone(rec)
+        self.assertIn("LOOP-CONTENT-", rec)
+
     def test_frozen_copy_not_polluted(self):
         msgs = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "keep me")
         canon, _, _ = self.sess.absorb(msgs)

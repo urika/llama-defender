@@ -452,6 +452,38 @@ class CanonicalSession(object):
                     [m for rnd in collect for m in rnd])
             except Exception:
                 pass
+            # L-11/DEF-307(2026-09-06): epoch 折叠原文寄存——此前只写索引行,
+            # recover_full_content 的 (anchor, turn) 按 archive 精确轮号必
+            # miss(manifest 行带的是折叠时刻轮号, 内容躺在早期轮), epoch 域
+            # 召回数据面断裂。与写入期压缩同协议寄存 orig/(同 anchor 键,
+            # 读取取最后一条)。只寄存 r: 单元(u: 无正文)且超零头阈值;
+            # fail-open 不影响折叠本体。
+            try:
+                import memory_stores as _ms
+                _seen = set()
+                for rnd in collect:
+                    for m in rnd:
+                        if m.get("role") != "user":
+                            continue
+                        _blocks = m.get("content")
+                        if not isinstance(_blocks, list):
+                            continue
+                        for _b in _blocks:
+                            if not isinstance(_b, dict) \
+                                    or _b.get("type") != "tool_result" \
+                                    or not _b.get("tool_use_id"):
+                                continue
+                            _key = "r:" + str(_b["tool_use_id"])
+                            if _key in _seen:
+                                continue
+                            _text = _um.result_text(_b, None)
+                            if len(_text) < 200:
+                                continue
+                            _seen.add(_key)
+                            _ms.record_orig_content(self.session_key, _key,
+                                                    _text)
+            except Exception:
+                pass
         new_lines = []
         for i, rnd in enumerate(collect):
             new_lines.append(_round_summary(rnd, i + 1))

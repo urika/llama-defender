@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """test_ctx_recall.py — R10.2 召回核心测试(FTS5 trigram/中文/短查询降级/kind 过滤)。"""
+import json
 import os
 import shutil
 import tempfile
@@ -505,6 +506,53 @@ class TestPagedDisclosure(unittest.TestCase):
         self.assertEqual(cr.parse_query_offset("r:x@4000"), ("r:x", 4000))
         self.assertEqual(cr.parse_query_offset("lists/model.py"), ("lists/model.py", 0))
         self.assertEqual(cr.parse_query_offset("r:x@abc"), ("r:x@abc", 0))
+
+
+class TestRecoverFullContentFallback(unittest.TestCase):
+    """L-11/DEF-307: epoch 行 turn=折叠时刻 → archive 全扫兜底 + 墓碑过滤。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="recover_fb_")
+        self._orig_dir = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._tmp
+        ms.MANIFEST.reset()
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig_dir
+        ms.MANIFEST.reset()
+
+    def _plant_archive(self, sid, turn, tid, text):
+        payload = json.dumps({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid,
+             "content": [{"type": "text", "text": text}]}]}]},
+            ensure_ascii=False)
+        arc = os.path.join(_ps._DIAG_DIR, "archive")
+        os.makedirs(arc, exist_ok=True)
+        with open(os.path.join(arc, sid + ".jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"turn": turn, "ts": "2026-09-06T00:00:00",
+                                "payload": payload}, ensure_ascii=False) + "\n")
+
+    def test_turn_mismatch_falls_back_to_full_scan(self):
+        # 内容在 turn 3 的 archive; manifest 行带 turn 61(折叠时刻) → 仍可恢复
+        self._plant_archive("sfb", 3, "t9", "FALLBACK-CONTENT-" + "y" * 200)
+        got = cr.recover_full_content("sfb", "r:t9", 61, max_chars=100)
+        self.assertIsNotNone(got)
+        self.assertIn("FALLBACK-CONTENT-", got)
+
+    def test_tombstone_payload_not_used_as_source(self):
+        # archive 里只有墓碑占位 → 不作恢复来源(诚实 None)
+        self._plant_archive("sfb2", 3, "t9",
+                            '{"error": "Tool result was not provided in '
+                            'the conversation history.", "tool_call_id": "t9"}')
+        self.assertIsNone(cr.recover_full_content("sfb2", "r:t9", 3))
+
+    def test_exact_turn_still_wins_over_fallback(self):
+        self._plant_archive("sfb3", 3, "t9", "OLD " + "a" * 200)
+        self._plant_archive("sfb3", 7, "t9", "NEW " + "b" * 200)
+        got = cr.recover_full_content("sfb3", "r:t9", 7, max_chars=100)
+        self.assertTrue(got.startswith("NEW"))
+        got2 = cr.recover_full_content("sfb3", "r:t9", 61)  # miss → 全扫取最后
+        self.assertTrue(got2.startswith("NEW"))
 
 
 if __name__ == "__main__":

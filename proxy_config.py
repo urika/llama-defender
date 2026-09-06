@@ -993,6 +993,16 @@ CONFIG_REGISTRY = {
         "doc": "Max injections per session (anti injection-loop guard; also "
                "deduped per target).",
     },
+    "PROXY_TOMBSTONE_RECALL_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Tombstone recall (2026-09-06): when the client history rewrite "
+               "drops old tool_results into dangling calls, reconnect the "
+               "proxy-banked originals — stage 20 annotates tombstones with "
+               "ctx_recall hints (passive) and AutoRecallStage proxy-answers "
+               "dangling calls from manifest deposits (active). Off = bare "
+               "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

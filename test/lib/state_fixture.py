@@ -29,6 +29,8 @@ SID_MAX_LEN = 8
 
 _DIAG_PATH_ATTRS = (
     "_DIAG_DIR",
+    "_DIAG_LEDGER_DIR",   # 台账落盘根(派生属性, 不重定向会泄漏真实 logs/diag/ledger)
+    "_DIAG_ARCHIVE_DIR",  # archive 落盘根(同上, session_ledger/archive_store 消费)
     "_SESSIONS_PATH",
     "_SESSIONS_PATH_BAK",
 )
@@ -64,6 +66,8 @@ class isolated_diag:
                 if attr == "_DIAG_DIR":
                     setattr(_ps, attr, new_dir)
                 else:
+                    # 含派生目录属性(_DIAG_LEDGER_DIR/_DIAG_ARCHIVE_DIR):
+                    # 按 dir 名对齐到 tmp diag 下的同名子目录
                     setattr(_ps, attr, os.path.join(new_dir, os.path.basename(
                         str(self._saved[attr]) or "sessions.jsonl")))
         return new_dir

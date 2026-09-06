@@ -1956,7 +1956,8 @@ class AutoRecallStage(ConditionalStage):
     name = "auto_recall"
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return (getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False)
+        return ((getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False)
+                 or getattr(_ps, "PROXY_TOMBSTONE_RECALL_ENABLED", False))
                 and bool(getattr(ctx, "session_id", ""))
                 and not ctx.session_id.endswith("::aux-haiku"))
 
@@ -1969,18 +1970,6 @@ class AutoRecallStage(ConditionalStage):
 
     def _process_inner(self, ctx: PipelineContext) -> None:
         ctx.auto_recall_info = {"injected": 0}
-        import session_ledger
-        ledger = session_ledger.LEDGER.build_ledger_json(ctx.session_id)
-        if not ledger:
-            return
-        try:
-            threshold = max(2, int(getattr(
-                _ps, "PROXY_AUTO_RECALL_DUP_THRESHOLD", 3)))
-            per_cap = max(1, int(getattr(
-                _ps, "PROXY_AUTO_RECALL_PER_SESSION", 5)))
-        except (TypeError, ValueError):
-            threshold, per_cap = 3, 5
-
         state = _ps._AUTO_RECALL_STATE
         sess_state = state.get(ctx.session_id)
         if sess_state is None:
@@ -1988,8 +1977,31 @@ class AutoRecallStage(ConditionalStage):
             if len(state) >= getattr(_ps, "_AUTO_RECALL_STATE_MAX", 128):
                 state.pop(next(iter(state)), None)
             sess_state = state[ctx.session_id] = {"count": 0, "targets": {}}
+        try:
+            per_cap = max(1, int(getattr(
+                _ps, "PROXY_AUTO_RECALL_PER_SESSION", 5)))
+        except (TypeError, ValueError):
+            per_cap = 5
         if sess_state["count"] >= per_cap:
             return
+        injected = False
+        if getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False):
+            injected = self._dup_recall(ctx, sess_state, per_cap)
+        if not injected and getattr(_ps, "PROXY_TOMBSTONE_RECALL_ENABLED", False):
+            self._dangling_recall(ctx, sess_state, per_cap)
+
+    def _dup_recall(self, ctx: PipelineContext, sess_state: dict,
+                    per_cap: int) -> bool:
+        """dup 触发路径（PROXY_AUTO_RECALL_ENABLED 门控）。注入返回 True。"""
+        import session_ledger
+        ledger = session_ledger.LEDGER.build_ledger_json(ctx.session_id)
+        if not ledger:
+            return False
+        try:
+            threshold = max(2, int(getattr(
+                _ps, "PROXY_AUTO_RECALL_DUP_THRESHOLD", 3)))
+        except (TypeError, ValueError):
+            threshold = 3
 
         import ctx_recall as _cr
         dup_queries = ledger.get("dup_queries") or []
@@ -2010,37 +2022,131 @@ class AutoRecallStage(ConditionalStage):
             if not rec:
                 continue
             reason_tag = "epoch/fifo" if not rec.get("reason") else rec["reason"]
+            # ast/heuristic 摘录的骨架带 @偏移(与分页协议同口径), 提示模型可直接取用
+            offset_note = ("; skeleton @N markers are char offsets usable "
+                           "directly as <offset>"
+                           if rec.get("strategy") in ("ast", "heuristic")
+                           else "")
             text = (
                 "[System: AUTO-RECALL — you are about to re-read %s for the "
                 "%d-th time, but its earlier content was folded away "
                 "(%s) and is preserved in this session store. Use the "
                 "content below directly; do NOT read the file again.\n"
                 "%s\n[anchor: %s — if truncated, continue with "
-                "ctx_recall query=\"%s@<offset>\"]]"
+                "ctx_recall query=\"%s@<offset>\"%s]]"
                 % (target, dq.get("count", 0), reason_tag,
-                   rec["content"], rec["anchor"], rec["anchor"])
+                   rec["content"], rec["anchor"], rec["anchor"], offset_note)
             )
-            ctx.messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": text}],
+            self._inject(ctx, sess_state, per_cap, text, {
+                "injected": 1, "trigger": "dup", "target": target,
+                "anchor": rec["anchor"], "chars": rec["chars"],
+                "dup_count": dq.get("count", 0),
             })
-            # ⑤ 记账（顺序无回退需求：注入已发生）
-            sess_state["count"] += 1
             sess_state["targets"][target] = rec["anchor"]
-            log(f"  -> [auto_recall] injected target={target} "
-                f"anchor={rec['anchor']} chars={rec['chars']} "
-                f"(session count={sess_state['count']}/{per_cap})")
-            if _ps.PROXY_DIAG_ENABLED:
-                try:
-                    import diagnostics
-                    diagnostics.record_injection("auto_recall")
-                except Exception as _e:
-                    _warn_diag("inject_auto_recall", _e)
-            ctx.auto_recall_info = {
-                "injected": 1, "target": target, "anchor": rec["anchor"],
-                "chars": rec["chars"], "dup_count": dq.get("count", 0),
-            }
-            return  # 每轮至多注入一条（克制窗口挤占）
+            return True  # 每轮至多注入一条（克制窗口挤占）
+        return False
+
+    def _dangling_recall(self, ctx: PipelineContext, sess_state: dict,
+                         per_cap: int) -> None:
+        """墓碑触发路径（PROXY_TOMBSTONE_RECALL_ENABLED 门控，2026-09-06）。
+
+        客户端历史改写把旧 tool_result 丢成悬空 tool_use（stage 20 配对
+        补洞稍后会注入墓碑）。悬空调用的 call_id 即 manifest 寄存锚
+        （r:<call_id>，写入期压缩落盘）——按锚直取原文，代理代答回填，
+        不必等 dup≥3（墓碑本身即最强的缺信息信号）。末条 assistant 的
+        未决调用豁免（其结果尚在途，非丢失）。
+        """
+        import memory_stores
+        import ctx_recall as _cr
+        last_asst = -1
+        for i, m in enumerate(ctx.messages):
+            if m.get("role") == "assistant":
+                last_asst = i
+        calls, answered = [], set()
+        for i, m in enumerate(ctx.messages):
+            blocks = m.get("content") if isinstance(m.get("content"), list) else []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if m.get("role") == "assistant" and b.get("type") == "tool_use":
+                    if i != last_asst:
+                        calls.append((b.get("id") or "", b.get("name") or "?"))
+                elif m.get("role") == "user" and b.get("type") == "tool_result":
+                    answered.add(b.get("tool_use_id") or "")
+        dangling = [c for c in calls if c[0] and c[0] not in answered]
+        if not dangling:
+            return
+        rows = {}
+        for _l in memory_stores.MANIFEST.lines(ctx.session_id):
+            # 同锚多行按 turn 降序(L-11 方案 C: 最新行不可恢复时试旧副本)
+            rows.setdefault(_l.get("anchor"), []).append(_l)
+        for _k in rows:
+            rows[_k].sort(key=lambda l: l.get("turn") or 0, reverse=True)
+        try:
+            budget = max(200, int(getattr(
+                _ps, "PROXY_AUTO_RECALL_MAX_CHARS", 4000)))
+        except (TypeError, ValueError):
+            budget = 4000
+        parts, used, recalled = [], 0, []
+        for cid, tool in dangling:
+            key = "call:" + cid
+            if key in sess_state["targets"]:
+                continue  # 同调用每会话只回填一次
+            row_list = rows.get("r:" + cid) or []
+            if not row_list:
+                continue  # 无寄存 → 保持墓碑（诚实告知缺失）
+            remaining = budget - used
+            if remaining < 200:
+                break
+            content = None
+            row = row_list[0]
+            for _row in row_list:  # 最新→最旧逐个试(候选回退)
+                content = _cr.recover_full_content(
+                    ctx.session_id, _row["anchor"], _row.get("turn"),
+                    max_chars=remaining)
+                if content:
+                    row = _row
+                    break
+            if not content:
+                continue
+            used += len(content)
+            recalled.append(cid)
+            sess_state["targets"][key] = row["anchor"]
+            parts.append(
+                "[%d] %s — earlier result (first %d of ~%s chars) was "
+                "dropped from history and is restored below. If truncated, "
+                "page with ctx_recall query=\"%s@<offset>\".\n%s"
+                % (len(parts) + 1, tool, len(content),
+                   row.get("size_chars") or "?", row["anchor"], content))
+        if not parts:
+            return
+        text = ("[System: AUTO-RECALL — the results of the earlier tool "
+                "calls below were dropped from the conversation history, "
+                "but the proxy preserved them. Use this content; do NOT "
+                "re-run those calls.]\n" + "\n".join(parts))
+        self._inject(ctx, sess_state, per_cap, text, {
+            "injected": 1, "trigger": "tombstone", "calls": recalled,
+            "chars": used,
+        })
+
+    def _inject(self, ctx: PipelineContext, sess_state: dict, per_cap: int,
+                text: str, info: dict) -> None:
+        ctx.messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+        })
+        # ⑤ 记账（顺序无回退需求：注入已发生）
+        sess_state["count"] += 1
+        log(f"  -> [auto_recall] injected trigger={info.get('trigger', 'dup')} "
+            f"chars={info.get('chars')} "
+            f"(session count={sess_state['count']}/{per_cap})")
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("auto_recall")
+            except Exception as _e:
+                _warn_diag("inject_auto_recall", _e)
+        ctx.auto_recall_info = info
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
         return getattr(ctx, "auto_recall_info", None)
@@ -2500,6 +2606,64 @@ class ToolPairingRepair(PipelineStage):
 # Stage 20: FormatConverter — Anthropic → OpenAI format + tool conversion
 # ============================================================================
 
+# 配对补洞墓碑的标记文本（与 message_converter._tombstone_tool_msg 同源，
+# 此处独立常量避免私有符号跨模块依赖）
+_TOMBSTONE_MARK = "Tool result was not provided in the conversation history."
+
+
+def _compute_tombstone_hints(session_id, call_ids):
+    """墓碑 call_id → ctx_recall 取回提示（manifest 有寄存才给，fail-open）。
+
+    寄存锚 = "r:"+call_id（写入期压缩落盘的 tool_result 行）。无寄存的
+    悬空调用保持裸墓碑——诚实告知缺失，优于虚构提示。
+    """
+    if not session_id or not call_ids:
+        return {}
+    try:
+        import memory_stores
+        rows = {l.get("anchor"): l
+                for l in memory_stores.MANIFEST.lines(session_id)}
+    except Exception:
+        return {}
+    hints = {}
+    for cid in call_ids:
+        row = rows.get("r:" + cid)
+        if not row:
+            continue
+        hints[cid] = (
+            "\n[ctx: this call's original result was dropped from the client "
+            "history but is preserved in this session store — ctx_recall("
+            "query=\"%s\") retrieves it (~%s chars)]"
+            % (row.get("anchor"), row.get("size_chars") or "?"))
+    return hints
+
+
+def _annotate_tombstones(messages, hints):
+    """就地给墓碑 tool 消息追加寄存提示（JSON 字段 recall_hint）；返回注记数。"""
+    if not hints:
+        return 0
+    n = 0
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        if not isinstance(c, str) or _TOMBSTONE_MARK not in c:
+            continue
+        try:
+            payload = json.loads(c)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        hint = hints.get(payload.get("tool_call_id"))
+        if not hint:
+            continue
+        payload["recall_hint"] = hint.strip()
+        m["content"] = json.dumps(payload, ensure_ascii=False)
+        n += 1
+    return n
+
+
 class FormatConverter(PipelineStage):
     """Stage 20: Convert messages to OpenAI format and build the backend request body.
 
@@ -2534,6 +2698,43 @@ class FormatConverter(PipelineStage):
 
         # 1. Convert messages
         messages = msg_converter.convert_anthropic_messages_to_openai(ctx.messages)
+
+        # 墓碑召回注记（2026-09-06，PROXY_TOMBSTONE_RECALL_ENABLED，默认关）：
+        # 客户端历史改写把旧 tool_result 丢成悬空调用，上面的配对补洞已为
+        # 其注入墓碑；若 manifest 已寄存该结果（写入期压缩），在墓碑上附
+        # ctx_recall 取回提示——模型可召回而不必重读文件。fail-open。
+        if getattr(_ps, "PROXY_TOMBSTONE_RECALL_ENABLED", False) and ctx.session_id:
+            try:
+                # 12.5 已代答回填的调用不再注记（避免同 call_id 双重信号）
+                _answered = set()
+                _sess = _ps._AUTO_RECALL_STATE.get(ctx.session_id)
+                if _sess:
+                    _answered = {k[5:] for k in _sess.get("targets", {})
+                                 if k.startswith("call:")}
+                _tids = []
+                for _m in messages:
+                    _c = _m.get("content")
+                    if (_m.get("role") == "tool" and isinstance(_c, str)
+                            and _TOMBSTONE_MARK in _c):
+                        try:
+                            _cid = (json.loads(_c) or {}).get("tool_call_id")
+                        except (json.JSONDecodeError, ValueError):
+                            _cid = None
+                        if _cid and _cid not in _answered:
+                            _tids.append(_cid)
+                _hints = _compute_tombstone_hints(ctx.session_id, _tids)
+                _n = _annotate_tombstones(messages, _hints)
+                if _n:
+                    log(f"  -> [tombstone_recall] annotated {_n} tombstone(s) "
+                        f"with ctx_recall hints")
+                    if _ps.PROXY_DIAG_ENABLED:
+                        try:
+                            import diagnostics
+                            diagnostics.record_injection("tombstone_recall")
+                        except Exception as _e:
+                            _warn_diag("inject_tombstone_recall", _e)
+            except Exception as _e:
+                _warn_diag("tombstone_recall", _e)
 
         # 2. Handle system prompt
         body = ctx.body

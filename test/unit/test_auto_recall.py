@@ -5,6 +5,7 @@
 AutoRecallStage 五环（台账 dup 检测 → manifest 折叠确认 → 召回 →
 尾部注入 → 记账）及全部护栏（阈值/限次/同目标去重/aux 跳过/开关关）。
 """
+import json
 import os
 import sys
 import unittest
@@ -15,7 +16,12 @@ import proxy_state as _ps  # noqa: E402
 import ctx_recall  # noqa: E402
 import memory_stores  # noqa: E402
 import session_ledger  # noqa: E402
-from pipeline import AutoRecallStage, PipelineContext  # noqa: E402
+from pipeline import (  # noqa: E402
+    AutoRecallStage,
+    PipelineContext,
+    _annotate_tombstones,
+    _compute_tombstone_hints,
+)
 from test.lib.config_fixture import patch_config  # noqa: E402
 from test.lib import state_fixture as sf  # noqa: E402
 
@@ -95,7 +101,10 @@ class TestAutoRecallForTarget(_IsolatedCase):
         with patch_config(PROXY_AUTO_RECALL_ENABLED=True):
             rec = ctx_recall.auto_recall_for_target(
                 "s-cap", TARGET, max_chars=300)
-        self.assertEqual(len(rec["content"]), 300)
+        # 结构感知摘录(2026-09-06): 预算内对齐行尾, 不再精确等于 max_chars
+        self.assertLessEqual(len(rec["content"]), 300)
+        self.assertTrue(CONTENT.startswith(rec["content"]))
+        self.assertEqual(rec["chars"], len(rec["content"]))
 
     def test_unknown_target_returns_none(self):
         _plant_folded("s-miss", _ps._DIAG_DIR)
@@ -186,6 +195,122 @@ class TestAutoRecallStage(_IsolatedCase):
         stage = AutoRecallStage()
         ctx = self._run("s-met")
         self.assertEqual(stage.output_metrics(ctx)["injected"], 1)
+
+
+class TestTombstoneRecall(_IsolatedCase):
+    """墓碑触发路径（PROXY_TOMBSTONE_RECALL_ENABLED，与 dup 触发解耦）。"""
+
+    TID = "t9"
+
+    def _dangling_ctx(self, pending_last=False, sid="s-tmb"):
+        """悬空调用历史: assistant(tool_use) 无配对 result。
+
+        pending_last=True 时把悬空调用放在最后一条 assistant（未决在途，
+        应豁免）；默认放在更早的 assistant（客户端改写场景，应触发）。
+        """
+        call = {"type": "tool_use", "id": self.TID, "name": "Read",
+                "input": {"file_path": TARGET}}
+        if pending_last:
+            msgs = [{"role": "user", "content": "start"},
+                    {"role": "assistant", "content": [call]}]
+        else:
+            msgs = [{"role": "user", "content": "start"},
+                    {"role": "assistant", "content": [call]},
+                    {"role": "user", "content": "next"},
+                    {"role": "assistant", "content": "thinking"}]
+        return PipelineContext(body={"messages": []}, session_id=sid,
+                               messages=msgs)
+
+    def test_dangling_with_deposit_injects(self):
+        _plant_folded("s-tmb", _ps._DIAG_DIR, tid=self.TID)
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=True):
+            ctx = AutoRecallStage().process(self._dangling_ctx())
+        self.assertEqual(len(ctx.messages), 5)  # 4 + 注入 1
+        text = ctx.messages[-1]["content"][0]["text"]
+        self.assertIn("AUTO-RECALL", text)
+        self.assertIn("r:%s" % self.TID, text)
+        self.assertIn(CONTENT.strip().splitlines()[0], text)
+        info = ctx.auto_recall_info
+        self.assertEqual(info["injected"], 1)
+        self.assertEqual(info["trigger"], "tombstone")
+        self.assertEqual(_ps._AUTO_RECALL_STATE["s-tmb"]["count"], 1)
+
+    def test_dangling_without_deposit_keeps_bare(self):
+        # 悬空但 manifest 无寄存 → 不注入（诚实缺失）
+        self._seed_session("s-tmb2")
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=True):
+            ctx = AutoRecallStage().process(self._dangling_ctx())
+        self.assertEqual(ctx.auto_recall_info, {"injected": 0})
+        self.assertEqual(len(ctx.messages), 4)  # 历史原样
+
+    def test_last_assistant_pending_exempt(self):
+        # 末条 assistant 的未决调用是在途而非丢失 → 豁免
+        _plant_folded("s-tmb3", _ps._DIAG_DIR, tid=self.TID)
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=True):
+            ctx = AutoRecallStage().process(self._dangling_ctx(pending_last=True))
+        self.assertEqual(ctx.auto_recall_info, {"injected": 0})
+
+    def test_disabled_no_injection(self):
+        _plant_folded("s-tmb4", _ps._DIAG_DIR, tid=self.TID)
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=False):
+            ctx = AutoRecallStage().process(self._dangling_ctx())
+        self.assertEqual(ctx.auto_recall_info, {"injected": 0})
+
+    def test_same_call_deduped_across_turns(self):
+        _plant_folded("s-tmb5", _ps._DIAG_DIR, tid=self.TID)
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=True):
+            first = AutoRecallStage().process(self._dangling_ctx(sid="s-tmb5"))
+            second = AutoRecallStage().process(self._dangling_ctx(sid="s-tmb5"))
+        self.assertEqual(first.auto_recall_info["injected"], 1)
+        self.assertEqual(second.auto_recall_info, {"injected": 0})
+        self.assertEqual(_ps._AUTO_RECALL_STATE["s-tmb5"]["count"], 1)
+
+    def test_should_run_gates(self):
+        stage = AutoRecallStage()
+        ctx = PipelineContext(body={"messages": []}, session_id="s-x")
+        aux = PipelineContext(body={"messages": []}, session_id="s::aux-haiku")
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=False):
+            self.assertFalse(stage.should_run(ctx))
+        with patch_config(PROXY_AUTO_RECALL_ENABLED=False,
+                          PROXY_TOMBSTONE_RECALL_ENABLED=True):
+            self.assertTrue(stage.should_run(ctx))
+            self.assertFalse(stage.should_run(aux))
+
+
+class TestTombstoneAnnotation(_IsolatedCase):
+    """stage 20 被动注记（_compute_tombstone_hints / _annotate_tombstones）。"""
+
+    def test_hints_only_for_deposited_anchors(self):
+        _plant_folded("s-ann", _ps._DIAG_DIR, tid="tA")
+        hints = _compute_tombstone_hints("s-ann", ["tA", "tMISSING"])
+        self.assertIn("tA", hints)
+        self.assertNotIn("tMISSING", hints)
+        self.assertIn('ctx_recall(query="r:tA")', hints["tA"])
+
+    def test_annotate_tombstones_inplace(self):
+        msgs = [{"role": "tool", "tool_call_id": "tA",
+                 "content": json.dumps(
+                     {"error": "Tool result was not provided in the "
+                               "conversation history.",
+                      "tool_call_id": "tA"}, ensure_ascii=False)},
+                {"role": "tool", "tool_call_id": "tB",
+                 "content": "normal result"}]
+        n = _annotate_tombstones(msgs, {"tA": "\n[ctx: hint r:tA]"})
+        self.assertEqual(n, 1)
+        payload = json.loads(msgs[0]["content"])
+        self.assertEqual(payload["recall_hint"], "[ctx: hint r:tA]")
+        self.assertEqual(msgs[1]["content"], "normal result")  # 非墓碑不动
+
+    def test_annotate_empty_hints_noop(self):
+        msgs = [{"role": "tool", "tool_call_id": "tA",
+                 "content": json.dumps({"error": "x", "tool_call_id": "tA"})}]
+        self.assertEqual(_annotate_tombstones(msgs, {}), 0)
 
 
 if __name__ == "__main__":

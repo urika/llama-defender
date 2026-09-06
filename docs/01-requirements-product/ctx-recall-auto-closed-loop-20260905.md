@@ -141,6 +141,84 @@ swe-eval 编排层两处缺口已闭合——`interleave=false` 臂主序分块�
 
 代理侧（§3 项 1/3/5/6）：约 1~2 天（含单测）；EXP-2 实验设计与执行（swe-eval 侧）：约 0.5 天 + 批跑 2~4 小时（本地 35B 节奏）。
 
+## 11. 后续扩展：墓碑召回（2026-09-06，已落地默认关）
+
+EXP-2 进行中的取证发现（`swe-eval/scripts/analyze_client_tombstone.py` 可一键复现）：
+客户端历史改写把旧 tool_result 丢成**悬空调用**（stage 20 配对补洞注入墓碑
+`"Tool result was not provided..."`；425 件丢失、保留跨度中位 1 轮、transcript
+级实证客户端持有真结果而请求里没有）。而代理写入期压缩**已被动寄存其中 ~40%**
+（manifest `r:<call_id>` 锚 + orig/archive 原文，`recover_full_content` 实测可取回）。
+
+据此新增 `PROXY_TOMBSTONE_RECALL_ENABLED`（默认关，与 dup 触发解耦）双机制：
+
+1. **被动注记**（stage 20）：配对补洞后扫墓碑 → manifest `r:<call_id>` 有寄存 →
+   墓碑 JSON 追加 `recall_hint` 字段（ctx_recall 取回提示）；无寄存保持裸墓碑
+2. **主动代答**（stage 12.5 `_dangling_recall`）：悬空调用（末条 assistant 未决
+   豁免）按 call_id 直查 manifest 寄存 → `recover_full_content` 取回 → `[System:
+   AUTO-RECALL]` 尾消息回填（预算/限次/同调用去重沿用 auto-recall 护栏）
+
+关键 join 键：悬空调用的 `call_id` 即寄存锚（`r:<call_id>`），比按文件路径匹配
+精确——补上了 auto_recall_for_target 路径检索命不中寄存行的缺口。EXP-2 判读
+注脚随之更新：dup 循环的信息丢失约四成在代理召回射程内，treatment 无效果时
+先查射程外（客户端组装层）份额再谈止损。
+
+**组装级显影（场景测试 `test/unit/test_tombstone_scenario.py`，2026-09-06）**：
+stage 19（ToolPairingRepair）会先删除悬空 tool_use（防 400 的既有孤儿清理），
+故 stage 20 在主链路上看不到墓碑注入条件——被动注记可达性受限（仅覆盖绕过
+stage 19 的路径，保留为防御性），**主动代答（12.5，先于 19、只追加尾消息）是
+主路径**——「单测绿≠组装对」的又一实证，场景测试按环节组装报文的价值所在。
+
+### 11.1 L-11/DEF-307 数据面缺陷与 EXP-2 判读措辞（2026-09-06，已修复）
+
+swe-eval 侧场景推演发现并经 s3851294 实证：**epoch 折叠路径原文未寄存**——
+`_collapse` 只写 manifest 索引行（且行带折叠时刻轮号，archive 按 (anchor, turn)
+精确匹配必 miss），auto-recall 主场景（epoch 折叠后重读）在数据面恒不可达；
+EXP-2 唯一成功注入（seq 5，test_psrp.py，采纳 ✓）走的是**写入期压缩**路径。
+
+**EXP-2 报告措辞纪律**：treatment 臂全程运行于「epoch 域召回不可达 + dup 路径
+检索命中靠运气」的半残状态——2 resolved 属会话方差不可归因机制，唯一注入是
+压缩路径样本。机制设计有效性由该样本（注入→采纳→重读停止）与三层测试背书；
+**dup 组间差异不构成 H1 判读依据**。修复（epoch 寄存 + archive 全扫 + 候选
+回退，DEF-307）随批后代理重启生效，机制完整版留待下一轮实验验证。
+
+## 12. EXP-3 候选设计：云端上下文管理 A/B（2026-09-06 记入，待前置依赖）
+
+**动机（经济账）**：云端按 token 计费，输入是复利式成本（60 轮 agent 会话后段单请求
+输入 50-100K）。写入期压缩对肥 tool_result 压缩率 40-60% → 长会话任务级成本约打
+5-7 折；`X-Proxy-Route-Cost` 已计量，节省可直接审计。典型口径（AGENTS §8.5）：
+56K token × 20 请求 ≈ ¥1-3/任务 → 压缩后估算 ¥0.5-2。注意订阅制 GLM 路径
+（zhipu，边际成本 0）无经济意义——实验只选计费臂（DeepSeek/Kimi）。
+
+**四道关与现状**（当初「云端透传」决策的搁置理由，逐条复核）：
+
+| 关卡 | 现状 |
+|---|---|
+| ① 前缀缓存兼容 | ✅ ctx_engine append-only + 写入期压缩本就 prefix-friendly；客户端墓碑化才是缓存杀手，本机制反而是修复 |
+| ② 疗效未验证 | ⏳ 待 EXP-2 判读走完 §8.2（机制未证明保 f2p 前，不上付费路径） |
+| ③ 客户端管理交叠 | ⏳ 云路径上客户端墓碑化已在「压缩」（粗暴全丢）；接管前需验证 `DISABLE_AUTOCOMPACT` 回退链（既有待办） |
+| ④ 边际收益 | 视用法：仅 50 轮+ 长会话压得到；短会话与订阅臂不适用 |
+
+**实验设计**（swe-eval D8 承载，与 EXP-2 同纪律）：
+
+- 双臂：`arm_cloud_cm_on`（去除云端 stage 门控 6/7/14/15/17 + 引擎 + 墓碑召回新机制）
+  vs `arm_cloud_cm_off`（现状透传）；target 用计费云端臂（llama-defender-cloud-k3 或 DeepSeek）
+- 实例：长会话实例（≥50 轮才压得到），同实例 × repeats≥3，salt 逐 (arm,repeat)
+- 主指标：**任务成本（¥/任务，route_cost 直接计量，确定性无方差判读难题）**；
+  副指标：f2p 不劣化（H2 式护栏）、dup_max_count、缓存命中（云厂商账单口径）
+- 判读：成本下降显著且 f2p 不劣 → Go；成本降但 f2f 劣化 → 压缩比降档重试一次；
+  成本不降 → 关闭方向（缓存失效抵消了压缩，属机制性失败）
+
+**工程前置清单**（按序，均不大）：
+
+1. EXP-2 判读完成（本批次 + 墓碑召回新代码的下一轮实验）
+2. `DISABLE_AUTOCOMPACT` 回退链验证（客户端让位，否则双层压缩互扰）
+3. 云端 stage 门控改型：门控条件从「路由==cloud 硬编码」（`pipeline.py` 6/7/14/15/17
+   与引擎的 `_route_target` 判断处）改为配置驱动（如 `PROXY_CLOUD_CM_ENABLED`），
+   让云端按实验臂开合；auto-recall/墓碑召回的 aux 豁免与 fail-open 语义沿用
+4. 成本计量核对：route_cost 对压缩后 token 的计费准确性抽查
+
+**非目标**：不承诺 f2p 提升（成本实验）；订阅臂不适用；短会话不适用。
+
 ## 参考
 
 - `docs/02-architecture-design/llama-defender-context-engineering-design.md` §14（召回缺位实测，证据全文）

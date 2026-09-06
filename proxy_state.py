@@ -539,6 +539,13 @@ PROXY_AUTO_RECALL_MAX_CHARS = int(os.environ.get(
 PROXY_AUTO_RECALL_PER_SESSION = int(os.environ.get(
     "PROXY_AUTO_RECALL_PER_SESSION", get_default("PROXY_AUTO_RECALL_PER_SESSION")))
 
+# 墓碑召回（2026-09-06：客户端历史改写把旧 tool_result 丢成悬空调用，
+# 代理写入期压缩已寄存约四成——本开关把寄存内容接回模型视野：
+# ①stage 20 墓碑追加 ctx_recall 取回提示（被动）；②AutoRecallStage
+# 悬空调用→manifest 寄存→代答注入（主动）。默认关，与 dup 触发解耦。
+PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
+    "PROXY_TOMBSTONE_RECALL_ENABLED", get_default("PROXY_TOMBSTONE_RECALL_ENABLED")).lower() in ("1", "true", "yes")
+
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
 # engineering-design §4.3/§4.9，Phase 0 §12 结论已坐实击穿根因为每轮回溯改写）
@@ -1175,6 +1182,7 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_DUP_THRESHOLD", "PROXY_AUTO_RECALL_DUP_THRESHOLD", "int", "3", "3"),
     ("PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_MAX_CHARS", "int", "4000", "4000"),
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
+    ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1348,6 +1356,7 @@ __all__ = [
     # ctx_recall 自闭环 auto-recall
     "PROXY_AUTO_RECALL_ENABLED", "PROXY_AUTO_RECALL_DUP_THRESHOLD",
     "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
+    "PROXY_TOMBSTONE_RECALL_ENABLED",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority

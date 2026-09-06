@@ -17,8 +17,10 @@ FTS5/WAL 本机已验证（SQLite 3.51.0，2026-08-29，存储选型文档 §3.2
 连接纪律：每次查询新建连接（召回低频，避免跨线程复用）；索引库为只读派生
 ——行数与 MANIFEST 不一致时自动重建。
 """
+import ast
 import json
 import os
+import re
 import sqlite3
 import threading
 
@@ -376,6 +378,9 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
     anchor "r:t1" → tool_use_id "t1"; "u:t1" → 搜索 tool_use 块的 input(不适合恢复全文)。
     回退链尾部: orig/<sid>.jsonl(压缩时寄存的原文)——压缩标记 key=r:x 的兑现。
     offset>0 时返回原文的 [offset : offset+max_chars] 窗口(分页续读协议)。
+    L-11/DEF-307(2026-09-06): epoch_collapse 行的 turn 是折叠时刻轮号, 内容
+    躺在 archive 早期轮——精确轮号 miss 后回落**全扫**(取最后一次出现的
+    非墓碑原文)。墓碑占位/零头(客户端改写产物)不作恢复来源。
     返回 str 或 None(未找到/archive 不存在)。
     """
     if not session_key or not anchor:
@@ -386,14 +391,14 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
 
     archive_path = os.path.join(_ps._DIAG_DIR, "archive",
                                 session_key + ".jsonl")
+    _tomb = "Tool result was not provided"
+    fallback = None
     try:
         with open(archive_path, encoding="utf-8") as f:
             for line in f:
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
-                    continue
-                if entry.get("turn") != turn:
                     continue
                 # payload 是 JSON 字符串(R15 落盘格式)
                 payload = entry.get("payload")
@@ -421,12 +426,19 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
                                 text = content
                             else:
                                 text = ""
-                            if text:
+                            if not text or _tomb in text:
+                                continue  # 墓碑占位不作恢复来源
+                            if turn is not None and entry.get("turn") == turn:
                                 window = (text[offset:offset + max_chars]
                                           if max_chars else text[offset:])
                                 return window or None
+                            fallback = text  # 全扫兜底: 记最后一次有效原文
     except (FileNotFoundError, OSError):
         pass
+    if fallback is not None:
+        window = (fallback[offset:offset + max_chars]
+                  if max_chars else fallback[offset:])
+        return window or None
     # 回退链尾部: 压缩时寄存的原文(标记 key=r:x 的兑现)
     try:
         import memory_stores
@@ -440,6 +452,193 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
     return None
 
 
+# ============================================================================
+# 结构感知摘录(2026-09-06): ast 骨架 → 多语言启发式 → 行边界兜底 三级梯队
+# ============================================================================
+
+# ---- 第三级: 多语言启发式结构摘录(2026-09-06) ----
+# 列 0 起始正则 + 配平定块尾; 命中 <2 视为无结构(调用方退行边界 fallback)。
+# 已知边界(详见设计文档 §4.1): 字符串内花括号不感知、仅跳过整行 // 注释与
+# #! 行、行尾注释/多行块注释含花括号会误计、Python 启发式按「下一列 0 起始
+# 行」定块尾(仅 ast 失败时启用, 块间非块代码并入前块)。
+_BRACE_START_RE = re.compile(r"^(?:"
+    r"(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+\w+|"  # js/ts
+    r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+\w+|"  # js/ts/java
+    r"(?:export\s+)?interface\s+\w+|"                             # ts/java
+    r"(?:export\s+)?(?:const|let|var)\s+\w+\s*=|"                 # 箭头函数等
+    r"func\s+(?:\([^)]*\)\s*)?\w+\s*\(|"                          # go(含方法)
+    r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+\w+|"            # rust
+    r"(?:pub\s+)?(?:struct|enum|impl|trait|mod)\s+\w+|"           # rust
+    r"(?:(?:public|private|protected|static|final|abstract)\s+)*"
+    r"(?:class|interface|enum)\s+\w+|"                            # java
+    r"[A-Za-z_][\w\s\*]*\s\w+\s*\([^;]*\)\s*\{?"                  # c/cpp 函数
+    r")")
+_RB_START_RE = re.compile(r"^(?:def|class|module)\s")
+_RB_END_RE = re.compile(r"^end\b")
+_SH_START_RE = re.compile(r"^[A-Za-z_][\w-]*\s*\(\)\s*\{")
+_PY_START_RE = re.compile(r"^(?:async\s+)?(?:def|class)\s+\w")
+
+# 扩展名 → (起始正则, 配平模式); .py 仅 ast 失败(mid-edit 损坏代码)时到达
+_HEURISTIC_LANGS = {}
+for _ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java",
+             ".rs", ".c", ".h", ".cpp", ".cc", ".hpp"):
+    _HEURISTIC_LANGS[_ext] = (_BRACE_START_RE, "brace")
+_HEURISTIC_LANGS[".rb"] = (_RB_START_RE, "ruby")
+_HEURISTIC_LANGS[".sh"] = (_SH_START_RE, "brace")
+_HEURISTIC_LANGS[".bash"] = (_SH_START_RE, "brace")
+_HEURISTIC_LANGS[".py"] = (_PY_START_RE, "nextstart")
+
+
+def _heuristic_blocks(text, start_re, mode):
+    """启发式顶层块检测：返回 [(start, end, sig)]（1-based 行号，含端点）。
+
+    起始正则（列 0 锚定）命中数 <2 视为无结构，返回 None。
+    mode：
+      "brace"     —— 花括号配平（跳过整行 // 注释与 #! 行）；无花括号的
+                     起始（箭头函数赋值等）在下一起始行前结束；
+      "ruby"      —— 列 0 def/class/module 计数 + 列 0 end 配对；
+      "nextstart" —— 块延伸至下一列 0 起始行前（ast 失败的 .py 用）。
+    """
+    lines = text.splitlines()
+    idxs = [i for i, ln in enumerate(lines) if start_re.match(ln)]
+    if len(idxs) < 2:
+        return None
+    blocks = []
+    for k, s in enumerate(idxs):
+        e = len(lines) - 1
+        if mode == "nextstart":
+            e = idxs[k + 1] - 1 if k + 1 < len(idxs) else len(lines) - 1
+        elif mode == "ruby":
+            depth = 0
+            for i in range(s, len(lines)):
+                if start_re.match(lines[i]):
+                    depth += 1
+                elif _RB_END_RE.match(lines[i]):
+                    depth -= 1
+                if i > s and depth <= 0:
+                    e = i  # 列 0 关键字配平归零: 块结束
+                    break
+        else:  # brace
+            depth, opened = 0, False
+            for i in range(s, len(lines)):
+                ln = lines[i]
+                st = ln.strip()
+                if st.startswith("//") or st.startswith("#!"):
+                    continue
+                if i > s and not opened and start_re.match(ln):
+                    e = i - 1  # 无花括号声明在下一起始行前结束
+                    break
+                depth += ln.count("{") - ln.count("}")
+                if depth > 0:
+                    opened = True
+                elif opened:
+                    e = i  # 深度回到 0: 块结束
+                    break
+        blocks.append((s + 1, e + 1, s + 1))
+    return blocks
+
+
+def structure_aware_excerpt(content, target_path, budget_chars):
+    """按结构摘录文件内容（auto-recall 首次注入用）。
+
+    三级梯队（strategy 枚举 "ast"|"heuristic"|"line"）：
+      1. .py 且 ast.parse 成功 → stdlib ast 提取顶层块（class/def/assign/
+         import）行区间，strategy="ast"；
+      2. 其他受支持代码语言（_HEURISTIC_LANGS：js/ts/go/java/rs/c/cpp/rb/
+         sh）或 ast 失败（mid-edit 损坏代码必须兜住）→ 多语言启发式
+         结构摘录（见 _heuristic_blocks 及其已知边界注释），
+         strategy="heuristic"；起始正则命中 <2 视为无结构；
+      3. 非代码 / 启发式无命中 / 骨架超预算 → 行边界 fallback：取
+         [0:budget] 对齐到最后一个完整行尾，strategy="line"。
+    ast 与 heuristic 共用同一渲染：输出 = 文件骨架（签名行 + L 行号区间 +
+    @ 字符偏移，偏移与 recover_full_content 的 anchor@offset 分页协议同
+    口径，模型可直接拿骨架 offset 续读）+ 按序填充的完整顶层块直至预算
+    耗尽。
+    返回 {"text": str, "strategy": "ast"|"heuristic"|"line",
+          "truncated": bool}。
+    """
+    text = content if isinstance(content, str) else ""
+    try:
+        budget = int(budget_chars)
+    except (TypeError, ValueError):
+        budget = 0
+    if not text or budget <= 0:
+        return {"text": "", "strategy": "line", "truncated": bool(text)}
+    if len(text) <= budget:
+        return {"text": text, "strategy": "line", "truncated": False}
+
+    def _line_fallback():
+        head = text[:budget]
+        cut = head.rfind("\n")
+        if cut > 0:
+            head = head[:cut + 1]  # 对齐到最后一个完整行尾
+        return {"text": head, "strategy": "line", "truncated": True}
+
+    ext = os.path.splitext(str(target_path or ""))[1].lower()
+    blocks, strategy = None, None
+    if ext == ".py":
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError):
+            tree = None
+        if tree is not None:
+            cand = []
+            for node in tree.body:
+                if not isinstance(node, (ast.ClassDef, ast.FunctionDef,
+                                         ast.AsyncFunctionDef, ast.Assign,
+                                         ast.Import, ast.ImportFrom)):
+                    continue
+                start = node.lineno
+                for dec in getattr(node, "decorator_list", []):
+                    start = min(start, dec.lineno)  # 装饰器并入块区间
+                end = getattr(node, "end_lineno", None) or node.lineno
+                cand.append((start, end, node.lineno))
+            if cand:
+                blocks, strategy = cand, "ast"
+    if blocks is None:
+        spec = _HEURISTIC_LANGS.get(ext)  # ast 失败/无块时也先尝试启发式
+        if spec is not None:
+            cand = _heuristic_blocks(text, spec[0], spec[1])
+            if cand:
+                blocks, strategy = cand, "heuristic"
+    if blocks is None:
+        return _line_fallback()
+
+    # 行号 → 字符偏移(与 recover_full_content 的 offset 切片同口径)
+    lines = text.splitlines(keepends=True)
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln)
+
+    def _start_off(line_no):
+        return starts[line_no - 1] if 0 < line_no <= len(starts) else len(text)
+
+    def _end_off(line_no):
+        return starts[line_no] if line_no < len(starts) else len(text)
+
+    header = ["[skeleton: %d top-level blocks; @N = char offset usable with "
+              "anchor@N paging]" % len(blocks)]
+    for s, e, sig_line in blocks:
+        header.append("[L%d-L%d @%d] %s"
+                      % (s, e, _start_off(s), lines[sig_line - 1].strip()))
+    header_text = "\n".join(header)
+    if len(header_text) >= budget:
+        return _line_fallback()  # 预算连骨架都装不下 → 退化为行截断
+
+    parts, used, omitted = [header_text], len(header_text), 0
+    for s, e, _ in blocks:
+        blk = text[_start_off(s):_end_off(e)].rstrip("\n")
+        need = len(blk) + 2  # "\n\n" 分隔
+        if used + need <= budget:
+            parts.append(blk)
+            used += need
+        else:
+            omitted += 1
+    return {"text": "\n\n".join(parts), "strategy": strategy,
+            "truncated": omitted > 0}
+
+
 def auto_recall_for_target(session_key, target, max_chars=None):
     """auto-recall 执行器（ctx-recall 自闭环设计 2026-09-05 §4③）：按目标取回折叠原文。
 
@@ -449,11 +648,12 @@ def auto_recall_for_target(session_key, target, max_chars=None):
          == target 的 u: 行（取最新 turn），再配对同 tool_use_id 的 r: 行
          （r: 行才有正文可恢复）；
       ② 回落 fts_search(target, kind=tool_result)（head/triggers 模糊命中）。
-    命中后 recover_full_content 取回（上限 max_chars，缺省
+    命中后取全量原文（max_chars=0 走 recover_full_content 不截断路径）再经
+    structure_aware_excerpt 做结构感知摘录（预算 max_chars，缺省
     PROXY_AUTO_RECALL_MAX_CHARS；分页锚点保留，续读由模型经 ctx_recall
-    query="锚点@偏移" 完成）。
+    query="锚点@偏移" 完成，续读路径不经过本函数、不受影响）。
     总开关关闭 / 无命中 / 恢复失败 → None（fail-open，调用方原样转发）。
-    返回 {"anchor","turn","reason","chars","content"} 或 None。
+    返回 {"anchor","turn","reason","chars","content","strategy"} 或 None。
     """
     if not session_key or not (target or "").strip():
         return None
@@ -471,10 +671,12 @@ def auto_recall_for_target(session_key, target, max_chars=None):
         except (TypeError, ValueError):
             limit = 4000
     try:
-        cand = None
         lines = memory_stores.MANIFEST.lines(session_key)
-        # ①a: u: 行按 handle 精确匹配 → 同 id r: 行（取最新 turn 语义）
-        best_turn = -1
+        # 候选集(全部同目标 r: 行, turn 降序=最新优先): 最新行不可恢复时
+        # 回退旧副本(L-11 方案 C——epoch 行 turn=折叠时刻, archive 精确轮
+        # 号 miss, 但该锚更早的行往往可恢复)
+        candidates = []
+        # ①a: u: 行按 handle 精确匹配 → 同 id r: 行
         uids = {}
         for line in lines:
             if line.get("kind") != "tool_use":
@@ -491,24 +693,31 @@ def auto_recall_for_target(session_key, target, max_chars=None):
                 if (line.get("kind") == "tool_result"
                         and anchor.startswith("r:")
                         and anchor[2:] in uids):
-                    t = line.get("turn") or 0
-                    if t >= best_turn:
-                        cand, best_turn = line, t
+                    candidates.append(line)
         # ②: 回落全文检索（head/triggers 含路径片段即命中）
-        if cand is None:
-            for line in fts_search(session_key, tgt, kind="tool_result", limit=3):
-                if (line.get("anchor") or "").startswith("r:"):
-                    cand = line
-                    break
-        if cand is None:
-            return None
-        content = recover_full_content(session_key, cand["anchor"],
-                                       cand.get("turn"), max_chars=limit)
+        if not candidates:
+            candidates.extend(
+                l for l in fts_search(session_key, tgt, kind="tool_result",
+                                      limit=3)
+                if (l.get("anchor") or "").startswith("r:"))
+        candidates.sort(key=lambda l: l.get("turn") or 0, reverse=True)
+        content = None
+        cand = None
+        for line in candidates:
+            got = recover_full_content(session_key, line["anchor"],
+                                       line.get("turn"), max_chars=0)
+            if got:
+                content, cand = got, line
+                break
         if not content:
+            return None
+        exc = structure_aware_excerpt(content, tgt, limit)
+        if not exc["text"]:
             return None
         return {"anchor": cand["anchor"], "turn": cand.get("turn"),
                 "reason": cand.get("reason") or "",
-                "chars": len(content), "content": content}
+                "chars": len(exc["text"]), "content": exc["text"],
+                "strategy": exc["strategy"]}
     except Exception:
         return None
 

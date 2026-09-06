@@ -342,6 +342,15 @@
 | **现象** | conf 值行内注释（`PROXY_CTX_KEEP_MESSAGES=12  # ...`）→ `reload_config.py:81` 裸 `int()` 抛 `ValueError` → SIGHUP 处理器未捕获 → **代理进程死亡**（生产中断 ~2 分钟，手动恢复） |
 | **修复方向** | 值解析失败应拒绝该项、保留旧值并 WARN（fail-safe），不得让异常逃逸信号处理器；顺带在 reload 前做 conf 干跑校验（parse-only）|
 
+### DEF-307: epoch 折叠原文未寄存，折叠域召回数据面断裂（L-11，P1） — ✅ 已修复（2026-09-06）
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | EXP-2 值守 + 场景测试推演（swe-eval 侧发现并移交；s3851294 实证） |
+| **现象** | `context_engine._collapse` 只写 manifest 索引行不寄存原文，且行带**折叠时刻轮号**（51 行全部 turn=61）而内容躺在 archive 早期轮——`recover_full_content` 的 `(anchor, turn)` 精确匹配必 miss → auto-recall 主场景（epoch 折叠后重读）恒 fail-open 静默跳过；EXP-2 唯一成功注入走的是写入期压缩路径（reason=compressed，有 orig 寄存） |
+| **修复** | 三件套：①`_collapse` 收编时同步寄存 r: 单元原文至 orig/（与写入期压缩同协议，≥200 chars 去重，fail-open）；②`recover_full_content` 精确轮号 miss 后回落 archive 全扫（取最后一次非墓碑原文；墓碑占位不作恢复来源）；③候选回退——最新 r: 行不可恢复时按 turn 降序试旧副本（`auto_recall_for_target` + `_dangling_recall`） |
+| **影响** | EXP-2 判读措辞：treatment 臂运行于 epoch 域召回不可达状态，dup 下降不可归因（机制半残 ≠ 机制无效）；修复随批后代理重启生效 |
+
 ---
 
 ## 五、缺陷分布与统计
