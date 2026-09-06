@@ -3599,9 +3599,19 @@ class BackendDispatcher(PipelineStage):
                 self._handler._micro_recall_dispatch = self._make_micro_turn_dispatch(
                     ctx, base_url, api_key)
                 try:
-                    self._handler._handle_streaming_response(resp, ctx.body)
+                    _stream_usage = self._handler._handle_streaming_response(
+                        resp, ctx.body)
                 finally:
                     self._handler._micro_recall_dispatch = None
+                # DEF-309/EXP-3 成本计量: 流式真实 usage(include_usage 尾块)
+                # 回填计费字段——此前云端流式从不累计日成本(仅估算)。
+                if (getattr(ctx, '_route_target', 'local') == 'cloud'
+                        and _stream_usage):
+                    if _stream_usage.get("input_tokens"):
+                        self._input_tokens = _stream_usage["input_tokens"]
+                    if _stream_usage.get("output_tokens"):
+                        self._output_tokens = _stream_usage["output_tokens"]
+                    self._accumulate_daily_cost(ctx)
             else:
                 # Pre-read non-streaming body so we can extract actual usage for
                 # accurate cost tracking, then hand a BytesIO wrapper to the handler.
@@ -3638,6 +3648,9 @@ class BackendDispatcher(PipelineStage):
                     self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                     self._output_tokens = usage.get("completion_tokens", self._output_tokens)
                     _ctx_record_usage(ctx, usage)
+                    # DEF-309/EXP-3: 云端非流式也累计日成本(此前仅 anthropic 路径)
+                    if getattr(ctx, '_route_target', 'local') == 'cloud':
+                        self._accumulate_daily_cost(ctx)
                     # R13/R16 (非流式): timings.prompt_n = 实算 prefill 数(缓存
                     # 未命中部分);无 timings 的后端字段保持缺省(P1 不发假值)。
                     if _ps.PROXY_DIAG_ENABLED:
@@ -3825,7 +3838,19 @@ class BackendDispatcher(PipelineStage):
         # TS-4: 客户端断连同 _do_dispatch 的处理 (见上),不视为云端/provider 失败。
         try:
             if ctx.is_stream:
-                self._handler._handle_anthropic_stream_passthrough(resp, ctx.body)
+                # DEF-309/EXP-3: 流式透传解析 anthropic SSE usage → 回填计费
+                # 字段(此前 zhipu 流式 token 账本为零, 200126 实证)
+                _stream_usage = self._handler._handle_anthropic_stream_passthrough(
+                    resp, ctx.body)
+                if _stream_usage:
+                    if _stream_usage.get("input_tokens"):
+                        self._input_tokens = _stream_usage["input_tokens"]
+                    if _stream_usage.get("output_tokens"):
+                        self._output_tokens = _stream_usage["output_tokens"]
+                    pin, pout = self._model_prices(cand["model"])
+                    ctx._route_actual_cost = round(
+                        (self._input_tokens * pin + self._output_tokens * pout)
+                        / 1_000_000, 6)
             else:
                 resp_bytes = resp.read()
                 try:

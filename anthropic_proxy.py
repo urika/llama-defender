@@ -440,6 +440,43 @@ def _huge_view_budget():
         return 0
 
 
+
+def _parse_anthropic_sse_usage(raw, acc):
+    """DEF-309/EXP-3: 从 anthropic SSE 数据行提取 usage 到 acc(就地更新)。
+
+    事件形态: message_start → message.usage.input_tokens;
+              message_delta → usage.output_tokens(累计值)。
+    非 data 行/坏 JSON 静默跳过——解析失败不影响透传。
+    """
+    if b'"usage"' not in raw:
+        return
+    try:
+        data_part = raw.split(b"data:", 1)[1]
+        d = json.loads(data_part)
+    except (IndexError, json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(d, dict):
+        return
+    etype = d.get("type")
+    usage = d.get("usage")
+    if etype == "message_start":
+        usage = (d.get("message") or {}).get("usage")
+    if etype not in ("message_start", "message_delta") or not isinstance(usage, dict):
+        return
+    try:
+        _in = int(usage.get("input_tokens") or 0)
+    except (TypeError, ValueError):
+        _in = 0
+    if _in:
+        acc["input_tokens"] = _in
+    try:
+        _out = int(usage.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        _out = 0
+    if _out:
+        acc["output_tokens"] = _out
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1649,6 +1686,10 @@ class Handler(BaseHTTPRequestHandler):
                             or getattr(_log_ctx, "model", ""))
             log(f"  [REQ_USAGE] input={input_tokens} output={output_tokens} "
                 f"model={_attribution}")
+        # DEF-309/EXP-3 成本计量: 流式真实 usage 返回给 dispatch 调用方
+        # (回填 self._input_tokens/_output_tokens → route_cost 日累计 +
+        # proxy_metrics 落盘)。此前流式只进诊断通道, 计费字段一直是估算值。
+        return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
     def _send_sse_stream_headers(self):
@@ -1968,6 +2009,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         _first_token_time = None
         _tail_written = False
+        usage_acc = {"input_tokens": 0, "output_tokens": 0}
         try:
             for raw in self._heartbeat_lines(resp):
                 if not isinstance(raw, bytes):
@@ -1975,8 +2017,11 @@ class Handler(BaseHTTPRequestHandler):
                 if _first_token_time is None and raw.strip() and not raw.startswith(b":"):
                     _first_token_time = time.monotonic()
                 # R13 流式通道: 尾注必须在 message_stop 之前(设计 D1——解析器
-                # 收到终止事件后停止读取,流尾追加会被静默丢弃)。该路径不解析
-                # usage(云端 anthropic 协议无 timings),token 字段按 P3 保持 null。
+                # 收到终止事件后停止读取,流尾追加会被静默丢弃)。
+                # DEF-309/EXP-3: 顺带解析 anthropic SSE 的 usage(message_start
+                # 带 input_tokens, message_delta 带 output_tokens)——此前该路径
+                # 不解析, zhipu 流式 run 的 token 账本是零(200126 实证)。
+                _parse_anthropic_sse_usage(raw, usage_acc)
                 if (PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL
                         and not _tail_written and b"message_stop" in raw):
                     _tail_written = self._write_diag_sse_tail()
@@ -1993,6 +2038,10 @@ class Handler(BaseHTTPRequestHandler):
             mc = getattr(_metrics_ctx, 'mc', None)
             if mc:
                 mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
+        # DEF-309/EXP-3: 解析到的真实 usage 返回给 dispatch 调用方(计费回填)
+        if usage_acc["input_tokens"] or usage_acc["output_tokens"]:
+            return usage_acc
+        return None
 
     def _write_diag_sse_tail(self):
         """Write the R13 SSE tail line; returns True if written. Never raises."""
