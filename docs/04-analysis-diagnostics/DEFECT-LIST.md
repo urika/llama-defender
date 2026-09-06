@@ -351,6 +351,18 @@
 | **修复** | 三件套：①`_collapse` 收编时同步寄存 r: 单元原文至 orig/（与写入期压缩同协议，≥200 chars 去重，fail-open）；②`recover_full_content` 精确轮号 miss 后回落 archive 全扫（取最后一次非墓碑原文；墓碑占位不作恢复来源）；③候选回退——最新 r: 行不可恢复时按 turn 降序试旧副本（`auto_recall_for_target` + `_dangling_recall`） |
 | **影响** | EXP-2 判读措辞：treatment 臂运行于 epoch 域召回不可达状态，dup 下降不可归因（机制半残 ≠ 机制无效）；修复随批后代理重启生效 |
 
+### DEF-308: prefix cache 击穿三因——每轮 46K 全额冷 prefill（L-13，P1） — 🟡 轨道①已实现待上线（2026-09-06），②③待批后
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | EXP-2R baseline r1（s38beef8）值守观测 + llama-server.log 日志取证（2026-09-06，swe-eval 侧发起、llama.cpp 侧定位） |
+| **现象** | 46K tokens/轮 × TTFT p50 215s（≈215 tok/s 有效 prefill，低于 35B 冷态规格 460-1360）——基本零前缀复用；单轮 200-360s 成本结构 = 全额 prefill 纯等待；35B 本地臂墙钟成本为缓存有效时 3-5 倍 |
+| **证据链** | ①**非架构**：`LCP unavailable: shared=45921 entry_len=47108 requested_len=47076 non_trimmable=True → MISS`——条目存在且 97.7% 匹配，hybrid `non_trimmable` 语义是**整条复用（请求须 ≥ 条目长）**而非不能复用；小请求 HIT 正常（91.6% 实录），后端 cached_tokens 会回传（HIT 行 cached=76 等）②**主因：发送视图字节级回写**——客户端 SDK 每轮墓碑化改写（L-12 域）制造孤儿 → 配对修复管线（stage 19 摘除孤儿 + `_ensure_tool_chain_integrity` 注入代理墓碑）在**后续轮的发送视图里用墓碑替换完整 tool 消息**（s38beef8 实证：8685 字符 role:"tool" 消息 turn4 在/turn5 消失，代理墓碑数 4→5 同步 +1）→ 已发送前缀被回写 → 整条匹配对任何字节变化零容忍 ③**帮凶：Metal 压力驱逐**——`prefix-pressure-evict` 5274 行（metal_cap=28.1GB/cache_max=7.7GB），近期窗口驱逐 4 万+ 条目（517-evict 事件同型）④**次要：aux 13-token 垃圾条目**连续 `tokens=14 stored=True` |
+| **误判修正** | 「hybrid 架构天然不能复用 KV」不成立——Mamba 类层限制的是**部分截断**（trim），整条复用不受影响；门禁时代 0.92-0.98 命中即同一架构取得 |
+| **修复方向（三轨）** | ①**P1 主攻：发送视图字节稳定化**——引擎 absorb 对客户端改写保持「新观测追加」纪律的同时，配对修复/墓碑注入**不得回写已发送前缀**（新内容只进增量段）；决定性小实验：递增 prompt 连发（预期整条 HIT）vs 收缩/改写 prompt 连发（预期 MISS 复现）②**驱逐缓解**：`--cache-memory-mb` 8192 上调 + gpu-mem 0.70→0.75 A/B（需后端重启，EXP-2R 批后）③**止血**：aux 小请求不 cache_store（rapid-mlx 侧特性/上游 issue） |
+| **影响** | 不阻塞 EXP-2R 判读（两臂同条件）；与 v4/EXP-2 同 regime（历史基线同源）；命中率权威口径 = llama-server.log `cache_fetch` 行（不依赖 usage 回传，L-5 缓解） |
+| **修复落地（轨道① 2026-09-06）** | `PROXY_CTX_VIEW_STABLE_ENABLED`（默认关，conf 就绪）：engine absorb 跳过/剥离已应答 exchange 的客户端改写副本（`_classify_rewrite` + `answered_tids` 增量账本），视图只增不缩；stage 19 `_fix_tool_pairings` 重复 tool_result 改 **keep-first**（去破坏性兜底，无旗标始终生效）。验收：test_view_stable.py 6 场景（前缀字节稳定/完整版保留/混合剥离/新结果不误伤/旗标关回旧轨/keep-first）+ 全量 1611 绿。**上线顺序**：EXP-2R 批后 → probe_prefix_cache.py 三组实验 → conf 开旗标 + restart → 观测 cache_fetch HIT 率与 TTFT |
+
 ---
 
 ## 五、缺陷分布与统计

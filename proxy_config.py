@@ -1003,6 +1003,16 @@ CONFIG_REGISTRY = {
                "dangling calls from manifest deposits (active). Off = bare "
                "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
     },
+    "PROXY_CTX_VIEW_STABLE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "DEF-308 track-1 sent-view byte stabilization: engine absorb "
+               "skips/strips client rewrite copies of already-answered "
+               "exchanges (SDK tombstoning) so the sent prefix never changes "
+               "bytes - backend whole-entry cache stays hit (saves 3-5x "
+               "wall-clock from per-turn 46K cold prefill). Pair with "
+               "stage-19 keep-first (always on).",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

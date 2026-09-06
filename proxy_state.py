@@ -539,6 +539,13 @@ PROXY_AUTO_RECALL_MAX_CHARS = int(os.environ.get(
 PROXY_AUTO_RECALL_PER_SESSION = int(os.environ.get(
     "PROXY_AUTO_RECALL_PER_SESSION", get_default("PROXY_AUTO_RECALL_PER_SESSION")))
 
+# DEF-308 轨道①: 发送视图字节稳定化——engine absorb 跳过/剥离「已应答
+# exchange 的客户端改写副本」(SDK 墓碑化), 视图只增不缩; 配合 stage 19
+# keep-first(无旗标, 始终生效)消除已发送前缀的字节回写 → 后端 hybrid
+# 整条匹配得以命中, 消除每轮 46K 全额冷 prefill。默认关, EXP-2R 批后开。
+PROXY_CTX_VIEW_STABLE_ENABLED = os.environ.get(
+    "PROXY_CTX_VIEW_STABLE_ENABLED", get_default("PROXY_CTX_VIEW_STABLE_ENABLED")).lower() in ("1", "true", "yes")
+
 # 墓碑召回（2026-09-06：客户端历史改写把旧 tool_result 丢成悬空调用，
 # 代理写入期压缩已寄存约四成——本开关把寄存内容接回模型视野：
 # ①stage 20 墓碑追加 ctx_recall 取回提示（被动）；②AutoRecallStage
@@ -1183,6 +1190,7 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_MAX_CHARS", "int", "4000", "4000"),
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
+    ("PROXY_CTX_VIEW_STABLE_ENABLED", "PROXY_CTX_VIEW_STABLE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1357,6 +1365,7 @@ __all__ = [
     "PROXY_AUTO_RECALL_ENABLED", "PROXY_AUTO_RECALL_DUP_THRESHOLD",
     "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
     "PROXY_TOMBSTONE_RECALL_ENABLED",
+    "PROXY_CTX_VIEW_STABLE_ENABLED",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority

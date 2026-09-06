@@ -294,6 +294,9 @@ class CanonicalSession(object):
         self.compression_region = []  # L3 压缩区文本行（epoch 收编产物）
         self.last_sent_tokens = 0     # 后端 usage 回填(验收门禁 1 计量)
         self.last_cached_tokens = 0
+        # DEF-308 轨道①: 已应答 tool_use_id 账本（增量维护）——客户端改写
+        # 判别的依据（视图字节稳定化, PROXY_CTX_VIEW_STABLE_ENABLED）
+        self.answered_tids = set()
         self.first_seen = time.time()
         self.last_seen = time.time()
 
@@ -333,11 +336,28 @@ class CanonicalSession(object):
         tail_hash = self.sent_order[-1] if self.sent_order else None
         mismatch = bool(tail_hash and tail_hash not in fp_set)
         # 新观测 = hash 未见过(按客户端顺序收集, 再统一压缩冻结)
+        stable = getattr(_ps, "PROXY_CTX_VIEW_STABLE_ENABLED", False)
         new_items = []
+        skipped_rewrites = 0
         for msg in (client_messages or []):
             h = _um.msg_hash(msg)
             if h in self.sent_set:
                 continue
+            if stable:
+                # DEF-308 轨道①: 客户端改写判别——tool_result 全部指向已
+                # 应答 tid 的消息是改写副本(墓碑化), canonical 已持有该
+                # exchange 的已发送完整版; 追加副本会制造重复 tool_result,
+                # 触发配对修复回写已发送前缀 → 后端整条匹配 MISS → 全额
+                # 冷 prefill。跳过/剥离后视图只增不缩, 字节逐位稳定。
+                verdict, stripped = self._classify_rewrite(msg)
+                if verdict == "skip":
+                    skipped_rewrites += 1
+                    continue
+                if verdict == "strip":
+                    msg = stripped
+                    h = _um.msg_hash(msg)
+                    if h in self.sent_set:
+                        continue
             self.sent_set.add(h)
             self.sent_order.append(h)
             new_items.append(msg)
@@ -345,10 +365,58 @@ class CanonicalSession(object):
         for msg in new_items:
             self.canonical.append(_frozen_copy(
                 _transform_message(msg, hints, self.session_key)))
+            self._note_answered(msg)
         new_user_msgs = sum(1 for m in new_items if m.get("role") == "user")
         if new_user_msgs:
             self.user_msgs += max(1, new_user_msgs)
+        if skipped_rewrites:
+            try:
+                from proxy_logging import log as _log
+                _log("  -> [context_engine] view-stable: skipped %d client "
+                     "rewrite copy(s), prefix bytes unchanged"
+                     % skipped_rewrites)
+            except Exception:
+                pass
         return self.canonical, mismatch, len(new_items)
+
+    def _classify_rewrite(self, msg):
+        """DEF-308 轨道①: 客户端改写判别 → ("append"|"skip"|"strip", 副本)。
+
+        user 消息的 tool_result 块**全部**指向 canonical 已应答 tid（该
+        exchange 此前轮已发送）→ 本条是客户端改写副本（SDK 墓碑化等）：
+          - 无其他内容块 → ("skip", None)：canonical 保留已发送完整版
+          - 混有文本/新块 → ("strip", 剥离已应答块后的副本)：新内容照常追加
+        含未应答 tid / 非 user / 非 tool_result 消息 → ("append", None)。
+        """
+        if msg.get("role") != "user":
+            return "append", None
+        blocks = msg.get("content")
+        if not isinstance(blocks, list):
+            return "append", None
+        tr = [b for b in blocks
+              if isinstance(b, dict) and b.get("type") == "tool_result"]
+        if not tr:
+            return "append", None
+        if not all(str(b.get("tool_use_id") or "") in self.answered_tids
+                   for b in tr):
+            return "append", None  # 含新结果 → 正常追加
+        rest = [b for b in blocks
+                if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+        if not rest:
+            return "skip", None
+        stripped = dict(msg)
+        stripped["content"] = rest
+        return "strip", stripped
+
+    def _note_answered(self, msg):
+        """追加消息后登记其 tool_use_id 到已应答账本（增量, 无界但量级小）。"""
+        blocks = msg.get("content")
+        if not isinstance(blocks, list):
+            return
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "tool_result" \
+                    and b.get("tool_use_id"):
+                self.answered_tids.add(str(b["tool_use_id"]))
 
     # ------------------------------------------------------------------ %
     def est_tokens(self, messages=None):

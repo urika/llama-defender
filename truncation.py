@@ -1729,7 +1729,6 @@ def _fix_tool_pairings(messages):
                     valid_tool_use_ids.add(tid)
 
     answered_tool_use_ids = set()
-    duplicate_result_ids = set()
     for m in messages:
         if m.get("role") != "user":
             continue
@@ -1740,29 +1739,15 @@ def _fix_tool_pairings(messages):
             if isinstance(b, dict) and b.get("type") == "tool_result":
                 tid = b.get("tool_use_id", "")
                 if tid:
-                    if tid in answered_tool_use_ids:
-                        duplicate_result_ids.add(tid)
-                    else:
-                        answered_tool_use_ids.add(tid)
+                    answered_tool_use_ids.add(tid)
+
+    # DEF-308 轨道①(keep-first): 重复 tool_result 只摘后续副本, 首个完整版
+    # 保留——此前全摘会回写已发送前缀(完整版→代理墓碑), 击穿后端整条匹配。
+    seen_result_ids = set()
 
     # Similarly deduplicate assistant tool_use ids (rare, but possible after
     # context_engine canonical rebuild or retry loops).
     seen_tool_use_ids = set()
-    duplicate_use_ids = set()
-    for m in messages:
-        if m.get("role") != "assistant":
-            continue
-        content = m.get("content", "")
-        if not isinstance(content, list):
-            continue
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "tool_use":
-                tid = b.get("id", "")
-                if tid:
-                    if tid in seen_tool_use_ids:
-                        duplicate_use_ids.add(tid)
-                    else:
-                        seen_tool_use_ids.add(tid)
 
     result = []
     removed_results = 0
@@ -1779,9 +1764,11 @@ def _fix_tool_pairings(messages):
                     if tid not in valid_tool_use_ids:
                         removed_results += 1
                         continue
-                    if tid in duplicate_result_ids:
+                    if tid in seen_result_ids:
+                        # 后续副本(客户端改写/重发) → 摘除; 首个已应答完整版不动
                         removed_results += 1
                         continue
+                    seen_result_ids.add(tid)
                 new_blocks.append(b)
             if not new_blocks:
                 continue
@@ -1796,9 +1783,11 @@ def _fix_tool_pairings(messages):
                     if tid and tid not in answered_tool_use_ids:
                         removed_uses += 1
                         continue
-                    if tid in duplicate_use_ids:
+                    if tid in seen_tool_use_ids:
                         removed_uses += 1
                         continue
+                    if tid:
+                        seen_tool_use_ids.add(tid)
                 new_blocks.append(b)
             if not new_blocks:
                 continue

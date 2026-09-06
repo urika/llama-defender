@@ -219,6 +219,31 @@ EXP-2 唯一成功注入（seq 5，test_psrp.py，采纳 ✓）走的是**写入
 
 **非目标**：不承诺 f2p 提升（成本实验）；订阅臂不适用；短会话不适用。
 
+## 13. DEF-308（L-13）prefix cache 击穿与轨道①修复（2026-09-06）
+
+EXP-2R 值守观测 + 日志取证（s38beef8）：46K tokens/轮 × TTFT p50 215s ≈ 每轮全额
+冷 prefill（35B 本地臂墙钟 3-5 倍）。**三因**（详见 DEFECT-LIST DEF-308）：①主因
+= 发送视图字节级回写——客户端 SDK 墓碑化改写制造孤儿，配对修复管线用代理墓碑
+替换完整 tool 消息（turn4→5 实证：8685 字符消失/墓碑 4→5）；②Metal 压力驱逐
+（5274 行 evict 日志）；③aux 13-token 垃圾条目。**架构约束假说被否定**：hybrid
+`non_trimmable` 是整条复用（请求 ≥ 条目即命中），shared=45921 的条目匹配 97.7%
+仍被弃用是因为视图回写，不是 Mamba 层不能复用。
+
+**轨道①修复（已实现待上线，`PROXY_CTX_VIEW_STABLE_ENABLED` 默认关）**：
+- engine absorb 新增改写判别（`_classify_rewrite` + `answered_tids` 增量账本）：
+  user 消息的 tool_result 全部指向已应答 tid → 改写副本 skip（无新内容）/
+  strip（混有新文本剥离后追加）——canonical 保留已发送完整版，视图只增不缩
+- stage 19 `_fix_tool_pairings` 重复 tool_result **keep-first**（去破坏性兜底，
+  无旗标始终生效）：首个完整版保留、后续副本摘除，替代原「全摘+注墓碑」
+- 验收：`test/unit/test_view_stable.py` 6 场景（VS1 前缀字节稳定 = 改写轮视图
+  与前轮视图字节级前缀兼容；VS2 完整版保留；VS3 混合剥离；VS4 新结果不误伤；
+  VS5 旗标关回旧轨；VS6 keep-first）+ 全量 1611 绿
+- **上线顺序**：EXP-2R 批后 → `tools/probe_prefix_cache.py` 三组受控实验
+  （递增/收缩/恒定，直连后端）→ conf 开旗标 + restart → 观测 cache_fetch
+  HIT 率与 TTFT（命中率权威口径 = llama-server.log，不依赖 usage 回传）
+- 轨道②（cache-mem/gpu-mem 上调 A/B）随同一次重启生效；轨道③（aux 不
+  cache_store）为 rapid-mlx 上游项，登记不实施
+
 ## 参考
 
 - `docs/02-architecture-design/llama-defender-context-engineering-design.md` §14（召回缺位实测，证据全文）
