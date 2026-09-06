@@ -430,12 +430,21 @@ def _timed_stream_lines(resp):
 
 
 
+def _huge_view_budget():
+    """TC28: engine-on huge 准入的视图预算 = 引擎折叠预算 S
+    （effective_trigger_tokens 热读，含 auto 推导）。"""
+    try:
+        from context_engine import effective_trigger_tokens
+        return int(effective_trigger_tokens())
+    except Exception:
+        return 0
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    @staticmethod
-    def _early_route_decision(parsed, total_chars):
+    def _early_route_decision(self, parsed, total_chars):
         """Fast cloud/local heuristic used before OOM safety pre-truncation.
 
         Returns 'cloud' only when the request is unambiguously a cloud candidate
@@ -764,6 +773,38 @@ class Handler(BaseHTTPRequestHandler):
                         _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
                     )
                     if _queue_bucket == "huge":
+                        # 2026-09-06(TC28): engine-on 会话先用引擎视图口径复检——
+                        # 原始 405K chars 折叠后实际发送 ~33K tokens（s38dc8d1
+                        # 实录），原始体积不代表后端负载；视图超折叠预算才拒绝。
+                        _huge_verdict = queue_manager.engine_view_admissible(
+                            msgs, _ps.PROXY_CTX_ENGINE_ENABLED,
+                            _huge_view_budget())
+                        if _huge_verdict is not None:
+                            if _huge_verdict["admissible"]:
+                                _queue_bucket = ""   # 引擎兜得住：按普通请求走管线
+                                log(f"  -> [queue] huge bucket waived (engine view "
+                                    f"~{_huge_verdict['view_tokens']:,} tokens <= budget "
+                                    f"{_huge_verdict['budget']:,}; raw {total_chars:,} chars)",
+                                    level="WARN")
+                            else:
+                                log(f"  -> [queue] huge bucket rejected (engine view "
+                                    f"~{_huge_verdict['view_tokens']:,} tokens > budget "
+                                    f"{_huge_verdict['budget']:,}; raw {total_chars:,} chars)",
+                                    level="WARN")
+                                if PROXY_METRICS_ENABLED:
+                                    mc = getattr(_metrics_ctx, 'mc', None)
+                                    if mc:
+                                        mc["queue_bucket"] = "huge"
+                                        mc["queue_rejected"] = "huge_context_not_supported_locally"
+                                        _finalize_metrics(mc)
+                                self._respond_json({"error": {
+                                    "type": "huge_context_not_supported_locally",
+                                    "message": f"Engine view ~{_huge_verdict['view_tokens']} tokens exceeds "
+                                               f"epoch fold budget {_huge_verdict['budget']}; cannot carry this session locally.",
+                                    "chars": total_chars,
+                                    "engine_view_tokens": _huge_verdict["view_tokens"],
+                                    "retryable": False}}, 413)
+                                return
                         # huge 不入本地队列。准入决策由 decide_huge_action 决定：
                         # - local（显式 X-Proxy-Route-To: local 且未超本地上限）→ 放行本地，
                         #   由管线 OOM 保护 / ContextTruncator 兜底；

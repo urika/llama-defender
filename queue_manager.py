@@ -51,6 +51,31 @@ def classify_bucket(total_chars, large_threshold, huge_threshold):
     return "standard"
 
 
+def engine_view_admissible(messages, session_enabled, budget_tokens):
+    """engine-on 会话的 huge 准入视图口径（2026-09-06 TC28）。
+
+    背景：原始 405K chars 的请求经 epoch 折叠后实际发送 ~33K tokens
+    （生产 s38dc8d1 实录）——engine-on 后客户端原始体积不再代表后端
+    负载，huge bucket 的 chars 判定会把"引擎兜得住"的会话钉死在门口。
+
+    返回 None = 无引擎口径（调用方保持原 chars 判定）；否则返回
+    {"admissible": bool, "view_tokens": int, "budget": int}。
+    口径与 context_engine.estimate_tokens 同源（chars/4 折算），budget
+    取引擎折叠预算 effective_trigger_tokens()——视图超预算即折叠兜不住。
+    """
+    if not session_enabled or not messages:
+        return None
+    try:
+        import context_engine as _ce
+        import json as _json
+        _chars = len(_json.dumps(messages, ensure_ascii=False, default=str))
+        view_tokens = int(_ce.estimate_tokens(_chars))
+    except Exception:
+        return None
+    return {"admissible": view_tokens <= budget_tokens,
+            "view_tokens": view_tokens, "budget": int(budget_tokens)}
+
+
 def decide_huge_action(total_chars, client_route, huge_action,
                        route_enabled, ctx_chars_limit, force_local=False):
     """huge bucket 准入决策（纯函数，Handler do_POST 调用）。

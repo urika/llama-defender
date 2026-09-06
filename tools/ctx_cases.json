@@ -206,9 +206,9 @@
  },
  {
   "id": "TC13",
-  "suite": "bigbody",
+  "suite": "big413",
   "session": "t13",
-  "name": "超大请求 413 硬拒（dispatch 门）",
+  "name": "超大请求 413 硬拒（dispatch 门·引擎off）",
   "body": {
    "model": "$client",
    "max_tokens": 64,
@@ -1139,6 +1139,57 @@
    },
    "log_contains": [
     "[REQ_USAGE]"
+   ]
+  }
+ },
+ {
+  "id": "TC28a",
+  "suite": "bigbody",
+  "session": "t28a",
+  "name": "huge bucket 引擎视图豁免：原始>阈值→waive放行，报文完整走管线",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark28",
+   "$turn_text": "read /repo/m%02d.py: filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler filler zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "$fact": {
+    "turn_index": 10,
+    "text": "read /repo/ops/size.md: BIGVIEW-FACT-9042 memorize"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "huge bucket waived"
+   ],
+   "log_not_contains": [
+    "huge bucket rejected"
+   ],
+   "backend_msg_count_min": 100
+  }
+ },
+ {
+  "id": "TC28b",
+  "suite": "bigbudget",
+  "session": "t28b",
+  "name": "huge bucket 引擎视图拒绝：视图>折叠预算→413（引擎兜不住）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$big": 90000
+  },
+  "expect": {
+   "resp_status": 413,
+   "dispatch_count": 0,
+   "log_contains": [
+    "huge bucket rejected"
    ]
   }
  }

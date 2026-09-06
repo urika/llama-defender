@@ -73,7 +73,23 @@ SUITES = {
     "bigbody": {"PROXY_CTX_ENGINE_ENABLED": "true",
                 "PROXY_PD_MICRO_TURN_ENABLED": "false",
                 "PROXY_MAX_REQUEST_BYTES": "102400",
-                "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "1000000"},
+                "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "40000",
+                "PROXY_QUEUE_ENABLED": "true",
+                "PROXY_QUEUE_HUGE_THRESHOLD_CHARS": "50000",
+                "PROXY_ROUTE_FORCE": ""},
+    # TC28b: 视图预算压到 5K——90K chars(≈22K tok)请求视图超预算即拒绝
+    "bigbudget": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                  "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                  "PROXY_MAX_REQUEST_BYTES": "102400",
+                  "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "5000",
+                  "PROXY_QUEUE_ENABLED": "true",
+                  "PROXY_QUEUE_HUGE_THRESHOLD_CHARS": "50000",
+                  "PROXY_ROUTE_FORCE": ""},
+    # TC13: 413 门单测——引擎关（防 epoch 溢出 500 抢先），queue 关
+    "big413": {"PROXY_CTX_ENGINE_ENABLED": "false",
+               "PROXY_PD_MICRO_TURN_ENABLED": "false",
+               "PROXY_MAX_REQUEST_BYTES": "102400",
+               "PROXY_QUEUE_ENABLED": "false"},
     # PRE_TRUNCATE 保持默认（管线前体级裁剪不登记 manifest）——登记路径
     # 须由 stage 14/17 触发；lifecycle 相位由 chars 阈值阶梯驱动，全部
     # 压低使 ~2.3KB 载荷直达 pre_trunc（truncate_rounds+oom_safety 开启）
@@ -227,10 +243,20 @@ class ProxyProcess(object):
             if self.proc.poll() is not None:
                 raise RuntimeError("proxy exited early, see %s" % self.log_path)
             try:
+                # 2026-09-06(TC28 调试): 影子代理内 pgrep 自省不可靠（沙箱下
+                # 匹配不到自身），改探 /v1/models 服务可用性
                 with urllib.request.urlopen(url, timeout=2) as r:
                     d = json.loads(r.read())
                 if (d.get("proxy") or {}).get("alive"):
                     return True
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d/v1/models" % PROXY_PORT,
+                        timeout=2) as r:
+                    if r.status == 200:
+                        return True
             except (urllib.error.URLError, OSError, ValueError):
                 pass
             time.sleep(0.4)
@@ -652,7 +678,8 @@ def main():
                 log_path = os.path.join(root, "proxy-%s.log" % case["suite"])
                 proxy = ProxyProcess(shadow,
                                      {k: v for k, v in suite_env.items()
-                                      if k not in BASE_ENV}, log_path)
+                                      if k not in ("PORT", "LLAMA_BASE_URL",
+                                                   "MODEL_NAME")}, log_path)
                 proxy.wait_ready()
                 current_suite = case["suite"]
                 print("== suite %s ==" % case["suite"])

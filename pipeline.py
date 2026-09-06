@@ -654,8 +654,10 @@ class ContextEngineStage(ConditionalStage):
         sess = context_engine.ENGINE.get_or_create(ctx.session_id)
         canonical, mismatch, new_msgs = sess.absorb(ctx.messages)
         if mismatch:
-            log("  -> [context_engine] client prefix mismatch — canonical rebuilt",
-                level="WARN")
+            # M2.1 语义: 只上报不重建(重建反而击穿缓存); L-12 后 cache_control
+            # 断点轮换不再误报, 此 WARN 恢复为真正的客户端改写信号
+            log("  -> [context_engine] client tail divergence (report-only, "
+                "canonical unchanged)", level="WARN")
         triggered, final = sess.maybe_epoch(
             context_engine.effective_trigger_tokens(),
             context_engine.effective_window_k())
