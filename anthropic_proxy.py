@@ -805,65 +805,67 @@ class Handler(BaseHTTPRequestHandler):
                                     "engine_view_tokens": _huge_verdict["view_tokens"],
                                     "retryable": False}}, 413)
                                 return
-                        # huge 不入本地队列。准入决策由 decide_huge_action 决定：
-                        # - local（显式 X-Proxy-Route-To: local 且未超本地上限）→ 放行本地，
-                        #   由管线 OOM 保护 / ContextTruncator 兜底；
-                        # - cloud（无 local 头 + 路由开启）→ 强制云端；
-                        # - reject → 413 拒绝（本地确实无法承载 / 路由关闭）。
-                        _client_route = parsed.get("_x_proxy_route_to", "")
-                        # 模型级强制本地(如 haiku behavior=force+prefer_local, 数据保密)
-                        # → 巨请求不得路由云端
-                        _pref = _ps.MODEL_ROUTE_PREFERENCES.get(parsed.get("model", ""), {})
-                        _force_local = bool(
-                            _pref.get("behavior") == "force"
-                            and _pref.get("route_bias") == "prefer_local")
-                        _huge_action = queue_manager.decide_huge_action(
-                            total_chars,
-                            _client_route,
-                            _ps.PROXY_QUEUE_HUGE_ACTION,
-                            PROXY_ROUTE_ENABLED,
-                            _ps.PROXY_CTX_CHARS_LIMIT,
-                            force_local=_force_local,
-                        )
-                        if _huge_action["action"] == "local":
-                            # 放行本地：保持 local 标记，SmartRouter / _early_route_decision 均走本地；
-                            # 不入队（huge 语义），由 _llama_lock 串行化。
-                            self._queue_response_headers = {"X-Queue-Bucket": "huge"}
-                            log(f"  -> [queue] huge bucket ({total_chars:,} chars): explicit "
-                                f"X-Proxy-Route-To: local, forwarding locally "
-                                f"(ctx_limit={_ps.PROXY_CTX_CHARS_LIMIT:,})", level="WARN")
-                        elif _huge_action["action"] == "cloud":
-                            # 复用 X-Proxy-Route-To 内部标记，SmartRouter 会强制走云端；
-                            # _early_route_decision 也会因此跳过 OOM 预截断。
-                            parsed["_x_proxy_route_to"] = "cloud"
-                            self._queue_response_headers = {"X-Queue-Bucket": "huge"}
-                            log(f"  -> [queue] huge bucket ({total_chars:,} chars >= "
-                                f"{_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}): force route to cloud", level="WARN")
                         else:
-                            log(f"  -> [queue] huge bucket rejected ({total_chars:,} chars, "
-                                f"action={PROXY_QUEUE_HUGE_ACTION}, route_enabled={PROXY_ROUTE_ENABLED})", level="WARN")
-                            if PROXY_METRICS_ENABLED:
-                                mc = getattr(_metrics_ctx, 'mc', None)
-                                if mc:
-                                    mc["queue_bucket"] = "huge"
-                                    mc["queue_rejected"] = "huge_context_not_supported_locally"
-                                    _finalize_metrics(mc)
-                                    log_metrics(mc)
-                            self._respond_json(
-                                {
-                                    "error": {
-                                        "type": "huge_context_not_supported_locally",
-                                        "message": (f"Prompt of {total_chars:,} chars exceeds the local queue "
-                                                    f"huge threshold ({_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}). "
-                                                    "Enable routing (PROXY_ROUTE_ENABLED) to auto-route such requests to cloud."),
-                                        "chars": total_chars,
-                                        "threshold": _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
-                                        "retryable": False,
-                                    }
-                                },
-                                413,
+                            # 无引擎口径（engine-off 或 est 失败）→ 原 chars 判定。
+                            # huge 不入本地队列。准入决策由 decide_huge_action 决定：
+                            # - local（显式 X-Proxy-Route-To: local 且未超本地上限）→ 放行本地，
+                            #   由管线 OOM 保护 / ContextTruncator 兜底；
+                            # - cloud（无 local 头 + 路由开启）→ 强制云端；
+                            # - reject → 413 拒绝（本地确实无法承载 / 路由关闭）。
+                            _client_route = parsed.get("_x_proxy_route_to", "")
+                            # 模型级强制本地(如 haiku behavior=force+prefer_local, 数据保密)
+                            # → 巨请求不得路由云端
+                            _pref = _ps.MODEL_ROUTE_PREFERENCES.get(parsed.get("model", ""), {})
+                            _force_local = bool(
+                                _pref.get("behavior") == "force"
+                                and _pref.get("route_bias") == "prefer_local")
+                            _huge_action = queue_manager.decide_huge_action(
+                                total_chars,
+                                _client_route,
+                                _ps.PROXY_QUEUE_HUGE_ACTION,
+                                PROXY_ROUTE_ENABLED,
+                                _ps.PROXY_CTX_CHARS_LIMIT,
+                                force_local=_force_local,
                             )
-                            return
+                            if _huge_action["action"] == "local":
+                                # 放行本地：保持 local 标记，SmartRouter / _early_route_decision 均走本地；
+                                # 不入队（huge 语义），由 _llama_lock 串行化。
+                                self._queue_response_headers = {"X-Queue-Bucket": "huge"}
+                                log(f"  -> [queue] huge bucket ({total_chars:,} chars): explicit "
+                                    f"X-Proxy-Route-To: local, forwarding locally "
+                                    f"(ctx_limit={_ps.PROXY_CTX_CHARS_LIMIT:,})", level="WARN")
+                            elif _huge_action["action"] == "cloud":
+                                # 复用 X-Proxy-Route-To 内部标记，SmartRouter 会强制走云端；
+                                # _early_route_decision 也会因此跳过 OOM 预截断。
+                                parsed["_x_proxy_route_to"] = "cloud"
+                                self._queue_response_headers = {"X-Queue-Bucket": "huge"}
+                                log(f"  -> [queue] huge bucket ({total_chars:,} chars >= "
+                                    f"{_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}): force route to cloud", level="WARN")
+                            else:
+                                log(f"  -> [queue] huge bucket rejected ({total_chars:,} chars, "
+                                    f"action={PROXY_QUEUE_HUGE_ACTION}, route_enabled={PROXY_ROUTE_ENABLED})", level="WARN")
+                                if PROXY_METRICS_ENABLED:
+                                    mc = getattr(_metrics_ctx, 'mc', None)
+                                    if mc:
+                                        mc["queue_bucket"] = "huge"
+                                        mc["queue_rejected"] = "huge_context_not_supported_locally"
+                                        _finalize_metrics(mc)
+                                        log_metrics(mc)
+                                self._respond_json(
+                                    {
+                                        "error": {
+                                            "type": "huge_context_not_supported_locally",
+                                            "message": (f"Prompt of {total_chars:,} chars exceeds the local queue "
+                                                        f"huge threshold ({_ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS:,}). "
+                                                        "Enable routing (PROXY_ROUTE_ENABLED) to auto-route such requests to cloud."),
+                                            "chars": total_chars,
+                                            "threshold": _ps.PROXY_QUEUE_HUGE_THRESHOLD_CHARS,
+                                            "retryable": False,
+                                        }
+                                    },
+                                    413,
+                                )
+                                return
                     else:
                         _queue_ticket = _qm.enqueue({
                             "request_id": getattr(self, "_request_id", "") or "",
