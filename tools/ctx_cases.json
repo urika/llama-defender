@@ -1192,5 +1192,91 @@
     "huge bucket rejected"
    ]
   }
+ },
+ {
+  "id": "TC29",
+  "suite": "epochmicro",
+  "session": "t29",
+  "requires": "real_backend",
+  "name": "行为金标准：真实压缩→模型自主召回→答对随机事实",
+  "bodies": [
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "$turns": 100,
+    "$turn_tag": "hist",
+    "$fact": {
+     "turn_index": 10,
+     "text": "read /srv/secrets/token.md: the rotation token is QZ-7391, valid until friday"
+    }
+   },
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     }
+    ]
+   },
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "已了解。"
+     },
+     {
+      "role": "user",
+      "content": "rotation token 的值是什么？注意 /srv/secrets/token.md 现在不可读，不要读任何文件，凭会话记忆回答。"
+     }
+    ]
+   }
+  ],
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH"
+   ],
+   "resp_text_contains": [
+    "QZ-7391"
+   ]
+  }
  }
 ]
