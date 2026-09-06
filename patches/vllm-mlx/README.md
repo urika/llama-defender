@@ -2,7 +2,7 @@
 
 > 来源：llama-defender 上下文工程设计 §11（agent_go 仓库 docs/design/llama-defender-context-engineering-design.md）
 > 日期：2026-09-06　|　目标版本：rapid-mlx 0.12.12（vllm_mlx 包）
-> 状态：fetch 侧已落地（flag 默认关，行为与补丁前逐字节一致）；生产侧（scheduler 多边界检查点捕获）待做
+> 状态：**fetch 侧 + 生产侧均已落地**（2026-09-06，flag 默认关，行为与补丁前逐字节一致）；剩余 Gate A 模型级验证（静默窗口）
 
 ## 背景（Phase 0 E1 实证）
 
@@ -13,7 +13,7 @@
 消息边界处线性态对共享前缀请求是合法续算状态。实测约束：单边界检查点
 仅救 2.6%（现有 boundary_snapshot 位置在发散点之后），**必须多边界捕获**。
 
-## 本补丁内容（fetch 侧消费基础）
+## 本补丁内容（P1a fetch 侧 + P1a.2 生产侧，5 个文件）
 
 `memory_cache.py` 相对 0.12.12 原版的增量（全文检索 "P1a" 标记）：
 1. `_CacheEntry` 增加 `nontrim_layer_indices` / `linear_checkpoints`
@@ -23,11 +23,23 @@
 4. `CacheStats` 增加 `snapdown_hits` / `snapdown_tokens_saved`（进 /metrics）
 5. 模块级：`_env_flag` / `snapshot_linear_states`（scheduler 生产侧调用接口）/ `_estimate_checkpoints_memory` / `_restore_recurrent_layer`
 
+## 生产侧（P1a.2，4 个文件）
+
+- `request.py`：`prefix_boundaries` 字段（升序 token 位置列表）
+- `engine_core.py`：`add_request` 透传
+- `engine/batched.py`：`select_checkpoint_positions` 纯函数（去重/间距/limit 尾部优先）
+  + `_compute_prefix_boundaries`（消息截断渲染 + token LCP，严格前缀守卫，fail-closed 返回 []）
+  + chat/stream_chat 调用点 `PROXY_CACHE_LCP_SNAPDOWN` 门控 + generate 两条路径透传
+- `scheduler.py`：`_schedule_waiting` N 段 insert_segments（预期局部切点存
+  `request._lcp_expected_local_splits`）；`_snapshot_boundary_segments` 事件收集置于
+  既有过滤之前 + `snapshot_linear_states` 现场累积（M=8 上限，采集完成即停）；
+  `_prompt_cache_save` 全量 store 挂载 `linear_checkpoints`
+
 ## 开关与生效条件
 
-- `PROXY_CACHE_LCP_SNAPDOWN=1` 开启 fetch 侧
-- 但**当前无生产者**：条目不带 linear_checkpoints 时行为不变——
-  生产侧（scheduler 多边界捕获，见 §11.7 P1a.2）落地后才有实际效果
+- `PROXY_CACHE_LCP_SNAPDOWN=1` 同时开启生产侧（多段 prefill + 检查点捕获）与
+  fetch 侧（snap-down 消费）；关闭时全部新路径 inert，行为与补丁前逐字节一致
+- 短上下文（<4K tokens）自动跳过（多段调度开销不划算）
 
 ## 应用 / 回滚 / 验证
 

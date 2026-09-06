@@ -1,0 +1,3548 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Batched engine for continuous batching with multiple concurrent users.
+
+This engine wraps AsyncEngineCore to provide continuous batching
+for better throughput when serving multiple concurrent requests.
+
+For MLLM models, all requests (text-only and multimodal) are routed through
+the MLLMScheduler, which handles vision encoding and batched generation via
+MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
+LLM engine), so text-only requests must also be routed through it.
+"""
+
+import functools
+import json
+import logging
+import os
+import threading
+import time
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from typing import Any
+
+from ..api.tool_calling import convert_tools_for_template
+from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..output_router import Channel, OutputRouter
+from ..utils.chat_template import apply_chat_template as shared_apply_chat_template
+from .base import BaseEngine, GenerationOutput
+
+logger = logging.getLogger(__name__)
+
+# Tokenization can change across a message boundary once the following turn is
+# appended. Replay a negligible suffix so non-trimmable caches never snapshot
+# an optimistic boundary that the next request cannot reuse.
+_PREFIX_BOUNDARY_REPLAY_TOKENS = 8
+
+
+def _load_lazy_and_install_disk_stream(
+    model_name: str, tokenizer_config: dict, cache_budget_gb: float
+):
+    """``--disk-stream`` model-load step, run as a single unit on the
+    mlx-step worker (see the ``_start_llm`` call site) so both the lazy
+    ``mlx_lm.load`` and ``disk_stream_patch.install`` touch MLX from the
+    same owning thread (#170 — see the surrounding comments in
+    ``_start_llm``).
+
+    Raises ``vllm_mlx.disk_stream_patch.UnsupportedModelTypeError``
+    immediately (before serving ever starts) if ``model_name``'s
+    ``model_type`` has no registered
+    ``vllm_mlx.registry.StreamingAdapter`` — no silent fallback to
+    resident loading, no downstream crash mid-forward.
+    """
+    from .. import disk_stream_patch
+    from ..utils.tokenizer import _resolve_model_path, load_model_with_fallback
+
+    model, tokenizer, config = load_model_with_fallback(
+        model_name, tokenizer_config, lazy=True, return_config=True
+    )
+    checkpoint_path = _resolve_model_path(model_name)
+    if checkpoint_path is None:
+        raise ValueError(
+            f"--disk-stream: could not resolve a local checkpoint path for "
+            f"{model_name!r}"
+        )
+    disk_stream_patch.install(
+        model,
+        config.get("model_type", ""),
+        checkpoint_path,
+        cache_budget_gb=cache_budget_gb,
+    )
+    return model, tokenizer
+
+
+# Harmony's chat template ends its generation prompt immediately after
+# ``<|start|>assistant`` and expects the model to choose a channel. When
+# thinking is disabled, seed an empty analysis message followed by an open
+# final message. These are resolved to token IDs from the loaded tokenizer;
+# they never pass through user-controlled message content or the template
+# sanitizer.
+_HARMONY_ASSISTANT_PREFIX_TOKENS = ("<|start|>", "assistant")
+_HARMONY_NO_THINKING_SUFFIX_TOKENS = (
+    "<|channel|>",
+    "analysis",
+    "<|message|>",
+    "<|end|>",
+    "<|start|>",
+    "assistant",
+    "<|channel|>",
+    "final",
+    "<|message|>",
+)
+
+
+def _resolve_hf_model_type(model_name: str) -> str | None:
+    """Best-effort read of ``config.json::model_type`` for ``model_name``.
+
+    ``model_name`` is whatever the operator passed to the CLI — an alias
+    (``gemma4-12b-4bit``), an HF repo id
+    (``mlx-community/gemma-4-12B-it-4bit``), or a local path. We resolve
+    aliases first, then look at the HF cache. Never raises: on any
+    failure (offline, missing config, malformed JSON, alias lookup blows
+    up) we return ``None`` so the caller can skip the MTP inject step
+    with a clear log rather than crashing engine boot.
+    """
+    import json as _json
+    import os as _os
+
+    hf_path: str | None = model_name
+    # Alias resolution — a contributor-curated ``gemma4-12b-4bit`` alias
+    # resolves to ``mlx-community/gemma-4-12B-it-4bit`` for the cache
+    # lookup below.
+    try:
+        from ..model_aliases import resolve_profile
+
+        profile = resolve_profile(model_name)
+        if profile is not None:
+            hf_path = getattr(profile, "hf_path", None) or model_name
+    except Exception:
+        # Alias resolution must never block engine boot — the raw
+        # model_name still works if it's already an HF repo id or path.
+        pass
+
+    # Local path — read config.json directly.
+    if hf_path and _os.path.isdir(hf_path):
+        cfg_path = _os.path.join(hf_path, "config.json")
+        if _os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path) as fh:
+                    cfg = _json.load(fh)
+                mt = cfg.get("model_type") if isinstance(cfg, dict) else None
+                if isinstance(mt, str):
+                    return mt
+            except Exception:
+                pass
+
+    # HF Hub — look at whatever ``huggingface_hub`` has already cached.
+    # Same pattern the CLI eligibility gate uses (``cli.py::
+    # _gather_kv_cache_dtype_inputs``) so a config that boots on the CLI
+    # will boot here.
+    try:
+        from huggingface_hub import try_to_load_from_cache as _cache_lookup
+
+        cached = _cache_lookup(repo_id=hf_path, filename="config.json")
+        if cached and _os.path.exists(cached):
+            with open(cached) as fh:
+                cfg = _json.load(fh)
+            mt = cfg.get("model_type") if isinstance(cfg, dict) else None
+            if isinstance(mt, str):
+                return mt
+    except Exception:
+        pass
+
+    return None
+
+
+# Return codes for :func:`_run_dispatch_mtp_inject`. Fine-grained
+# because ``_start_llm`` needs to distinguish "operator config is bad
+# → abort boot" from "environment race (offline HF cache, missing
+# config on the executor thread even though the CLI just read it)
+# → warn and continue on plain decode."
+#
+# Codex round-D BLOCKER #1: prior revision collapsed all failure modes
+# into ``False`` and the caller then hard-raised on ``False``. That
+# turned a benign transient resolution failure — the CLI had already
+# vetted the config on the asyncio thread — into a boot abort in
+# offline environments that used to work under MTP speculative config.
+# Splitting the return keeps the fail-loud contract for
+# operator-facing errors (family injector actively rejected) while
+# preserving the fail-soft contract for pipeline plumbing hiccups
+# (model_type couldn't be resolved on the executor).
+_DISPATCH_ATTACHED = "attached"
+_DISPATCH_UNRESOLVED = "unresolved"
+_DISPATCH_NO_INJECT = "no_inject"
+_DISPATCH_REJECTED = "rejected"
+
+
+def _run_dispatch_mtp_inject(
+    model: Any,
+    model_name: str,
+    mtp_sidecar: str | None,
+    *,
+    preferred_model_type: str | None = None,
+) -> str:
+    """MLX-step-worker entrypoint that runs ``dispatch_mtp_inject``.
+
+    Extracted so ``_start_llm`` can ``submit(...)`` it onto the model-
+    load executor cleanly. Never raises — the dispatcher's own
+    contract is ``never raises``, but we wrap the ``model_type``
+    resolution in the same fail-closed shape so an offline / missing-
+    config path degrades to a distinct return code instead of
+    aborting the engine.
+
+    Returns one of:
+
+    * :data:`_DISPATCH_ATTACHED` — family injector attached the MTP
+      contract to ``model`` (``mtp_forward`` / ``make_mtp_cache`` /
+      ``mtp``). Happy path.
+    * :data:`_DISPATCH_UNRESOLVED` — could not resolve
+      ``config.json::model_type`` for ``model_name`` (offline HF cache
+      race, missing local config, etc.). Soft-skip: the CLI already
+      accepted the flag with its own config lookup on the asyncio
+      thread, so the executor-thread lookup missing is almost always
+      transient plumbing — the caller should log and continue rather
+      than abort boot.
+    * :data:`_DISPATCH_NO_INJECT` — ``model_type`` resolved but no
+      family injector is registered. Soft-skip: same treatment as
+      unresolved; the CLI's eligibility gate should have already
+      rejected this case, so hitting here means a plumbing skew, not
+      an operator misuse.
+    * :data:`_DISPATCH_REJECTED` — the family injector was invoked and
+      returned ``False`` (missing sidecar, loader failure, weight
+      shape mismatch, etc.). Hard-fail: the operator explicitly asked
+      for MTP speculative config on a valid target and the injector
+      couldn't attach. Caller should abort boot rather than boot with
+      MTP silently disabled.
+
+    Never raises.
+    """
+    from ..spec_decode.mtp import dispatch_mtp_inject
+    from ..spec_decode.mtp.dispatch import _MTP_INJECT_DISPATCH
+
+    # Codex round-E blocker #2: prefer the CLI-resolved model_type
+    # when available. The CLI reads ``config.json`` on the asyncio
+    # thread before spawning the executor; passing that value down
+    # avoids a re-read on the executor thread that can race with the
+    # CLI's own IO under offline HF cache and produce a spurious
+    # ``_DISPATCH_UNRESOLVED`` even though the config was just read.
+    model_type = preferred_model_type or _resolve_hf_model_type(model_name)
+    if model_type is None:
+        logger.warning(
+            "[MTP-vendored] could not resolve model_type for %r; skipping "
+            "dispatch_mtp_inject. MTP speculative config will be a no-op on "
+            "this boot.",
+            model_name,
+        )
+        return _DISPATCH_UNRESOLVED
+
+    if model_type not in _MTP_INJECT_DISPATCH:
+        logger.warning(
+            "[MTP-vendored] model_type=%r has no registered MTP inject "
+            "(sidecar=%r); soft-skip. This is a plumbing skew between "
+            "the CLI eligibility gate and the dispatcher table — the "
+            "CLI should have already rejected this case.",
+            model_type,
+            mtp_sidecar,
+        )
+        return _DISPATCH_NO_INJECT
+
+    ok = dispatch_mtp_inject(
+        model,
+        model_type,
+        mtp_sidecar=mtp_sidecar,
+    )
+    if ok:
+        logger.info(
+            "[MTP-vendored] dispatch_mtp_inject succeeded for model_type=%r sidecar=%r",
+            model_type,
+            mtp_sidecar,
+        )
+        return _DISPATCH_ATTACHED
+
+    logger.warning(
+        "[MTP-vendored] dispatch_mtp_inject returned False for "
+        "model_type=%r sidecar=%r; family injector rejected. "
+        "MTP speculative config will be a hard-fail at boot.",
+        model_type,
+        mtp_sidecar,
+    )
+    return _DISPATCH_REJECTED
+
+
+# Codex round-G BLOCKING #3: hard cap on the executor-side MTP
+# dispatch call. Sidecar loads that touch HF Hub / large safetensor
+# reads can wedge on a slow network or a stuck DNS lookup; without a
+# timeout, ``rapid-mlx serve --speculative-config '{"method":"mtp",
+# "model":"<hf-repo>"}'`` boot can block indefinitely. Default 600s covers slow
+# 4-16GB assistant downloads on a typical residential connection; an
+# ops override lives at ``RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC`` for
+# corp networks with mandatory proxies. Set to ``0`` to opt out of
+# the timeout (matches pre-round-G behaviour — not recommended).
+_MTP_DISPATCH_TIMEOUT_SEC_DEFAULT = 600.0
+
+
+def _get_mtp_dispatch_timeout_sec() -> float | None:
+    """Return the bounded timeout for ``_run_dispatch_mtp_inject``.
+
+    Reads ``RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC`` env var; falls back
+    to :data:`_MTP_DISPATCH_TIMEOUT_SEC_DEFAULT` (600s). Returning
+    ``None`` disables the timeout (an explicit ``0`` in the env,
+    for ops that want to preserve pre-round-G behaviour on locked-
+    down corp networks). Any parse failure logs a warning and uses
+    the default — never raises.
+    """
+    import os as _os
+
+    raw = _os.environ.get("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC")
+    if raw is None:
+        return _MTP_DISPATCH_TIMEOUT_SEC_DEFAULT
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning(
+            "[MTP-vendored] could not parse "
+            "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC=%r as a float; "
+            "using default %.0fs.",
+            raw,
+            _MTP_DISPATCH_TIMEOUT_SEC_DEFAULT,
+        )
+        return _MTP_DISPATCH_TIMEOUT_SEC_DEFAULT
+    if parsed <= 0.0:
+        # Explicit opt-out (0 or negative). Log INFO so ops-audit
+        # trails know the boot ran without the safety net.
+        logger.info(
+            "[MTP-vendored] RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC=%r "
+            "disables the executor-side dispatch timeout.",
+            raw,
+        )
+        return None
+    return parsed
+
+
+def _log_mtp_dispatch_timeout(timeout_sec: float) -> None:
+    """Emit the operator-facing CRITICAL log line for an MTP dispatch
+    timeout.
+
+    Codex round-L BLOCKING #1 replaced the earlier ``os._exit(1)``
+    hammer with a plain ``RuntimeError`` that :func:`_apply_mtp_
+    dispatch` raises up to the caller. Rationale from the round-L
+    reviewer:
+
+    * The prior implementation killed the entire Python process —
+      hostile to embedded callers, pytest sessions, and process
+      supervisors that expect the interpreter to unwind cleanly
+      (library code should never call ``os._exit``).
+    * The startup path already surfaces the ``RuntimeError`` to
+      the CLI, which exits the process normally. Bin/cli wrapping
+      already handles unhandled exceptions with a nonzero exit
+      status.
+    * Orphan-mutation risk on the shared mlx-step executor is a
+      known tradeoff, explicitly accepted: the CLI's normal exit
+      still tears down the interpreter (worker thread dies with
+      it), and embedded / library callers own the tradeoff of
+      keeping the interpreter alive past the abort.
+
+    Extracted so :func:`_apply_mtp_dispatch` and tests can share
+    the exact operator-facing wording.
+    """
+    logger.critical(
+        "[MTP-vendored] dispatch timed out after %.0fs — the mlx-step "
+        "worker may still be mutating model in place. Raising "
+        "RuntimeError to abort startup. In embedded callers the "
+        "shared executor is left intact; the orphan mutation risk "
+        "is scoped to the caller's choice to keep the process "
+        "alive past this abort. Bump the timeout via "
+        "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC=<seconds> or set it "
+        "to 0 to opt out of the safety net.",
+        timeout_sec,
+    )
+
+
+def _decide_mtp_dispatch_action(
+    dispatch_result: str,
+    *,
+    cli_vetted_model_type: str | None,
+) -> tuple[str, str | None]:
+    """Production-side predicate for the ``_start_llm`` MTP dispatch gate.
+
+    Codex round-F NIT: the test suite's replay of the gate was
+    reimplementing the predicate instead of exercising a real helper,
+    so the tests could pass while the boot path silently drifted.
+    Extract the branch decision into a single side-effect-free helper
+    that both ``_start_llm`` and the tests call directly.
+
+    Args:
+      dispatch_result: One of the ``_DISPATCH_*`` sentinels returned
+        by :func:`_run_dispatch_mtp_inject`.
+      cli_vetted_model_type: Value of
+        ``SchedulerConfig.mtp_model_type``. When non-None, the CLI
+        already read ``config.json`` on the asyncio thread and vetted
+        the model_type; codex round-E blocker #2 requires the gate to
+        hard-fail on ANY non-attached result in that case. When None
+        (bench-harness / direct-SchedulerConfig caller), the round-D
+        lenient behaviour applies: only ``_DISPATCH_REJECTED`` hard-
+        fails.
+
+    Returns:
+      ``("attached", None)`` on the happy path.
+      ``("continue", None)`` when the caller should proceed on plain
+        autoregressive decode without emitting an error.
+      ``("raise", <error message>)`` when the caller should raise
+        ``RuntimeError`` with the returned message. The message
+        already includes the operator-facing context (dispatch
+        result, CLI-vetted model_type, etc.).
+
+    Pure function — no logging, no exceptions. The caller decides
+    whether to log the "continue" case, so the same helper can serve
+    both production and unit tests without side-effect entanglement.
+    """
+    if dispatch_result == _DISPATCH_ATTACHED:
+        return ("attached", None)
+
+    if dispatch_result == _DISPATCH_REJECTED:
+        return (
+            "raise",
+            "MTP speculative-config was set but the family MTP "
+            "injector rejected the model. See preceding "
+            "warnings for the specific failure (typical causes: "
+            "MTP weights missing from the target checkpoint, "
+            "unsupported model_type, sidecar path unreachable, or "
+            "assistant checkpoint model_type mismatch). Refusing to "
+            "boot with MTP silently disabled — remove "
+            "--speculative-config to continue without MTP.",
+        )
+
+    _cli_vetted = cli_vetted_model_type is not None
+    if _cli_vetted:
+        return (
+            "raise",
+            f"MTP speculative-config was set and the CLI vetted "
+            f"model_type={cli_vetted_model_type!r}, but the engine "
+            f"could not attach the MTP protocol "
+            f"(dispatch_result={dispatch_result!r}). This "
+            "indicates a plumbing skew between the CLI "
+            "eligibility gate and the engine's dispatch "
+            "table — not an environment race. Refusing to "
+            "boot with MTP silently disabled — remove "
+            "--speculative-config to continue without MTP, "
+            "or file an issue with the model_type + engine "
+            "version.",
+        )
+
+    return ("continue", None)
+
+
+def _apply_mtp_dispatch(
+    *,
+    model: Any,
+    model_name: str,
+    scheduler_config: Any,
+    executor: Any,
+) -> str:
+    """Executor-side MTP dispatch step used by ``_start_llm``.
+
+    Extracted so tests can drive the full boot-time gate end-to-end
+    (codex round-G NIT #4 — an ``inspect.getsource()`` string check
+    is not a runtime test). Also carries the round-G BLOCKING #3
+    timeout: the executor-side dispatch runs under a bounded wait
+    so a stuck HF download / DNS / sidecar load never wedges
+    server startup.
+
+    Returns the dispatch result string; the caller can key logging
+    or metrics on it. Raises ``RuntimeError`` on hard-fail
+    (rejected, or CLI-vetted-but-not-attached, or timeout).
+
+    Assumes ``spec_decode == "mtp"`` — caller must gate.
+    """
+    import concurrent.futures as _cf
+
+    preferred_mt = getattr(scheduler_config, "mtp_model_type", None)
+    sidecar = getattr(scheduler_config, "mtp_sidecar", None)
+
+    future = executor.submit(
+        _run_dispatch_mtp_inject,
+        model,
+        model_name,
+        sidecar,
+        preferred_model_type=preferred_mt,
+    )
+    timeout = _get_mtp_dispatch_timeout_sec()
+    try:
+        # ``timeout=None`` matches the pre-round-G blocking wait;
+        # only used when the operator explicitly sets the env var
+        # to 0.
+        dispatch_result = future.result(timeout=timeout)
+    except _cf.TimeoutError as exc:
+        # Codex round-G BLOCKING #3: convert executor-side hang
+        # into a clean startup abort. Cancel the future so the
+        # worker doesn't keep running past shutdown (best-effort:
+        # ``future.cancel()`` is a no-op for a task that has
+        # already started running).
+        future.cancel()
+        # Codex round-L BLOCKING #1: replaced the earlier
+        # ``os._exit(1)`` process-exit hook with a plain
+        # ``RuntimeError``. Library code must never terminate the
+        # interpreter — it's hostile to embedded callers, pytest
+        # sessions, and process supervisors that expect a clean
+        # unwind. The CLI startup path already surfaces this
+        # ``RuntimeError`` to the operator (main() exits with a
+        # nonzero status), and embedded callers can now catch and
+        # recover if they need to. See :func:`_log_mtp_dispatch_
+        # timeout` for the accepted orphan-mutation tradeoff.
+        #
+        # Codex round-J BLOCKING #1 (still in force): do NOT call
+        # ``executor.shutdown(...)`` here — the same shared
+        # ``_model_load_executor`` continues to serve mlx-step
+        # ops after boot, so a shutdown would break every
+        # embedded caller that catches the RuntimeError and
+        # tries to continue. Leave the executor untouched.
+        _log_mtp_dispatch_timeout(timeout)
+        raise RuntimeError(
+            "MTP speculative-config dispatch timed out after "
+            f"{timeout:.0f}s. Typical causes: HF Hub outage on the "
+            "sidecar path, corp proxy blocking huggingface.co, or "
+            "a very large assistant checkpoint on a slow link. "
+            "Bump the timeout with "
+            "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC=<seconds>, or set "
+            "it to 0 to disable the timeout entirely. Refusing to "
+            "boot with an in-flight dispatch that could complete "
+            "after the server accepts requests."
+        ) from exc
+
+    action, err_msg = _decide_mtp_dispatch_action(
+        dispatch_result,
+        cli_vetted_model_type=preferred_mt,
+    )
+    if action == "raise":
+        raise RuntimeError(err_msg)
+    if action == "continue":
+        logger.info(
+            "[MTP-vendored] dispatch soft-skipped (result=%r); "
+            "continuing on plain autoregressive decode. The "
+            "scheduler MTP install gate will also skip. "
+            "(Non-CLI caller — no ``mtp_model_type`` set; a "
+            "CLI caller would have hard-failed here.)",
+            dispatch_result,
+        )
+    return dispatch_result
+
+
+def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
+    """Normalize OpenAI tool-call replay for templates expecting mappings.
+
+    OpenAI's API contract has ``message.tool_calls[i].function.arguments`` as a
+    JSON string, but many chat templates iterate that field as a mapping
+    (e.g., ``{% for k, v in tool_call.function.arguments.items() %}``) and
+    blow up on a string. Parse the JSON string back into a dict before
+    handing the message list to ``apply_chat_template``; wrap non-mapping
+    parsed values (``["a","b"]`` etc.) so the template still gets a dict.
+
+    Returns a deep-copied, mutated message list; the original is left alone
+    so the API surface (where ``arguments`` must remain a string) is intact.
+    """
+    normalized = json.loads(json.dumps(messages, default=str))
+    for message in normalized:
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                parsed = {"value": arguments}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+            function["arguments"] = parsed
+    return normalized
+
+
+def _probe_mllm_cache_type(language_model: Any) -> str | None:
+    """Return the offending cache type name when ``language_model`` is
+    incompatible with MLLM continuous batching, or None if it's fine.
+
+    "Incompatible" means ``make_prompt_cache`` returns something other than
+    a list of ``KVCache`` / ``RotatingKVCache`` — currently ArraysCache (hybrid
+    Qwen3.5/3.6, etc.) or MambaCache (Nemotron, Granite4). Returning a name
+    instead of a bool lets the caller put the actual class in the error
+    message (#352).
+
+    The probe is best-effort; if mlx-lm raises before producing a cache list
+    we return None and let the runtime path surface the real error instead
+    of masking it with a misleading hybrid-incompat message.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from ..mllm_cache_compat import first_incompatible_mllm_cache_type
+
+    try:
+        test_cache = make_prompt_cache(language_model)
+    except Exception:
+        return None
+    if not test_cache:
+        return None
+    return first_incompatible_mllm_cache_type(test_cache)
+
+
+def _resolve_mllm_cache_policy(
+    cache_type: str | None,
+    max_num_seqs: int,
+    prefill_batch_size: int,
+    completion_batch_size: int,
+) -> tuple[int, int, int, bool]:
+    """Return safe MLLM batch limits and ArraysCache admission policy."""
+    if cache_type == "ArraysCache":
+        return 1, 1, 1, True
+    return max_num_seqs, prefill_batch_size, completion_batch_size, False
+
+
+_CHANNEL_TO_STRING = {
+    Channel.CONTENT: "content",
+    Channel.REASONING: "reasoning",
+    Channel.TOOL_CALL: "tool_call",
+}
+
+_OUTPUT_ROUTER_ALLOWLIST = {"gemma4", "harmony"}
+
+
+def _channel_name(channel: Channel) -> str:
+    """Convert router channel enum values to GenerationOutput.channel strings."""
+    return _CHANNEL_TO_STRING[channel]
+
+
+def _resolve_mllm_prefill_step_size(
+    user_value: int | None,
+    *,
+    text_default: int,
+    mllm_default: int,
+) -> int:
+    """Apply the MLLM ``prefill_step_size`` bump-policy (#682).
+
+    A 1920×1080 screenshot decoded by Qwen3-VL produces ~2200 vision
+    tokens — past the 2048 text-LLM default that ``SchedulerConfig``
+    ships with. The per-batch cap in
+    ``mllm_batch_generator._process_prompts`` would otherwise fire
+    silently and surface as ``finish_reason="length"`` + empty content
+    (#682).
+
+    Policy:
+    - ``None`` or value equal to ``text_default`` → ``mllm_default``
+      (the Desktop-sidecar happy path).
+    - Any other value → honored as-is (memory-constrained operators
+      and high-end deployments keep their explicit choice; codex r2
+      MAJOR contract).
+
+    Trade-off: a user who explicitly picks exactly ``text_default``
+    on a VLM is treated as "took the default" and gets bumped. Closing
+    #682 outweighs the rare operator who deliberately wants the text
+    default on VLM. Operators who want the smaller value can pick any
+    nearby number (e.g. 2049) and it's honored.
+
+    Args:
+        user_value: ``getattr(scheduler_config, "prefill_step_size", None)``
+            — ``None`` covers both "no scheduler_config" and "config
+            object without the attribute".
+        text_default: ``SchedulerConfig.prefill_step_size``'s
+            dataclass default (the CLI default).
+        mllm_default: ``MLLMSchedulerConfig.prefill_step_size``'s
+            dataclass default (the MLLM-tuned value).
+
+    Returns:
+        The resolved ``prefill_step_size`` for the MLLM scheduler.
+    """
+    if user_value is None or user_value == text_default:
+        return mllm_default
+    return user_value
+
+
+def _compute_metal_cache_limit(soft_limit_bytes: int) -> int:
+    """Pick a Metal free-cache size that scales with the device's working set.
+
+    The free cache holds memory that was freed by Python objects but not yet
+    returned to the GPU. A larger cache speeds up subsequent allocations
+    (KV cache churn, prefix cache moves) but caps the budget that inference
+    can grow into under load.
+
+    Old behavior (hardcoded 32 GB) was sized for big machines: comfortable on
+    M3 Ultra 256GB (15% of soft limit), but allowed cache to grow to ~50% of
+    the soft limit on M2 Max 96GB, leaving insufficient room for a 35B model
+    + accumulated prefix cache + transient prefill allocations. Small machines
+    hit memory pressure → macOS paging → catastrophic slowdown.
+
+    Scale to 25% of the soft allocation limit, capped at 32 GiB (no change for
+    big machines), floored at 2 GiB (avoid degenerate cache on small machines).
+    Clamp to soft_limit to preserve MLX's implicit cache ≤ memory invariant on
+    pathologically tiny devices.
+    """
+    cache = max(
+        2 * 1024 * 1024 * 1024,
+        min(32 * 1024 * 1024 * 1024, soft_limit_bytes // 4),
+    )
+    return min(cache, soft_limit_bytes) if soft_limit_bytes > 0 else cache
+
+
+# Check for guided generation availability
+try:
+    from ..api.guided import GuidedGenerator, is_guided_available
+
+    HAS_GUIDED = is_guided_available()
+except ImportError:
+    HAS_GUIDED = False
+    GuidedGenerator = None
+
+
+def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
+    """
+    Extract images and videos from OpenAI-format messages.
+
+    Returns:
+        Tuple of (has_media, images_list, videos_list)
+    """
+    images = []
+    videos = []
+
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            # Handle Pydantic models
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            elif hasattr(item, "dict"):
+                item = {k: v for k, v in item.dict().items() if v is not None}
+
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type", "")
+
+            if item_type == "image_url":
+                img_url = item.get("image_url", {})
+                if isinstance(img_url, str):
+                    images.append(img_url)
+                elif isinstance(img_url, dict):
+                    url = img_url.get("url", "")
+                    if url:
+                        images.append(url)
+
+            elif item_type == "image":
+                img = item.get("image") or item.get("url", "")
+                if img:
+                    images.append(img)
+
+            elif item_type == "video_url":
+                vid_url = item.get("video_url", {})
+                if isinstance(vid_url, str):
+                    videos.append(vid_url)
+                elif isinstance(vid_url, dict):
+                    url = vid_url.get("url", "")
+                    if url:
+                        videos.append(url)
+
+            elif item_type == "video":
+                vid = item.get("video") or item.get("url", "")
+                if vid:
+                    videos.append(vid)
+
+    has_media = bool(images or videos)
+    return has_media, images, videos
+
+
+class MLLMModelWrapper:
+    """
+    Wrapper for MLLM models to make them compatible with BatchGenerator.
+
+    BatchGenerator expects model output to be subscriptable (logits array),
+    but MLLM models return LanguageModelOutput objects. This wrapper extracts
+    the logits from the output.
+
+    Also handles Gemma 3's required pixel_values argument by injecting None
+    for text-only requests.
+    """
+
+    def __init__(self, model):
+        self._model = model
+        # Detect if this is a Gemma 3 model (requires pixel_values as positional arg)
+        self._is_gemma3 = (
+            hasattr(model, "model_type")
+            and "gemma3" in str(getattr(model, "model_type", "")).lower()
+        )
+
+    def __call__(self, *args, **kwargs):
+        """Call the model and extract logits from LanguageModelOutput."""
+        # Gemma 3 requires pixel_values as a positional argument, unlike Qwen
+        # which makes it optional. Inject pixel_values=None for text-only requests.
+        if self._is_gemma3 and "pixel_values" not in kwargs:
+            kwargs["pixel_values"] = None
+
+        output = self._model(*args, **kwargs)
+        # If output has logits attribute, return just the logits
+        if hasattr(output, "logits"):
+            return output.logits
+        return output
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped model."""
+        return getattr(self._model, name)
+
+
+def select_checkpoint_positions(
+    candidates: list[int],
+    total: int,
+    *,
+    limit: int = 8,
+    min_spacing: int = 1024,
+) -> list[int]:
+    """从候选边界位置选择检查点集合（纯函数，P1a §11，可单测）。
+
+    规则：升序去重 → 最小间距前向贪心过滤 → 数量上限取最后 limit 个
+    （靠近上下文尾部的边界未来 LCP 命中率最高——E1 实测中位发散点在
+    请求 81% 处，检查点必须覆盖中后段历史）。
+    """
+    valid = sorted({c for c in candidates if 0 < c < total})
+    spaced: list[int] = []
+    for c in valid:
+        if not spaced or c - spaced[-1] >= min_spacing:
+            spaced.append(c)
+    return spaced[-limit:]
+
+
+class BatchedEngine(BaseEngine):
+    """
+    Batched engine for continuous batching.
+
+    This engine provides better throughput when serving multiple
+    concurrent users by batching requests together.
+
+    For MLLM (multimodal) models, this engine uses MLLMScheduler
+    which handles images and videos alongside text generation.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = True,
+        scheduler_config: Any | None = None,
+        stream_interval: int = 1,
+        force_mllm: bool = False,
+        gpu_memory_utilization: float = 0.90,
+        *,
+        force_text: bool = False,
+        force_hybrid: bool = False,
+        no_hybrid: bool = False,
+        force_spec_decode: bool = False,
+        no_spec_decode: bool = False,
+        force_openai_harmony_streaming: bool = False,
+        no_openai_harmony_streaming: bool = False,
+        enable_disk_stream: bool = False,
+        disk_stream_cache_gb: float = 1.0,
+    ):
+        """
+        Initialize the batched engine.
+
+        Args:
+            model_name: HuggingFace model name or local path
+            trust_remote_code: Whether to trust remote code
+            scheduler_config: Optional scheduler configuration
+            stream_interval: Tokens to batch before streaming (1=every token)
+            force_mllm: Force loading as MLLM even if not auto-detected
+            gpu_memory_utilization: Fraction of device memory for Metal allocation
+                limit and emergency threshold (0.0-1.0, default 0.90)
+            force_text: Keyword-only. Force loading as text-only LLM even when
+                auto-detection would route as MLLM (#393 escape hatch).
+                Mutually exclusive with ``force_mllm`` — caller is responsible
+                for not setting both. Keyword-only to avoid shifting
+                positional-arg semantics for existing callers.
+            force_hybrid / no_hybrid: Keyword-only. SOP §10 routing
+                escape hatches for ``ModelConfig.is_hybrid``. Forwarded
+                to ``EngineConfig`` and applied by ``EngineCore.__init__``
+                right after auto-detection. Mutually exclusive.
+            force_spec_decode / no_spec_decode: Keyword-only. SOP §10
+                routing escape hatches for
+                ``ModelConfig.supports_spec_decode``. Mutually exclusive.
+            enable_disk_stream: Keyword-only. ``--disk-stream`` (PRD-
+                rapid-mlx-integration.md). Loads the model lazily and
+                installs ``vllm_mlx.disk_stream_patch`` on its MoE blocks
+                in ``_start_llm``, before the model is handed to
+                ``AsyncEngineCore``. Strictly opt-in; default False keeps
+                every existing caller's behavior unchanged.
+            disk_stream_cache_gb: Keyword-only. Byte budget (GB) for the
+                disk-stream expert LRU cache. Only used when
+                ``enable_disk_stream`` is True.
+        """
+        self._model_name = model_name
+        # Lazily resolved by ``_muse_wire_model()`` — gates the ATEM
+        # channel demux in ``clean_output_text`` on the SERVING MODEL's
+        # checkpoint model_type, never on output bytes (codex r6 #1).
+        self._is_muse_wire: bool | None = None
+        self._trust_remote_code = trust_remote_code
+        self._scheduler_config = scheduler_config
+        self._stream_interval = stream_interval
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._force_hybrid = force_hybrid
+        self._no_hybrid = no_hybrid
+        self._enable_disk_stream = enable_disk_stream
+        self._disk_stream_cache_gb = disk_stream_cache_gb
+        self._force_spec_decode = force_spec_decode
+        self._no_spec_decode = no_spec_decode
+        # #516 — auto-routing escape hatches for the HarmonyStreamingRouter
+        # auto-upgrade introduced in PR #515. Mutually exclusive (CLI
+        # enforces; engine accepts and asserts defensively at use time).
+        self._force_openai_harmony_streaming = force_openai_harmony_streaming
+        self._no_openai_harmony_streaming = no_openai_harmony_streaming
+        # Remember whether the operator EXPLICITLY forced the vision lane.
+        # The automatic text-only degrade (#393/#1187) fires only for
+        # AUTO-detected MLLM routing; an explicit ``--mllm`` is a deliberate
+        # demand for the vision lane, so a missing vision tower must hard-fail
+        # for that operator rather than silently degrade behind their back.
+        self._force_mllm = force_mllm
+        if force_text:
+            # User explicitly opted out of MLLM routing. Skip the probe
+            # entirely so a False from auto-detection can't be overridden
+            # by a future config-based True.
+            self._is_mllm = False
+        else:
+            self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._tool_logits_processor_factory = None
+
+        self._model = None
+        self._processor = None  # For MLLM
+        self._tokenizer = None  # For LLM
+        self._engine = None  # AsyncEngineCore for LLM
+        self._mllm_scheduler = None  # MLLMScheduler for MLLM
+        self._model_load_executor = None  # mlx-step worker (#170)
+        self._mllm_instance = None  # MLXMultimodalLM instance
+        self._loaded = False
+        self._engine_started = False  # Track if engine loop is running
+        self._start_time: float | None = None
+
+        # Atomic admission counter. Tracks in-flight requests admitted
+        # via ``check_admission``; released by
+        # ``release_admission_reservation`` once the route handler is
+        # done (response sent / streaming generator closed). The cap
+        # check + bump runs under ``_admission_lock`` so two concurrent
+        # route handlers cannot both pass admission at ``cap-1`` — the
+        # race codex R2 flagged on the streaming path.
+        # ``threading.Lock`` (not ``asyncio.Lock``) because the scheduler
+        # step thread also calls these methods in defence-in-depth
+        # checks; an asyncio lock would only serialise the event loop.
+        self._admission_lock = threading.Lock()
+        self._admission_reservations = 0
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name."""
+        return self._model_name
+
+    @property
+    def is_mllm(self) -> bool:
+        """Check if this is a multimodal model."""
+        return self._is_mllm
+
+    def check_admission(self) -> None:
+        """Atomic admission gate that *reserves* a slot on success.
+
+        Under ``_admission_lock``, compares
+        ``_admission_reservations`` to ``max_concurrent_requests``;
+        if the cap is reached, raises ``BackpressureError``; otherwise
+        bumps the counter so a second concurrent caller sees the cap
+        immediately. Closes the streaming race codex R2 flagged where
+        two requests at ``cap-1`` could both pass a plain check-then-
+        act gate and then have the loser raise ``BackpressureError``
+        *inside* the response generator (which would degrade to a 200
+        SSE error chunk instead of a clean HTTP 503).
+
+        The reservation counter is authoritative for the cap — the
+        scheduler's own ``len(requests) >= cap`` check in
+        ``Scheduler.add_request`` is retained as defence in depth (a
+        direct ``add_request`` caller that bypasses the engine would
+        still hit it) but the route-handler path lives entirely on
+        this counter, so a request never double-counts.
+
+        The caller MUST call ``release_admission_reservation`` exactly
+        once per successful ``check_admission`` — when the request is
+        finished (response sent, generator closed, validation error,
+        whatever). ``_disconnect_guard`` and ``_wait_with_disconnect``
+        do this from a ``finally`` clause so route handlers don't have
+        to thread it manually.
+        """
+        from ..scheduler import BackpressureError
+
+        if self._is_mllm and self._mllm_scheduler is not None:
+            cap = getattr(self._mllm_scheduler.config, "max_concurrent_requests", None)
+        else:
+            # ``self._engine`` is an ``AsyncEngineCore`` wrapper; the
+            # actual ``Scheduler`` lives on its inner ``EngineCore`` —
+            # ``self._engine.engine.scheduler``. The old
+            # ``getattr(self._engine, "scheduler", None)`` lookup
+            # silently returned ``None`` because ``AsyncEngineCore``
+            # does not expose ``scheduler`` directly, so the LLM
+            # admission gate was a no-op (codex R4 BLOCKER: streaming
+            # text requests at cap were degrading to 200 SSE error
+            # chunks instead of the intended 503 + Retry-After).
+            inner_engine = (
+                getattr(self._engine, "engine", None) if self._engine else None
+            )
+            scheduler = getattr(inner_engine, "scheduler", None)
+            if scheduler is None:
+                # Cold-start / pre-load window — the scheduler may not
+                # exist yet but a burst of streaming requests can
+                # still pour in. Fall back to the configured cap from
+                # ``self._scheduler_config`` so the reservation
+                # counter enforces backpressure even before
+                # ``_start_llm``/``_start_mllm`` finishes (codex R6
+                # P2: without this, cold-start requests slipped past
+                # admission and the late ``BackpressureError`` from
+                # ``add_request`` degraded to a 200 SSE error chunk).
+                # When the engine was constructed without an explicit
+                # ``scheduler_config`` (e.g. ``load_model`` defaults,
+                # tests, or programmatic ``BatchedEngine(...)``
+                # callers), ``self._scheduler_config`` is ``None`` —
+                # use the dataclass default so the gate still
+                # enforces 256 instead of silently degrading to a
+                # no-op (codex R10 P2).
+                from ..scheduler import SchedulerConfig
+
+                sc = self._scheduler_config
+                if sc is None:
+                    sc = SchedulerConfig()
+                cap = getattr(sc, "max_concurrent_requests", None)
+            else:
+                cap = getattr(scheduler.config, "max_concurrent_requests", None)
+
+        if cap is None or cap <= 0:
+            return
+
+        with self._admission_lock:
+            if self._admission_reservations >= cap:
+                raise BackpressureError(
+                    f"max_concurrent_requests={cap} reached "
+                    f"(currently {self._admission_reservations} in-flight)"
+                )
+            self._admission_reservations += 1
+
+    def release_admission_reservation(self) -> None:
+        """Release a slot reserved by ``check_admission``.
+
+        Idempotent below zero — a stray extra release (e.g. both
+        success path and a finally clause firing on an unusual
+        cancellation) cannot corrupt the cap accounting.
+        """
+        with self._admission_lock:
+            if self._admission_reservations > 0:
+                self._admission_reservations -= 1
+
+    @property
+    def tokenizer(self) -> Any:
+        """Get the tokenizer."""
+        if self._is_mllm and self._processor:
+            return getattr(self._processor, "tokenizer", self._processor)
+        return self._tokenizer
+
+    def generate_warmup(self) -> None:
+        """Run a minimal forward pass to compile Metal shaders.
+
+        Routes through the MLX step thread so cache arrays touched during
+        warmup carry the step thread's generation_stream. Otherwise models
+        with eagerly-materialized caches (Gemma 4 RotatingKVCache,
+        sliding-window) raise "There is no Stream(gpu, 1) in current thread"
+        on the first request because BatchGenerator.prompt() runs on the
+        step thread but evals state tagged with the main thread's stream
+        (#170, follow-on to #161 / #167).
+        """
+        if not self._loaded or self._model is None or self._is_mllm:
+            return
+        try:
+            import mlx.core as mx
+
+            tokens = self._tokenizer.encode("Hi")
+
+            def _warmup_forward() -> None:
+                # Allocate input on the step thread so the array is bound to
+                # the worker's generation_stream — main-thread allocation
+                # poisons every downstream op with a stream the worker can't
+                # eval (#170 hot path on mlx-lm 0.31.3+ where streams are
+                # ThreadLocalStream).
+                input_ids = mx.array([tokens])
+                out = self._model(input_ids)
+                mx.eval(out)
+
+            engine_core = (
+                getattr(self._engine, "engine", None) if self._engine else None
+            )
+            if (
+                engine_core is not None
+                and getattr(engine_core, "_mlx_executor", None) is not None
+            ):
+                engine_core._run_on_step_thread(_warmup_forward)
+            else:
+                _warmup_forward()
+        except Exception:
+            pass  # Non-fatal
+
+    async def start(self) -> None:
+        """Start the engine (load model if not loaded)."""
+        if self._loaded:
+            return
+
+        if self._is_mllm:
+            await self._start_mllm()
+        else:
+            await self._start_llm()
+
+        self._loaded = True
+        self._start_time = time.monotonic()
+        logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
+
+    async def _start_mllm(self) -> None:
+        """Start the MLLM engine with MLLMScheduler (continuous batching)."""
+        import concurrent.futures
+
+        from ..engine_core import _init_mlx_step_thread
+        from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from ..models.mllm import MLXMultimodalLM, TextOnlyCheckpointError
+        from ..scheduler import SchedulerConfig
+
+        # MLLM-tuned default for ``prefill_step_size``. Vision tokens balloon
+        # the prompt size on VLMs (~2200 tokens for a 1920×1080 Qwen3-VL
+        # screenshot), so we override only when the user left the text-LLM
+        # default (2048) — see the bump-policy comment below for the rationale.
+        _MLLM_DEFAULT_PREFILL_STEP_SIZE = MLLMSchedulerConfig.__dataclass_fields__[
+            "prefill_step_size"
+        ].default
+
+        # Load the MLLM model on a dedicated worker thread (#170 / #174 fix
+        # extended to MLLM). mlx-lm 0.31.3+ tags every mx.array with the
+        # calling thread's default stream, and MLLMScheduler.batch_generator
+        # later evals against these weights. Loading on the asyncio loop
+        # thread and stepping on a separate mllm-step worker would crash with
+        # "There is no Stream(gpu, N) in current thread" on the first request.
+        # The same executor is then handed to MLLMScheduler so step calls
+        # land on the model-owning thread.
+        self._model_load_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mllm-step",
+            initializer=_init_mlx_step_thread,
+        )
+
+        def _load_mllm() -> MLXMultimodalLM:
+            instance = MLXMultimodalLM(
+                self._model_name,
+                trust_remote_code=self._trust_remote_code,
+            )
+            instance.load()
+            return instance
+
+        # Reason string for the text-only degrade, set only when we intend to
+        # fall back. Captured so the fallback can run OUTSIDE the ``except``
+        # block — see the memory-release note below.
+        degrade_reason: str | None = None
+        try:
+            self._mllm_instance = self._model_load_executor.submit(_load_mllm).result()
+        except Exception as e:
+            # ANY load failure tears down the mllm-step worker FIRST so its
+            # thread never leaks — this runs whether we degrade or re-raise
+            # (codex BLOCKING: previously only TextOnlyCheckpointError shut it
+            # down, so an unrelated failure orphaned the executor).
+            self._model_load_executor.shutdown(wait=True)
+            self._model_load_executor = None
+            # A TextOnlyCheckpointError means the checkpoint's config.json
+            # declares a vision modality (so ``is_mllm_model`` routed it here)
+            # but mlx-vlm found no usable vision tower in the actual
+            # safetensors — a text-only fork, a broken multimodal quant, or an
+            # index.json that lists vision tensors the shards don't contain
+            # (gemma-4 OptiQ, #1187). The routing detector reads the index and
+            # cannot see this before load; mlx-vlm's strict weight load is the
+            # authoritative signal. The language backbone IS fully present, so
+            # auto-degrade to the text lane instead of aborting startup —
+            # exactly what ``--no-mllm`` would have done, done automatically.
+            #
+            # Everything else — corrupt language weights, unsupported arch,
+            # OOM — and ANY failure under an explicit ``--mllm`` (``force_mllm``,
+            # where degrading silently would betray a deliberate demand for the
+            # vision lane) is a hard failure and propagates unchanged.
+            if isinstance(e, TextOnlyCheckpointError) and not self._force_mllm:
+                degrade_reason = str(e)
+            else:
+                raise
+
+        # Fallback runs OUTSIDE the ``except`` so the caught exception (and the
+        # traceback frames it pins) is released FIRST. mlx-vlm's failed
+        # ``load_model`` holds the whole weights dict + the partially built
+        # model in the frame that raised; ``e.__cause__``'s traceback keeps
+        # that alive for the duration of the handler. Loading the text model
+        # while it is still pinned would transiently DOUBLE resident memory and
+        # can OOM a RAM-tight box (the #1187 reporter is on a 48 GB M4 Max).
+        # ``gc.collect()`` forces the now-unreferenced partial vision load to
+        # be reclaimed before the text lane allocates. (Codex review: MAJOR.)
+        if degrade_reason is not None:
+            import gc
+
+            logger.warning(
+                "%s — auto-falling back to text-only serving for '%s'. "
+                "Multimodal requests (image/video/audio) will be rejected. "
+                "Pass --mllm to force the multimodal lane (it will fail on this "
+                "checkpoint), or --no-mllm to silence this warning. See #393.",
+                degrade_reason,
+                self._model_name,
+            )
+            gc.collect()
+            self._is_mllm = False
+            await self._start_llm()
+            return
+
+        self._model = self._mllm_instance.model
+        self._processor = self._mllm_instance.processor
+
+        # Probe the language-backbone cache before the port reports ready.
+        # ArraysCache has the merge/filter/extract primitives needed for a
+        # correctness-first serialized lane (#1796), but concurrent hybrid
+        # batching is intentionally not enabled. Mamba, quantized, and unknown
+        # cache types continue to fail at startup with the #352 diagnostic.
+        language_model = getattr(self._model, "language_model", self._model)
+        cache_type = self._model_load_executor.submit(
+            _probe_mllm_cache_type, language_model
+        ).result()
+        arrays_cache_compat = cache_type == "ArraysCache"
+        if cache_type is not None and not arrays_cache_compat:
+            raise RuntimeError(
+                f"Model '{self._model_name}' uses a hybrid/linear-attention "
+                f"language backbone ({cache_type}), which is incompatible "
+                f"with --mllm continuous batching (requires standard KVCache "
+                f"or RotatingKVCache). Drop --mllm for text-only use, or pick "
+                f"a non-hybrid VLM (Qwen3-VL, Gemma-3, etc.). See #352."
+            )
+
+        # Create MLLM scheduler config with batch generator support
+        if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
+            max_num_seqs = self._scheduler_config.max_num_seqs
+        else:
+            max_num_seqs = 16  # Default for continuous batching
+
+        # Get batch sizes from config if available. Fallback defaults match
+        # SchedulerConfig's canonical defaults so a config object missing
+        # these fields (e.g., a stripped-down test double) does not silently
+        # downgrade MLLM batch sizes vs the standard text path.
+        prefill_batch_size = getattr(self._scheduler_config, "prefill_batch_size", 8)
+        completion_batch_size = getattr(
+            self._scheduler_config, "completion_batch_size", 32
+        )
+        (
+            max_num_seqs,
+            prefill_batch_size,
+            completion_batch_size,
+            arrays_cache_compat,
+        ) = _resolve_mllm_cache_policy(
+            cache_type,
+            max_num_seqs,
+            prefill_batch_size,
+            completion_batch_size,
+        )
+        if arrays_cache_compat:
+            logger.warning(
+                "Model '%s' uses ArraysCache; enabling serialized hybrid MLLM "
+                "compatibility (one active request, additional requests queued).",
+                self._model_name,
+            )
+        # ``prefill_step_size`` for MLLM is the per-request budget that
+        # caps total prompt tokens (vision + text). See
+        # ``_resolve_mllm_prefill_step_size`` for the bump-policy
+        # rationale (#682).
+        prefill_step_size = _resolve_mllm_prefill_step_size(
+            getattr(self._scheduler_config, "prefill_step_size", None),
+            text_default=SchedulerConfig.__dataclass_fields__[
+                "prefill_step_size"
+            ].default,
+            mllm_default=_MLLM_DEFAULT_PREFILL_STEP_SIZE,
+        )
+        # Carry the user-configured admission cap across to the MLLM
+        # scheduler. Without this, a server started with
+        # ``SchedulerConfig(max_concurrent_requests=N)`` would always
+        # admission-gate MLLM routes against the dataclass default —
+        # leaving memory-constrained vision deployments without the
+        # configured backpressure protection (codex R5). Fallback 256
+        # matches ``MLLMSchedulerConfig``'s own dataclass default so
+        # the no-explicit-config programmatic construction path (no
+        # ``scheduler_config`` passed to ``BatchedEngine``) still
+        # admission-gates rather than passing ``None`` through and
+        # silently disabling the cap (codex R8).
+        max_concurrent_requests = getattr(
+            self._scheduler_config, "max_concurrent_requests", 256
+        )
+
+        mllm_config = MLLMSchedulerConfig(
+            max_num_seqs=max_num_seqs,
+            prefill_batch_size=prefill_batch_size,
+            completion_batch_size=completion_batch_size,
+            prefill_step_size=prefill_step_size,
+            enable_vision_cache=True,
+            vision_cache_size=100,
+            max_concurrent_requests=max_concurrent_requests,
+            allow_arrays_cache=arrays_cache_compat,
+        )
+
+        # Create and start MLLM scheduler — pass the model-owning executor so
+        # _step_no_queue runs on the same thread as model load.
+        self._mllm_scheduler = MLLMScheduler(
+            model=self._model,
+            processor=self._processor,
+            config=mllm_config,
+            step_executor=self._model_load_executor,
+        )
+        await self._mllm_scheduler.start()
+
+        logger.info(
+            f"MLLM Scheduler started with continuous batching: "
+            f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
+            f"completion_batch={completion_batch_size}"
+        )
+
+    async def _start_llm(self) -> None:
+        """Start the LLM engine with AsyncEngineCore."""
+        import concurrent.futures
+
+        from ..engine_core import AsyncEngineCore, EngineConfig, _init_mlx_step_thread
+        from ..scheduler import SchedulerConfig
+        from ..utils.tokenizer import load_model_with_fallback
+
+        # Build tokenizer config
+        tokenizer_config = {"trust_remote_code": self._trust_remote_code}
+
+        # Qwen3 fix
+        if "qwen3" in self._model_name.lower() or "Qwen3" in self._model_name:
+            tokenizer_config["eos_token"] = "<|im_end|>"
+
+        # Load model on the future MLX step worker thread (#170).
+        # mlx-lm 0.31.3+ binds module-level `generation_stream` and any
+        # auto-default stream to the thread that triggers them. If the model
+        # weights, quantization tables, or `mx.compile`-cached graphs are
+        # touched on the asyncio loop thread first, every later eval on the
+        # step worker hits "There is no Stream(gpu, 1) in current thread."
+        # Spinning the step worker BEFORE model load — and reusing the same
+        # worker for AsyncEngineCore via the model_load_executor handoff —
+        # keeps every MLX op on a single owning thread.
+        self._model_load_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mlx-step",
+            initializer=_init_mlx_step_thread,
+        )
+        # getattr-guarded (not a direct self._enable_disk_stream read):
+        # some tests build a BatchedEngine via object.__new__ and set only
+        # the attributes their scenario needs (see
+        # tests/test_mtp_cli_wiring.py::test_start_llm_calls_apply_mtp_dispatch),
+        # bypassing __init__ entirely. Matches this file's existing
+        # getattr(self._scheduler_config, ...) defensive style.
+        if getattr(self, "_enable_disk_stream", False):
+            # --disk-stream: load lazily (routed-expert MoE weights never
+            # materialized) and install the disk-streaming patch on this
+            # SAME mlx-step worker, before the model is handed to
+            # AsyncEngineCore below. Skips the dspark/MTP load_kwargs
+            # path above — disk-stream and dspark aren't a validated
+            # combination and lazy loading bypasses
+            # load_model_with_fallback's fallback branches entirely (see
+            # its docstring).
+            self._model, self._tokenizer = self._model_load_executor.submit(
+                _load_lazy_and_install_disk_stream,
+                self._model_name,
+                tokenizer_config,
+                getattr(self, "_disk_stream_cache_gb", 1.0),
+            ).result()
+        else:
+            load_kwargs = {"tokenizer_config": tokenizer_config}
+            if self._scheduler_config is not None and (
+                getattr(self._scheduler_config, "spec_decode", "none") == "dspark"
+            ):
+                load_kwargs["enable_dspark"] = True
+            self._model, self._tokenizer = self._model_load_executor.submit(
+                load_model_with_fallback,
+                self._model_name,
+                **load_kwargs,
+            ).result()
+
+        # 0.9.13 PR-A: new-arch MTP inject dispatcher (Gemma 4 external
+        # assistant / Qwen3.5 baked-in MTP). Runs BEFORE the scheduler is
+        # built so ``_install_mtp_vendored`` in scheduler.py sees the
+        # ``mtp_forward`` / ``make_mtp_cache`` / ``mtp`` attributes it
+        # gates on. Kept on the model-load executor thread — the family
+        # injector (Gemma 4 in particular) materialises assistant weights
+        # via ``mlx_lm.load`` and mutates the target model in place, both
+        # of which touch MLX streams that only the mlx-step worker owns
+        # (#170). Running here on the asyncio thread would create a
+        # stray Stream(gpu, N) reference on first assistant forward.
+        #
+        # The CLI eligibility gate at ``cli.py:_gather_kv_cache_dtype_inputs``
+        # / ``detect_mtp_eligibility(...)`` already rejected non-eligible
+        # configs — this call is a strict subordinate of that decision.
+        # Dispatch is a no-op (returns False, logs INFO) for any
+        # ``model_type`` not in the dispatch table, so an operator who
+        # forgot the CLI gate still gets a clean skip rather than a
+        # traceback.
+        sc = self._scheduler_config
+        _new_arch_mtp = sc is not None and getattr(sc, "spec_decode", "none") == "mtp"
+        if _new_arch_mtp:
+            # Codex round-G NIT #4 + BLOCKING #3: entire dispatch
+            # gate now lives in :func:`_apply_mtp_dispatch` so tests
+            # can exercise it end-to-end (not just via a source
+            # string check) and the executor call carries a bounded
+            # timeout that converts a stuck HF/DNS load into a
+            # clean startup ``RuntimeError`` instead of an
+            # indefinite hang.
+            _apply_mtp_dispatch(
+                model=self._model,
+                model_name=self._model_name,
+                scheduler_config=sc,
+                executor=self._model_load_executor,
+            )
+
+        # Set Metal memory limits on the SAME mlx-step worker that loaded
+        # the model. Calling these from the asyncio loop thread would touch
+        # MLX from a thread that doesn't own the worker stream and create
+        # a stray Stream(gpu, 1) reference (#170).
+        def _set_metal_limits() -> None:
+            import mlx.core as mx
+
+            if not mx.metal.is_available():
+                return
+            device_info = mx.device_info()
+            max_recommended = device_info.get(
+                "max_recommended_working_set_size",
+                device_info.get("memory_size", 0),
+            )
+            if max_recommended > 0:
+                soft_limit = int(max_recommended * self._gpu_memory_utilization)
+                mx.set_memory_limit(soft_limit)
+                cache_limit = _compute_metal_cache_limit(soft_limit)
+                mx.set_cache_limit(cache_limit)
+                pct = self._gpu_memory_utilization * 100
+                logger.info(
+                    f"Metal memory limits set: "
+                    f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                    f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
+                    f"cache_limit={cache_limit / 1e9:.1f}GB"
+                )
+
+        try:
+            self._model_load_executor.submit(_set_metal_limits).result()
+        except Exception as e:
+            logger.warning(f"Failed to set Metal memory limits: {e}")
+
+        # Create engine config
+        scheduler_config = self._scheduler_config or SchedulerConfig()
+        engine_config = EngineConfig(
+            model_name=self._model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=self._stream_interval,
+            gpu_memory_utilization=self._gpu_memory_utilization,
+            tool_logits_processor_factory=self._tool_logits_processor_factory,
+            force_hybrid=self._force_hybrid,
+            no_hybrid=self._no_hybrid,
+            force_spec_decode=self._force_spec_decode,
+            no_spec_decode=self._no_spec_decode,
+        )
+
+        # Create async engine and hand it the EXISTING model-load executor
+        # so all subsequent MLX work (forward passes, cache materialization,
+        # eval) runs on the same worker thread that owns the model weights.
+        self._engine = AsyncEngineCore(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            config=engine_config,
+        )
+
+        await self._engine.engine.start(executor=self._model_load_executor)
+        self._engine_started = True
+
+    async def stop(self) -> None:
+        """Stop the engine and cleanup resources."""
+        if self._mllm_scheduler:
+            await self._mllm_scheduler.stop()
+            self._mllm_scheduler = None
+            # MLLMScheduler doesn't own the injected executor, so shut it
+            # down here on the MLLM path. (For LLM, _engine.stop() already
+            # tore it down via the executor handoff.)
+            if self._is_mllm and self._model_load_executor is not None:
+                self._model_load_executor.shutdown(wait=False)
+
+        if self._engine:
+            await self._engine.stop()
+            self._engine.engine.close()
+            self._engine = None
+
+        # _engine.stop() already shutdown the shared mlx-step executor
+        # (handed off in start()). Drop our reference so __del__ doesn't
+        # double-shutdown.
+        self._model_load_executor = None
+        self._start_time = None
+
+        self._model = None
+        self._tokenizer = None
+        self._processor = None
+        self._mllm_instance = None
+        self._loaded = False
+        self._engine_started = False
+        logger.info("BatchedEngine stopped")
+
+    def _prepare_harmony_no_thinking_prompt(
+        self,
+        prompt: str,
+        *,
+        enable_thinking: bool | None,
+        has_tools: bool,
+        as_token_ids: bool,
+    ) -> tuple[str | list[int], tuple[int, ...] | None]:
+        """Open Harmony's final channel when thinking is disabled.
+
+        GPT-OSS ignores the generic ``enable_thinking`` template kwarg. Its
+        protocol instead requires an empty analysis message followed by an
+        open final message. Build that continuation from tokenizer-owned IDs
+        after template rendering so Harmony control markers are structural
+        tokens, never user text.
+
+        Tool requests are excluded: Harmony tool calls are emitted through
+        the commentary channel and forcing final would make them impossible.
+        Non-Harmony or non-canonical templates fail closed to the unchanged
+        string prompt.
+
+        Returns the generation/accounting prompt and the suffix IDs used to
+        prime the output router into the same open-final state.
+        """
+        if enable_thinking is not False or has_tools or self._is_mllm:
+            return prompt, None
+
+        tokenizer = self.tokenizer
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(convert) or not callable(encode):
+            return prompt, None
+
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+
+        def _ids_for(tokens: tuple[str, ...]) -> tuple[int, ...] | None:
+            ids: list[int] = []
+            for token in tokens:
+                try:
+                    token_id = convert(token)
+                except Exception:
+                    logger.debug(
+                        "Harmony no-thinking token lookup failed for %r",
+                        token,
+                        exc_info=True,
+                    )
+                    return None
+                if (
+                    not isinstance(token_id, int)
+                    or isinstance(token_id, bool)
+                    or token_id < 0
+                    or token_id == unk_id
+                ):
+                    return None
+                ids.append(token_id)
+            return tuple(ids)
+
+        assistant_prefix_ids = _ids_for(_HARMONY_ASSISTANT_PREFIX_TOKENS)
+        suffix_ids = _ids_for(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+        if assistant_prefix_ids is None or suffix_ids is None:
+            return prompt, None
+
+        bos = getattr(tokenizer, "bos_token", None)
+        add_special_tokens = bos is None or not prompt.startswith(bos)
+        try:
+            prompt_ids = list(encode(prompt, add_special_tokens=add_special_tokens))
+        except Exception:
+            logger.debug(
+                "Harmony no-thinking prompt tokenization failed",
+                exc_info=True,
+            )
+            return prompt, None
+
+        # Canonical GPT-OSS templates end at ``<|start|>assistant``. Refuse
+        # to inject into a custom template with a different boundary.
+        if tuple(prompt_ids[-len(assistant_prefix_ids) :]) != assistant_prefix_ids:
+            logger.debug(
+                "Harmony no-thinking skipped: generation prompt does not end "
+                "with <|start|>assistant"
+            )
+            return prompt, None
+
+        if as_token_ids:
+            return [*prompt_ids, *suffix_ids], suffix_ids
+        return prompt + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS), suffix_ids
+
+    def build_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """Render the chat prompt for ``messages`` + ``tools`` without starting
+        generation.
+
+        ``add_generation_prompt`` (default True) toggles the assistant
+        generation prefix; the reasoning-budget seed probe renders twice
+        (True/False) and diffs to isolate the template-added prefix exactly.
+
+        Used for streaming chat-template eager validation so ``TemplateError``
+        surfaces as HTTP 400 instead of a mid-stream failure.
+        """
+        if not self._loaded:
+            raise RuntimeError("Engine not loaded — call start() first")
+        if self._is_mllm:
+            raise RuntimeError("build_prompt is not supported for MLLM models")
+        template_tools = convert_tools_for_template(tools) if tools else None
+        prompt = self._apply_chat_template(
+            messages,
+            tools=template_tools,
+            enable_thinking=enable_thinking,
+            add_generation_prompt=add_generation_prompt,
+        )
+        prepared, _ = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=False,
+        )
+        return prepared
+
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        num_images: int = 0,
+        enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """Apply chat template to messages.
+
+        Uses the processor's (or tokenizer's) apply_chat_template with the
+        full message list so that system prompts and conversation history
+        are preserved.
+
+        Args:
+            messages: Chat messages in OpenAI format.
+            tools: Converted tool definitions for template.
+            num_images: Number of images (triggers MLLM message preparation).
+            enable_thinking: Whether to enable thinking mode (None = auto).
+        """
+        messages = _normalize_tool_call_arguments_for_template(messages)
+
+        # Choose the best template applicator.
+        # For MLLM models, the processor handles special vision tokens.
+        # For text-only models, the tokenizer is sufficient.
+        #
+        # Subtlety: some MLLM processors (notably ``Gemma3nProcessor`` and
+        # ``Gemma3Processor`` as loaded by ``mlx_vlm.load``) expose
+        # ``apply_chat_template`` as a method but ship ``chat_template=None``
+        # at the processor layer — only the inner tokenizer carries the
+        # Jinja template. Calling ``processor.apply_chat_template`` then
+        # raises ``ValueError: Cannot use apply_chat_template because this
+        # processor does not have a chat template.`` and every request
+        # returns zero tokens. The inner tokenizer's template understands
+        # the same image/audio content types (it's the source the processor
+        # would have copied from), so falling back to it is safe for both
+        # text-only and vision requests.
+        template_applicator = None
+        if (
+            self._is_mllm
+            and self._processor
+            and hasattr(self._processor, "apply_chat_template")
+            and getattr(self._processor, "chat_template", None)
+        ):
+            template_applicator = self._processor
+        elif hasattr(self.tokenizer, "apply_chat_template"):
+            template_applicator = self.tokenizer
+
+        # Convert OpenAI image_url content parts to HuggingFace format
+        # so the processor can insert the correct vision placeholder tokens.
+        if self._is_mllm and num_images > 0:
+            messages = self._prepare_mllm_messages(messages)
+
+        # If no suitable applicator was found, pass self.tokenizer anyway;
+        # the shared function will fall back to plain-text formatting when
+        # apply_chat_template is missing.
+        applicator = template_applicator or self.tokenizer
+        return shared_apply_chat_template(
+            applicator,
+            messages,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            model_name=self._model_name,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    @staticmethod
+    def _prepare_mllm_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert OpenAI-style image_url content to HuggingFace format.
+
+        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
+        while HuggingFace processors expect ``{"type": "image"}``.
+
+        Args:
+            messages: List of chat messages in OpenAI format. Each message is a
+                dict with at least ``role`` and ``content`` keys.
+
+        Returns:
+            A new list of messages with ``image_url`` parts replaced by
+            ``{"type": "image"}`` entries for the HuggingFace processor.
+        """
+        prepared = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        new_content.append({"type": "image"})
+                    elif isinstance(part, (dict, str)):
+                        new_content.append(part)
+                    # skip non-dict/non-str parts to avoid passing unexpected types
+                prepared.append({**msg, "content": new_content})
+            else:
+                prepared.append(msg)
+        return prepared
+
+    async def generate(
+        self,
+        prompt: str | list[int],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """
+        Generate a complete response (non-streaming).
+
+        Args:
+            prompt: Input text
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            images: Optional image URLs/paths (for MLLM)
+            videos: Optional video URLs/paths (for MLLM)
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            GenerationOutput with complete text
+        """
+        if not self._loaded:
+            await self.start()
+
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests when model is multimodal.
+            # MLLM models only initialise the _mllm_scheduler (not _engine),
+            # so text-only requests must also be routed here.
+            #
+            # ``_assistant_text_prefix`` — see the text-engine branch
+            # below for the rationale. The MLLM branch pops the same
+            # key off ``kwargs`` so the forced-tool prefix is included
+            # in the returned ``text`` / ``raw_text`` (codex r2 P2:
+            # without this, qwen3-vl-2b-4bit's forced ``tool_choice``
+            # path would fall through to the post-parse synthesis
+            # fallback because the parser sees only the model
+            # continuation, not the prefixed envelope).
+            mllm_assistant_text_prefix = kwargs.pop("_assistant_text_prefix", "") or ""
+            # OpenAI-spec penalty passthrough (#512). Mirror the LLM
+            # branch below: pop the three penalty knobs out of kwargs
+            # and forward to the MLLM scheduler so the route-layer
+            # cascade (chat / completions / responses / anthropic) reaches
+            # the per-request logits processors inside the VLM batch
+            # generator. ``top_k`` / ``min_p`` / ``seed`` MLLM passthrough
+            # is intentionally NOT in scope here — see #512 follow-ups.
+            _mllm_penalty_kwargs = {
+                k: kwargs.pop(k)
+                for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
+                if k in kwargs
+            }
+            output = await self._mllm_scheduler.generate(
+                prompt=prompt,
+                images=images,
+                videos=videos,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                video_fps=kwargs.pop("video_fps", None),
+                video_max_frames=kwargs.pop("video_max_frames", None),
+                **_mllm_penalty_kwargs,
+            )
+            mllm_full_text = output.output_text or ""
+            if mllm_assistant_text_prefix:
+                mllm_full_text = mllm_assistant_text_prefix + mllm_full_text
+
+            return GenerationOutput(
+                text=clean_output_text(mllm_full_text),
+                raw_text=mllm_full_text,
+                tokens=output.output_token_ids,
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                finish_reason=output.finish_reason,
+                # H-03: MLLM non-stream parity — propagate the matched
+                # stop string for the Anthropic adapter.
+                matched_stop=getattr(output, "matched_stop", None),
+            )
+
+        # Use LLM engine for text-only (non-MLLM models)
+        from ..request import SamplingParams
+
+        # Extended sampling params (#355). The route handler only forwards
+        # keys it has explicit client values for, so any field absent from
+        # kwargs falls back to SamplingParams' own defaults. All five
+        # extended fields are wired into the scheduler — top_k via the
+        # sampler, repetition/presence/frequency_penalty via mlx-lm's
+        # make_logits_processors().
+        _sp_kwargs = {
+            k: kwargs.pop(k)
+            for k in (
+                "top_k",
+                "min_p",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                # H-11: forward the per-request seed onto SamplingParams
+                # so the scheduler can build a fresh seeded sampler. Without
+                # this, the seed field on the request model is parsed,
+                # validated, and silently dropped — Tomek r3's reproduced
+                # failure mode (five calls with seed=42 → five different
+                # outputs).
+                "seed",
+            )
+            if k in kwargs
+        }
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop or [],
+            **_sp_kwargs,
+        )
+
+        # Forward prefix_boundary so multi-turn hybrid models save the
+        # snapshot at the message boundary (#427). Set by ``chat()`` after
+        # message-aware boundary computation; absent for raw-prompt callers.
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        # P1a LCP snap-down（§11）：多边界检查点位置（chat() 经
+        # PROXY_CACHE_LCP_SNAPDOWN 计算传入；raw-prompt 调用者缺席 = 不启用）。
+        prefix_boundaries = kwargs.pop("prefix_boundaries", None)
+        # PFlash routing hints (#287). chat()/stream_chat() set these
+        # from tools / response_format; raw-prompt callers default to
+        # the safe (un-protected) values.
+        has_tools = bool(kwargs.pop("has_tools", False))
+        requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
+        # Forced-tool-call prefix injected by ``chat()`` when the OpenAI
+        # ``tool_choice`` is a forced function; the engine generates only
+        # the continuation, so we prepend the prefix to the response text
+        # below before the tool parser scans it.
+        assistant_text_prefix = kwargs.pop("_assistant_text_prefix", "") or ""
+        output_router_seed = kwargs.pop("_output_router_seed_token_ids", None)
+        # Grammar-constrained tool calling (#558): per-request logits
+        # processor forwarded to the scheduler's request_processors slot.
+        grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
+        reasoning_budget_logits_processor = kwargs.pop(
+            "reasoning_budget_logits_processor", None
+        )
+        suppressed_tokens_logits_processor = kwargs.pop(
+            "suppressed_tokens_logits_processor", None
+        )
+        if output_router_seed is None and isinstance(prompt, str):
+            # ``build_prompt(enable_thinking=False)`` is part of the public
+            # engine contract and returns the prepared Harmony string. A
+            # caller may feed that string back into ``generate()`` without
+            # going through ``chat()``, which is normally responsible for
+            # carrying the private router seed. Recover the seed from the
+            # exact prepared suffix so routing starts in the prompt-opened
+            # final channel on that composition path too.
+            suffix = "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS)
+            if prompt.endswith(suffix):
+                base_prompt = prompt[: -len(suffix)]
+                _, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+                    base_prompt,
+                    enable_thinking=False,
+                    has_tools=False,
+                    as_token_ids=False,
+                )
+        output = await self._engine.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
+            prefix_boundaries=prefix_boundaries,
+            has_tools=has_tools,
+            requires_prompt_integrity=requires_prompt_integrity,
+            grammar_logits_processor=grammar_logits_processor,
+            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
+            suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
+        )
+
+        if assistant_text_prefix:
+            # Prepend the forced prefix to the raw text so the tool
+            # parser sees the complete wire envelope.
+            output_text = assistant_text_prefix + (output.output_text or "")
+            output.output_text = output_text
+        text = clean_output_text(output.output_text, muse_wire=self._muse_wire_model())
+        # Token-level channel extraction via ``OutputRouter`` — the SAME
+        # state machine the streaming path already uses
+        # (``_stream_with_output_router``). For non-streaming we feed the
+        # full token sequence through ``feed_sequence`` to get the
+        # authoritative reasoning/content split. Text-based regex
+        # cleaning above (``clean_output_text``) keeps working for the
+        # happy paths (final channel present, or tool-call commentary
+        # bail-out); the router result tells us when text-based cleaning
+        # would be WRONG — specifically the "analysis channel only, no
+        # final" case where ``_clean_gpt_oss_output``'s else branch
+        # would otherwise leak the analysis body into ``content``
+        # (issue #442). The router doesn't care about ``<|end|>``
+        # terminators so it also recovers reasoning from truncated
+        # output (``finish_reason=length`` mid-thinking).
+        reasoning_text, text, structured_tool_calls = self._route_tokens_for_channels(
+            output.output_token_ids,
+            fallback_text=text,
+            seed_token_ids=output_router_seed,
+        )
+
+        return GenerationOutput(
+            text=text,
+            raw_text=output.output_text,
+            reasoning_text=reasoning_text,
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            finish_reason=output.finish_reason,
+            tool_calls=structured_tool_calls,
+            cached_tokens=output.cached_tokens,
+            # H-03: propagate the scheduler-pinned stop string so the
+            # Anthropic ``/v1/messages`` adapter can surface
+            # ``stop_reason="stop_sequence"`` + ``stop_sequence: <str>``.
+            # ``None`` for EOS / length / no-stop and harmless to ignore
+            # on the OpenAI surface (it already lumps stop+EOS under
+            # ``finish_reason="stop"``).
+            matched_stop=getattr(output, "matched_stop", None),
+        )
+
+    async def stream_generate(
+        self,
+        prompt: str | list[int],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """
+        Stream generation token by token.
+
+        Args:
+            prompt: Input text
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            images: Optional image URLs/paths (for MLLM)
+            videos: Optional video URLs/paths (for MLLM)
+            **kwargs: Additional model-specific parameters. C-01:
+                ``request_id_holder`` (``list[str | None]``) — when
+                provided, the engine writes the admitted scheduler
+                ``request_id`` into ``holder[0]`` the moment
+                ``add_request`` returns. The route layer's
+                ``_disconnect_guard`` reads the same holder so it can
+                force-call ``scheduler.abort_request`` on client
+                disconnect WITHOUT relying solely on the
+                generator-close cascade (which can stall in production
+                when Starlette's ``is_disconnected()`` never reports
+                True — Astrid r3 saw ``disconnect_guard`` poll 70+
+                times before the runaway generation finally hit its
+                token cap). When ``None`` (default) this is a no-op —
+                preserves the pre-C-01 contract for callers that don't
+                need force-abort.
+
+        Yields:
+            GenerationOutput with incremental text
+        """
+        if not self._loaded:
+            await self.start()
+
+        # C-01: extract optional request_id holder so the route's
+        # disconnect_guard can force-abort the scheduler on client
+        # disconnect. Popped from kwargs so it never reaches the
+        # scheduler's add_request (which would reject unknown kwargs).
+        request_id_holder = kwargs.pop("request_id_holder", None)
+
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all streaming when model is multimodal
+            # OpenAI-spec penalty passthrough (#512) — see ``generate()``
+            # MLLM branch above for the rationale.
+            _mllm_penalty_kwargs = {
+                k: kwargs.pop(k)
+                for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")
+                if k in kwargs
+            }
+            request_id = await self._mllm_scheduler.add_request_async(
+                prompt=prompt,
+                images=images,
+                videos=videos,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                video_fps=kwargs.pop("video_fps", None),
+                video_max_frames=kwargs.pop("video_max_frames", None),
+                **_mllm_penalty_kwargs,
+            )
+            # C-01 force-abort: publish the scheduler request id so the
+            # route's disconnect_guard can call abort_request directly.
+            if request_id_holder is not None:
+                try:
+                    request_id_holder[0] = request_id
+                except Exception:
+                    logger.debug(
+                        "[stream_generate] request_id_holder publish failed",
+                        exc_info=True,
+                    )
+
+            async for output in self._mllm_scheduler.stream_outputs(request_id):
+                # ``logprobs`` is now wired through from
+                # ``MLLMScheduler._process_batch_responses`` (the
+                # ``MLLMBatchResponse`` carries them but the prior
+                # ``RequestOutput`` construction dropped the field).
+                # Pre-fix, MLLM streams hit the route's logprobs
+                # extractor with ``chunk.logprobs=None`` and the
+                # OpenAI ``choices[0].logprobs`` slot was always
+                # ``null`` — even when the client asked for
+                # ``logprobs=true, top_logprobs=K``.
+                yield GenerationOutput(
+                    text=clean_output_text(
+                        output.output_text, muse_wire=self._muse_wire_model()
+                    ),
+                    new_text=output.new_text,
+                    tokens=output.new_token_ids,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finished=output.finished,
+                    finish_reason=output.finish_reason,
+                    logprobs=output.logprobs,
+                    # H-03: MLLM stream parity — propagate the matched
+                    # stop string for the Anthropic adapter.
+                    matched_stop=getattr(output, "matched_stop", None),
+                )
+            return
+
+        # Use LLM engine for text-only
+        from ..request import SamplingParams
+
+        # Extended sampling params (#355) — see generate() for rationale.
+        _sp_kwargs = {
+            k: kwargs.pop(k)
+            for k in (
+                "top_k",
+                "min_p",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                # H-11: forward the per-request seed onto SamplingParams
+                # so the scheduler can build a fresh seeded sampler. Without
+                # this, the seed field on the request model is parsed,
+                # validated, and silently dropped — Tomek r3's reproduced
+                # failure mode (five calls with seed=42 → five different
+                # outputs).
+                "seed",
+            )
+            if k in kwargs
+        }
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop or [],
+            **_sp_kwargs,
+        )
+
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        prefix_boundaries = kwargs.pop("prefix_boundaries", None)
+        # PFlash routing hints (#287) — parity with generate().
+        has_tools = bool(kwargs.pop("has_tools", False))
+        requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
+        # Grammar-constrained tool calling (#558) — streaming parity.
+        grammar_logits_processor = kwargs.pop("grammar_logits_processor", None)
+        reasoning_budget_logits_processor = kwargs.pop(
+            "reasoning_budget_logits_processor", None
+        )
+        suppressed_tokens_logits_processor = kwargs.pop(
+            "suppressed_tokens_logits_processor", None
+        )
+        request_id = await self._engine.add_request(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
+            prefix_boundaries=prefix_boundaries,
+            has_tools=has_tools,
+            requires_prompt_integrity=requires_prompt_integrity,
+            grammar_logits_processor=grammar_logits_processor,
+            reasoning_budget_logits_processor=reasoning_budget_logits_processor,
+            suppressed_tokens_logits_processor=suppressed_tokens_logits_processor,
+        )
+        # C-01 force-abort: publish the scheduler request id (text path)
+        # so the route's disconnect_guard can call abort_request directly
+        # on client disconnect.
+        if request_id_holder is not None:
+            try:
+                request_id_holder[0] = request_id
+            except Exception:
+                logger.debug(
+                    "[stream_generate] request_id_holder publish failed",
+                    exc_info=True,
+                )
+
+        # F-012 belt-and-suspenders: ``stream_outputs.finally`` already
+        # aborts on any abnormal exit AFTER it enters its ``try`` block.
+        # But there is a narrow window between ``add_request`` returning
+        # (request is in the scheduler) and ``stream_outputs.try``
+        # actually starting (the implicit ``await __anext__`` on the
+        # async generator) where a propagated ``GeneratorExit`` /
+        # ``CancelledError`` would skip the inner ``finally`` entirely,
+        # leaving the request alive in the scheduler with no consumer.
+        # The window is one implicit ``await`` deep but real under
+        # storm conditions — cancellations triggered by the
+        # ``StreamingResponse`` task group can land between the two
+        # yields here. The outer ``try/finally`` below ensures we
+        # ALWAYS abort once ``add_request`` has succeeded, no matter
+        # how this generator unwinds. The deferred-abort scheduler
+        # path (``_pending_abort_ids`` set processed by the next
+        # ``step()``) is idempotent, so the common case where
+        # ``stream_outputs.finally`` also aborts cannot corrupt
+        # anything — the second abort just no-ops on a request that
+        # was already finished.
+        try:
+            async for output in self._engine.stream_outputs(request_id):
+                text = clean_output_text(
+                    output.output_text, muse_wire=self._muse_wire_model()
+                )
+
+                yield GenerationOutput(
+                    text=text,
+                    new_text=output.new_text,
+                    tokens=output.new_token_ids,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finished=output.finished,
+                    finish_reason=output.finish_reason,
+                    logprobs=output.logprobs,
+                    cached_tokens=output.cached_tokens,
+                    # H-03: text stream parity — propagate the matched
+                    # stop string for the Anthropic adapter.
+                    matched_stop=getattr(output, "matched_stop", None),
+                )
+        finally:
+            # Best-effort defensive abort. Codex r2 P1 #2 concern: this
+            # runs on the asyncio event-loop thread (we're inside an
+            # async generator's finally), while scheduler.add_request
+            # is dispatched through the MLX executor. The thread-safety
+            # contract that makes this safe is documented on
+            # ``Scheduler.abort_request`` itself ("Queue request for
+            # abort. Thread-safe, called from any thread. The actual
+            # abort is deferred to the executor thread (inside step())
+            # to avoid race conditions with in-flight Metal GPU
+            # operations.") — it is a one-line ``set.add`` + log, NOT
+            # the executor-thread ``_do_abort_request`` which the
+            # scheduler's own ``_process_pending_aborts`` will run on
+            # the next ``step()``. So the event loop is never blocked
+            # here, and the executor-thread invariant is preserved.
+            # ``_cleanup_request`` is also non-blocking — just dict
+            # pops + a ``scheduler.remove_finished_request`` ``pop``.
+            #
+            # Idempotent against double-abort from
+            # ``stream_outputs.finally``: adds the same id to
+            # ``_pending_abort_ids`` twice, and ``_do_abort_request``
+            # is itself idempotent for the already-finished case.
+            try:
+                eng = self._engine
+                if eng is not None and hasattr(eng, "scheduler"):
+                    # Thread-safe non-blocking enqueue — see
+                    # docstring on ``Scheduler.abort_request``.
+                    eng.scheduler.abort_request(request_id)
+                if eng is not None and hasattr(eng, "_cleanup_request"):
+                    # Non-blocking dict pops + idempotent.
+                    eng._cleanup_request(request_id)
+            except Exception:
+                logger.debug(
+                    "[stream_generate] best-effort cleanup raised for %s",
+                    request_id,
+                    exc_info=True,
+                )
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """
+        Chat completion (non-streaming).
+
+        For MLLM models, all requests (including text-only) are routed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            tools: Optional tool definitions
+            images: Optional image URLs/paths
+            videos: Optional video URLs/paths
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            GenerationOutput with assistant response
+        """
+        if not self._loaded:
+            await self.start()
+
+        messages, transient_message_start = self._prepare_cache_stable_messages(
+            messages
+        )
+
+        # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
+        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        all_images = (images or []) + extracted_images
+        all_videos = (videos or []) + extracted_videos
+
+        # Extract enable_thinking before passing kwargs downstream
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        # PFlash routing hints (#287). ``requires_prompt_integrity`` is
+        # set by the route layer for response_format / structured-output
+        # requests — those are hard-protected (no opt-out flag exists).
+        # Tools, by contrast, are gated via ``has_tools`` + the
+        # ``skip_when_tools`` config knob (CLI ``--pflash-include-tools``
+        # inverts it). Do NOT force ``requires_prompt_integrity=True``
+        # for tool requests here: it would short-circuit before
+        # ``skip_when_tools`` is even consulted and make the documented
+        # ``--pflash-include-tools`` opt-in inert (codex r6 BLOCKING).
+        # The safe default still holds: ``skip_when_tools=True`` is the
+        # config default, so tool prompts skip compression unless the
+        # user explicitly opts in.
+        requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
+
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+
+        # Apply chat template
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            num_images=len(all_images),
+            enable_thinking=enable_thinking,
+        )
+        prompt, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=True,
+        )
+        if output_router_seed is not None:
+            kwargs["_output_router_seed_token_ids"] = output_router_seed
+
+        # ``forced_assistant_prefix`` — OpenAI-spec ``tool_choice`` forced
+        # mode (#673). The route layer builds a parser-shaped prefix
+        # (e.g. ``<tool_call>\n{"name": "X", "arguments":``) and we
+        # append it directly to the rendered prompt. The model continues
+        # from there, completing the tool call body in the parser's wire
+        # format.  Currently the route only emits a prefix for the
+        # ``hermes`` parser (the only verified JSON-body ``<tool_call>``
+        # parser — see ``_verified_json_tool_call_parsers`` in
+        # ``routes/chat.py``); other parsers fall through to the
+        # post-parse synthesis fallback. Engine support is parser-
+        # agnostic — any parser whose wire opener can be precomputed
+        # by the route can opt in by extending the allowlist (codex r7 NIT).
+        forced_assistant_prefix = kwargs.pop("forced_assistant_prefix", None)
+        if forced_assistant_prefix:
+            prompt = prompt + forced_assistant_prefix
+            # When we prefix the assistant turn ourselves, the response
+            # surface lacks the prefix bytes (the model only emits the
+            # continuation). The tool parser needs to see the full
+            # assistant body — propagate the prefix down to the engine
+            # so it can prepend it to ``output.text`` before returning.
+            kwargs["_assistant_text_prefix"] = forced_assistant_prefix
+
+        # Compute prefix boundary for hybrid-model cache reuse (#427).
+        # Must run on the NON-streaming path too — pydantic_ai / smolagents /
+        # langchain default to ``stream:false`` and hit ``chat()`` directly.
+        # PR #435 only wired this into ``stream_chat`` so the fix was a no-op
+        # for the very SDKs fishloa was hitting; this closes that gap.
+        #
+        # Non-trimmable-cache gate: the boundary split routes through
+        # ``BatchGenerator.insert_segments`` which on pure-Transformer models
+        # (e.g. gpt-oss-20b-mxfp4-q8 harmony) corrupts the harmony tool-call channel
+        # state across multi-turn-with-tools and the agent loops forever.
+        # Pure Transformers don't need the boundary save anyway — the prefix
+        # cache already reuses via trim+supersequence. Only hybrid models
+        # (Mamba/DeltaNet+Transformer) have the "can't trim" constraint that
+        # PR #435 was built to fix. Gating on ``is_hybrid`` keeps the fix
+        # active where it's needed and inert where it broke things.
+        if self._needs_prefix_boundary_snapshot():
+            if transient_message_start is None:
+                prefix_boundary = self._compute_prefix_boundary(messages, tools)
+            else:
+                prefix_boundary = self._compute_prefix_boundary(
+                    messages,
+                    tools,
+                    transient_message_start=transient_message_start,
+                )
+            if prefix_boundary > 0:
+                kwargs["prefix_boundary"] = prefix_boundary
+            # P1a LCP snap-down（§11）：PROXY_CACHE_LCP_SNAPDOWN 开启时计算
+            # 多边界检查点位置。空/异常 → 不传（既有单边界行为，fail-closed）。
+            if os.environ.get("PROXY_CACHE_LCP_SNAPDOWN", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                _bounds = self._compute_prefix_boundaries(messages, tools)
+                if prefix_boundary > 0:
+                    _bounds = sorted(set(_bounds) | {prefix_boundary})
+                if _bounds:
+                    kwargs["prefix_boundaries"] = _bounds
+
+        if tools:
+            kwargs["has_tools"] = True
+        if requires_prompt_integrity:
+            kwargs["requires_prompt_integrity"] = True
+
+        return await self.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            images=all_images if all_images else None,
+            videos=all_videos if all_videos else None,
+            **kwargs,
+        )
+
+    def _is_hybrid_model(self) -> bool:
+        """Is the loaded model a hybrid Mamba/DeltaNet + Transformer?
+
+        The boundary-snapshot fix (#427) exists because hybrid models'
+        linear-attention layers are non-trimmable: the prefix cache
+        finds the LCP match but can't crop the Mamba state at the
+        cut point, so a stored "full prompt+output" entry is unusable
+        for a turn-2 prompt that shares only the prefix. The fix
+        captures cache state mid-prefill at the message boundary so
+        the next turn's lookup gets an exact-length match.
+
+        Pure Transformer models don't have this constraint — trim works
+        — so they don't need the boundary save. Worse, the boundary
+        split routes through ``insert_segments`` which on gpt-oss-20b-mxfp4-q8
+        empirically corrupts harmony tool-call channel state across
+        multi-turn-with-tools (pydantic_ai multi_tool 5/6 → loops on
+        ``add(3,4)``). Gating the entire boundary path on this flag is
+        the smallest change that keeps the fix where it's needed and
+        inert where it isn't.
+
+        Returns False on any access error so a malformed engine state
+        never *enables* the new path — fails closed.
+        """
+        try:
+            return bool(self._engine.engine.model_config.is_hybrid)
+        except (AttributeError, TypeError):
+            return False
+
+    def _needs_prefix_boundary_snapshot(self) -> bool:
+        """Whether growing conversations need an explicit message boundary.
+
+        Hybrid models need this because their recurrent cache state cannot be
+        trimmed.  Some pure-attention models have the same constraint (for
+        example DeepSeek V4's pooling KV cache).  The CLI detects those caches
+        and enables ``hybrid_cache_entries``; use that signal here instead of
+        incorrectly assuming every pure-attention cache is trimmable.
+        """
+        if self._is_hybrid_model():
+            return True
+        try:
+            return (
+                int(getattr(self._scheduler_config, "hybrid_cache_entries", 0) or 0) > 0
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _compute_prefix_boundaries(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        *,
+        transient_message_start: int | None = None,
+        limit: int = 8,
+        min_spacing_tokens: int = 1024,
+    ) -> list[int]:
+        """计算多边界检查点位置（P1a LCP snap-down，§11）。
+
+        对每个消息切点 i：渲染 ``messages[:i]``（无 generation marker），与
+        真实 prompt 求 token LCP——前缀稳定模板下 LCP 即该切点在 prompt 内
+        的边界位置。截断渲染若非严格前缀（非稳定模板）该切点跳过。
+        任何异常返回 []（fail-closed → 既有单边界行为）。
+        调用方负责 PROXY_CACHE_LCP_SNAPDOWN 门控。
+        """
+        try:
+            template_tools = convert_tools_for_template(tools) if tools else None
+            real_prompt = self._apply_chat_template(
+                messages, template_tools, add_generation_prompt=True
+            )
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+            real_tokens = tokenizer.encode(real_prompt)
+            total = len(real_tokens)
+            if total < 4 * 1024:  # 短上下文不值得多段 prefill 的调度开销
+                return []
+            candidates: list[int] = []
+            cut_range = range(1, len(messages))
+            if transient_message_start is not None:
+                cut_range = range(1, min(len(messages), transient_message_start))
+            for cut in cut_range:
+                try:
+                    rendered = self._apply_chat_template(
+                        messages[:cut], template_tools, add_generation_prompt=False
+                    )
+                    r_tokens = tokenizer.encode(rendered)
+                except Exception:
+                    continue
+                lcp = 0
+                for real_token, rendered_token in zip(real_tokens, r_tokens):
+                    if real_token != rendered_token:
+                        break
+                    lcp += 1
+                # 严格前缀守卫：lcp 必须恰好耗尽截断渲染（非稳定模板切点跳过）
+                if 0 < lcp < total and lcp == len(r_tokens):
+                    candidates.append(lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+            return select_checkpoint_positions(
+                candidates, total, limit=limit, min_spacing=min_spacing_tokens
+            )
+        except Exception:
+            return []
+
+    def _compute_prefix_boundary(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        *,
+        transient_message_start: int | None = None,
+    ) -> int:
+        """Compute the latest prefix that is stable across the next turn.
+
+        The preferred boundary is the prompt rendered *without* the assistant
+        generation marker.  That includes the latest user message but excludes
+        the template-only suffix which is replaced by the real assistant turn
+        on the next request.  Saving there prevents non-trimmable hybrid and
+        DeepSeek-V4 caches from lagging one conversation turn.
+
+        Some third-party templates do not make the no-generation rendering a
+        strict prefix of the generation rendering.  For those, retain the
+        historical dummy-last-user LCP boundary as a conservative fallback.
+        """
+        # Find index of last user message
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
+            return 0
+        try:
+            template_tools = convert_tools_for_template(tools) if tools else None
+
+            # Tokenize the real generation prompt and the same conversation
+            # before its transient assistant-generation marker is appended.
+            real_prompt = self._apply_chat_template(
+                messages, template_tools, add_generation_prompt=True
+            )
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+
+            real_tokens = tokenizer.encode(real_prompt)
+
+            if transient_message_start is not None:
+                future_prompt = self._apply_chat_template(
+                    [
+                        *messages[:transient_message_start],
+                        {
+                            "role": "assistant",
+                            "content": "__rapid_mlx_boundary_probe__",
+                        },
+                    ],
+                    template_tools,
+                    add_generation_prompt=False,
+                )
+                future_tokens = tokenizer.encode(future_prompt)
+                transient_lcp = 0
+                for real_token, future_token in zip(real_tokens, future_tokens):
+                    if real_token != future_token:
+                        break
+                    transient_lcp += 1
+                return max(0, transient_lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+
+            stable_prompt = self._apply_chat_template(
+                messages, template_tools, add_generation_prompt=False
+            )
+            next_turn_prompt = self._apply_chat_template(
+                [
+                    *messages,
+                    {
+                        "role": "assistant",
+                        "content": "__rapid_mlx_boundary_probe__",
+                    },
+                ],
+                template_tools,
+                add_generation_prompt=False,
+            )
+
+            stable_tokens = tokenizer.encode(stable_prompt)
+            next_turn_tokens = tokenizer.encode(next_turn_prompt)
+            stable_lcp = 0
+            for real_token, stable_token in zip(real_tokens, stable_tokens):
+                if real_token != stable_token:
+                    break
+                stable_lcp += 1
+
+            # A useful snapshot must be strictly inside the generation prompt;
+            # equality produces no inter-segment boundary in BatchGenerator.
+            next_turn_lcp = 0
+            for real_token, next_token in zip(real_tokens, next_turn_tokens):
+                if real_token != next_token:
+                    break
+                next_turn_lcp += 1
+            if (
+                stable_lcp == len(stable_tokens)
+                and next_turn_lcp >= len(stable_tokens)
+                and stable_lcp < len(real_tokens)
+            ):
+                return max(0, stable_lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+
+            # Conservative fallback for templates whose no-generation form is
+            # not a strict prefix of their generation form.
+            dummy_messages = list(messages)
+            dummy_messages[last_user_idx] = {
+                **messages[last_user_idx],
+                "content": "XXXXXXXXXX",
+            }
+            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+
+            dummy_tokens = tokenizer.encode(dummy_prompt)
+
+            # Find LCP — the point where the two diverge is the boundary
+            lcp = 0
+            for j in range(min(len(real_tokens), len(dummy_tokens))):
+                if real_tokens[j] != dummy_tokens[j]:
+                    break
+                lcp = j + 1
+
+            boundary = min(lcp, next_turn_lcp) if stable_lcp else lcp
+            return max(0, boundary - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _prepare_cache_stable_messages(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Strip internal priming metadata and locate its stable-prefix edge."""
+        transient_start = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("_rapid_mlx_transient_priming") is True
+            ),
+            None,
+        )
+        cleaned = [
+            {
+                key: value
+                for key, value in message.items()
+                if key != "_rapid_mlx_transient_priming"
+            }
+            for message in messages
+        ]
+        return cleaned, transient_start
+
+    def _muse_wire_model(self) -> bool:
+        """True iff the serving checkpoint's model_type is muse_glimmer.
+
+        Gates the ATEM channel demux in ``clean_output_text`` on model
+        IDENTITY (offline config read, never-raises resolver) rather
+        than on output-byte sniffing, so a non-muse model emitting
+        literal wire-shaped text can never have content misclassified
+        and erased (codex r6 #1). Resolved once per engine — the
+        model_name is fixed for the engine's lifetime.
+        """
+        if getattr(self, "_is_muse_wire", None) is None:
+            model_name = getattr(self, "_model_name", None)
+            # Partial test/lifecycle fixtures may reach the helper before
+            # model identity is installed. Do not cache that transient
+            # absence as a permanent non-Muse decision.
+            if model_name is None:
+                return False
+            self._is_muse_wire = _resolve_hf_model_type(model_name) == "muse_glimmer"
+        return self._is_muse_wire
+
+    def _route_tokens_for_channels(
+        self,
+        token_ids: list[int] | None,
+        *,
+        fallback_text: str,
+        seed_token_ids: tuple[int, ...] | None = None,
+    ) -> tuple[str, str, list[dict] | None]:
+        """Run ``OutputRouter.feed_sequence`` on a completed token list.
+
+        Returns ``(reasoning_text, content_text, structured_tool_calls)``
+        for the non-streaming path. The router is the token-level state
+        machine that the streaming path already trusts
+        (``_stream_with_output_router``); using it here closes a long-
+        standing gap where non-streaming relied on text-based
+        ``clean_output_text`` regex parsing and leaked analysis-channel
+        content into ``content`` when the model finished mid-thinking
+        (``finish_reason=length`` — issue #442) or otherwise emitted no
+        ``final`` channel.
+
+        ``fallback_text`` is the result of ``clean_output_text`` — we
+        keep it as ``content`` for cases the router doesn't override.
+        The override fires when the router is authoritative AND
+        text-based cleaning is known wrong — specifically when the
+        router sees REASONING tokens but no CONTENT tokens (no
+        ``final`` channel emitted), or when the router surfaced
+        structured tool calls (their bodies must NOT bleed into
+        content text via the un-cleaned commentary header).
+
+        ``structured_tool_calls`` carries ``[{"name", "arguments"}]``
+        entries from routers that natively parse the model's tool-call
+        protocol (currently ``HarmonyStreamingRouter`` via
+        openai-harmony's ``StreamableParser``). When non-None, the
+        route layer bypasses text-based extraction entirely (see
+        ``GenerationOutput.tool_calls`` plumbing). This eliminates the
+        sentinel-delimited wire-text round-trip that previously lost
+        tool calls whose JSON arguments contained literal harmony
+        marker substrings — PR #515 codex round-12 / round-14 BLOCKING.
+        """
+        if not token_ids:
+            return "", fallback_text, None
+        router = self._create_output_router()
+        if router is None:
+            return "", fallback_text, None
+        try:
+            router.reset()
+            for token_id in seed_token_ids or ():
+                router.feed(token_id)
+            routed = router.feed_sequence(token_ids)
+        except Exception as e:
+            logger.debug("OutputRouter sequence routing failed: %s", e)
+            return "", fallback_text, None
+
+        reasoning = routed.get("reasoning") or ""
+        raw_tool_calls = routed.get("tool_calls") or []
+        # Normalise to the structured ``{"name", "arguments"}`` shape
+        # the route layer expects. The HarmonyStreamingRouter already
+        # produces dicts; the legacy ``OutputRouter`` emits wire-text
+        # strings (gemma4 / qwen / deepseek) which we leave to the
+        # legacy text-based parser path — those models don't surface
+        # structured payloads yet, so structured_tool_calls is None
+        # for them and the existing fallback_text + regex extraction
+        # flow continues unchanged.
+        structured_tool_calls: list[dict] | None
+        if raw_tool_calls and all(isinstance(tc, dict) for tc in raw_tool_calls):
+            structured_tool_calls = list(raw_tool_calls)
+        else:
+            structured_tool_calls = None
+
+        # When the router surfaces structured tool calls, the text-
+        # based fallback path is dead weight — and worse, the
+        # un-cleaned harmony commentary header still embedded in
+        # ``fallback_text`` would bleed into the route's user-facing
+        # ``content`` field. Force content to the router's CONTENT
+        # channel result (final-channel text only) and drop the
+        # commentary residue. Reasoning is also taken from the router
+        # because the harmony reasoning parser cannot find an
+        # ``<|end|>`` terminator on the analysis channel after the
+        # tool call has consumed the commentary block.
+        if structured_tool_calls is not None:
+            return reasoning, routed.get("content") or "", structured_tool_calls
+
+        # Override content ONLY when the router authoritatively says
+        # there is no content channel AND there is reasoning. In every
+        # other case we keep ``fallback_text`` so non-reasoning models
+        # (router emits CONTENT only) keep their text-cleaning result.
+        if routed.get("content") is None and reasoning:
+            return reasoning, "", None
+
+        return reasoning, fallback_text, None
+
+    def _create_output_router(self) -> OutputRouter | None:
+        """Create a per-request token router for supported tokenizer formats.
+
+        Uses ``from_tokenizer_for_streaming`` so harmony models (gpt-oss)
+        get routed through ``HarmonyStreamingRouter`` backed by
+        openai-harmony's ``StreamableParser`` (issue #513). Falls back to
+        the legacy custom state machine for non-harmony models and for
+        harmony tokenizers whose IDs don't match the official encoding.
+
+        Detection (``from_tokenizer_for_streaming`` →
+        ``tokenizer.get_vocab()``) rebuilds the tokenizer's full vocab dict
+        — ~60-85ms for a 262k-token Gemma vocab — and was previously paid on
+        EVERY streaming request. The tokenizer and the harmony escape-hatch
+        flags are fixed for the engine's lifetime, so the *detection result*
+        (format + marker ``TokenMap``) is invariant; only the returned
+        router's state machine is per-request. Memoize the detected
+        ``(kind, TokenMap)`` once and rebuild a fresh, cheap router per
+        request. This removes the entire ~84ms MLLM first-token overhead (the
+        whole rapid-vs-mlx-vlm vision TTFT gap) and shaves the same
+        per-request cost off every gemma-4 / gpt-oss streaming completion. The
+        per-request router object is constructed exactly as before — this only
+        skips re-scanning the vocab.
+        """
+        # Read the tokenizer first — the property can raise mid-lifecycle
+        # ("not loaded" during a startup/teardown race). Treat that as the
+        # legacy no-router path for THIS request without caching anything, so a
+        # later (loaded) request still detects normally.
+        try:
+            tokenizer = self.tokenizer
+        except Exception as e:
+            logger.debug("OutputRouter unavailable (tokenizer error): %s", e)
+            return None
+
+        # Cache keyed on the tokenizer *object identity* so a model/tokenizer
+        # hot-swap (a different ``self.tokenizer``) transparently re-detects
+        # instead of serving a stale format map.
+        cached = getattr(self, "_output_router_template", None)
+        if cached is not None and cached[0] is tokenizer:
+            template = cached[1]
+        else:
+            try:
+                template = self._detect_output_router_template(tokenizer)
+            except Exception as e:
+                # A TRANSIENT detection failure (e.g. ``get_vocab()`` raising
+                # during lazy init) must NOT be cached: caching the negative
+                # result would permanently disable the router for this
+                # tokenizer, silently leaking channel tokens into every later
+                # response. Fall back to no-router for this request only and
+                # retry detection next time — matching the pre-cache behavior
+                # where every request re-ran detection. A *legitimate* "no
+                # supported format" result returns ``None`` (not a raise) and
+                # IS cached below.
+                logger.debug("OutputRouter detection failed (will retry): %s", e)
+                return None
+            self._output_router_template = (tokenizer, template)
+
+        if template is None:
+            return None
+        kind, token_map = template
+        try:
+            if kind == "harmony":
+                from ..output_router_harmony import HarmonyStreamingRouter
+
+                return HarmonyStreamingRouter(token_map, tokenizer)
+            return OutputRouter(token_map, tokenizer)
+        except Exception as e:
+            logger.debug("OutputRouter rebuild failed for this request: %s", e)
+            return None
+
+    def _detect_output_router_template(
+        self,
+        tokenizer: Any,
+    ) -> tuple[str, Any] | None:
+        """One-time router-format detection (see ``_create_output_router``).
+
+        Runs the full ``from_tokenizer_for_streaming`` scan once and captures
+        the router *kind* (``"harmony"`` vs the legacy ``"legacy"`` state
+        machine) plus its marker ``TokenMap``, so subsequent requests rebuild
+        a router without re-reading the vocabulary. Returns ``None`` for a
+        *legitimate* negative — no tokenizer, no supported format, or a format
+        outside the allowlist — which the caller caches. Deliberately does NOT
+        swallow exceptions: a transient failure (e.g. ``get_vocab()`` during
+        lazy init) must propagate so the caller can retry instead of caching a
+        permanently-broken no-router result.
+        """
+        if tokenizer is None:
+            return None
+        router = OutputRouter.from_tokenizer_for_streaming(
+            tokenizer,
+            force_harmony_streaming=self._force_openai_harmony_streaming,
+            no_harmony_streaming=self._no_openai_harmony_streaming,
+        )
+        if router is None:
+            return None
+        if router.map.format_tag not in _OUTPUT_ROUTER_ALLOWLIST:
+            return None
+        # ``from_tokenizer_for_streaming`` returns either the legacy
+        # ``OutputRouter`` state machine or a ``HarmonyStreamingRouter``;
+        # remember which so the per-request rebuild picks the same class.
+        from ..output_router_harmony import HarmonyStreamingRouter
+
+        kind = "harmony" if isinstance(router, HarmonyStreamingRouter) else "legacy"
+        return (kind, router.map)
+
+    def _make_routed_output(
+        self,
+        source: GenerationOutput,
+        event,
+        *,
+        new_text: str | None = None,
+        finished: bool = False,
+        finish_reason: str | None = None,
+        logprobs=None,
+    ) -> GenerationOutput:
+        # Propagate structured tool-call payload from the router event
+        # when present (HarmonyStreamingRouter on TOOL_CALL channel
+        # close). Carrying it on the per-token streaming output lets
+        # the postprocessor emit a structured ``tool_call`` StreamEvent
+        # directly instead of round-tripping through text-based
+        # extraction — the same bypass the non-streaming path uses via
+        # ``GenerationOutput.tool_calls``.
+        tool_calls = None
+        event_tc = getattr(event, "tool_call", None)
+        if event_tc is not None:
+            tool_calls = [event_tc]
+        return GenerationOutput(
+            text=source.text,
+            new_text=event.text if new_text is None else new_text,
+            tokens=[event.token_id] if event.token_id is not None else [],
+            prompt_tokens=source.prompt_tokens,
+            completion_tokens=source.completion_tokens,
+            finished=finished,
+            finish_reason=finish_reason,
+            logprobs=logprobs,
+            channel=_channel_name(event.channel),
+            tool_calls=tool_calls,
+            cached_tokens=source.cached_tokens,
+            # H-03: preserve matched_stop through the router-wrapped
+            # streaming chunks so the terminal chunk still carries it
+            # for /v1/messages stop_sequence surfacing.
+            matched_stop=source.matched_stop,
+        )
+
+    def _routed_finish_sentinel(self, source: GenerationOutput) -> GenerationOutput:
+        return GenerationOutput(
+            text=source.text,
+            new_text="",
+            tokens=[],
+            prompt_tokens=source.prompt_tokens,
+            completion_tokens=source.completion_tokens,
+            finished=True,
+            finish_reason=source.finish_reason,
+            logprobs=source.logprobs,
+            channel=None,
+            cached_tokens=source.cached_tokens,
+            # H-03: preserve matched_stop on the terminal sentinel so
+            # /v1/messages stop_sequence surfacing works on router-led
+            # streams (harmony / gemma4).
+            matched_stop=source.matched_stop,
+        )
+
+    def _finalize_output_router(
+        self,
+        router: OutputRouter,
+        source: GenerationOutput,
+    ) -> GenerationOutput | None:
+        try:
+            event = router.finalize()
+        except Exception as e:
+            # Unlike unavailable routers, mid-stream/finalize failures mean a
+            # selected router broke after consuming request bytes; warn loudly.
+            logger.warning("OutputRouter finalize failed; falling back: %s", e)
+            return None
+        if event is None:
+            return None
+        return self._make_routed_output(
+            source,
+            event,
+            finished=True,
+            finish_reason=source.finish_reason,
+        )
+
+    async def _stream_with_output_router(
+        self,
+        outputs: AsyncIterator[GenerationOutput],
+        router: OutputRouter | None,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Attach semantic channels to streamed chat tokens when supported.
+
+        This intentionally emits one GenerationOutput per routed token, even
+        when an upstream flush contains multiple tokens, so downstream
+        postprocessing sees clean channel boundaries. For the common
+        stream_interval=1 case, preserve the scheduler's incremental
+        detokenizer text instead of re-decoding the token in the router.
+        """
+        if router is None:
+            async for output in outputs:
+                yield output
+            return
+
+        async for output in outputs:
+            if router is None:
+                yield output
+                continue
+
+            token_ids = output.tokens
+            if not token_ids:
+                yield output
+                continue
+
+            # Normalize source logprobs to a per-step list so each routed
+            # output can carry its own per-token distribution. Without this,
+            # OutputRouter models (gemma4, harmony/gpt-oss) silently drop
+            # ALL logprobs to the route — every ``logprobs=true`` request
+            # returns a response missing the ``logprobs`` field entirely
+            # because ``_extract_streaming_token_logprobs`` sees
+            # ``chunk.logprobs is None`` for every routed chunk. Confirmed
+            # on gpt-oss-20b-mxfp4-q8 PyPI v0.6.66 during the 2026-05-23 onboarding
+            # sweep. PR #450 fixed the pre-existing AttributeError on the
+            # non-routed path but couldn't surface this gap because its
+            # tests use single-token GenerationOutput stubs that never go
+            # through the router.
+            src_logprobs = output.logprobs
+            if isinstance(src_logprobs, list):
+                lps_per_step = src_logprobs
+            elif src_logprobs is not None:
+                lps_per_step = [src_logprobs]
+            else:
+                lps_per_step = None
+
+            routed_outputs: list[GenerationOutput] = []
+            try:
+                for tok_idx, token_id in enumerate(token_ids):
+                    event = router.feed(token_id)
+                    if event is None:
+                        continue
+                    # TOOL_CALL events are deferred multi-token aggregates: the
+                    # router suppresses tokens during RouterState.TOOL_CALL and
+                    # emits once on the end marker with event.text carrying the
+                    # full decoded body. The single-token-flush optimization
+                    # (use output.new_text) is correct for one-token-in /
+                    # one-event-out channels (CONTENT, REASONING), but for
+                    # TOOL_CALL it would override the accumulated body with
+                    # just the end-marker token's text, dropping the body on
+                    # the floor and breaking streaming tool calls for gemma4
+                    # and harmony — caught on gemma-4-26b-4bit post-v0.6.61.
+                    if event.channel == Channel.TOOL_CALL:
+                        event_text = event.text
+                        # Tool-call channel aggregates many tokens; the
+                        # OpenAI spec doesn't define per-token logprobs for
+                        # tool_calls deltas, so leave them off — matches
+                        # pre-fix behavior for this channel only.
+                        token_logprob = None
+                    else:
+                        event_text = (
+                            output.new_text if len(token_ids) == 1 else event.text
+                        )
+                        token_logprob = (
+                            lps_per_step[tok_idx]
+                            if lps_per_step is not None and tok_idx < len(lps_per_step)
+                            else None
+                        )
+                    routed_outputs.append(
+                        self._make_routed_output(
+                            output,
+                            event,
+                            new_text=event_text,
+                            logprobs=token_logprob,
+                        )
+                    )
+            except Exception as e:
+                # Unlike unavailable routers, mid-stream failures mean a
+                # selected router broke after consuming request bytes; warn
+                # loudly and disable routing for the rest of this request.
+                logger.warning(
+                    "OutputRouter failed; falling back to legacy parsers: %s", e
+                )
+                router = None
+                yield output
+                continue
+
+            if not routed_outputs:
+                if output.finished:
+                    finalized = self._finalize_output_router(router, output)
+                    yield finalized or self._routed_finish_sentinel(output)
+                continue
+
+            if output.finished:
+                finalized = self._finalize_output_router(router, output)
+                if finalized is None:
+                    routed_outputs[-1] = replace(
+                        routed_outputs[-1],
+                        finished=True,
+                        finish_reason=output.finish_reason,
+                    )
+                else:
+                    routed_outputs.append(finalized)
+
+            for routed in routed_outputs:
+                yield routed
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """
+        Stream chat completion token by token.
+
+        For MLLM models, all requests (including text-only) are streamed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            tools: Optional tool definitions
+            images: Optional image URLs/paths
+            videos: Optional video URLs/paths
+            **kwargs: Additional model-specific parameters
+
+        Yields:
+            GenerationOutput with incremental text
+        """
+        if not self._loaded:
+            await self.start()
+
+        messages, transient_message_start = self._prepare_cache_stable_messages(
+            messages
+        )
+
+        # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
+        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        all_images = (images or []) + extracted_images
+        all_videos = (videos or []) + extracted_videos
+
+        # Extract enable_thinking before passing kwargs downstream
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        # PFlash routing hints (#287) — parity with chat(). Tools are
+        # NOT auto-folded into ``requires_prompt_integrity``; the
+        # ``has_tools`` flag plus ``skip_when_tools`` is the user-
+        # facing knob (CLI ``--pflash-include-tools`` inverts the
+        # default skip). See chat() comment for the codex r6 fix.
+        requires_prompt_integrity = bool(kwargs.pop("requires_prompt_integrity", False))
+
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+
+        # Apply chat template
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            num_images=len(all_images),
+            enable_thinking=enable_thinking,
+        )
+        prompt, output_router_seed = self._prepare_harmony_no_thinking_prompt(
+            prompt,
+            enable_thinking=enable_thinking,
+            has_tools=bool(template_tools),
+            as_token_ids=True,
+        )
+
+        # ``forced_assistant_prefix`` — see ``chat()`` for the rationale.
+        # On the streaming path the prefix is also injected into the
+        # prompt so the model continuation begins inside the parser's
+        # wire envelope. The first streamed chunk gets a synthetic
+        # ``new_text`` carrying the prefix bytes so route-layer
+        # streaming tool-call parsers (hermes / qwen3coder) see the
+        # complete envelope from the very first delta.
+        forced_assistant_prefix = kwargs.pop("forced_assistant_prefix", None)
+        if forced_assistant_prefix:
+            prompt = prompt + forced_assistant_prefix
+
+        # Compute prefix boundary for cache — non-trimmable-cache gate, see
+        # ``chat()`` for the rationale. Path parity: stream and non-stream
+        # must apply the same gating condition so a future change can't
+        # silently regress one path while keeping the other green.
+        if self._needs_prefix_boundary_snapshot():
+            if transient_message_start is None:
+                prefix_boundary = self._compute_prefix_boundary(messages, tools)
+            else:
+                prefix_boundary = self._compute_prefix_boundary(
+                    messages,
+                    tools,
+                    transient_message_start=transient_message_start,
+                )
+            if prefix_boundary > 0:
+                kwargs["prefix_boundary"] = prefix_boundary
+            # P1a LCP snap-down（§11）：PROXY_CACHE_LCP_SNAPDOWN 开启时计算
+            # 多边界检查点位置。空/异常 → 不传（既有单边界行为，fail-closed）。
+            if os.environ.get("PROXY_CACHE_LCP_SNAPDOWN", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                _bounds = self._compute_prefix_boundaries(messages, tools)
+                if prefix_boundary > 0:
+                    _bounds = sorted(set(_bounds) | {prefix_boundary})
+                if _bounds:
+                    kwargs["prefix_boundaries"] = _bounds
+
+        if tools:
+            kwargs["has_tools"] = True
+        if requires_prompt_integrity:
+            kwargs["requires_prompt_integrity"] = True
+
+        router = self._create_output_router()
+        if router is not None and output_router_seed is not None:
+            try:
+                router.reset()
+                for token_id in output_router_seed:
+                    router.feed(token_id)
+            except Exception as e:
+                logger.warning(
+                    "Harmony no-thinking output-router seed failed; "
+                    "falling back to unrouted output: %s",
+                    e,
+                )
+                router = None
+        stream = self.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            images=all_images if all_images else None,
+            videos=all_videos if all_videos else None,
+            **kwargs,
+        )
+        # On the streaming path inject the forced prefix as a synthetic
+        # first chunk so the route layer's streaming tool-call parser
+        # sees the wire envelope opener from the very first delta.
+        if forced_assistant_prefix:
+            yield GenerationOutput(
+                text=forced_assistant_prefix,
+                new_text=forced_assistant_prefix,
+                prompt_tokens=0,
+                completion_tokens=0,
+                finished=False,
+                finish_reason=None,
+            )
+        async for output in self._stream_with_output_router(stream, router):
+            yield output
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get engine statistics."""
+        stats = {
+            "engine_type": "batched",
+            "model_name": self._model_name,
+            "is_mllm": self._is_mllm,
+            "loaded": self._loaded,
+            "stream_interval": self._stream_interval,
+        }
+
+        if self._mllm_scheduler:
+            mllm_stats = self._mllm_scheduler.get_stats()
+            stats["mllm_scheduler"] = mllm_stats
+            # The health and Prometheus routes consume the common top-level
+            # stats contract. MLLM scheduler values used to remain nested
+            # under ``mllm_scheduler``, leaving Gemma's activity and token
+            # counters permanently at zero while generation was successful.
+            # Keep the detailed nested snapshot and promote the same fields
+            # that the text engine exposes at the top level.
+            for key in (
+                "num_waiting",
+                "num_running",
+                "num_finished",
+                "num_requests_processed",
+                "total_prompt_tokens",
+                "total_completion_tokens",
+                "num_requests_cancelled",
+                "num_requests_cancelled_via_disconnect",
+                "metal_active_memory_gb",
+                "metal_peak_memory_gb",
+                "metal_cache_memory_gb",
+                "batch_generator",
+                "vision_embedding_cache",
+                "vision_cache",
+            ):
+                if key in mllm_stats:
+                    stats[key] = mllm_stats[key]
+            stats["steps_executed"] = getattr(self._mllm_scheduler, "_step_count", 0)
+            start_time = getattr(self, "_start_time", None)
+            stats["uptime_seconds"] = (
+                max(0.0, time.monotonic() - start_time)
+                if start_time is not None
+                else 0.0
+            )
+        elif self._engine:
+            stats.update(self._engine.get_stats())
+
+        return stats
+
+    def get_cache_stats(self) -> dict[str, Any] | None:
+        """Get cache statistics."""
+        if self._mllm_scheduler and self._mllm_scheduler.vision_cache:
+            return self._mllm_scheduler.vision_cache.get_stats()
+        elif self._engine:
+            return self._engine.get_cache_stats()
+        return None
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort an active or queued batched request by request ID.
+
+        Routes to whichever backend is loaded:
+        - MLLMScheduler.abort_request is sync (returns bool).
+        - AsyncEngineCore.abort_request is async (returns coroutine).
+
+        Returns ``True`` when the engine accepted the abort, ``False`` if no
+        backend is available or the request was already finished/not found.
+        """
+        import inspect
+
+        if self._mllm_scheduler is not None:
+            return self._mllm_scheduler.abort_request(request_id)
+        if self._engine is not None and hasattr(self._engine, "abort_request"):
+            result = self._engine.abort_request(request_id)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        return False
+
+    def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
+        """Save prefix cache to disk for persistence across restarts.
+
+        ``should_abort`` is forwarded to the underlying engine so the
+        lifespan SIGTERM-grace deadline can short-circuit a multi-GB
+        flush; see ``EngineCore.save_cache_to_disk`` for details.
+        """
+        if self._engine:
+            return self._engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
+        return False
+
+    def load_cache_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded.
+
+        ``replace=True`` (export/import "replace" strategy, #476) forwards
+        to the underlying engine so the cache clear runs atomically on the
+        mlx-step thread after index validation — see
+        ``EngineCore.load_cache_from_disk``.
+
+        ``protected_import`` (#1111 codex r3): True for explicit HTTP import
+        (pin), False for startup auto-load (obey the retention bound).
+        """
+        if self._engine:
+            return self._engine.load_cache_from_disk(
+                cache_dir, replace=replace, protected_import=protected_import
+            )
+        return 0
+
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """Forward to the inner engine's outcome-returning save (#1100 codex
+        round 4 #2). Returns a ``SaveOutcome`` computed on the step thread.
+
+        #1100 codex round 8 (#4): if the inner engine is absent (model not
+        started / torn down) this is NOT an empty snapshot — it's an
+        engine-not-loaded condition. Raise ``EngineNotReadyError`` so the cache
+        route surfaces the advertised 503 instead of a 200 that publishes a
+        lying empty manifest. (The bare ``save_cache_to_disk`` keeps its
+        no-op-False for lifespan persistence, where "no engine, nothing to
+        persist" is legitimate — only the export/import outcome path must fail
+        loudly.)
+        """
+        if self._engine:
+            return self._engine.save_cache_with_outcome(
+                cache_dir, should_abort=should_abort
+            )
+        from ..cache.protocol import EngineNotReadyError
+
+        raise EngineNotReadyError("cannot export cache: inner engine is not loaded")
+
+    def load_cache_with_result(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ):
+        """Forward to the inner engine's result-returning load (#1100 codex
+        round 4 #2). Returns a ``LoadResult`` computed on the step thread.
+
+        #1100 codex round 8 (#4): absent inner engine → raise
+        ``EngineNotReadyError`` (→ route 503) rather than reporting a
+        successful zero-entry load, matching ``save_cache_with_outcome``.
+
+        ``protected_import`` (#1111 codex r3): defaults True — this
+        result-returning path serves the EXPLICIT HTTP import (#476).
+        """
+        if self._engine:
+            return self._engine.load_cache_with_result(
+                cache_dir, replace=replace, protected_import=protected_import
+            )
+        from ..cache.protocol import EngineNotReadyError
+
+        raise EngineNotReadyError("cannot import cache: inner engine is not loaded")
+
+    # ------------------------------------------------------------------
+    # Guided generation (JSON schema constrained decoding via llguidance)
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_guided_generation(self) -> bool:
+        """Check if guided generation is available."""
+        return HAS_GUIDED and not self._is_mllm
+
+    async def generate_with_schema(
+        self,
+        messages: list[dict[str, Any]],
+        json_schema: dict[str, Any],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        raise_on_failure: bool = False,
+        **kwargs,
+    ) -> GenerationOutput:
+        """Generate JSON output constrained to a schema using guided decoding.
+
+        Uses llguidance for constrained generation to guarantee the output is
+        valid JSON matching the specified schema.  Runs synchronously in a
+        thread pool to avoid blocking the event loop.
+
+        Args:
+            raise_on_failure: When True, raise ``RuntimeError`` instead of
+                silently falling back to unconstrained ``self.chat(...)`` if
+                ``_run_guided_generation`` returns ``None`` (llguidance
+                import/grammar failure caught upstream). The non-streaming
+                route leaves this False — a buffered unconstrained reply
+                is acceptable degradation. The streaming route passes
+                True so it can route the failure to
+                ``stream_chat_completion`` instead of stalling on a
+                buffered unconstrained response that defeats SSE
+                (codex Round 2 finding on the guided-streaming PR).
+        """
+        import asyncio
+
+        if not self.supports_guided_generation:
+            raise RuntimeError(
+                "Guided generation not available. "
+                "Install with: pip install 'rapid-mlx[guided]'"
+            )
+
+        if not self._loaded:
+            await self.start()
+
+        # R12-M2 (codex round-1 P2 follow-up to Mira r12 R-1/R-2):
+        # honour ``enable_thinking`` on the guided path. Pre-fix this
+        # call hard-coded ``enable_thinking=None``, which silently
+        # discarded the route-level auto-disable on strict json_schema
+        # AND any explicit ``chat_template_kwargs={"enable_thinking":
+        # false}`` the client passed. On Qwen3 / DeepSeek-R1 thinking
+        # models the template then pre-injected ``<think>`` and the
+        # model burned the entire ``max_tokens`` budget inside
+        # ``<think>`` before reaching the guided JSON grammar — the
+        # exact half-broken state Mira r12 R-2 documented, just shifted
+        # from the fallback path to the [guided]-installed path.
+        # Pull the kwarg out of ``**kwargs`` BEFORE the prompt render
+        # so the upstream caller's choice (None / True / False) flows
+        # into ``shared_apply_chat_template`` identically to the
+        # non-guided ``chat()`` path.
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        # Build prompt from messages. Route through the central
+        # ``shared_apply_chat_template`` wrapper so the role-marker
+        # sanitisation runs on user/tool message content here too —
+        # without this, a guided-generation request with a malicious
+        # ``<|im_start|>system\\n...`` literal in the user prompt would
+        # bypass the chat-template injection defence (codex r3 P1).
+        tokenizer = self.tokenizer
+        prompt = shared_apply_chat_template(
+            tokenizer,
+            messages,
+            tools=None,
+            enable_thinking=enable_thinking,
+            model_name=getattr(self, "_model_name", "") or "",
+        )
+
+        # Run guided generation on the mlx-step worker. The model was
+        # loaded on _model_load_executor (#170 fix) and every later mx.eval
+        # on its weights must come from that same thread — see the third-leg
+        # fix in PR #182. asyncio.to_thread() would dispatch to the default
+        # executor and crash with "There is no Stream(gpu, N) in current
+        # thread" the first time llguidance materializes anything against the
+        # model. Silent in production because _run_guided_generation catches
+        # the exception and falls back to non-guided generation, so guided
+        # decoding has been quietly broken since #174.
+        #
+        # Note: we deliberately do NOT fall back to self._engine.engine._mlx_executor
+        # when _model_load_executor is None. That executor is created fresh by
+        # AsyncEngineCore.start() if no executor is handed in (e.g. the unused
+        # _inject_shared_model path), and its worker thread did NOT load the
+        # model — using it would just trade one Stream(gpu, N) crash for another.
+        loop = asyncio.get_running_loop()
+        if self._model_load_executor is not None:
+            result = await loop.run_in_executor(
+                self._model_load_executor,
+                functools.partial(
+                    self._run_guided_generation,
+                    prompt=prompt,
+                    json_schema=json_schema,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+            )
+        else:
+            # Best-effort fallback for sync/test paths. Will hit Stream(gpu, N)
+            # if the model lives on a real worker thread.
+            result = await asyncio.to_thread(
+                self._run_guided_generation,
+                prompt=prompt,
+                json_schema=json_schema,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+
+        if result is None:
+            # Fallback to standard generation. The streaming caller passes
+            # raise_on_failure=True so it can delegate to its own SSE
+            # fallback rather than buffer a long unconstrained chat
+            # response into a single content chunk.
+            if raise_on_failure:
+                raise RuntimeError(
+                    "Guided generation produced no result "
+                    "(llguidance import/grammar failure — see prior log)"
+                )
+            logger.warning(
+                "Guided generation failed, falling back to regular generation"
+            )
+            # R12-M2 (codex round-2 P2): re-inject enable_thinking
+            # into the fallback kwargs. We popped it out above so the
+            # guided prompt render could consume it explicitly; the
+            # fallback ``self.chat(...)`` runs its own prompt render
+            # (via ``_apply_chat_template``) and reads
+            # ``enable_thinking`` off ``**kwargs`` (batched.py L1439).
+            # Without this re-injection an explicit
+            # ``enable_thinking=False`` (or the R12-M2 route-level
+            # auto-disable on strict json_schema) would be lost on
+            # the fallback path, reverting to the template default.
+            # Non-strict json_schema callers leave ``raise_on_failure``
+            # at its default ``False`` so this is a reachable code
+            # path, not a defense-in-depth nit.
+            if enable_thinking is not None:
+                kwargs["enable_thinking"] = enable_thinking
+            return await self.chat(messages=messages, max_tokens=max_tokens, **kwargs)
+
+        # Tokenize for completion count
+        tokens = tokenizer.encode(result)
+        return GenerationOutput(
+            text=result,
+            tokens=tokens,
+            prompt_tokens=len(tokenizer.encode(prompt)),
+            completion_tokens=len(tokens),
+            finish_reason="stop",
+        )
+
+    def _run_guided_generation(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any],
+        max_tokens: int,
+        temperature: float,
+    ) -> str | None:
+        """Run guided generation synchronously (called from thread pool)."""
+        try:
+            model = self._model
+            tokenizer = self._tokenizer
+            if self._is_mllm:
+                return None
+            generator = GuidedGenerator(model, tokenizer)
+            return generator.generate_json(
+                prompt=prompt,
+                json_schema=json_schema,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as e:
+            # ``generate_json`` already degrades every failure — compile-reject
+            # (structural validity is settled at the route boundary) and
+            # transient guided failure alike — to ``None``. This stays only as a
+            # last-resort guard for a wiring failure in the setup above.
+            logger.error(f"Guided generation error: {e}")
+            return None
+
+    async def _inject_shared_model(
+        self,
+        model,
+        tokenizer,
+        start_engine: bool = True,
+    ) -> None:
+        """
+        Inject a pre-loaded shared model instead of loading a new one.
+
+        This is used to inject a pre-loaded model instance.
+
+        Caveat (#170 stream binding): this path leaves
+        ``_model_load_executor`` unset, so ``generate_with_schema`` will
+        fall back to ``asyncio.to_thread`` and hit
+        ``RuntimeError: There is no Stream(gpu, N) in current thread``
+        the first time llguidance materializes against the model. If you
+        wire this method up to a production code path, hand the model's
+        owning ThreadPoolExecutor in via a new arg and assign it to
+        ``self._model_load_executor``.
+
+        Args:
+            model: Pre-loaded MLX model
+            tokenizer: Pre-loaded tokenizer
+            start_engine: Whether to start the engine loop immediately.
+        """
+        from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..scheduler import SchedulerConfig
+
+        self._model = model
+        self._tokenizer = tokenizer
+
+        # Create engine config
+        scheduler_config = self._scheduler_config or SchedulerConfig()
+        engine_config = EngineConfig(
+            model_name=self._model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=self._stream_interval,
+            tool_logits_processor_factory=self._tool_logits_processor_factory,
+            force_hybrid=self._force_hybrid,
+            no_hybrid=self._no_hybrid,
+            force_spec_decode=self._force_spec_decode,
+            no_spec_decode=self._no_spec_decode,
+        )
+
+        # Create async engine with shared model
+        self._engine = AsyncEngineCore(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            config=engine_config,
+        )
+
+        # Only start engine loop if requested
+        if start_engine:
+            await self._engine.engine.start()
+
+        self._loaded = True
+        self._engine_started = start_engine
+        logger.info(
+            f"BatchedEngine injected with shared model: {self._model_name} (started={start_engine})"
+        )
