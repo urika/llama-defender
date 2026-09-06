@@ -295,12 +295,28 @@ run_promptfoo() {
     return 0
   fi
 
-  # Preflight: proxy must be reachable.
-  local proxy="${PROXY_BASE:-http://127.0.0.1:4000}"
-  if ! curl -sf --max-time 5 "$proxy/v1/models" >/dev/null 2>&1; then
-    warn "proxy not reachable at $proxy — skipping promptfoo tier"
-    warn "start it with: ./manage.sh start   (or)   ./manage.sh start-cloud"
-    record "promptfoo" "skip" "proxy not reachable at $proxy"
+  # Preflight: 影子环境只需真实后端（模型内容断言）——不再依赖生产代理。
+  local backend="${LLAMA_BASE_URL:-http://127.0.0.1:8081/v1}"
+  if ! curl -sf --max-time 5 "${backend%/v1}/v1/models" >/dev/null 2>&1; then
+    warn "backend not reachable at ${backend%/v1} — skipping promptfoo tier"
+    warn "start it with: ./manage.sh start-backend"
+    record "promptfoo" "skip" "backend not reachable"
+    return 0
+  fi
+
+  # 影子代理环境（2026-09-06）: 从工作树启动独立代理——测的是待提交代码,
+  # 引擎关(一发式 prompt 与 append-only 语义不兼容, 见 lib/promptfoo_env.sh
+  # 头注), 状态隔离, 不打生产代理。状态哨兵覆盖 pfshadow 足迹(与集成同款
+  # 元测试: 拆除后 diag 不得有残留)。
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/test/lib/state_sentinel.sh"
+  state_sentinel_begin
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/test/lib/promptfoo_env.sh"
+  if ! pf_shadow_start; then
+    state_sentinel_end
+    warn "promptfoo shadow env failed to start — skipping tier"
+    record "promptfoo" "skip" "shadow env start failed"
     return 0
   fi
 
@@ -317,7 +333,7 @@ run_promptfoo() {
   local out rc
   # Build arg list safely (handles empty extra_args with set -u)
   local args=(
-      --config promptfooconfig.yaml
+      --config "$PF_SHADOW_CONFIG"
       --no-cache
       --no-share
       --max-concurrency 1
@@ -329,7 +345,14 @@ run_promptfoo() {
   fi
   out=$(cd "$REPO_ROOT" && "$promptfoo_bin" eval "${args[@]}" 2>&1)
   rc=$?
+  pf_shadow_stop
   echo "$out" | tail -15 | tee "$log"
+
+  # 哨兵终检(拆除后 diag 不得有 pfshadow 残留)——fail 与用例失败合并计
+  if ! state_sentinel_end; then
+    record "promptfoo" "fail" "state sentinel: pfshadow 会话状态残留(泄漏)"
+    return
+  fi
 
   if [[ $rc -ne 0 ]]; then
     record "promptfoo" "fail" "promptfoo eval exited $rc (see logs/promptfoo_test.log)"

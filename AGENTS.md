@@ -270,7 +270,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 |------|------|------|------|
 | 单元 | `bash test/run_tests.sh --unit` | 无 | `test/unit/test_*.py`，纯函数逻辑，51 个文件 1516 个用例（2026-09-02 实测），<15s |
 | 集成 | `bash test/run_tests.sh --integration` | 启动 mock backend | `test/integration/*.sh` + `mock_backend.py`，约 60s |
-| Promptfoo | `bash test/run_tests.sh --promptfoo` | 运行中的代理 | 固定 prompt 回归测试（9 个用例） |
+| Promptfoo | `bash test/run_tests.sh --promptfoo` | 真实后端（:8081） | 固定 prompt 回归测试（9 个用例）；**影子代理环境**——从工作树启动独立代理（:4021，引擎关、状态隔离，测的是待提交代码），不打生产代理（2026-09-06，此前直打生产有三重缺陷：代码滞后/engine canonical 污染/生产状态扰动，见 `test/lib/promptfoo_env.sh` 头注） |
 | E2E | `bash test/run_tests.sh --e2e` | 运行中的代理 + 后端 | `test/e2e/*` |
 | 签名 | `bash test/run_tests.sh --signature` | 无 | 校验函数签名快照是否漂移（`tools/gen_func_signatures.py`） |
 | 行为快照 | `bash test/run_tests.sh --snapshot` | 无 | 校验行为快照是否漂移（`tools/gen_behavior_snapshots.py`） |
@@ -292,7 +292,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 1. `--unit`
 2. `--signature`
 3. `--snapshot`
-4. 如果代理正在运行，额外运行 `--promptfoo` 快速模式（只跑 5 个核心用例）
+4. 如果真实后端正在运行，额外运行 `--promptfoo` 快速模式（只跑 5 个核心用例；影子代理环境，批跑实验占用后端时会因排队变慢）
 
 安装：
 

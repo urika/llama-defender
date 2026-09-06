@@ -7,8 +7,9 @@
 #   2. --promptfoo fast mode (only if proxy is already running; ~40s, core 5 tests)
 #
 # Why conditional promptfoo:
-#   - pre-commit must stay fast when no proxy is running
-#   - if proxy IS running, fast mode runs core 5 tests (~40s) instead of full 9 (~80s)
+#   - pre-commit must stay fast when no model backend is running
+#   - if backend IS running, fast mode runs core 5 tests (~40s; 影子代理从
+#     工作树启动, 实验批跑占用后端时会相应变慢——排队所致, 属预期)
 #
 # Skip mechanisms (use sparingly):
 #   SKIP_TESTS=1 git commit -m "..."    # explicit env-var skip
@@ -110,12 +111,17 @@ echo ""
 echo "✅ pre-commit: refactoring regression checks passed."
 
 # ------------------------------------------------------------
-# Optional: Promptfoo regression tests (only if proxy is running)
+# Optional: Promptfoo regression tests (shadow env; needs real backend only)
 # ------------------------------------------------------------
-PROXY_URL="${PROXY_BASE:-http://127.0.0.1:4000}"
-if curl -sf --max-time 2 "$PROXY_URL/v1/models" >/dev/null 2>&1; then
+# 2026-09-06: promptfoo 走影子代理环境(lib/promptfoo_env.sh)——从工作树启动
+# 独立代理(测的是待提交代码), 引擎关, 状态隔离, 不再依赖/干扰生产代理。
+# 前置条件相应改为真实后端可达(模型内容断言的依赖); 后端不可达时跳过,
+# 保持无后端时提交快速。
+BACKEND_URL="${LLAMA_BASE_URL:-http://127.0.0.1:8081}"
+if curl -sf --max-time 2 "$BACKEND_URL/v1/models" >/dev/null 2>&1 \
+   || curl -sf --max-time 2 "$BACKEND_URL/models" >/dev/null 2>&1; then
   echo ""
-  echo "pre-commit: proxy detected at $PROXY_URL — running Promptfoo regression tests (fast mode)..."
+  echo "pre-commit: backend detected at $BACKEND_URL — running Promptfoo regression tests (shadow env, fast mode)..."
   echo ""
   PROMPTFOO_FAST=1 bash "$RUNNER" --promptfoo
   rc=$?
