@@ -543,6 +543,18 @@ PROXY_AUTO_RECALL_PER_SESSION = int(os.environ.get(
 # exchange 的客户端改写副本」(SDK 墓碑化), 视图只增不缩; 配合 stage 19
 # keep-first(无旗标, 始终生效)消除已发送前缀的字节回写 → 后端 hybrid
 # 整条匹配得以命中, 消除每轮 46K 全额冷 prefill。默认关, EXP-2R 批后开。
+# DEF-310: aux 隔离强化——tools=0 即分域(不限 haiku tier)。WebSearch 子
+# 请求(tools=0 非 haiku)漏网实证: 154B 系统+指令型污染被 absorb 进主
+# canonical(EXP-2R seq4)。默认关=基线规则(haiku+tools=0)。
+# DEF-309/EXP-3 前置③: 云端路由默认交代理做上下文管理(engine 写入期压缩/
+# 召回), 提升 token 效率。false=云端透传(client 管理, 旧行为)。
+# 时序注: 引擎在 stage 0.5, 豁免判定补看 _route_header_override(stage 0)。
+PROXY_CLOUD_CM_ENABLED = os.environ.get(
+    "PROXY_CLOUD_CM_ENABLED", get_default("PROXY_CLOUD_CM_ENABLED")).lower() in ("1", "true", "yes")
+
+PROXY_AUX_ISOLATION_STRICT = os.environ.get(
+    "PROXY_AUX_ISOLATION_STRICT", get_default("PROXY_AUX_ISOLATION_STRICT")).lower() in ("1", "true", "yes")
+
 PROXY_CTX_VIEW_STABLE_ENABLED = os.environ.get(
     "PROXY_CTX_VIEW_STABLE_ENABLED", get_default("PROXY_CTX_VIEW_STABLE_ENABLED")).lower() in ("1", "true", "yes")
 
@@ -1191,6 +1203,8 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_VIEW_STABLE_ENABLED", "PROXY_CTX_VIEW_STABLE_ENABLED", "bool", "false", "false"),
+    ("PROXY_AUX_ISOLATION_STRICT", "PROXY_AUX_ISOLATION_STRICT", "bool", "false", "false"),
+    ("PROXY_CLOUD_CM_ENABLED", "PROXY_CLOUD_CM_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
@@ -1366,6 +1380,8 @@ __all__ = [
     "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
     "PROXY_TOMBSTONE_RECALL_ENABLED",
     "PROXY_CTX_VIEW_STABLE_ENABLED",
+    "PROXY_AUX_ISOLATION_STRICT",
+    "PROXY_CLOUD_CM_ENABLED",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority

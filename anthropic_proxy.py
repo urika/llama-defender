@@ -2073,7 +2073,8 @@ class Handler(BaseHTTPRequestHandler):
         metrics_path = os.path.join(metrics_dir, "proxy_metrics.jsonl")
         records = []
         try:
-            with open(metrics_path, "r") as f:
+            # errors="replace" 同 DEF-309: 实时写入文件可能含截断非法字节
+            with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             for line in lines[-last_n:]:
                 try:
@@ -2182,11 +2183,14 @@ class Handler(BaseHTTPRequestHandler):
         sess_filter = (parse_qs(urlparse(self.path).query).get("session", [""])[0] or "").strip()
         records = []
         try:
-            with open(metrics_path, "r") as f:
+            # errors="replace": EXP-2R 实时写入中, 文件截断行可能含非法字节
+            # (0xb8)——裸 decode 会让整个 /metrics/history 500 (DEF-309)。
+            # 逐行容错: 坏行丢弃, 好行照常聚合。
+            with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         rec = json.loads(line.strip())
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                         continue
                     if sess_filter and rec.get("session_id") != sess_filter:
                         continue

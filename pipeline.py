@@ -578,9 +578,14 @@ def _context_exempt(ctx):
     """per-route 上下文管理豁免（设计 §10.1，TC25/26/27）。
 
     解析优先级：per-request 头 X-Proxy-Context-Managed-By > 目录元数据
-    context_managed_by > 路由目标默认（cloud=client / local=proxy）。
+    context_managed_by > 路由目标默认（local=proxy；cloud=按
+    PROXY_CLOUD_CM_ENABLED——DEF-309/EXP-3 前置③：云端默认交代理管理
+    以提升 token 效率，旗标关则回退 client 透传）。
     返回 True 时内容改写类 stage（0.5/7/14/17）全部跳过，报文逐字透传；
     横切观测类（诊断/IFC/PDC/归因头）不豁免。
+    时序注意：本函数在 stage 0.5（引擎）被调用时 SmartRouter(2.5) 未跑，
+    _route_target 还是默认 local——故云端判定补看 _route_header_override
+    (stage 0 由 RequestParser 落入 ctx)。
     """
     v = ((ctx.body or {}).get("_x_proxy_context_managed_by") or "").strip().lower()
     if v in ("client", "proxy"):
@@ -593,7 +598,11 @@ def _context_exempt(ctx):
             return cm == "client"
     except Exception:
         pass
-    return getattr(ctx, '_route_target', 'local') == 'cloud'
+    cloud = (getattr(ctx, '_route_target', 'local') == 'cloud'
+             or getattr(ctx, '_route_header_override', '') == 'cloud')
+    if cloud:
+        return not getattr(_ps, "PROXY_CLOUD_CM_ENABLED", False)
+    return False
 
 
 def _ctx_record_usage(ctx, usage):
@@ -638,16 +647,22 @@ class ContextEngineStage(ConditionalStage):
             return False
         if not _ctx_engine_on() or not ctx.session_id:
             return False
-        # aux(辅助模型)请求隔离: claude SDK 的 title 生成等内部辅助调用
-        # (haiku tier + tools=0)与主对话共用 session id(ANTHROPIC_CUSTOM_
-        # HEADERS 对 SDK 全部请求统一注入, harness 无法区分)——若并入同一
-        # canonical, aux 历史污染主对话形态 → prefix mismatch rebuild →
-        # 主任务 1 轮 end_turn 空 patch(2026-09-04 复现实锤)。haiku tier
-        # 的 tools=0 请求按独立会话处理: key 加 model 域后缀, 与主对话
-        # canonical 互不可见。
-        if (getattr(ctx, "_agent_model_tier", "sonnet") == "haiku"
-                and not (ctx.tools_list or [])):
-            ctx.session_id = ctx.session_id + "::aux-haiku"
+        # aux(辅助模型)请求隔离: claude SDK 的内部辅助调用与主对话共用
+        # session id(ANTHROPIC_CUSTOM_HEADERS 对 SDK 全部请求统一注入,
+        # harness 无法区分)——若并入同一 canonical, aux 历史污染主对话形态。
+        # 两代规则:
+        #   基线(cdf1df5): haiku tier + tools=0 → ::aux-haiku
+        #   STRICT(DEF-310, 2026-09-06): **tools=0 即分域**——WebSearch 子
+        #   请求(chars=2609, tools=0, 非 haiku)漏网实证: 其 154B 系统+150B
+        #   指令被 absorb 进主 canonical(指令型污染, 模型服从执行了搜索),
+        #   且 system[0] 调包致前缀全失效(双轮冷 prefill)。主对话恒有工具
+        #   (52), tools=0 的请求无论 tier 一律 ::aux 域。
+        if not (ctx.tools_list or []):
+            strict = getattr(_ps, "PROXY_AUX_ISOLATION_STRICT", False)
+            if strict or getattr(ctx, "_agent_model_tier",
+                                 "sonnet") == "haiku":
+                ctx.session_id = ctx.session_id + (
+                    "::aux-strict" if strict else "::aux-haiku")
         return True
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
@@ -3779,11 +3794,13 @@ class BackendDispatcher(PipelineStage):
         if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
             log(f"  -> Request body too large for anthropic backend: "
                 f"{len(body_bytes)} > {_ps.PROXY_CLOUD_MAX_REQUEST_BYTES}")
+            target = getattr(ctx, '_route_target', 'local')
             self._handler._respond_json(
                 {"error": {
                     "type": "payload_too_large",
                     "message": f"Request body ({len(body_bytes)} bytes) exceeds anthropic "
                                f"backend maximum ({_ps.PROXY_CLOUD_MAX_REQUEST_BYTES} bytes).",
+                    "route_target": target,
                 }}, 413)
             return
 

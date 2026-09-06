@@ -355,6 +355,30 @@ class TestPipelineWiring(unittest.TestCase):
             aux.messages = _tu("gen title")  # RequestParser 通常负责; 此处显式
             self.assertTrue(stage.should_run(aux))
             self.assertEqual(aux.session_id, "s-aux1::aux-haiku")
+            # DEF-310: STRICT 下非 haiku 的 tools=0 子请求(WebSearch 流)也分域
+            _ps.PROXY_AUX_ISOLATION_STRICT = True
+            try:
+                aux2 = PipelineContext(body={"model": "claude-sonnet-4-6",
+                                             "messages": [_tu("search")]},
+                                       request_id="r3")
+                aux2.session_id = "s-aux1"
+                aux2.tools_list = []
+                aux2._agent_model_tier = "sonnet"  # 非 haiku: 基线规则漏网形态
+                aux2.messages = [_tu("Perform a web search for the query: x")]
+                self.assertTrue(stage.should_run(aux2))
+                self.assertEqual(aux2.session_id, "s-aux1::aux-strict")
+                # 主对话 key 不受任何 aux 请求影响
+                main2 = PipelineContext(body={"model": "claude-sonnet-4-6",
+                                              "messages": [_tu("task2")]},
+                                        request_id="r4")
+                main2.session_id = "s-aux1"
+                main2.tools_list = [{"name": "Bash"}]
+                main2._agent_model_tier = "sonnet"
+                main2.messages = _tu("task2")
+                self.assertTrue(stage.should_run(main2))
+                self.assertEqual(main2.session_id, "s-aux1")
+            finally:
+                _ps.PROXY_AUX_ISOLATION_STRICT = False
             # 两者 canonical 独立(aux 不进主会话)
             ce.ENGINE._sessions.pop("s-aux1", None)
             ce.ENGINE._sessions.pop("s-aux1::aux-haiku", None)

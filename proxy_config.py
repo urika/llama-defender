@@ -1013,6 +1013,25 @@ CONFIG_REGISTRY = {
                "wall-clock from per-turn 46K cold prefill). Pair with "
                "stage-19 keep-first (always on).",
     },
+    "PROXY_AUX_ISOLATION_STRICT": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "DEF-310 aux isolation hardening: ANY tools=0 request is "
+               "isolated into its own ::aux-strict engine domain (not just "
+               "haiku tier) - SDK WebSearch sub-requests otherwise leak "
+               "their tiny system prompt + instruction into the main "
+               "canonical (instruction-shaped pollution the model obeys).",
+    },
+    "PROXY_CLOUD_CM_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Cloud-route context management master switch (EXP-3 "
+               "prereq 3): when on, cloud-routed requests are managed by "
+               "the proxy (engine write-time compression + recall) instead "
+               "of passing through - saves input tokens on long agent "
+               "sessions. Per-model/per-request overrides (context_managed_by "
+               "metadata / X-Proxy-Context-Managed-By) still win.",
+    },
     "PROXY_CTX_ENGINE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

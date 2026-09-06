@@ -391,6 +391,16 @@
 
 ---
 
+### DEF-310: aux 隔离盲区——WebSearch 子请求泄漏进主 canonical，系统提示词被调包（L-13 姊妹篇，P1） — 🟡 修复已实现待上线（2026-09-06）
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | EXP-2R seq4（s38d5e97，treatment r2）值守观测 + archive 逐轮 diff（2026-09-06） |
+| **现象** | turn 19 视图 158K→90K：`system[0]` 从 29310 字符被换成 154 字符，且新增 150 字节 user 消息「Perform a web search for the query: ansible psrp connection plugin」**永久驻留 canonical**（turn 20-45 常驻 index 36）；turn 20 系统恢复又失效一次——双轮全额冷 prefill |
+| **根因** | SDK 内部 WebSearch 子请求（`chars=2609, tools=0`，17:25:48 与主请求同 3 秒抵达）带同一会话头；aux 隔离规则（cdf1df5：`haiku tier + tools=0`）要求 tier=haiku，该子请求非 haiku → 漏网 → 其 2 条消息被 engine absorb 永久追加进主 canonical（含可被模型服从的**指令型污染**：模型后续执行 WebSearch ×1 + searxng ×2） |
+| **修复** | `PROXY_AUX_ISOLATION_STRICT`（默认关）：aux 判别从「haiku 且 tools=0」扩展为「**tools=0 即分域**」（主对话恒有 52 工具，tools=0 的子请求无论 tier 一律 `::aux` 域）；配套**系统钉扎**——`::aux` 分域后子请求的 154B 系统永不触碰主 canonical 的 29310B 系统（位置 0 的字节稳定由分域保证，与轨道①同族） |
+| **影响** | 污染指令被模型服从（3 次搜索浪费轮次）——seq4 failed 的混淆变量，判读时单列；公平性无碍（子请求泄漏与旗标无关，两臂同概率） |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）

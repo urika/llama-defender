@@ -881,7 +881,7 @@ def _get_context_optimization_stats():
     loop/blocker counts, and the most recent blocker event.
     """
     try:
-        with open(_ps._METRICS_PATH, "r", encoding="utf-8") as f:
+        with open(_ps._METRICS_PATH, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except (OSError, IOError):
         return _empty_context_optimization_stats()
@@ -967,7 +967,7 @@ def _get_compression_stats():
     当 metrics 文件不存在或为空时返回 _empty_compression_stats.
     """
     try:
-        with open(_ps._METRICS_PATH, "r", encoding="utf-8") as f:
+        with open(_ps._METRICS_PATH, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except (OSError, IOError):
         return _empty_compression_stats()
@@ -1398,7 +1398,7 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
         return cached
     rows = []
     try:
-        with open(metrics_path, "r", encoding="utf-8") as f:
+        with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
             from collections import deque
             for line in deque(f, maxlen=max_lines):
                 line = line.strip()
@@ -1437,7 +1437,7 @@ def _load_recent_session_ids(max_lines: int = 5000, n: int = 12):
     models = {}  # sid -> set of model names
     client_types = {}  # sid -> {type: count}
     try:
-        with open(metrics_path, "r", encoding="utf-8") as f:
+        with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
             from collections import deque
             for line in deque(f, maxlen=max_lines):
                 line = line.strip()

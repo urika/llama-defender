@@ -212,9 +212,14 @@ EXP-2 唯一成功注入（seq 5，test_psrp.py，采纳 ✓）走的是**写入
 
 1. EXP-2 判读完成（本批次 + 墓碑召回新代码的下一轮实验）
 2. `DISABLE_AUTOCOMPACT` 回退链验证（客户端让位，否则双层压缩互扰）
-3. 云端 stage 门控改型：门控条件从「路由==cloud 硬编码」（`pipeline.py` 6/7/14/15/17
-   与引擎的 `_route_target` 判断处）改为配置驱动（如 `PROXY_CLOUD_CM_ENABLED`），
-   让云端按实验臂开合；auto-recall/墓碑召回的 aux 豁免与 fail-open 语义沿用
+3. ✅ 已落地（2026-09-06）：`PROXY_CLOUD_CM_ENABLED`（默认关，reloadable）——
+   `_context_exempt` 云端默认分支改由旗标驱动（旗标 on=代理管理/off=透传），
+   并修复豁免判定的时序盲区（stage 0.5 早于 SmartRouter，补看 stage 0 的
+   `_route_header_override`）；按模型/按请求覆盖（catalog
+   `context_managed_by` 元数据 / X-Proxy-Context-Managed-By 头）优先级更高。
+   实测确认：engine 本就因时序漏洞在云端运行（意外半开状态），本旗标把它
+   变成显式可控；anthropic 分发复用 ctx.openai_body（管线调整已应用），
+   修改后报文确认到达云端 API。auto-recall/墓碑召回语义沿用
 4. 成本计量核对：route_cost 对压缩后 token 的计费准确性抽查
 
 **非目标**：不承诺 f2p 提升（成本实验）；订阅臂不适用；短会话不适用。
@@ -243,6 +248,20 @@ EXP-2R 值守观测 + 日志取证（s38beef8）：46K tokens/轮 × TTFT p50 21
   HIT 率与 TTFT（命中率权威口径 = llama-server.log，不依赖 usage 回传）
 - 轨道②（cache-mem/gpu-mem 上调 A/B）随同一次重启生效；轨道③（aux 不
   cache_store）为 rapid-mlx 上游项，登记不实施
+
+### 13.1 轨道④：aux 隔离强化（DEF-310，已实现待上线）
+
+EXP-2R seq4 实证第三种视图污染形态：SDK 内部 **WebSearch 子请求**
+（chars=2609, tools=0, 非 haiku tier）带同一会话头，绕过 cdf1df5 的
+「haiku+tools=0」隔离规则——其 154B 短系统 + 150B 指令（"Perform a web
+search for…"）被 absorb 进主 canonical 并**永久驻留**（turn 20-45）；
+system[0] 被调包致前缀全失效（turn 19/20 双轮冷 prefill）；模型服从污染
+指令执行了 3 次搜索（浪费轮次，seq4 failed 的混淆变量）。
+
+修复：`PROXY_AUX_ISOLATION_STRICT`（默认关）——aux 判别从「haiku 且
+tools=0」扩展为「**tools=0 即分域**」(→ `::aux-strict`)；系统钉扎由分域
+天然保证（子请求系统永不触碰主 canonical 位置 0）。与轨道①同属「视图
+字节稳定化」家族：轨道①管 tool_result 墓碑副本，轨道④管子请求泄漏。
 
 ## 参考
 
