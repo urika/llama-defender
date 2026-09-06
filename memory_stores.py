@@ -305,7 +305,9 @@ def record_orig_content(session_key, anchor, content, diag_dir=None):
     try:
         od = os.path.join(d, "orig")
         os.makedirs(od, exist_ok=True)
-        path = os.path.join(od, sanitize_session_key(session_key)[:8] + ".jsonl")
+        # DEF-309: 全量 key 命名(不再 [:8] 二次截断——截断时代同前缀会话
+        # orig 互串;旧 8 字符存量经 session_ledger.resolve_session_key 兼容)
+        path = os.path.join(od, sanitize_session_key(session_key) + ".jsonl")
         lines = []
         if os.path.exists(path):
             try:
@@ -326,7 +328,7 @@ def read_orig_content(session_key, anchor, diag_dir=None):
     """按锚点读回压缩前原文; 未找到返回 None。"""
     from session_ledger import sanitize_session_key
     d = diag_dir or getattr(_ps, "_DIAG_DIR", os.path.join("logs", "diag"))
-    path = os.path.join(d, "orig", sanitize_session_key(session_key)[:8] + ".jsonl")
+    path = os.path.join(d, "orig", sanitize_session_key(session_key) + ".jsonl")
     try:
         with open(path, encoding="utf-8") as f:
             best = None

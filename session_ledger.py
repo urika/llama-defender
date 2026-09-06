@@ -6,6 +6,8 @@
         (与上下文工程 Phase 1 解耦,先行落地)。前缀失配 → 全量重建 + canonical_mismatch。
   - D4: turn = 代理所见该会话的请求序号(一次请求内多工具调用同 turn)。
   - D5: 会话 key 沿用 X-Claude-Code-Session-Id[:8];key_source 记录来源。
+        (DEF-309 修订 2026-09-06: 引擎 key 改用 header sid 全量(cap 64),
+        [:8] 仅作日志显示;存量 8 字符数据经 resolve_session_key 兼容)
   - D7: sent_view(实际发给后端的最终 payload)是"模型实际所见"的唯一权威,
         常态每轮落盘 logs/diag/archive/<sid>.jsonl,受 MB 上限 + TTL 约束。
 
@@ -50,6 +52,59 @@ _WRITE_TOOLS = ("write", "edit")
 def sanitize_session_key(sid):
     """会话 key → 文件系统安全形式(用于 archive 路径)。"""
     return re.sub(r'[^A-Za-z0-9_-]', '_', sid or "")[:64] or "_anon"
+
+
+def _diag_store_dirs():
+    """会话态落盘目录(ledger/archive/manifest/orig)——resolve 共用。"""
+    return (
+        getattr(_ps, "_DIAG_LEDGER_DIR", ""),
+        getattr(_ps, "_DIAG_ARCHIVE_DIR", ""),
+        os.path.join(getattr(_ps, "_DIAG_DIR", ""), "manifest"),
+        os.path.join(getattr(_ps, "_DIAG_DIR", ""), "orig"),
+    )
+
+
+def resolve_session_key(key):
+    """查询 key → 磁盘存储 key 解析(诊断端点统一入口, DEF-309)。
+
+    顺序: ①ledger 精确命中(活跃会话) ②前缀唯一匹配(消费方持 sid[:8]
+    查全量 key 会话的兼容面) ③其余 store 精确命中(archive/manifest/orig
+    旧存量) ④key[:8] 旧存量(截断时代数据) ⑤原样返回。
+    ②多命中歧义时 fail-closed 原样返回——宁可 404 不误并两个会话(本修复
+    要消灭的正是误并)。①先于③: 防止 archive 里截断时代的同名旧档短路
+    活跃会话(2026-09-06 EXP-2R 重跑实测: 8 字符查询误解析到上午旧会话)。
+    """
+    s = sanitize_session_key(key)
+    dirs = [d for d in _diag_store_dirs() if d]
+    if dirs and os.path.isfile(os.path.join(dirs[0], s + ".jsonl")):
+        return key
+    # 前缀匹配;__aux-* 边车(影子模型同会话)归并到主 stem
+    hits = set()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl") or not name.startswith(s):
+                continue
+            stem = name[:-6].split("__aux", 1)[0]
+            if stem != s:
+                hits.add(stem)
+    if len(hits) == 1:
+        return hits.pop()
+    if len(hits) > 1:
+        return key
+    for d in dirs[1:]:
+        if os.path.isfile(os.path.join(d, s + ".jsonl")):
+            return key
+    short = key[:8]
+    if (short != key and dirs
+            and os.path.isfile(os.path.join(dirs[0], sanitize_session_key(short) + ".jsonl"))):
+        return short
+    return key
 
 
 def _msg_hash(msg):

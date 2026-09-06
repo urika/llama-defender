@@ -443,7 +443,10 @@ class RequestParser(PipelineStage):
             ctx.raw_tools_orig = raw_tools
 
         # Session ID (from thread-local logging context)
-        ctx.session_id = getattr(_ps._log_ctx, 'session_id', None) or ""
+        # DEF-309: 优先取全量 session_key(引擎唯一 key);session_id 仅 8 字符
+        # 日志显示,旧代理路径/测试未设 session_key 时回落。
+        ctx.session_id = (getattr(_ps._log_ctx, 'session_key', None)
+                          or getattr(_ps._log_ctx, 'session_id', None) or "")
 
         # Character count
         ctx.total_chars = sum(

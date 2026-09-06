@@ -482,11 +482,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
+        # DEF-309: 引擎会话 key 不再截 8 字符——header sid 全量(cap 64, 与
+        # sanitize_session_key 上限对齐)经 _log_ctx.session_key 下发引擎;
+        # session_id 仅存 8 字符日志显示。截断时代同前缀会话共享引擎状态
+        # (内容经前缀失配重建无损但缓存互扰, gate 实测教训②)。
+        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:64]
         if not raw_sid:
             client_addr = getattr(self, 'client_address', ('127.0.0.1', 0))
             client_key = f"{client_addr[0]}:{self.headers.get('User-Agent', '')}:{datetime.now().strftime('%Y-%m-%d')}"
             raw_sid = "cli_" + hashlib.md5(client_key.encode()).hexdigest()[:8]
+        _log_ctx.session_key = raw_sid
         _log_ctx.session_id = raw_sid[:8]
         try:
             try:
@@ -640,16 +645,23 @@ class Handler(BaseHTTPRequestHandler):
             _log_ctx.session_id = None
 
     def do_POST(self):
-        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:8]
+        # DEF-309: 引擎会话 key 不再截 8 字符——header sid 全量(cap 64, 与
+        # sanitize_session_key 上限对齐)经 _log_ctx.session_key 下发引擎;
+        # session_id 仅存 8 字符日志显示。截断时代同前缀会话共享引擎状态
+        # (内容经前缀失配重建无损但缓存互扰, gate 实测教训②)。
+        raw_sid = self.headers.get("X-Claude-Code-Session-Id", "")[:64]
         if not raw_sid:
             client_addr = getattr(self, 'client_address', ('127.0.0.1', 0))
             client_key = f"{client_addr[0]}:{self.headers.get('User-Agent', '')}:{datetime.now().strftime('%Y-%m-%d')}"
             raw_sid = "cli_" + hashlib.md5(client_key.encode()).hexdigest()[:8]
+        _log_ctx.session_key = raw_sid
         _log_ctx.session_id = raw_sid[:8]
         if PROXY_METRICS_ENABLED:
             _metrics_ctx.mc = {
                 "ts": datetime.now().isoformat(),
-                "session_id": getattr(_log_ctx, 'session_id', None) or "",
+                # metrics 行(session.jsonl/proxy_metrics.jsonl)随引擎 key
+                # 走全量——按 8 字符截断聚合的跨批次串扰史见 #60(2026-08-29)
+                "session_id": getattr(_log_ctx, 'session_key', None) or "",
                 "client_type": _detect_client_type(self.headers.get('User-Agent', '')),
                 "pipeline": {},
             }
@@ -949,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         import diagnostics
                         diagnostics.begin_request(
-                            _req_id, raw_sid[:8],
+                            _req_id, raw_sid,
                             "header" if self.headers.get("X-Claude-Code-Session-Id") else "fallback")
                         mc = getattr(_metrics_ctx, 'mc', None)
                         if mc:
@@ -2299,16 +2311,10 @@ class Handler(BaseHTTPRequestHandler):
         import session_ledger
         import diagnostics
 
-        # G-D: 允许消费方持完整会话头值查询——精确 key 未命中且其 8 字符
-        # 截断形式有台账/档案时按截断 key 归并（代理内部路由本就如此归并，
-        # 语义一致；harness 无需自行实现截断）。
-        if len(key) > 8:
-            _short = key[:8]
-            if (not session_ledger.LEDGER.session_alive(key)
-                    and not session_ledger.ARCHIVE.has_archive(key)
-                    and (session_ledger.LEDGER.session_alive(_short)
-                         or session_ledger.ARCHIVE.has_archive(_short))):
-                key = _short
+        # G-D(DEF-309 重写): 查询 key → 存储 key 统一解析——精确 → 前缀唯一
+        # (消费方持 sid[:8] 查全量 key 会话) → 旧 8 字符存量(截断时代) → 原样。
+        # 取代原先单向的 full→short 归并；歧义 fail-closed(resolve 内注释)。
+        key = session_ledger.resolve_session_key(key)
 
         if tail == "ledger":
             ledger = session_ledger.LEDGER.build_ledger_json(

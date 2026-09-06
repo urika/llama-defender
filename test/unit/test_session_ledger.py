@@ -361,5 +361,78 @@ class TestLedgerPersistence(unittest.TestCase):
         self.assertIsNone(store.build_ledger_json("never_seen"))
 
 
+class TestResolveSessionKey(unittest.TestCase):
+    """resolve_session_key — DEF-309 查询 key → 存储 key 解析。
+
+    背景: 引擎 key 自 DEF-309 起为 header sid 全量,[:8] 仅日志显示;
+    消费方(harness run_agent/analyze/status)仍持 sid[:8] 查询,需前缀
+    唯一解析;截断时代 8 字符存量走旧形式精确命中。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="resolve_key_")
+        self._saved = (_ps._DIAG_LEDGER_DIR, _ps._DIAG_ARCHIVE_DIR, _ps._DIAG_DIR)
+        _ps._DIAG_LEDGER_DIR = os.path.join(self._tmp, "ledger")
+        _ps._DIAG_ARCHIVE_DIR = os.path.join(self._tmp, "archive")
+        _ps._DIAG_DIR = self._tmp
+        os.makedirs(_ps._DIAG_LEDGER_DIR, exist_ok=True)
+
+    def tearDown(self):
+        _ps._DIAG_LEDGER_DIR, _ps._DIAG_ARCHIVE_DIR, _ps._DIAG_DIR = self._saved
+
+    @staticmethod
+    def _touch(d, name):
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, name), "w").close()
+
+    def test_exact_full_key_hit(self):
+        full = "s38beef8ab-instance_ansible__ansible-1a4644ff15355f"
+        self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(full) + ".jsonl")
+        self.assertEqual(sl.resolve_session_key(full), full)
+
+    def test_short_query_resolves_unique_full_key(self):
+        full = "s38beef8ab-instance_ansible__ansible-1a4644ff15355f"
+        self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(full) + ".jsonl")
+        self.assertEqual(sl.resolve_session_key(full[:8]), full)
+
+    def test_aux_sidecar_merges_into_main_stem(self):
+        full = "s38beef8ab-instance_ansible__ansible-1a4644ff15355f"
+        self._touch(_ps._DIAG_ARCHIVE_DIR, sl.sanitize_session_key(full) + ".jsonl")
+        self._touch(_ps._DIAG_ARCHIVE_DIR,
+                    sl.sanitize_session_key(full) + "__aux-haiku.jsonl")
+        self.assertEqual(sl.resolve_session_key(full[:8]), full)
+
+    def test_ambiguous_prefix_fails_closed(self):
+        a = "s38beef8ab-instance_one"
+        b = "s38beef8ab-instance_two"
+        self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(a) + ".jsonl")
+        self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(b) + ".jsonl")
+        # 歧义 → 原样返回(端点层 404),不误并
+        self.assertEqual(sl.resolve_session_key("s38beef8ab"), "s38beef8ab")
+
+    def test_legacy_short_store_hit(self):
+        # 截断时代存量: 磁盘名就是 8 字符(manifest 目录派生自 _DIAG_DIR)
+        self._touch(os.path.join(_ps._DIAG_DIR, "manifest"), "s38beef8.jsonl")
+        self.assertEqual(sl.resolve_session_key("s38beef8"), "s38beef8")
+
+    def test_legacy_full_header_query_falls_back_to_short_store(self):
+        # 旧会话(存储名 8 字符) + 新客户端持全量 sid 重连 → 回落 [:8] 命中
+        self._touch(_ps._DIAG_LEDGER_DIR, "s38beef8.jsonl")
+        full = "s38beef8ab-instance_ansible__ansible-1a4644ff15355f"
+        self.assertEqual(sl.resolve_session_key(full), "s38beef8")
+
+    def test_unknown_key_unchanged(self):
+        self.assertEqual(sl.resolve_session_key("cli_2566"), "cli_2566")
+
+    def test_stale_short_archive_does_not_shadow_live_full_session(self):
+        # EXP-2R 重跑实测回归: archive 里截断时代的 8 字符旧档 + 活跃全 key
+        # 会话并存时, 8 字符查询必须解析到活跃会话(ledger 前缀), 而非被
+        # archive 精确命中短路——否则 harness ?since 拉取 404, 机制证据丢失
+        full = "s38beef8a4f-instance_ansible__ansible-1a4644ff15355f"
+        self._touch(_ps._DIAG_ARCHIVE_DIR, "s38beef8.jsonl")
+        self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(full) + ".jsonl")
+        self.assertEqual(sl.resolve_session_key("s38beef8"), full)
+
+
 if __name__ == "__main__":
     unittest.main()

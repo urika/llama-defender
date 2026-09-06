@@ -67,6 +67,9 @@ class TestRequestParser(unittest.TestCase):
             ],
         }
         _ps._log_ctx.session_id = "sess_test_123"
+        # DEF-309: session_key 优先级高于 session_id——清掉同线程先前
+        # handler 级测试在线程本地里的残留,保证用例确定性
+        _ps._log_ctx.session_key = None
 
     def test_extracts_basic_fields(self):
         ctx = RequestParser().process(PipelineContext(body=self.body))
