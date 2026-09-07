@@ -1278,5 +1278,275 @@
     "QZ-7391"
    ]
   }
+ },
+ {
+  "id": "TC30",
+  "suite": "autorecall",
+  "session": "t30b",
+  "name": "代码目标 auto-recall 注入：结构感知摘录端到端",
+  "seed_archive": [
+   {
+    "session": "t30b",
+    "tool_use_id": "call_dup0",
+    "content": "1\t# filler line 0 of the psrp connection module\n2\t# filler line 1 of the psrp connection module\n3\t# filler line 2 of the psrp connection module\n4\t# filler line 3 of the psrp connection module\n5\t# filler line 4 of the psrp connection module\n6\t# filler line 5 of the psrp connection module\n7\t# filler line 6 of the psrp connection module\n8\t# filler line 7 of the psrp connection module\n9\t# filler line 8 of the psrp connection module\n10\t# filler line 9 of the psrp connection module\n11\t# filler line 10 of the psrp connection module\n12\t# filler line 11 of the psrp connection module\n13\t# filler line 12 of the psrp connection module\n14\t# filler line 13 of the psrp connection module\n15\t# filler line 14 of the psrp connection module\n16\t# filler line 15 of the psrp connection module\n17\t# filler line 16 of the psrp connection module\n18\t# filler line 17 of the psrp connection module\n19\t# filler line 18 of the psrp connection module\n20\t# filler line 19 of the psrp connection module\n21\t# filler line 20 of the psrp connection module\n22\t# filler line 21 of the psrp connection module\n23\t# filler line 22 of the psrp connection module\n24\t# filler line 23 of the psrp connection module\n25\t# filler line 24 of the psrp connection module\n26\t# filler line 25 of the psrp connection module\n27\t# filler line 26 of the psrp connection module\n28\t# filler line 27 of the psrp connection module\n29\t# filler line 28 of the psrp connection module\n30\t# filler line 29 of the psrp connection module\n31\t# filler line 30 of the psrp connection module\n32\t# filler line 31 of the psrp connection module\n33\t# filler line 32 of the psrp connection module\n34\t# filler line 33 of the psrp connection module\n35\t# filler line 34 of the psrp connection module\n36\t# filler line 35 of the psrp connection module\n37\t# filler line 36 of the psrp connection module\n38\t# filler line 37 of the psrp connection module\n39\t# filler line 38 of the psrp connection module\n40\t# filler line 39 of the psrp connection module\n41\t# filler line 40 of the psrp connection module\n42\t# filler line 41 of the psrp connection module\n43\t# filler line 42 of the psrp connection module\n44\t# filler line 43 of the psrp connection module\n45\t# filler line 44 of the psrp connection module\n46\t# filler line 45 of the psrp connection module\n47\t# filler line 46 of the psrp connection module\n48\t# filler line 47 of the psrp connection module\n49\t# filler line 48 of the psrp connection module\n50\t# filler line 49 of the psrp connection module\n51\t# filler line 50 of the psrp connection module\n52\t# filler line 51 of the psrp connection module\n53\t# filler line 52 of the psrp connection module\n54\t# filler line 53 of the psrp connection module\n55\t# filler line 54 of the psrp connection module\n56\t# filler line 55 of the psrp connection module\n57\t# filler line 56 of the psrp connection module\n58\t# filler line 57 of the psrp connection module\n59\t# filler line 58 of the psrp connection module\n60\t# filler line 59 of the psrp connection module\n61\t# filler line 60 of the psrp connection module\n62\t# filler line 61 of the psrp connection module\n63\t# filler line 62 of the psrp connection module\n64\t# filler line 63 of the psrp connection module\n65\t# filler line 64 of the psrp connection module\n66\t# filler line 65 of the psrp connection module\n67\t# filler line 66 of the psrp connection module\n68\t# filler line 67 of the psrp connection module\n69\t# filler line 68 of the psrp connection module\n70\t# filler line 69 of the psrp connection module\n71\t# filler line 70 of the psrp connection module\n72\t# filler line 71 of the psrp connection module\n73\t# filler line 72 of the psrp connection module\n74\t# filler line 73 of the psrp connection module\n75\t# filler line 74 of the psrp connection module\n76\t# filler line 75 of the psrp connection module\n77\t# filler line 76 of the psrp connection module\n78\t# filler line 77 of the psrp connection module\n79\t# filler line 78 of the psrp connection module\n80\t# filler line 79 of the psrp connection module\n81\t# filler line 80 of the psrp connection module\n82\t# filler line 81 of the psrp connection module\n83\t# filler line 82 of the psrp connection module\n84\t# filler line 83 of the psrp connection module\n85\t# filler line 84 of the psrp connection module\n86\t# filler line 85 of the psrp connection module\n87\t# filler line 86 of the psrp connection module\n88\t# filler line 87 of the psrp connection module\n89\t# filler line 88 of the psrp connection module\n90\t# filler line 89 of the psrp connection module\n91\t# filler line 90 of the psrp connection module\n92\t# filler line 91 of the psrp connection module\n93\t# filler line 92 of the psrp connection module\n94\t# filler line 93 of the psrp connection module\n95\t# filler line 94 of the psrp connection module\n96\t# filler line 95 of the psrp connection module\n97\t# filler line 96 of the psrp connection module\n98\t# filler line 97 of the psrp connection module\n99\t# filler line 98 of the psrp connection module\n100\t# filler line 99 of the psrp connection module\n101\t# filler line 100 of the psrp connection module\n102\t# filler line 101 of the psrp connection module\n103\t# filler line 102 of the psrp connection module\n104\t# filler line 103 of the psrp connection module\n105\t# filler line 104 of the psrp connection module\n106\t# filler line 105 of the psrp connection module\n107\t# filler line 106 of the psrp connection module\n108\t# filler line 107 of the psrp connection module\n109\t# filler line 108 of the psrp connection module\n110\t# filler line 109 of the psrp connection module\n111\t# filler line 110 of the psrp connection module\n112\t# filler line 111 of the psrp connection module\n113\t# filler line 112 of the psrp connection module\n114\t# filler line 113 of the psrp connection module\n115\t# filler line 114 of the psrp connection module\n116\t# filler line 115 of the psrp connection module\n117\t# filler line 116 of the psrp connection module\n118\t# filler line 117 of the psrp connection module\n119\t# filler line 118 of the psrp connection module\n120\t# filler line 119 of the psrp connection module\n121\t# filler line 120 of the psrp connection module\n122\t# filler line 121 of the psrp connection module\n123\t# filler line 122 of the psrp connection module\n124\t# filler line 123 of the psrp connection module\n125\t# filler line 124 of the psrp connection module\n126\t# filler line 125 of the psrp connection module\n127\t# filler line 126 of the psrp connection module\n128\t# filler line 127 of the psrp connection module\n129\t# filler line 128 of the psrp connection module\n130\t# filler line 129 of the psrp connection module\n131\t# filler line 130 of the psrp connection module\n132\t# filler line 131 of the psrp connection module\n133\t# filler line 132 of the psrp connection module\n134\t# filler line 133 of the psrp connection module\n135\t# filler line 134 of the psrp connection module\n136\t# filler line 135 of the psrp connection module\n137\t# filler line 136 of the psrp connection module\n138\t# filler line 137 of the psrp connection module\n139\t# filler line 138 of the psrp connection module\n140\t# filler line 139 of the psrp connection module\n141\t# filler line 140 of the psrp connection module\n142\t# filler line 141 of the psrp connection module\n143\t# filler line 142 of the psrp connection module\n144\t# filler line 143 of the psrp connection module\n145\t# filler line 144 of the psrp connection module\n146\t# filler line 145 of the psrp connection module\n147\t# filler line 146 of the psrp connection module\n148\t# filler line 147 of the psrp connection module\n149\t# filler line 148 of the psrp connection module\n150\t# filler line 149 of the psrp connection module\n151\t# filler line 150 of the psrp connection module\n152\t# filler line 151 of the psrp connection module\n153\t# filler line 152 of the psrp connection module\n154\t# filler line 153 of the psrp connection module\n155\t# filler line 154 of the psrp connection module\n156\t# filler line 155 of the psrp connection module\n157\t# filler line 156 of the psrp connection module\n158\t# filler line 157 of the psrp connection module\n159\t# filler line 158 of the psrp connection module\n160\t# filler line 159 of the psrp connection module\n161\t# filler line 160 of the psrp connection module\n162\t# filler line 161 of the psrp connection module\n163\t# filler line 162 of the psrp connection module\n164\t# filler line 163 of the psrp connection module\n165\t# filler line 164 of the psrp connection module\n166\t# filler line 165 of the psrp connection module\n167\t# filler line 166 of the psrp connection module\n168\t# filler line 167 of the psrp connection module\n169\t# filler line 168 of the psrp connection module\n170\t# filler line 169 of the psrp connection module\n171\t# filler line 170 of the psrp connection module\n172\t# filler line 171 of the psrp connection module\n173\t# filler line 172 of the psrp connection module\n174\t# filler line 173 of the psrp connection module\n175\t# filler line 174 of the psrp connection module\n176\t# filler line 175 of the psrp connection module\n177\t# filler line 176 of the psrp connection module\n178\t# filler line 177 of the psrp connection module\n179\t# filler line 178 of the psrp connection module\n180\t# filler line 179 of the psrp connection module\n181\t# filler line 180 of the psrp connection module\n182\t# filler line 181 of the psrp connection module\n183\t# filler line 182 of the psrp connection module\n184\t# filler line 183 of the psrp connection module\n185\t# filler line 184 of the psrp connection module\n186\t# filler line 185 of the psrp connection module\n187\t# filler line 186 of the psrp connection module\n188\t# filler line 187 of the psrp connection module\n189\t# filler line 188 of the psrp connection module\n190\t# filler line 189 of the psrp connection module\n191\t# filler line 190 of the psrp connection module\n192\t# filler line 191 of the psrp connection module\n193\t# filler line 192 of the psrp connection module\n194\t# filler line 193 of the psrp connection module\n195\t# filler line 194 of the psrp connection module\n196\t# filler line 195 of the psrp connection module\n197\t# filler line 196 of the psrp connection module\n198\t# filler line 197 of the psrp connection module\n199\t# filler line 198 of the psrp connection module\n200\t# filler line 199 of the psrp connection module\nclass PsrpConnection:\n    def _connect(self):\n        return 'psrp'\n    def _load_extras(self, extras):\n        return extras\n"
+   }
+  ],
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "injected trigger=dup"
+   ],
+   "last_dispatch_contains": [
+    "[skeleton:"
+   ]
+  },
+  "bodies": [
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "修复 psrp extras 处理的问题。"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup0",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup0",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "继续。"
+     }
+    ]
+   },
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "修复 psrp extras 处理的问题。"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup0",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup0",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup1",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup1",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "继续修复 psrp extras。"
+     }
+    ]
+   },
+   {
+    "model": "$client",
+    "max_tokens": 512,
+    "tools": {
+     "$standard": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Grep"
+     ],
+     "$dummy": 20
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "修复 psrp extras 处理的问题。"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup0",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup0",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup1",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup1",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "call_dup2",
+        "name": "Read",
+        "input": {
+         "file_path": "/repo/lib/ansible/plugins/connection/psrp.py"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "call_dup2",
+        "content": "1\tclass PsrpConnection:\n2\t    def _connect(self):\n3\t        return 'psrp'\n4\t    def _load_extras(self, extras):\n5\t        return extras\n6\t    def other(self): pass"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "继续修复 psrp extras 处理的问题。"
+     }
+    ]
+   }
+  ],
+  "seed_manifest": [
+   {
+    "session": "t30b",
+    "rows": [
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "u:call_dup0",
+      "kind": "tool_use",
+      "role": "assistant",
+      "tool": "Read",
+      "handle": {
+       "type": "path",
+       "value": "/repo/lib/ansible/plugins/connection/psrp.py"
+      },
+      "size_chars": 200,
+      "head": "",
+      "triggers": "",
+      "ts": "2026-09-07T00:00:00"
+     },
+     {
+      "turn": 1,
+      "reason": "fifo_drop",
+      "anchor": "r:call_dup0",
+      "kind": "tool_result",
+      "role": "user",
+      "tool": "Read",
+      "handle": null,
+      "size_chars": 10308,
+      "head": "class PsrpConnection: def _connect return psrp",
+      "triggers": "psrp connection",
+      "ts": "2026-09-07T00:00:00"
+     }
+    ]
+   }
+  ]
  }
 ]

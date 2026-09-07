@@ -111,6 +111,12 @@ SUITES = {
                    "PROXY_PD_MICRO_TURN_ENABLED": "true",
                    "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "2000",
                    "PROXY_CTX_WINDOW_K": "4"},
+    # auto-recall(代理代答)注入路径：代码目标的结构感知摘录
+    "autorecall": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                   "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                   "PROXY_AUTO_RECALL_ENABLED": "true",
+                   "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "40000",
+                   "PROXY_CTX_WINDOW_K": "24"},
 }
 
 # ---------------------------------------------------------------------------
@@ -577,6 +583,17 @@ def run_case(case, mock, shadow, log_path):
         if spec.get("$bulk"):
             rows = expand_bulk_seed(spec["$bulk"])
         seed_manifest(shadow, spec["session"], rows)
+
+    for spec in case.get("seed_archive") or []:
+        apath = os.path.join(shadow, "logs", "diag", "archive",
+                             spec["session"] + ".jsonl")
+        payload = {"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": spec.get("tool_use_id", "call_x"),
+             "content": spec["content"]}]}]}
+        with open(apath, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn": 1,
+                                "payload": json.dumps(payload, ensure_ascii=False)},
+                               ensure_ascii=False) + "\n")
 
     resp_status, resp_headers, resp = 0, {}, None
     bodies = case.get("bodies")

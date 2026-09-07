@@ -122,7 +122,7 @@ class TestStructureAwareExcerpt(unittest.TestCase):
         self.assertTrue(res["truncated"])
         res = ctx_recall.structure_aware_excerpt(None, TARGET, 100)
         self.assertEqual(res, {"text": "", "strategy": "line",
-                               "truncated": False})
+                               "truncated": False, "symbols": []})
 
     def test_content_within_budget_returned_verbatim(self):
         res = ctx_recall.structure_aware_excerpt(PY_CONTENT, TARGET, 4000)
