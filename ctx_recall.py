@@ -39,7 +39,10 @@ TOOL_SCHEMA = {
         "类单元附带完整原文。会话约定：被折叠的内容一直保留在本会话存储中，"
         "随时可查——当你发现自己缺少早前工作过的信息（改过哪些文件、当时的结论、"
         "读过的内容）时先查这里，不要直接重读文件；若折叠提示中给出了锚点"
-        "（如 r:call_xxx），直接把锚点作为 query 可精确取回；大文件原文分页披露——续读用 锚点@偏移（如 r:call_x@4000）。"
+        "（如 r:call_xxx），直接把锚点作为 query 可精确取回；代码文件支持符号寻址："
+        "query=锚点#sym:函数名 直接取该函数源码（如 r:call_x#sym:_load_extras），"
+        "query=路径::函数名（如 plugins/psrp.py::load_extras）可定位符号；"
+        "大文件原文分页披露——续读用 锚点@偏移（如 r:call_x@4000）。"
     ),
     "input_schema": {
         "type": "object",
@@ -265,6 +268,51 @@ def fts_search(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     # 锚点直查(tool description 承诺"锚点可精确取回"; 2026-09-01 review
     # 发现为虚假承诺——FTS 只索引 text 列不含 anchor, 此前必然 miss)
     # 含分页: "r:xxx@4000" → base "r:xxx"(offset 由 format 层消费)
+    # 锚点 #sym: 后缀容忍(TC29 治理: 模型可写 r:xxx#sym:func 直取符号)
+    if "#sym:" in q:
+        q = q.split("#sym:", 1)[0]
+    if "::" in q and not _ANCHOR_RE.match(q.split("::")[0]):
+        # path::symbol 符号定位: 持久索引在场时返回带源码获取提示的注记行
+        path_part, _, sym = q.rpartition("::")
+        path_part, sym = path_part.strip(), sym.strip()
+        if path_part and sym:
+            for line in memory_stores.MANIFEST.lines(session_key):
+                hv = (line.get("handle") or {}).get("value", "") \
+                    if isinstance(line.get("handle"), dict) else ""
+                base_anchor = line.get("anchor", "")
+                if (hv and hv.endswith(path_part) and line.get("kind") == "tool_use"
+                        and base_anchor.startswith("u:")):
+                    r_anchor = "r:" + base_anchor[2:]
+                    located = None
+                    idx = chunk_index_load(session_key, r_anchor)
+                    for sym_row in (idx or {}).get("symbols") or []:
+                        if sym_row.get("name", "").endswith(sym):
+                            located = "[symbol %s: %s | L%d-L%d]" % (
+                                sym_row.get("name"), str(sym_row.get("sig", ""))[:60],
+                                sym_row.get("line_start"), sym_row.get("line_end"))
+                            break
+                    if not located:
+                        # 方法级符号不在 top-level 索引——回收内容行扫描定位
+                        try:
+                            _content = _recover_full_content_raw(
+                                session_key, r_anchor, None, 0, 0)
+                            if _content:
+                                slines = re.sub(r"(?m)^\s*\d+\t", "",
+                                                _content).splitlines()
+                                _pat = re.compile(
+                                    r"^\s*def\s+" + re.escape(sym) + r"\s*\(")
+                                for i, sl in enumerate(slines):
+                                    if _pat.match(sl):
+                                        located = "[symbol %s | %s]" % (
+                                            sym, sl.strip()[:70])
+                                        break
+                        except Exception:
+                            pass
+                    if located:
+                        annotated = dict(line)
+                        annotated["head"] = "%s — 源码: ctx_recall query=\"%s#sym:%s\"" % (
+                            located, r_anchor, sym)
+                        return [annotated]
     if _ANCHOR_RE.match(q) or _ANCHOR_OFFSET_RE.match(q):
         q = _ANCHOR_OFFSET_RE.match(q).group(1) if _ANCHOR_OFFSET_RE.match(q) else q
         kind_map = {"r": "tool_result", "u": "tool_use"}
@@ -371,7 +419,119 @@ def lookup(session_key, query, kind=None, limit=DEFAULT_LIMIT):
 # Archive 全文恢复(MVP 增强): manifest 索引行 → archive 完整 tool_result
 # ============================================================================
 
+# ============================================================================
+# 符号块索引 sidecar(2026-09-07): chunk 持久化 + #sym:/path::symbol 寻址
+# ============================================================================
+
+def _chunk_sidecar_path(session_key):
+    d = os.path.join(_ps._DIAG_DIR, "chunks")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(d, memory_stores.sanitize_session_key(session_key)[:64] + ".jsonl")
+
+
+def chunk_index_store(session_key, anchor, path, excerpt):
+    """structure_aware_excerpt 的 symbols → sidecar 持久化。
+    strategy=line 无符号可存。fail-open。"""
+    syms = (excerpt or {}).get("symbols") or []
+    if not syms or (excerpt or {}).get("strategy") == "line":
+        return False
+    try:
+        with open(_chunk_sidecar_path(session_key), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"anchor": anchor, "path": path,
+                                "strategy": excerpt.get("strategy"),
+                                "symbols": syms}, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def chunk_index_load(session_key, anchor):
+    """读取该锚的符号块索引; 无/损坏 → None。"""
+    try:
+        with open(_chunk_sidecar_path(session_key), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if d.get("anchor") == anchor and d.get("symbols"):
+                    return d
+    except OSError:
+        pass
+    return None
+
+
+def chunk_symbol_slice(session_key, anchor, symbol, content, ext=".py"):
+    """锚+#sym: 的源码切片: 持久索引优先, 缺失时对 content 现算。
+    行号切片基于 content 自身(行号前缀不影响按行对齐)。失败 → None。"""
+    stripped = re.sub(r"(?m)^\s*\d+\t", "", content or "")
+    lines = stripped.splitlines(keepends=True)
+    blocks, _strategy = _code_blocks(stripped, ext)
+    if not blocks:
+        return None
+    target = None
+    idx = chunk_index_load(session_key, anchor)
+    if idx:
+        for s in idx.get("symbols") or []:
+            nm = s.get("name", "")
+            if nm == symbol or nm.split(".")[-1] == symbol.split(".")[-1]:
+                target = (nm, s.get("sig", ""), s.get("line_start"),
+                          s.get("line_end"))
+                break
+    if target is None:
+        for s, e, sig_line in blocks:
+            sig = lines[sig_line - 1].strip()
+            nm = re.search(r"(?:class|def)\s+([A-Za-z_][\w]*)", sig)
+            if nm and (nm.group(1) == symbol or
+                       symbol.endswith("." + nm.group(1))):
+                target = (nm.group(1), sig, s, e)
+                break
+    if target is None:
+        # 方法级兜底: 任意缩进的 def <symbol>( 行扫描, 切到同级/低缩进边界
+        # (top-level 符号表不含嵌套方法——类方法是最常被点名的召回对象)
+        pat = re.compile(r"^(\s*)def\s+" + re.escape(symbol.split(".")[-1])
+                         + r"\s*\(")
+        slines = stripped.splitlines()
+        for i, l in enumerate(slines):
+            m = pat.match(l)
+            if not m:
+                continue
+            base_indent = len(m.group(1))
+            j = i + 1
+            while j < len(slines):
+                lj = slines[j]
+                if lj.strip() and (len(lj) - len(lj.lstrip())) <= base_indent:
+                    break
+                j += 1
+            target = (symbol, l.strip(), i + 1, j)
+            break
+    if target is None:
+        return None
+    nm, sig, ls, le = target
+    seg = "".join(lines[ls - 1: le]).rstrip("\n")
+    return "[symbol: %s | %s | L%d-L%d]\n%s" % (nm, sig[:80], ls, le, seg)
+
+
 def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
+    """恢复完整被丢弃内容; 锚含 #sym:函数名 时按符号切片(ast/索引),
+    切片失败回退全文。其余口径见 _recover_full_content_raw。"""
+    sym = None
+    if anchor and "#sym:" in anchor:
+        anchor, _, sym = anchor.partition("#sym:")
+        sym = sym.strip() or None
+    text = _recover_full_content_raw(session_key, anchor, turn,
+                                     max_chars if not sym else 0, offset)
+    if text and sym:
+        sliced = chunk_symbol_slice(session_key, anchor, sym, text)
+        if sliced:
+            return sliced
+    return text
+
+
+def _recover_full_content_raw(session_key, anchor, turn, max_chars=4000, offset=0):
     """从 manifest 索引行恢复完整被丢弃的内容(支持分页续读)。
 
     数据流: manifest(地址: anchor+turn) → archive(内容: payload) → 完整 tool_result。
@@ -538,52 +698,10 @@ def _heuristic_blocks(text, start_re, mode):
     return blocks
 
 
-def structure_aware_excerpt(content, target_path, budget_chars):
-    """按结构摘录文件内容（auto-recall 首次注入用）。
-
-    三级梯队（strategy 枚举 "ast"|"heuristic"|"line"）：
-      1. .py 且 ast.parse 成功 → stdlib ast 提取顶层块（class/def/assign/
-         import）行区间，strategy="ast"；
-      2. 其他受支持代码语言（_HEURISTIC_LANGS：js/ts/go/java/rs/c/cpp/rb/
-         sh）或 ast 失败（mid-edit 损坏代码必须兜住）→ 多语言启发式
-         结构摘录（见 _heuristic_blocks 及其已知边界注释），
-         strategy="heuristic"；起始正则命中 <2 视为无结构；
-      3. 非代码 / 启发式无命中 / 骨架超预算 → 行边界 fallback：取
-         [0:budget] 对齐到最后一个完整行尾，strategy="line"。
-    ast 与 heuristic 共用同一渲染：输出 = 文件骨架（签名行 + L 行号区间 +
-    @ 字符偏移，偏移与 recover_full_content 的 anchor@offset 分页协议同
-    口径，模型可直接拿骨架 offset 续读）+ 按序填充的完整顶层块直至预算
-    耗尽。
-    返回 {"text": str, "strategy": "ast"|"heuristic"|"line",
-          "truncated": bool}。
-    """
-    text = content if isinstance(content, str) else ""
-    try:
-        budget = int(budget_chars)
-    except (TypeError, ValueError):
-        budget = 0
-    if not text or budget <= 0:
-        return {"text": "", "strategy": "line", "truncated": bool(text)}
-    if len(text) <= budget:
-        return {"text": text, "strategy": "line", "truncated": False}
-
-    def _line_fallback():
-        head = text[:budget]
-        cut = head.rfind("\n")
-        if cut > 0:
-            head = head[:cut + 1]  # 对齐到最后一个完整行尾
-        return {"text": head, "strategy": "line", "truncated": True}
-
-    ext = os.path.splitext(str(target_path or ""))[1].lower()
-    blocks, strategy = None, None
+def _code_blocks(text, ext):
+    """→ (blocks, strategy)。无结构 → (None, "line")。行号前缀须先剥离。"""
+    blocks, strategy = None, "line"
     if ext == ".py":
-        # 2026-09-07(DEF-310/seq5 深挖): Read 工具产出的内容带行号前缀
-        # ("1\t# ..."), 原样 ast.parse 必然 SyntaxError → .py 全部落 line
-        # 兜底(文件头 4K), 结构摘录形同虚设。解析/摘录统一在剥离副本上
-        # 进行, @offset 分页口径随之切换为剥离后文本(注入所见即所续读)。
-        _stripped = re.sub(r"(?m)^\s*\d+\t", "", text)
-        if _stripped != text:
-            text = _stripped
         try:
             tree = ast.parse(text)
         except (SyntaxError, ValueError, RecursionError):
@@ -608,6 +726,58 @@ def structure_aware_excerpt(content, target_path, budget_chars):
             cand = _heuristic_blocks(text, spec[0], spec[1])
             if cand:
                 blocks, strategy = cand, "heuristic"
+    return blocks, strategy
+
+
+def structure_aware_excerpt(content, target_path, budget_chars,
+                            focus_terms=None):
+    """按结构摘录文件内容（auto-recall 首次注入用）。
+
+    三级梯队（strategy 枚举 "ast"|"heuristic"|"line"）：
+      1. .py 且 ast.parse 成功 → stdlib ast 提取顶层块（class/def/assign/
+         import）行区间，strategy="ast"；
+      2. 其他受支持代码语言（_HEURISTIC_LANGS：js/ts/go/java/rs/c/cpp/rb/
+         sh）或 ast 失败（mid-edit 损坏代码必须兜住）→ 多语言启发式
+         结构摘录（见 _heuristic_blocks 及其已知边界注释），
+         strategy="heuristic"；起始正则命中 <2 视为无结构；
+      3. 非代码 / 启发式无命中 / 骨架超预算 → 行边界 fallback：取
+         [0:budget] 对齐到最后一个完整行尾，strategy="line"。
+    Read 工具产出的 "N\t" 行号前缀在解析/摘录/offset 前统一剥离
+    （DEF-310/seq5：前缀使 ast.parse 必炸 → 恒落 line 兜底）。
+    ast 与 heuristic 共用同一渲染：输出 = 文件骨架（签名行 + L 行号区间 +
+    @ 字符偏移，偏移与 recover_full_content 的 anchor@offset 分页协议同
+    口径，模型可直接拿骨架 offset 续读）+ 完整顶层块填充。
+    focus_terms: 查询引导词（dup 目标/近期探查词）——命中多的块优先进入
+    预算（2026-09-07 seq5 实证：文件序填充会让模型要的函数落在预算外）。
+    返回 {"text", "strategy", "truncated",
+          "symbols": [{name, sig, line_start, line_end, offset}]}——
+    symbols 是 chunk 索引持久化与 #sym: 符号寻址的数据源。
+    """
+    text = content if isinstance(content, str) else ""
+    try:
+        budget = int(budget_chars)
+    except (TypeError, ValueError):
+        budget = 0
+    if not text or budget <= 0:
+        return {"text": "", "strategy": "line", "truncated": bool(text),
+                "symbols": []}
+    if len(text) <= budget:
+        return {"text": text, "strategy": "line", "truncated": False,
+                "symbols": []}
+
+    def _line_fallback():
+        head = text[:budget]
+        cut = head.rfind("\n")
+        if cut > 0:
+            head = head[:cut + 1]  # 对齐到最后一个完整行尾
+        return {"text": head, "strategy": "line", "truncated": True,
+                "symbols": []}
+
+    ext = os.path.splitext(str(target_path or ""))[1].lower()
+    stripped = re.sub(r"(?m)^\s*\d+\t", "", text)
+    if stripped != text:
+        text = stripped
+    blocks, strategy = _code_blocks(text, ext)
     if blocks is None:
         return _line_fallback()
 
@@ -624,6 +794,15 @@ def structure_aware_excerpt(content, target_path, budget_chars):
     def _end_off(line_no):
         return starts[line_no] if line_no < len(starts) else len(text)
 
+    # 符号表: chunk 索引持久化与 #sym: 符号寻址的数据源
+    symbols = []
+    for s, e, sig_line in blocks:
+        sig = lines[sig_line - 1].strip()
+        nm = re.search(r"(?:class|def)\s+([A-Za-z_][\w]*)", sig)
+        symbols.append({"name": nm.group(1) if nm else sig[:48],
+                        "sig": sig[:120], "line_start": s, "line_end": e,
+                        "offset": _start_off(s)})
+
     header = ["[skeleton: %d top-level blocks; @N = char offset usable with "
               "anchor@N paging]" % len(blocks)]
     for s, e, sig_line in blocks:
@@ -634,7 +813,18 @@ def structure_aware_excerpt(content, target_path, budget_chars):
         return _line_fallback()  # 预算连骨架都装不下 → 退化为行截断
 
     parts, used, omitted = [header_text], len(header_text), 0
-    for s, e, _ in blocks:
+    # focus 查询引导: 命中多的块优先(稳定序: 命中降序 → 文件序)
+    order = list(range(len(blocks)))
+    if focus_terms:
+        ft = [t.lower() for t in focus_terms if isinstance(t, str) and t.strip()]
+        if ft:
+            def _hits(i):
+                s, e, _ = blocks[i]
+                seg = text[_start_off(s):_end_off(e)].lower()
+                return sum(1 for t in ft if t in seg)
+            order.sort(key=lambda i: (-_hits(i), i))
+    for i in order:
+        s, e, _ = blocks[i]
         blk = text[_start_off(s):_end_off(e)].rstrip("\n")
         need = len(blk) + 2  # "\n\n" 分隔
         if used + need <= budget:
@@ -643,10 +833,11 @@ def structure_aware_excerpt(content, target_path, budget_chars):
         else:
             omitted += 1
     return {"text": "\n\n".join(parts), "strategy": strategy,
-            "truncated": omitted > 0}
+            "truncated": omitted > 0, "symbols": symbols}
 
 
-def auto_recall_for_target(session_key, target, max_chars=None):
+def auto_recall_for_target(session_key, target, max_chars=None,
+                           focus_terms=None):
     """auto-recall 执行器（ctx-recall 自闭环设计 2026-09-05 §4③）：按目标取回折叠原文。
 
     数据源优先级：
@@ -718,13 +909,16 @@ def auto_recall_for_target(session_key, target, max_chars=None):
                 break
         if not content:
             return None
-        exc = structure_aware_excerpt(content, tgt, limit)
+        exc = structure_aware_excerpt(content, tgt, limit,
+                                      focus_terms=focus_terms)
         if not exc["text"]:
             return None
+        chunk_index_store(session_key, cand["anchor"], tgt, exc)
         return {"anchor": cand["anchor"], "turn": cand.get("turn"),
                 "reason": cand.get("reason") or "",
                 "chars": len(exc["text"]), "content": exc["text"],
-                "strategy": exc["strategy"]}
+                "strategy": exc["strategy"],
+                "symbols": exc.get("symbols") or []}
     except Exception:
         return None
 

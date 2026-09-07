@@ -2024,6 +2024,15 @@ class AutoRecallStage(ConditionalStage):
             threshold = 3
 
         import ctx_recall as _cr
+        # focus 词(2026-09-07): 近期 Grep/Bash 探查词 → 注入摘录按查询相关度
+        # 选块(文件序会让模型要的函数落在预算外——seq5 实证)
+        import re as _re_mod
+        focus = []
+        for a in (ledger.get("actions") or [])[-10:]:
+            if a.get("tool") in ("Grep", "Bash"):
+                focus.extend(_re_mod.findall(
+                    r"[A-Za-z_][\w]{3,}", str(a.get("target") or ""))[-4:])
+        focus = list(dict.fromkeys(focus))[-12:] or None
         dup_queries = ledger.get("dup_queries") or []
         dup_queries.sort(key=lambda d: -d.get("count", 0))
         for dq in dup_queries:
@@ -2038,7 +2047,8 @@ class AutoRecallStage(ConditionalStage):
             if target in sess_state["targets"]:
                 continue  # 同目标每会话只注入一次（防注入抖动）
             # ② 决策 + ③ 执行（包装内含 manifest 确认与 fail-open）
-            rec = _cr.auto_recall_for_target(ctx.session_id, target)
+            rec = _cr.auto_recall_for_target(ctx.session_id, target,
+                                             focus_terms=focus)
             if not rec:
                 continue
             reason_tag = "epoch/fifo" if not rec.get("reason") else rec["reason"]
