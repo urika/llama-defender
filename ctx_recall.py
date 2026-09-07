@@ -577,6 +577,13 @@ def structure_aware_excerpt(content, target_path, budget_chars):
     ext = os.path.splitext(str(target_path or ""))[1].lower()
     blocks, strategy = None, None
     if ext == ".py":
+        # 2026-09-07(DEF-310/seq5 深挖): Read 工具产出的内容带行号前缀
+        # ("1\t# ..."), 原样 ast.parse 必然 SyntaxError → .py 全部落 line
+        # 兜底(文件头 4K), 结构摘录形同虚设。解析/摘录统一在剥离副本上
+        # 进行, @offset 分页口径随之切换为剥离后文本(注入所见即所续读)。
+        _stripped = re.sub(r"(?m)^\s*\d+\t", "", text)
+        if _stripped != text:
+            text = _stripped
         try:
             tree = ast.parse(text)
         except (SyntaxError, ValueError, RecursionError):

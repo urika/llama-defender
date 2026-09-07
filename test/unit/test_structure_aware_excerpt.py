@@ -212,3 +212,27 @@ class TestAutoRecallExcerptIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_read_line_number_prefix_stripped_for_ast(self):
+        """2026-09-07(DEF-310/seq5): Read 工具产出的 "N\t" 行号前缀会让
+        ast.parse 必炸 → .py 全落 line 兜底(文件头 4K)。修复后应在剥离
+        副本上解析, strategy=ast 且骨架含符号行。"""
+        code = "\n".join(
+            ["%d\t%s" % (i + 1, l) for i, l in enumerate([
+                "# coding header",
+                "import os",
+                "",
+                "class Connection:",
+                "    def _connect(self):",
+                "        return 1",
+                "",
+                "    def _load_extras(self, extras):",
+                "        return extras",
+            ])]
+        )
+        r = structure_aware_excerpt(code, "/repo/x/connection/psrp.py", 4000)
+        self.assertEqual(r["strategy"], "ast")
+        self.assertIn("class Connection", r["text"])
+        self.assertIn("_load_extras", r["text"])
+
