@@ -993,6 +993,11 @@ CONFIG_REGISTRY = {
         "doc": "Max injections per session (anti injection-loop guard; also "
                "deduped per target).",
     },
+    "PROXY_AUTO_RECALL_STUCK_EXTRA": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "卡死型 dup 升级阈值增量: 已注入目标 dup 达 阈值+此值 时注入一次换路线提示(seq5 深挖: 卡死型召回无效)。",
+    },
     "PROXY_TOMBSTONE_RECALL_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
@@ -1130,6 +1135,14 @@ CONFIG_REGISTRY = {
         "defaults": {"all": ""},
         "type": "str", "scope": "module",
         "doc": "Extra CLI args appended to the rapid-mlx command line. Consumed by manage.sh.",
+    },
+    "PROXY_CACHE_LCP_SNAPDOWN": {
+        "defaults": {"all": "0"},
+        "type": "bool", "scope": "module",
+        "doc": "L-13 P1a LCP snap-down (patched rapid-mlx memory_cache): serve "
+               "multi-boundary checkpoints instead of rejecting shorter-than-"
+               "entry requests. Consumed by the backend process env "
+               "(patches/vllm-mlx), not proxy_state. Conf sets 1 in production.",
     },
 }
 

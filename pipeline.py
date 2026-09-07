@@ -2045,6 +2045,29 @@ class AutoRecallStage(ConditionalStage):
             if dq.get("count", 0) < threshold:
                 break  # 降序排列，后面只会更小
             if target in sess_state["targets"]:
+                # 2026-09-07(seq5 深挖): 已注入过仍重复读 → 卡死型 dup,
+                # 召回无效。达到升级阈值(阈值+3)时注入一次"换路线"提示
+                # (每目标一次), 引导模型换方法或明示阻塞——不再反复注入
+                # 同样的内容(那条路已被证明走不通)。
+                stuck_at = (int(getattr(_ps,
+                    "PROXY_AUTO_RECALL_DUP_THRESHOLD", 3))
+                    + int(getattr(_ps, "PROXY_AUTO_RECALL_STUCK_EXTRA", 3)))
+                esc_key = target + "::escalated"
+                if dq.get("count", 0) >= stuck_at and esc_key not in sess_state["targets"]:
+                    sess_state["targets"][esc_key] = "escalated"
+                    self._inject(ctx, sess_state, per_cap, (
+                        "[System: AUTO-RECALL-ESCALATE — you have re-read %s "
+                        "for the %d-th time and a recall was already provided "
+                        "earlier. Re-reading again will not help: the current "
+                        "approach appears stuck. Either change your approach, "
+                        "state clearly what is blocking you, or move on to a "
+                        "different part of the task. Do NOT read this file "
+                        "again.]" % (target, dq.get("count", 0))), {
+                        "injected": 1, "trigger": "stuck_escalate",
+                        "class": "stuck", "target": target,
+                        "dup_count": dq.get("count", 0),
+                    })
+                    return True
                 continue  # 同目标每会话只注入一次（防注入抖动）
             # ② 决策 + ③ 执行（包装内含 manifest 确认与 fail-open）
             rec = _cr.auto_recall_for_target(ctx.session_id, target,

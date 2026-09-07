@@ -47,7 +47,14 @@ def reload_config(signum=None, frame=None, target_module=None):
         proxy_state.MODEL_NAME = model
         setattr(target_module, "MODEL_NAME", model)
 
-        new_max = int(env.get("PROXY_MAX_CONCURRENT", "4" if is_cloud else "1"))
+        # DEF-306 补全: 并发数两处裸 int() 同样须 fail-safe(坏值炸 SIGHUP
+        # 处理器 = 代理死亡), 解析失败保留旧值并 WARN。
+        try:
+            new_max = int(env.get("PROXY_MAX_CONCURRENT", "4" if is_cloud else "1"))
+        except (TypeError, ValueError):
+            new_max = getattr(target_module, "PROXY_MAX_CONCURRENT", 1)
+            log("[RELOAD] WARN: PROXY_MAX_CONCURRENT='%s' 解析失败, 保留旧值 %s"
+                % (env.get("PROXY_MAX_CONCURRENT"), new_max), level="WARN")
         old_max = getattr(target_module, "PROXY_MAX_CONCURRENT")
         proxy_state.PROXY_MAX_CONCURRENT = new_max
         setattr(target_module, "PROXY_MAX_CONCURRENT", new_max)
@@ -67,8 +74,14 @@ def reload_config(signum=None, frame=None, target_module=None):
         proxy_state.invalidate_sensitive_patterns_cache()
 
         # Rebuild cloud lock if route cloud concurrent changed
-        new_cloud_cc = int(env.get("PROXY_ROUTE_CLOUD_CONCURRENT",
-                           str(getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2))))
+        # Rebuild cloud lock if route cloud concurrent changed
+        try:
+            new_cloud_cc = int(env.get("PROXY_ROUTE_CLOUD_CONCURRENT",
+                               str(getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2))))
+        except (TypeError, ValueError):
+            new_cloud_cc = getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2)
+            log("[RELOAD] WARN: PROXY_ROUTE_CLOUD_CONCURRENT='%s' 解析失败, 保留旧值 %s"
+                % (env.get("PROXY_ROUTE_CLOUD_CONCURRENT"), new_cloud_cc), level="WARN")
         old_cloud_cc = getattr(target_module, "PROXY_ROUTE_CLOUD_CONCURRENT", 2)
         if new_cloud_cc != old_cloud_cc:
             proxy_state._cloud_lock = threading.Semaphore(new_cloud_cc)
