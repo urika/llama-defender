@@ -392,9 +392,20 @@ _wait_for_ready() {
             return 1
         fi
 
-        if curl -s --max-time 2 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
-            info "✅ $name 就绪 (PID: $pid)"
-            return 0
+        # 就绪判定（2026-09-06 404 风暴归因修复）：功能性探针——用真实模型名
+        # 发 1-token 推理请求。uvicorn 起来时 /v1/models 即 200 但模型仍在
+        # 加载，此窗口内客户端请求收到 not_found_error 404 并触发 SDK 重试
+        # 风暴（历史累计 8,452 次）。探针 404=加载中（下轮循环重试）、200=就绪。
+        # 注意：引擎 8081 无 /api/status（R1 是代理侧端点），不能用它判就绪。
+        if curl -s --max-time 5 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
+            if curl -s --max-time 15 "http://$LLAMA_HOST:$LLAMA_PORT/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d "{\"model\":\"$LLAMA_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ready?\"}],\"max_tokens\":1}" \
+                2>/dev/null | grep -q '"choices"'; then
+                info "✅ $name 就绪 (PID: $pid, 模型已加载)"
+                return 0
+            fi
+            info "⏳ $name HTTP 已起、模型加载中 (PID: $pid)…"
         fi
 
         # 检查下载进度
