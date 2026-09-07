@@ -109,6 +109,7 @@ def begin_request(request_id, session_key, key_source="unknown"):
     _ps._diag_ctx.session_key = session_key
     _ps._diag_ctx.key_source = key_source
     _ps._diag_ctx.injections = []
+    _ps._diag_ctx.injection_details = {}  # DEF-310: 注入属性采集(kind→dict/列表)
     _ps._diag_ctx.route_target = None
     _ps._diag_ctx.actual_model = None
     _ps._diag_ctx.prompt_processed_tokens = None
@@ -129,8 +130,12 @@ def begin_request(request_id, session_key, key_source="unknown"):
         _ps._diag_ctx.root_span_id = None
 
 
-def record_injection(kind):
-    """登记一处代理合成内容注入(管线各注入点调用,设计 D6)。"""
+def record_injection(kind, detail=None):
+    """登记一处代理合成内容注入(管线各注入点调用,设计 D6)。
+
+    detail(可选, DEF-310): 注入属性字典(target/anchor/chars/source 等)
+    ——R16 行追踪面此前只有 kind 计数, 严格版机制核验(如 H3"注入含
+    epoch_collapse 来源")无字段可用, 2026-09-07 EXP-2R 复盘补采集。"""
     if not _ps.PROXY_DIAG_ENABLED or not kind:
         return
     injections = getattr(_ps._diag_ctx, "injections", None)
@@ -139,6 +144,19 @@ def record_injection(kind):
         _ps._diag_ctx.injections = injections
     if kind not in injections:
         injections.append(kind)
+    if isinstance(detail, dict) and detail:
+        details = getattr(_ps._diag_ctx, "injection_details", None)
+        if details is None:
+            details = {}
+            _ps._diag_ctx.injection_details = details
+        # 同 kind 本轮多次注入合并为列表(保序), 单次保持标量字典易读
+        prev = details.get(kind)
+        if prev is None:
+            details[kind] = detail
+        elif isinstance(prev, list):
+            prev.append(detail)
+        else:
+            details[kind] = [prev, detail]
 
 
 def peek_injections():
@@ -411,6 +429,9 @@ def finalize_request(mc):
         "epoch_triggered": None,
         "is_epoch_turn": None,
         "feedback_injected": peek_injections(),
+        # DEF-310: 注入属性(target/anchor/chars/source/session_count)——
+        # 严格版机制核验(注入来源归因)数据面;无注入轮为 {}
+        "injection_details": dict(getattr(ctx, "injection_details", None) or {}),
         "prefix_ratio": ((mc or {}).get("pipeline", {})
                          .get("common_prefix_ratio", {}) or {}).get("ratio"),
         "canonical_mismatch": bool(getattr(ctx, "canonical_mismatch", False)),

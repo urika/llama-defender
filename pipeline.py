@@ -2061,6 +2061,8 @@ class AutoRecallStage(ConditionalStage):
                 "injected": 1, "trigger": "dup", "target": target,
                 "anchor": rec["anchor"], "chars": rec["chars"],
                 "dup_count": dq.get("count", 0),
+                # DEF-310: 注入来源归因(寄存来源域, 严格版 H3 依据)
+                "source": reason_tag,
             })
             sess_state["targets"][target] = rec["anchor"]
             return True  # 每轮至多注入一条（克制窗口挤占）
@@ -2163,7 +2165,18 @@ class AutoRecallStage(ConditionalStage):
         if _ps.PROXY_DIAG_ENABLED:
             try:
                 import diagnostics
-                diagnostics.record_injection("auto_recall")
+                # DEF-310: 注入属性随 R16 行落盘(sessions.jsonl
+                # injection_details.auto_recall), 供注入来源/目标归因
+                diagnostics.record_injection("auto_recall", detail={
+                    "trigger": info.get("trigger"),
+                    "source": info.get("source"),
+                    "target": info.get("target"),
+                    "anchor": info.get("anchor"),
+                    "chars": info.get("chars"),
+                    "dup_count": info.get("dup_count"),
+                    "calls": info.get("calls"),
+                    "session_count": sess_state["count"],
+                })
             except Exception as _e:
                 _warn_diag("inject_auto_recall", _e)
         ctx.auto_recall_info = info
