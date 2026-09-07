@@ -67,6 +67,8 @@ Key behaviors (all default-off unless noted): folded placeholders carry the ctx_
 
 ## Service management
 
+> **⚠️ 引擎重启协调（硬规则）**：多会话共享单引擎——重启 = 杀所有会话在途请求 + 清空全部 KV 缓存。**重启前必须三查并公告**（① 批跑进程存活 ② 引擎日志 10 分钟内推理事件 ③ 代理状态），实验/批跑运行期间引擎冻结；OOM/挂死等紧急情况允许先斩后奏但须登记 changelog。完整协议与即用命令：`docs/05-operations-changelog/engine-restart-coordination-20260906.md`
+
 ```bash
 ./manage.sh start                 # Start local backend + proxy with active.conf
 ./manage.sh start-cloud           # Start proxy only, forwarding to cloud API
