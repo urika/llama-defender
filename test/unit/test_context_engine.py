@@ -4,6 +4,7 @@
 最小阈值/句柄) §4.9(epoch 状态机/回退保护/硬上限) §4.10(canonical 两套账);
 Phase 0 §12.3 结论 4(击穿根因=回溯改写)——引擎开启时 7/14/17 stage 跳过。
 """
+import json
 import os
 import sys
 import tempfile
@@ -219,6 +220,45 @@ class TestCanonicalSession(unittest.TestCase):
         self.assertGreater(pin_start, 0)
         self.assertGreater(pin_end, pin_start)
         self.assertEqual(whole[pin_start:pin_end].count("运行单元测试"), 1)
+
+    def test_epoch_token_budget_retention(self):
+        """L-9/DEF-313: 保留口径 token 化——keep 预算内轮次保留, 超预算
+        旧轮收编; 视图按预算收敛而非按轮数。"""
+        saved = _ps.PROXY_CTX_KEEP_TOKEN_BUDGET
+        _ps.PROXY_CTX_KEEP_TOKEN_BUDGET = 6000
+        try:
+            msgs = [{"role": "system", "content": "SYS"}]
+            for i in range(30):
+                msgs += _tu("q%d" % i) + _tool_round(
+                    "t%d" % i, "Bash", {"command": "c%d" % i}, "o" * 4000)
+            self.sess.absorb(msgs)
+            before = len(self.sess.canonical)
+            triggered, final = self.sess.maybe_epoch(
+                self.sess._real_scale() // 4, 24)
+            self.assertTrue(triggered)
+            kept = [m for m in final
+                    if m.get("role") != "system"
+                    and not m.get("_ctx_engine_epoch")]
+            self.assertGreaterEqual(len(kept), 2)   # 兜底下限
+            self.assertLess(len(kept), before)      # 收编确实发生
+        finally:
+            _ps.PROXY_CTX_KEEP_TOKEN_BUDGET = saved
+
+    def test_policy_loss_warn(self):
+        """DEF-313 观测面: 曾见政策段而折叠未提取到 → WARN 一次且无钉住块
+        (防静默失卡)。"""
+        msgs = [{"role": "system", "content": "SYS"}]
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, "o" * 4000)
+        self.sess._policy_seen = True   # 模拟会话早期曾见政策段
+        self.sess.absorb(msgs)
+        triggered, final = self.sess.maybe_epoch(
+            self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        self.assertTrue(getattr(self.sess, "_policy_warned", False))
+        self.assertNotIn("[policy pinned from collapsed rounds]",
+                         json.dumps(final, ensure_ascii=False))
 
     def test_frozen_copy_not_polluted(self):
         msgs = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "keep me")

@@ -580,6 +580,10 @@ PROXY_CTX_EPOCH_TRIGGER_TOKENS = int(os.environ.get(
 PROXY_CTX_WINDOW_K = int(os.environ.get(
     "PROXY_CTX_WINDOW_K", get_default("PROXY_CTX_WINDOW_K")))
 
+# L-9/DEF-313: 折叠后保留窗口的 token 预算; 0 = 旧口径(按 K 轮数保留)
+PROXY_CTX_KEEP_TOKEN_BUDGET = int(os.environ.get(
+    "PROXY_CTX_KEEP_TOKEN_BUDGET", get_default("PROXY_CTX_KEEP_TOKEN_BUDGET")))
+
 _DIAG_DIR = os.path.join(_LOG_DIR, "diag")
 _DIAG_SESSIONS_PATH = os.path.join(_DIAG_DIR, "sessions.jsonl")
 _DIAG_ARCHIVE_DIR = os.path.join(_DIAG_DIR, "archive")

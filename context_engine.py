@@ -479,9 +479,20 @@ class CanonicalSession(object):
         # self.compression_region, 不重置会把 K=24 失败尝试的台账行重复
         # 累计进 K=4 的产物(重复行膨胀 → 误触硬上限)。
         base_region = list(self.compression_region)
-        for k, halve in ((window_k, False), (4, False), (4, True)):
+        # L-9/DEF-313(2026-09-07): 保留口径 token 化——触发按 S(token) 而
+        # 保留按 K(轮数) 的错配, 导致折叠时机与保留体量脱节(EXP-3 v2 实测
+        # 双/三折叠再膨胀)。PROXY_CTX_KEEP_TOKEN_BUDGET>0 时, 保留窗口改按
+        # token 预算自最新轮回保(回退阶梯: 全额→半额→旧 K=4+减半)。
+        keep_budget = int(getattr(_ps, "PROXY_CTX_KEEP_TOKEN_BUDGET", 0) or 0)
+        if keep_budget > 0:
+            ladder = ((keep_budget, False), (max(2, keep_budget // 2), False),
+                      (4, True))
+        else:
+            ladder = ((window_k, False), (4, False), (4, True))
+        for k, halve in ladder:
             self.compression_region = list(base_region)
-            messages = self._collapse(k, halve)
+            messages = self._collapse(k, halve,
+                                      keep_budget=(k if keep_budget > 0 else 0))
             if self._real_scale(messages) <= trigger_tokens:
                 self.canonical = messages
                 self._sync_order_after_collapse(messages)
@@ -503,13 +514,29 @@ class CanonicalSession(object):
         tail = self.sent_order[-keep_msgs:]
         self.sent_order = list(tail)
 
-    def _collapse(self, window_k, halve):
-        """K 窗口外轮次 → 压缩区动作行; 返回重切后的消息列表（不落 self.canonical）。"""
+    def _collapse(self, window_k, halve, keep_budget=0):
+        """K 窗口外轮次 → 压缩区动作行; 返回重切后的消息列表（不落 self.canonical）。
+
+        L-9/DEF-313: keep_budget>0 时保留窗口按 token 预算自最新轮回保
+        （至少最近 2 轮），window_k 仅作预算=0 时的旧口径。"""
         rounds = _rounds(self.canonical)
         system_rounds = [r for r in rounds if _is_system_round(r)]
         body_rounds = [r for r in rounds if not _is_system_round(r)]
-        keep = body_rounds[-window_k:] if window_k else []
-        collect = body_rounds[:-window_k] if window_k else body_rounds
+        if keep_budget > 0:
+            keep, acc = [], 0
+            for rnd in reversed(body_rounds):
+                cost = self._real_scale(list(rnd))
+                if keep and acc + cost > keep_budget:
+                    break
+                keep.insert(0, rnd)
+                acc += cost
+            if len(keep) < 2 and len(body_rounds) >= 2:
+                keep = body_rounds[-2:]  # 兜底: 至少保留最近 2 轮
+            kcount = len(keep)
+            collect = body_rounds[:-kcount] if kcount else list(body_rounds)
+        else:
+            keep = body_rounds[-window_k:] if window_k else []
+            collect = body_rounds[:-window_k] if window_k else body_rounds
         # R10.1 manifest: 收编轮次留索引行(页表;折叠面板行已含摘要,索引行
         # 提供可寻址性;fail-open)
         if getattr(_ps, "PROXY_PD_ENABLED", True) and collect and self.session_key:
@@ -631,6 +658,18 @@ class CanonicalSession(object):
                     _used += len(_take)
                 _pinned = ("[policy pinned from collapsed rounds]\n"
                            + "\n".join(_parts) + "\n")
+            # DEF-313 观测面: 曾见政策段(_policy_seen)而本次折叠未提取到
+            # → 说明政策在被收编面里丢失, 打 WARN 一次(防"静默失卡"类
+            # 缺陷再溜进生产——EXP-3 v2 的失卡即人工取证才发现)。
+            if _segs:
+                self._policy_seen = True
+            elif getattr(self, "_policy_seen", False) and not getattr(
+                    self, "_policy_warned", False):
+                self._policy_warned = True
+                from proxy_logging import log as _plog
+                _plog("  -> [context_engine] WARN: policy segment expected "
+                      "but absent in collapsed rounds — possible silent loss "
+                      "(DEF-313 observability)")
         except Exception:
             _pinned = ""
         if region:
@@ -640,7 +679,7 @@ class CanonicalSession(object):
                     "type": "text",
                     "text": "[context-engine epoch %d: %d earlier rounds collapsed "
                             "to action ledger below; handles preserved]\n%s%s%s" % (
-                                self.epoch_count + 1, len(collect), _pinned,
+                                self.epoch_count, len(collect), _pinned,
                                 "\n".join(region), _cue_suffix),
                 }],
                 "_ctx_engine_epoch": True,

@@ -873,6 +873,15 @@ CONFIG_REGISTRY = {
                "protection; overflow beyond cap is accepted rather than deleting "
                "protected files).",
     },
+    "PROXY_CTX_KEEP_TOKEN_BUDGET": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "L-9/DEF-313: token budget for the post-fold retention window "
+               "(newest rounds kept while cumulative real-scale tokens fit). "
+               "0 = legacy round-count window (K). Replaces the round/size "
+               "mismatch: folds triggered by token budget S now retain by "
+               "token budget too.",
+    },
 
     # ---- PDC 渐进披露（IFC-3 方案 B，2026-08-30）----
     # PROXY_PD_ENABLED 自 MVP 起以 getattr 默认运行，此处正式注册为唯一权威。
