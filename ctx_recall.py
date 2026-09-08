@@ -91,7 +91,11 @@ RECALL_CUE = (
     "use ctx_recall to recover instead of re-reading files, "
     "e.g. ctx_recall(query='<file-path-or-keyword>') or "
     "ctx_recall(query='<anchor>'). "
-    "Recall first; re-read only if ctx_recall returns nothing."
+    "Recall first; re-read only if ctx_recall returns nothing. "
+    "When asked for a specific value (token/key/number/config) that is not "
+    "in your current context: you MUST recall it via ctx_recall first; if "
+    "recall finds nothing, say explicitly that the information is no longer "
+    "available — NEVER guess or invent a value. (IFC-11 2026-09-07)"
 )
 
 # 面板附带查询键上限（精确 anchor 优先；多了费 token 且无收益）
