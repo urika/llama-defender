@@ -865,6 +865,14 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Total ledger dir size cap in MB; oldest session files are deleted beyond it.",
     },
+    "PROXY_DIAG_ACTIVE_PROTECT_MIN": {
+        "defaults": {"all": "360"},
+        "type": "int", "scope": "reloadable",
+        "doc": "DEF-312: minutes of recent activity protecting a session's "
+               "archive/ledger files from cap eviction (multi-day batch evidence "
+               "protection; overflow beyond cap is accepted rather than deleting "
+               "protected files).",
+    },
 
     # ---- PDC 渐进披露（IFC-3 方案 B，2026-08-30）----
     # PROXY_PD_ENABLED 自 MVP 起以 getattr 默认运行，此处正式注册为唯一权威。

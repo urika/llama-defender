@@ -465,8 +465,14 @@ class LedgerStore(object):
             pass
 
     def _enforce_ledger_cap_locked(self):
-        """ledger 目录总量 MB 上限: 删最老会话文件(archive 同模式)。"""
+        """ledger 目录总量 MB 上限: 删最老会话文件(archive 同模式)。
+
+        DEF-312: 活跃会话保护同 archive——mtime 在
+        PROXY_DIAG_ACTIVE_PROTECT_MIN 内的不驱逐(台账是取证一手源)。"""
         cap = max(10, getattr(_ps, "PROXY_DIAG_LEDGER_MAX_MB", 100)) * 1024 * 1024
+        protect_s = max(0, int(getattr(
+            _ps, "PROXY_DIAG_ACTIVE_PROTECT_MIN", 360))) * 60
+        now = time.time()
         try:
             files = []
             for name in os.listdir(_ps._DIAG_LEDGER_DIR):
@@ -477,9 +483,11 @@ class LedgerStore(object):
             if total <= cap:
                 return
             files.sort()
-            for _, sz, p in files:
+            for mt, sz, p in files:
                 if total <= cap:
                     break
+                if now - mt < protect_s:
+                    continue  # DEF-312: 活跃会话证据不驱逐
                 try:
                     os.remove(p)
                     total -= sz
@@ -603,8 +611,17 @@ class ArchiveStore(object):
                 pass
 
     def _enforce_cap_locked(self):
-        """archive 总量 MB 上限: 删最老会话文件。"""
+        """archive 总量 MB 上限: 删最老会话文件。
+
+        DEF-312(2026-09-07): 活跃会话保护——mtime 在
+        PROXY_DIAG_ACTIVE_PROTECT_MIN(默认 360 分钟)内的文件不驱逐;
+        多天批量实验期, 早期会话的 archive 是唯一取证源(EXP-3 v2 实测
+        14 折叠会话 7 个 archive 整体缺失)。全受保护仍超限时接受溢出
+        (不删活跃证据), 由 cap 调参消化。"""
         cap = max(10, _ps.PROXY_DIAG_ARCHIVE_MAX_MB) * 1024 * 1024
+        protect_s = max(0, int(getattr(
+            _ps, "PROXY_DIAG_ACTIVE_PROTECT_MIN", 360))) * 60
+        now = time.time()
         try:
             files = []
             for name in os.listdir(_ps._DIAG_ARCHIVE_DIR):
@@ -615,9 +632,11 @@ class ArchiveStore(object):
             if total <= cap:
                 return
             files.sort()
-            for _, sz, p in files:
+            for mt, sz, p in files:
                 if total <= cap:
                     break
+                if now - mt < protect_s:
+                    continue  # DEF-312: 活跃会话证据不驱逐
                 try:
                     os.remove(p)
                     total -= sz

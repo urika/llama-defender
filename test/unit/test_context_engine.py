@@ -190,6 +190,36 @@ class TestCanonicalSession(unittest.TestCase):
         self.assertIsNotNone(rec)
         self.assertIn("LOOP-CONTENT-", rec)
 
+    def test_epoch_pins_policy_segments(self):
+        """DEF-311: 折叠时 <system-reminder>/<test_env> 政策段落钉在台账
+        头部——深会话折叠后环境契约卡/CLAUDE.md 指引不丢失(EXP-3 v2
+        实测 5/6 深卡臂会话折叠后失卡)。"""
+        card = ("<test_env>\n- 运行单元测试: .venv/bin/python -m pytest\n"
+                "- 官方 runner ansible-test 不可用\n</test_env>")
+        msgs = [{"role": "system", "content": "SYS"}]
+        msgs += _tu("任务背景<system-reminder>Available agent types: claude"
+                    "</system-reminder>\n" + card)
+        body = "BODY-" + ("x" * 3000)
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, body)
+        self.sess.absorb(msgs)
+        triggered, final = self.sess.maybe_epoch(
+            self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        import json as _json
+        whole = _json.dumps(final, ensure_ascii=False)
+        self.assertIn("[policy pinned from collapsed rounds]", whole)
+        self.assertIn("<test_env>", whole)
+        self.assertIn("运行单元测试", whole)          # 卡片文本存活
+        self.assertIn("Available agent types", whole)  # reminder 段也钉住
+        # 去重不变量: 钉住块内同段只出现一次(台账摘要行的引用另计, 合法)
+        pin_start = whole.find("[policy pinned from collapsed rounds]")
+        pin_end = whole.find("turn 1:", pin_start)
+        self.assertGreater(pin_start, 0)
+        self.assertGreater(pin_end, pin_start)
+        self.assertEqual(whole[pin_start:pin_end].count("运行单元测试"), 1)
+
     def test_frozen_copy_not_polluted(self):
         msgs = _tu("q1") + _tool_round("t1", "Bash", {"command": "ls"}, "keep me")
         canon, _, _ = self.sess.absorb(msgs)

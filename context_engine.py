@@ -590,14 +590,57 @@ class CanonicalSession(object):
         out = []
         for r in system_rounds:
             out.extend(r)
+        # DEF-311(2026-09-07): 政策文本钉住——被收编轮次里的
+        # <system-reminder>/<test_env> 段落是"指令面"(环境契约卡/CLAUDE.md
+        # 等), 折叠台账化会把指引永久挤出视图(EXP-3 v2 实测 5/6 深卡臂
+        # 会话最新轮失卡)。折叠时从被收编 user 消息提取此类段落, 去重后
+        # 钉在台账头部(总预算 8000 字符, 超出截断并注明); 台账被后续折叠
+        # 收编时本提取重复执行, 段落随去重跨折叠延续。fail-open: 提取失败
+        # 不影响折叠本体。
+        _pinned = ""
+        try:
+            import json as _json
+            import hashlib as _hashlib
+            _segs, _seen_seg = [], set()
+            _pat = re.compile(
+                r"(<system-reminder>.*?</system-reminder>"
+                r"|<test_env>.*?</test_env>)",
+                re.DOTALL)
+            for rnd in collect:
+                for m in rnd:
+                    if m.get("role") != "user":
+                        continue
+                    _c = m.get("content")
+                    _text = _c if isinstance(_c, str) else _json.dumps(
+                        _c, ensure_ascii=False)
+                    for _seg in _pat.findall(_text):
+                        _k = _hashlib.sha256(_seg.encode("utf-8")).hexdigest()
+                        if _k in _seen_seg:
+                            continue
+                        _seen_seg.add(_k)
+                        _segs.append(_seg)
+            if _segs:
+                _pin_budget = 8000
+                _parts, _used = [], 0
+                for _seg in _segs:
+                    if _used >= _pin_budget:
+                        _parts.append("[policy pinned: further segments truncated]")
+                        break
+                    _take = _seg[:max(0, _pin_budget - _used)]
+                    _parts.append(_take)
+                    _used += len(_take)
+                _pinned = ("[policy pinned from collapsed rounds]\n"
+                           + "\n".join(_parts) + "\n")
+        except Exception:
+            _pinned = ""
         if region:
             out.append({
                 "role": "user",
                 "content": [{
                     "type": "text",
                     "text": "[context-engine epoch %d: %d earlier rounds collapsed "
-                            "to action ledger below; handles preserved]\n%s%s" % (
-                                self.epoch_count + 1, len(collect),
+                            "to action ledger below; handles preserved]\n%s%s%s" % (
+                                self.epoch_count + 1, len(collect), _pinned,
                                 "\n".join(region), _cue_suffix),
                 }],
                 "_ctx_engine_epoch": True,

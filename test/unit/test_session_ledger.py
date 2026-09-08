@@ -6,6 +6,7 @@ dup/last_dup_turn 派生、材料启发式、TTL/FIFO 驱逐（410 语义）、s
 设计依据: docs/02-architecture-design/diagnostics-dataplane-design-20260819.md
 """
 import json
+import shutil
 import os
 import sys
 import tempfile
@@ -432,6 +433,50 @@ class TestResolveSessionKey(unittest.TestCase):
         self._touch(_ps._DIAG_ARCHIVE_DIR, "s38beef8.jsonl")
         self._touch(_ps._DIAG_LEDGER_DIR, sl.sanitize_session_key(full) + ".jsonl")
         self.assertEqual(sl.resolve_session_key("s38beef8"), full)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestArchiveActiveProtect(unittest.TestCase):
+    """DEF-312: 容量驱逐的活跃会话保护——mtime 在
+    PROXY_DIAG_ACTIVE_PROTECT_MIN 内的 archive/ledger 文件不驱逐;
+    多天批量实验期, 早期会话证据不再被整体吃掉(EXP-3 v2 实测
+    14 折叠会话 7 个 archive 整体缺失)。"""
+
+    def test_active_protected_oldest_first_unprotected(self):
+        import time as _time
+        tmp = tempfile.mkdtemp()
+        saved = _ps._DIAG_ARCHIVE_DIR
+        saved_cap = _ps.PROXY_DIAG_ARCHIVE_MAX_MB
+        try:
+            _ps._DIAG_ARCHIVE_DIR = tmp
+            _ps.PROXY_DIAG_ARCHIVE_MAX_MB = 10
+            def mk(name, size, age_h=None):
+                p = os.path.join(tmp, name)
+                with open(p, "wb") as f:
+                    f.write(b"x" * size)
+                if age_h:
+                    tstamp = _time.time() - 3600 * age_h
+                    os.utime(p, (tstamp, tstamp))
+            mk("old-a.jsonl", 100_000, age_h=48)          # 最旧, 无保护
+            mk("old-b.jsonl", 12 * 1024 * 1024, age_h=24)  # 旧, 大
+            mk("new-session.jsonl", 100_000)               # 活跃
+            mk("big.jsonl", 3 * 1024 * 1024)               # 活跃
+            store = sl.ArchiveStore.__new__(sl.ArchiveStore)
+            store._writes = 3
+            store._enforce_cap_locked()
+            rem = sorted(os.listdir(tmp))
+            self.assertNotIn("old-a.jsonl", rem)
+            self.assertNotIn("old-b.jsonl", rem)
+            self.assertIn("new-session.jsonl", rem)
+            self.assertIn("big.jsonl", rem)
+        finally:
+            _ps._DIAG_ARCHIVE_DIR = saved
+            _ps.PROXY_DIAG_ARCHIVE_MAX_MB = saved_cap
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
