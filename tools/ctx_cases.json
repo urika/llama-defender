@@ -1548,5 +1548,41 @@
     ]
    }
   ]
+ },
+ {
+  "id": "TC31",
+  "suite": "epoch",
+  "session": "t31",
+  "name": "折叠政策钉住(DEF-311): test_env 环境卡跨折叠存活于发送视图",
+  "body": {
+   "model": "$client",
+   "max_tokens": 512,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "mark",
+   "$fact": {
+    "turn_index": 1,
+    "text": "read /repo/ENV-CARD.md: <test_env>\n- 运行单元测试: .venv/bin/python -m pytest\n- 官方 runner ansible-test 不可用\n</test_env>"
+   }
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH"
+   ],
+   "last_dispatch_contains": [
+    "运行单元测试",
+    "<test_env>",
+    "ansible-test 不可用"
+   ],
+   "manifest_count_min": [
+    {
+     "session": "t31",
+     "min": 1
+    }
+   ]
+  }
  }
 ]
