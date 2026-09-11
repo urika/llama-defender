@@ -908,6 +908,20 @@ CONFIG_REGISTRY = {
                "one incremental prefill).",
     },
 
+    # ---- L-22 会话拯救（2026-09-12，EXP-3 v2 失败归因）----
+    # 纯文本响应（无任何工具调用）使 CLI 判"只说不做"直接 end_turn：
+    # A1=长会话末轮泄漏 raw-XML 工具调用文本；A3=回 "No response requested."
+    # 模板短语。rescue 模式将首段文本缓冲至首个工具 delta（或流末），坏模式
+    # 整段拦截并经微轮闭包追加纠错消息重派（预算共享 PROXY_PD_MICRO_TURN_MAX，
+    # fail-open）。关闭即恢复旧版实时发射行为。
+    "PROXY_RESCUE_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "L-22 session rescue: intercept idle-phrase (A3) / raw-XML tool-call "
+               "drift (A1) text-only responses and re-dispatch with corrective "
+               "follow-up via micro-turn machinery. Off = legacy emit-as-streamed.",
+    },
+
     # ---- H_BE shadow 探针（belief-entropy shadow probe，2026-08-29）----
     # 只测不动：成功的本地响应完成后，搭 prefix cache 便车追加一次双探针锚定
     # 提问，用 top_logprobs 截断熵估计 MMPO 式信念熵 H_BE，落盘 logs/diag/hbe.jsonl。

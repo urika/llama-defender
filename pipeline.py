@@ -3054,8 +3054,12 @@ class BackendDispatcher(PipelineStage):
         开始时无法回退到路径 A。
         """
         def _dispatch(follow_up_msgs):
+            # 门=PD 总开关 + 任一微轮用途(ctx_recall=L-22 前旧用途 / L-22
+            # rescue)。子开关由各调用点自行判定(anthropic_proxy 侧), 闭包
+            # 只管预算与重派。
             if not (_ps.PROXY_PD_ENABLED
-                    and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
+                    and (getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)
+                         or getattr(_ps, "PROXY_RESCUE_ENABLED", True))):
                 return False
             if getattr(ctx, '_micro_turn_used', 0) >= int(
                     getattr(_ps, "PROXY_PD_MICRO_TURN_MAX", 2)):

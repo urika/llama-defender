@@ -477,6 +477,93 @@ def _parse_anthropic_sse_usage(raw, acc):
         acc["output_tokens"] = _out
 
 
+# ---- L-22 会话拯救（rescue，2026-09-12）：A1 工具协议漂移 + A3 首轮空转 ----
+# EXP-3 v2 失败归因实证：纯文本响应（无任何工具调用）使 CLI 判"只说不做"
+# 直接 end_turn——A1=长会话末轮泄漏 raw-XML 工具调用文本（全场工作作废）；
+# A3=对完整任务 prompt 回 "No response requested." 模板短语。合计 16/83
+# 失败，全部可由"整段拦截 + 纠错微轮重派"挽回。检测为固定签名，零误报源。
+_RESCUE_IDLE_PHRASES = {
+    "no response requested.",
+    "no response required.",
+    "no action required.",
+}
+_RESCUE_RAW_TOOL_RE = re.compile(r"</tool_call>|<parameter=\w+>|</function>")
+
+
+def _classify_rescue_response(total_text, has_tool_use):
+    """纯文本响应坏模式分类：None=正常 / 'idle'=A3 空转 / 'raw_xml'=A1 漂移。
+
+    仅对无任何工具调用的响应调用。空/近空（≤2 字符）与已知空转短语归
+    idle；含 raw-XML 工具调用签名归 raw_xml。其余纯文本（正常任务总结）
+    不拦。
+    """
+    if has_tool_use:
+        return None
+    t = (total_text or "").strip()
+    if not t or len(t) <= 2 or t.lower() in _RESCUE_IDLE_PHRASES:
+        return "idle"
+    if _RESCUE_RAW_TOOL_RE.search(t):
+        return "raw_xml"
+    return None
+
+
+def _build_rescue_follow_up(kind, text):
+    """纠错微轮消息对（OpenAI 格式，与 ctx_recall 微轮同通道）。"""
+    if kind == "raw_xml":
+        tip = ("Your previous message contained a raw XML tool-call text "
+               "(e.g. </tool_call>) instead of a proper tool_use block, so "
+               "that call was NOT executed. Re-issue it through the standard "
+               "tool calling mechanism now.")
+    else:
+        tip = ("You responded with an empty placeholder instead of doing the "
+               "task. Start working on the task now: investigate the code and "
+               "produce the fix using tool calls.")
+    return [
+        {"role": "assistant", "content": text or ""},
+        {"role": "user", "content": tip},
+    ]
+
+
+def _estimate_prompt_tokens(anthropic_body):
+    """L-23：请求体保守估算 token 数——回填 message_start.usage.input_tokens。
+
+    rapid-mlx timings 覆盖率低（L-5，3.5%）导致此前恒 0，CLI auto-compact
+    失明，全量会话历史滚到 32MB 请求体爆窗（EXP-3 v2 seq12/31/86 实证）。
+    json.dumps 含结构开销 → 估算偏高 = 安全方向（促使 CLI 提前 compact）。
+    """
+    try:
+        ratio = max(float(getattr(_ps, "PROXY_CTX_TOKEN_RATIO", 4) or 4), 0.1)
+        chars = len(json.dumps(anthropic_body, ensure_ascii=False))
+        return max(1, int(chars / ratio))
+    except Exception:
+        return 1
+
+
+def _inject_session_known(session_key):
+    """ADR-013 T1: /admin/inject 的会话存在性判定（设计 §2 fail-open 404 口径）。
+
+    引擎（context_engine.ENGINE）/ 台账（session_ledger.LEDGER，内存优先 +
+    档案兜底）/ 请求计数（_SESSION_REQUEST_COUNT）任一认识该 key 即已知；
+    判定本身 fail-open——任一检查抛错不阻断其余检查。
+    """
+    try:
+        import context_engine
+        if context_engine.ENGINE.has_session(session_key):
+            return True
+    except Exception:
+        pass
+    try:
+        import session_ledger
+        if session_ledger.LEDGER.session_alive(session_key):
+            return True
+        # A3 档案兜底: 内存驱逐 ≠ 档案删除, 台账端点同口径
+        if session_ledger.LEDGER.build_ledger_json(session_key) is not None:
+            return True
+    except Exception:
+        pass
+    return session_key in _ps._SESSION_REQUEST_COUNT
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1354,7 +1441,14 @@ class Handler(BaseHTTPRequestHandler):
         output_char_count = 0
         output_force_stopped = False
 
-        def _emit_text_delta(t):
+        # L-22: rescue 模式（微轮续流递归层关闭——递归层响应直接发射）。
+        # 开启时首段文本缓冲不发射: 空转/漂移响应(A1/A3)在流末整段拦截重派,
+        # 客户端零字节污染; 正常 agent 轮的文本在首个工具 delta 处一次性补发。
+        _rescue_on = (not _micro_continue) and bool(
+            getattr(_ps, "PROXY_RESCUE_ENABLED", True))
+        _pending_text = []
+
+        def _flush_text_delta(t):
             """Emit a text delta SSE event, opening the text block lazily."""
             nonlocal text_block_started, total_text, output_char_count, output_force_stopped
             if not t:
@@ -1378,7 +1472,27 @@ class Handler(BaseHTTPRequestHandler):
                 # 的断连处理: 立即停止中继并 close() 到后端的连接取消在途生成。
                 raise
 
-        # Send message_start (usage will be updated from llama-server timings)
+        def _emit_text_delta(t):
+            """L-22 rescue 分发: rescue 开启时缓冲, 否则直接发射。"""
+            nonlocal total_text, output_char_count
+            if not t:
+                return
+            if _rescue_on:
+                _pending_text.append(t)
+                total_text += t
+                output_char_count += len(t)
+                return
+            _flush_text_delta(t)
+
+        def _flush_pending_text():
+            while _pending_text:
+                _flush_text_delta(_pending_text.pop(0))
+
+        # Send message_start
+        # L-23(2026-09-12): input_tokens 用请求体估算回填——此前硬编码 0,
+        # CLI auto-compact 依据 usage 占比触发, 恒 0 即永不压缩, 全量历史
+        # 滚到 32MB 请求体爆窗(seq12/31/86)。引擎真实 timings 若可达, 仍
+        # 照旧在流中提取并更新计费字段; 此处估算偏高=促使 CLI 提前 compact。
         if not _micro_continue:
             event = {
                 "type": "message_start",
@@ -1390,7 +1504,7 @@ class Handler(BaseHTTPRequestHandler):
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": {"input_tokens": _estimate_prompt_tokens(anthropic_body), "output_tokens": 0}
                 }
             }
             self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
@@ -1479,6 +1593,10 @@ class Handler(BaseHTTPRequestHandler):
             # Handle tool_calls in streaming
             tc_delta = delta.get("tool_calls")
             if tc_delta:
+                # L-22 rescue: 首个工具 delta → 前段文本属正常 agent 轮, 补发
+                # (顺序 text(index 0)→tools(index 1+), 块序不变)
+                if _pending_text:
+                    _flush_pending_text()
                 for tc in tc_delta:
                     idx = tc.get("index", 0)
                     if idx not in tool_calls_buffer:
@@ -1513,6 +1631,9 @@ class Handler(BaseHTTPRequestHandler):
                 if kind == "text":
                     _emit_text_delta(value)
                 else:  # "tool"
+                    # L-22 rescue: 内联工具出现 → 前段文本属正常轮, 补发
+                    if _pending_text:
+                        _flush_pending_text()
                     content_tools_pending.append(value)
 
         # Flush any unfinished state-machine state.
@@ -1561,6 +1682,35 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"  [JSON_REPAIRED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
                 except json.JSONDecodeError:
                     log(f"  [JSON_TRUNCATED_REPAIR_FAILED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+
+        # L-22(2026-09-12): 会话拯救——A1 工具协议漂移 / A3 首轮空转。
+        # rescue 模式下文本从未向客户端发射(_pending_text 缓冲), 坏响应可
+        # 在此整段拦截, 经微轮闭包追加纠错消息重派(客户端全透明, 预算共享
+        # PROXY_PD_MICRO_TURN_MAX)。开关关闭/预算耗尽/无闭包 → 缓冲文本
+        # 原样发射(fail-open, 会话不挂)。检测签名固定, 零误报源。
+        if _rescue_on and _pending_text and (tool_calls_buffer or content_tools_pending):
+            _flush_pending_text()  # 正常 agent 轮(有工具): 补发缓冲文本
+        _rescue_kind = (
+            _classify_rescue_response(total_text, bool(tool_calls_buffer or content_tools_pending))
+            if _rescue_on else None)
+        if _rescue_kind:
+            _dispatch = getattr(self, '_micro_recall_dispatch', None)
+            if _dispatch is not None:
+                self._micro_continuation = True
+                try:
+                    if _dispatch(_build_rescue_follow_up(_rescue_kind, total_text)):
+                        log("  -> [RESCUE] %s response intercepted (%d chars), "
+                            "re-dispatched with corrective follow-up (sid=%s)"
+                            % (_rescue_kind, len(total_text),
+                               getattr(_log_ctx, 'session_id', '?')))
+                        return
+                finally:
+                    self._micro_continuation = False
+            # 预算耗尽/无闭包: 缓冲文本照常发射(fail-open)
+            _flush_pending_text()
+        # 正常纯文本轮(任务总结等, 分类 None): 兜底发射缓冲
+        if _pending_text:
+            _flush_pending_text()
 
         # IFC-3 方案B(2026-08-30): 微轮重派——本响应尚未向客户端发出任何内容
         # 块(无文本、无内联工具)且工具调用全部为 ctx_recall 时, 代理在同一请求

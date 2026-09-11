@@ -127,7 +127,10 @@ class TestMicroTurnDispatchClosure(unittest.TestCase):
         return closure, calls
 
     def test_disabled_returns_false(self):
+        # L-22 门语义: 闭包门=PD + (MICRO_TURN or RESCUE); 两个子开关全关
+        # 才拒绝(各调用点另有自己的子开关门)。
         _ps.PROXY_PD_MICRO_TURN_ENABLED = False
+        _ps.PROXY_RESCUE_ENABLED = False
         try:
             from pipeline import PipelineContext
             ctx = PipelineContext()
@@ -136,6 +139,25 @@ class TestMicroTurnDispatchClosure(unittest.TestCase):
             self.assertEqual(calls, [])
         finally:
             _ps.PROXY_PD_MICRO_TURN_ENABLED = False
+            _ps.PROXY_RESCUE_ENABLED = True
+
+    def test_rescue_bypass_keeps_gate_open(self):
+        # L-22: ctx_recall 子开关关但 rescue 开 → 闭包门仍开(rescue 通道)。
+        _ps.PROXY_PD_MICRO_TURN_ENABLED = False
+        _ps.PROXY_RESCUE_ENABLED = True
+        try:
+            from pipeline import PipelineContext
+            ctx = PipelineContext()
+            ctx.openai_body = {"messages": [{"role": "user", "content": "hi"}]}
+            closure, calls = self._make_closure(ctx)
+            follow = [{"role": "assistant", "content": "bad"},
+                      {"role": "user", "content": "corrective tip"}]
+            self.assertTrue(closure(follow))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(ctx._micro_turn_used, 1)
+        finally:
+            _ps.PROXY_PD_MICRO_TURN_ENABLED = False
+            _ps.PROXY_RESCUE_ENABLED = True
 
     def test_budget_exhaustion_returns_false(self):
         _ps.PROXY_PD_MICRO_TURN_ENABLED = True
