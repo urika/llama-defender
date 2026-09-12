@@ -914,6 +914,13 @@ CONFIG_REGISTRY = {
     # 模板短语。rescue 模式将首段文本缓冲至首个工具 delta（或流末），坏模式
     # 整段拦截并经微轮闭包追加纠错消息重派（预算共享 PROXY_PD_MICRO_TURN_MAX，
     # fail-open）。关闭即恢复旧版实时发射行为。
+    "PROXY_TOOLS_DENYLIST": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "L-26 defense-in-depth: comma-separated tool names stripped from the "
+               "tools array before engine dispatch (e.g. 'WebFetch,WebSearch'). "
+               "Empty = no filtering. Complements CLI-side --disallowedTools.",
+    },
     "PROXY_RESCUE_ENABLED": {
         "defaults": {"all": "true"},
         "type": "bool", "scope": "reloadable",

@@ -21,9 +21,31 @@ def _inject_ctx_recall(tools_list):
     return tools_list
 
 
+def _apply_tool_denylist(tools):
+    """L-26 纵深防御(2026-09-12): 按名字剥离工具定义——模型"看不见"即不会调用。
+
+    PROXY_TOOLS_DENYLIST（reloadable, 逗号分隔, 默认空=不过滤）。
+    背景: SW-2 闭网经 --disallowedTools 在 CLI 侧拦截, 但 CLI 版本/模式差异
+    可致穿透(bypassPermissions 下"移出 allowedTools ≠ 禁用", EXP-6 实测
+    17/47 runs 泄漏)。代理层剥 tools 定义是独立于 CLI 的第二道闸。
+    只剥定义不动历史消息: 历史 tool_use 不在 tools 定义里是合法状态
+    (tools 只约束新调用), 不碰消息对避免配对断裂。
+    """
+    deny = getattr(_ps, "PROXY_TOOLS_DENYLIST", "") or ""
+    names = {n.strip() for n in deny.split(",") if n.strip()}
+    if not names or not tools:
+        return tools, 0
+    kept = [t for t in tools
+            if not (isinstance(t, dict) and t.get("name", "") in names)]
+    return kept, len(tools) - len(kept)
+
+
 def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, session_id=""):
+    # L-26: denylist 先于一切早退分支(含 below_max)——黑名单剥离无条件生效
+    tools, _denied = _apply_tool_denylist(tools)
     if not tools or len(tools) <= _ps.PROXY_TOOL_FILTER_MAX:
-        return _inject_ctx_recall(tools), {"filtered": False, "reason": "below_max"}
+        return _inject_ctx_recall(tools), {"filtered": False, "reason": "below_max",
+                                           "denied": _denied}
 
     recent_tools = set()
     assistant_count = 0
