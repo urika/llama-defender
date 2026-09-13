@@ -727,6 +727,111 @@ class ContextEngineStage(ConditionalStage):
 
 
 # ============================================================================
+# Stage 0.6: AdminInject — admin 注入原语（ADR-013 T1）
+# ============================================================================
+
+# 注入 tag 白名单（设计 §6：契约内 tag=cloud-consult；钉住是标签级白名单——
+# 只有 cloud-consult 进 T9 钉住正则, 防任意标签蹭钉住预算）
+_INJECT_TAG_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+
+
+def _sanitize_inject_text(tag, text):
+    """注入卫生（设计 §6.2）：text 内会撞破包裹结构/污染钉住去重的标签
+    序列（</?{tag}>、</?system-reminder>、</?test_env>）的尖括号替换为全角。"""
+    for t in (tag, "system-reminder", "test_env"):
+        text = re.sub(r"</?%s>" % re.escape(t),
+                      lambda m: m.group(0).replace("<", "＜").replace(">", "＞"),
+                      text)
+    return text
+
+
+class AdminInjectStage(ConditionalStage):
+    """Stage 0.6: /admin/inject 队列 → 本轮发送视图尾部注入（ADR-013 T1）。
+
+    设计: admin-inject-primitive-design-20260909（机制面, 无任务语义）。
+    - drain 时机（§3.4）: 锁内 pop 出该会话全部队列项——once 语义 = 写入
+      视图/canonical 的同一过程内清除, 不等后端成功（BackendDispatcher
+      之前的确定性时点）
+    - 双路径（§3.1）: engine-on 追加进 canonical（`_proxy_injected` 冻结
+      消息, 跨轮存活 + T9 钉住延续）并同现本轮视图尾部; engine-off 仅
+      view-only（末条 user 且 content 为 list 时合并 text block, 否则新建
+      user 消息——防 consecutive user 模板/配对异常, §3.3）
+    - 投递确认（§5）: 每条 record_injection("admin_inject", {tag, chars,
+      engine_persisted})——X-Proxy-Feedback-Injected 头/R16 落盘即凭证
+    - 隔离（§3.5）: ::aux 后缀会话不注入（辅助请求不吃处方）
+    - fail-open: 单条异常不阻断其余条目与主流程
+    """
+    # kv: append
+
+    name = "admin_inject"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        sid = getattr(ctx, "session_id", "") or ""
+        if not sid or "::aux" in sid:
+            return False
+        with _ps._ADMIN_INJECT_LOCK:
+            return bool(_ps._ADMIN_INJECT_QUEUE.get(sid))
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        ctx.admin_inject_info = {"injected": 0}
+        sid = ctx.session_id
+        with _ps._ADMIN_INJECT_LOCK:
+            items = _ps._ADMIN_INJECT_QUEUE.pop(sid, [])
+        for item in items:
+            try:
+                self._inject_one(ctx, sid, item)
+            except Exception as e:
+                _warn_diag("admin_inject", e)
+        if ctx.admin_inject_info["injected"]:
+            log("  -> [admin_inject] injected %d block(s) into session tail"
+                % ctx.admin_inject_info["injected"])
+        return ctx
+
+    def _inject_one(self, ctx: PipelineContext, sid: str, item: dict) -> None:
+        tag = str((item or {}).get("tag") or "")
+        text = (item or {}).get("text")
+        if not _INJECT_TAG_RE.fullmatch(tag) or not isinstance(text, str) or not text:
+            log("  -> [admin_inject] skip invalid queue item (tag=%r)" % tag,
+                level="WARN")
+            return
+        wrapped = "<%s>\n%s\n</%s>" % (tag, _sanitize_inject_text(tag, text), tag)
+        engine_persisted = False
+        if _ctx_engine_on() and sid:
+            # engine-on 路径（§3.1）: canonical 追加(_proxy_injected 冻结消息,
+            # 跨轮存活) + 本轮视图尾部同现
+            import context_engine
+            msg = context_engine.ENGINE.get_or_create(sid).append_injected(wrapped)
+            ctx.messages.append(msg)
+            engine_persisted = True
+        else:
+            # engine-off 路径（§3.1 view-only, 单轮有效）
+            last = ctx.messages[-1] if ctx.messages else None
+            if last is not None and last.get("role") == "user" \
+                    and isinstance(last.get("content"), list):
+                last["content"].append({"type": "text", "text": wrapped})
+            else:
+                ctx.messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": wrapped}],
+                })
+        ctx.admin_inject_info["injected"] += 1
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                # §5 投递确认: 非流式 X-Proxy-Feedback-Injected 头 / 流式 SSE
+                # 尾注 / R16 sessions.jsonl injection_details.admin_inject
+                diagnostics.record_injection("admin_inject", detail={
+                    "tag": tag, "chars": len(text),
+                    "engine_persisted": engine_persisted,
+                })
+            except Exception as _e:
+                _warn_diag("inject_admin_inject", _e)
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return getattr(ctx, "admin_inject_info", None)
+
+
+# ============================================================================
 # Stage 1: LifecycleClassifier — classify context size into lifecycle stage
 # ============================================================================
 
@@ -1955,6 +2060,33 @@ class RereadDetector(PipelineStage):
 # Stage 12.5: AutoRecallStage — ctx_recall 自闭环（auto-recall，默认关）
 # ============================================================================
 
+def _extract_asserted_pairs(messages):
+    """从最近 assistant 文本提取"键: 值"断言对(IFC-13 输入)。
+    只看最后一轮 assistant(刚说的才需要核对), 上限 8 对。"""
+    try:
+        last_asst = None
+        for m in reversed(messages):
+            if m.get("role") == "assistant":
+                last_asst = m
+                break
+        if not last_asst:
+            return []
+        _c = last_asst.get("content")
+        if isinstance(_c, list):
+            text = " ".join(b.get("text", "") for b in _c
+                            if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = str(_c or "")
+        import re as _re2
+        pairs = [(m.group(1), m.group(2)) for m in _re2.finditer(
+            r"([A-Za-z_][\w-]{2,30}(?:[ \t]?[Kk]ey|[ \t]?[Tt]oken|[ \t]?"
+            r"[Pp]assword)?)\s*(?:is|为|[:=])\s*[\`'\"']?"
+            r"([A-Za-z0-9][A-Za-z0-9_/+-]{3,60})[\`'\"']?", text)]
+        return pairs[:8]
+    except Exception:
+        return []
+
+
 class AutoRecallStage(ConditionalStage):
     """Stage 12.5: ctx_recall auto closed-loop (2026-09-05 design, off by default).
 
@@ -2004,6 +2136,28 @@ class AutoRecallStage(ConditionalStage):
             per_cap = 5
         if sess_state["count"] >= per_cap:
             return
+        # IFC-13(DEF-310 治理矩阵③): 断言值核对——上一轮模型回答中
+        # 断言了具体值且与登记事实矛盾时, 本轮注入更正(幻觉戳穿)。
+        # 独立于 AUTO_RECALL_ENABLED 门控(改写在 CONTEXT_MANAGED 豁免外)。
+        try:
+            import ctx_recall as _cr2
+            _pairs = _extract_asserted_pairs(ctx.messages)
+            _corr = _cr2.assert_values(ctx.session_id, _pairs) if _pairs else None
+            if _corr:
+                ctx.messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": _corr}],
+                })
+                log("  -> [value_check] correction injected")
+                if _ps.PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.record_injection("value_check")
+                    except Exception as _e2:
+                        _warn_diag("value_check", _e2)
+        except Exception as _e:
+            _warn_diag("value_check_scan", _e)
+
         injected = False
         if getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False):
             injected = self._dup_recall(ctx, sess_state, per_cap)
@@ -2024,6 +2178,12 @@ class AutoRecallStage(ConditionalStage):
             threshold = 3
 
         import ctx_recall as _cr
+        # dup 分型(2026-09-07 seq5): 台账 dup_queries 附 class
+        # foldable=遗忘型(召回可治) / stuck=卡死型(已注入仍重读, 转径不注入)
+        for _dq in (ledger.get("dup_queries") or []):
+            _t = (_dq.get("target") or "").strip()
+            _dq["class"] = ("stuck" if (_t + "::escalated")
+                            in sess_state["targets"] else "foldable")
         # focus 词(2026-09-07): 近期 Grep/Bash 探查词 → 注入摘录按查询相关度
         # 选块(文件序会让模型要的函数落在预算外——seq5 实证)
         import re as _re_mod

@@ -535,6 +535,56 @@ def recover_full_content(session_key, anchor, turn, max_chars=4000, offset=0):
     return text
 
 
+def assert_values(session_key, asserted_pairs):
+    """IFC-13(DEF-310 治理矩阵③): 断言值核对。
+
+    模型在回答中断言了具体值(值形态串), 代理持 manifest/orig 原文可核对:
+    被断言的"键→值"对与寄存事实不匹配 → 返回更正文本(AutoRecallStage
+    注入下一轮), 匹配/未知 → None。fail-open: 任何异常返回 None。
+    asserted_pairs: [(key_str, value_str), ...] (由调用方从模型输出提取)
+    """
+    if not session_key or not asserted_pairs:
+        return None
+    try:
+        lines = memory_stores.MANIFEST.lines(session_key)
+        if not lines:
+            return None
+        # 从 manifest head/triggers 汇总会话登记的事实值面
+        known = {}
+        for ln in lines:
+            blob = " ".join(str(ln.get(k, "")) for k in
+                            ("head", "triggers"))
+            for m in re.finditer(
+                    r"([A-Za-z_][\w-]{2,30})\s*[:=]\s*"
+                    r"([A-Za-z0-9][A-Za-z0-9_/+-]{3,60})", blob):
+                known.setdefault(m.group(1).upper(), set()).add(m.group(2))
+        if not known:
+            return None
+        corrections = []
+        for key, val in asserted_pairs:
+            ku = re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
+            # 键的多形态匹配: 原样 / 去前后缀 / 词序归一(token rotation→rotation token)
+            _cands = {ku}
+            for k2 in list(known):
+                if k2.endswith(ku) or ku.endswith(k2) or ku in k2 or k2 in ku:
+                    _cands.add(k2)
+            vals = set()
+            for k2 in _cands:
+                vals |= known.get(k2, set())
+            if vals and val not in vals:
+                corrections.append(
+                    "%s=%s is INCORRECT (session store has: %s)"
+                    % (key, val, ", ".join(sorted(vals)[:3])))
+        if not corrections:
+            return None
+        return ("[System: VALUE-CHECK — your previous answer asserted value(s) "
+                "that contradict the session store. Corrections:\n"
+                + "\n".join(corrections)
+                + "\nUse the corrected values; do not re-assert the wrong ones.]")
+    except Exception:
+        return None
+
+
 def _recover_full_content_raw(session_key, anchor, turn, max_chars=4000, offset=0):
     """从 manifest 索引行恢复完整被丢弃的内容(支持分页续读)。
 

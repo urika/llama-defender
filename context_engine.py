@@ -311,6 +311,25 @@ class CanonicalSession(object):
         return self.last_cached_tokens / self.last_sent_tokens
 
     # ------------------------------------------------------------------ %
+    # ------------------------------------------------------------------ %
+    def append_injected(self, text):
+        """ADR-013 T1: admin 注入块 → canonical 尾部（admin-inject-primitive-
+        design-20260909 §3.1 engine-on 路径：跨轮存活, 折叠时经 T9 钉住延续）。
+
+        构造 `_proxy_injected` 标记的冻结消息，经 _frozen_copy 追加；
+        **不进 sent_set/sent_order**（§3.2：客户端永远不会重发它——
+        sent_order[-1] 仍是最后一条客户端消息指纹, absorb 尾部失配检查
+        不产生假 mismatch WARN; _sync_order_after_collapse 的 keep 计数
+        同步排除本标记）。返回该消息 dict，调用方负责把它同现本轮发送
+        视图尾部（canonical 持有的是冻结副本，下游就地改写不回污染）。
+        """
+        msg = {"role": "user",
+               "content": [{"type": "text", "text": text}],
+               "_proxy_injected": True}
+        self.canonical.append(_frozen_copy(msg))
+        self.last_seen = time.time()
+        return msg
+
     def absorb(self, client_messages):
         """吸收客户端全量历史 → (发送视图, mismatch, new_msgs)。
 
@@ -502,12 +521,15 @@ class CanonicalSession(object):
     def _sync_order_after_collapse(self, messages):
         """epoch 回写后同步 sent_order（折叠视图 = system + 压缩区 + K 窗口）。
 
-        sent_order 取旧序列尾部 keep 条(即 K 窗口对应指纹)；
+        sent_order 取旧序列尾部 keep 条(即 K 窗口对应指纹)；keep 计数排除
+        `_proxy_injected` 注入消息（ADR-013 T1 §3.2：注入块不进 sent_order,
+        尾部对齐口径不被注入块稀释）。
         sent_set **不收缩**——折叠掉的旧消息 hash 仍登记, 客户端重发旧轮时
         会被跳过, 不会错误地重新 append(发送视图稳定性不因 epoch 破坏)。
         """
         keep_msgs = sum(1 for m in messages
-                        if m.get("role") != "system" and not m.get("_ctx_engine_epoch"))
+                        if m.get("role") != "system" and not m.get("_ctx_engine_epoch")
+                        and not m.get("_proxy_injected"))
         if keep_msgs <= 0:
             self.sent_order = []
             return
@@ -631,7 +653,8 @@ class CanonicalSession(object):
             _segs, _seen_seg = [], set()
             _pat = re.compile(
                 r"(<system-reminder>.*?</system-reminder>"
-                r"|<test_env>.*?</test_env>)",
+                r"|<test_env>.*?</test_env>"
+                r"|<cloud-consult>.*?</cloud-consult>)",
                 re.DOTALL)
             for rnd in collect:
                 for m in rnd:
@@ -661,6 +684,56 @@ class CanonicalSession(object):
             # DEF-313 观测面: 曾见政策段(_policy_seen)而本次折叠未提取到
             # → 说明政策在被收编面里丢失, 打 WARN 一次(防"静默失卡"类
             # 缺陷再溜进生产——EXP-3 v2 的失卡即人工取证才发现)。
+            # IFC-12(2026-09-07, DEF-310 治理矩阵①): 关键事实钉住——
+            # 被收编轮次的 tool_result 中含 token/key/password/secret 形态
+            # 的行(=值), 提炼为"符号: 值"摘要行钉进台账头。TC29 实测: 此类
+            # 事实折叠后模型被提问会幻觉编造(1/2); 钉住使其常驻视图,
+            # 幻觉触发条件消除。预算 1000 字符(值是短行, 20+ 条足够),
+            # 事实行去重跨折叠延续(与 policy 段同机制)。fail-open。
+            try:
+                _fact_pat = re.compile(
+                    r"^.*[A-Za-z_-]*(token|key|password|passwd|secret"
+                    r"|credential)[A-Za-z_]*"
+                    r"[^\n]{0,60}?[:=][ \t]*([A-Za-z0-9][A-Za-z0-9_/+-]{3,60})",
+                    re.IGNORECASE | re.MULTILINE)
+                _seen_fact, _facts = set(), []
+                for rnd in collect:
+                    for m in rnd:
+                        if m.get("role") != "user":
+                            continue
+                        _c = m.get("content")
+                        if isinstance(_c, list):
+                            # block 形态取 text 拼接(避免 json 转义噪声进钉块)
+                            _t = "\n".join(
+                                b.get("text", "") for b in _c
+                                if isinstance(b, dict) and b.get("type") == "text")
+                            _t = _t or _json.dumps(_c, ensure_ascii=False)
+                        else:
+                            _t = _c if isinstance(_c, str) else _json.dumps(
+                                _c, ensure_ascii=False)
+                        for fm in _fact_pat.finditer(_t):
+                            _line = fm.group(0).strip()[:160]
+                            _k = _hashlib.sha256(
+                                _line.encode("utf-8")).hexdigest()
+                            if _k in _seen_fact:
+                                continue
+                            _seen_fact.add(_k)
+                            _facts.append(_line)
+                if _facts:
+                    _fbudget = 1000
+                    _flines, _fused = [], 0
+                    for _fl in _facts:
+                        if _fused + len(_fl) + 1 > _fbudget:
+                            _flines.append("[further facts truncated]")
+                            break
+                        _flines.append(_fl)
+                        _fused += len(_fl) + 1
+                    _fact_block = ("[key facts pinned from collapsed rounds "
+                                   "(do not guess these — values are below)]\n"
+                                   + "\n".join(_flines) + "\n")
+                    _pinned = (_fact_block + _pinned) if _pinned else _fact_block
+            except Exception:
+                pass
             if _segs:
                 self._policy_seen = True
             elif getattr(self, "_policy_seen", False) and not getattr(
@@ -705,6 +778,11 @@ class EngineStore(object):
                 sess = CanonicalSession(key)
                 self._sessions[key] = sess
             return sess
+
+    def has_session(self, key):
+        """ADR-013 T1: /admin/inject 的会话存在性判定（引擎面）。"""
+        with self._lock:
+            return key in self._sessions
 
     def mark_epoch_turn(self, key, turn):
         with self._lock:
