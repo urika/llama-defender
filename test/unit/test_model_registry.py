@@ -409,13 +409,13 @@ class TestProxyStateIntegration(unittest.TestCase):
         # deepseek 退为链上兜底; opus 保持 glm-5.3 首发。
         self.assertEqual(prefs["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(prefs["claude-sonnet-4-6"]["fallback_models"],
-                         ["glm-5.3-flash", "k3", "glm-5.3", "deepseek-v4-flash"])
+                         ["glm-5.3-flash", "k3", "glm-5.3", "deepseek-flash"])
         self.assertEqual(prefs["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(prefs["claude-haiku-4-5"]["fallback_models"],
-                         ["glm-5.3-flash", "kimi-for-coding-highspeed", "deepseek-v4-flash"])
+                         ["glm-5.3-flash", "kimi-for-coding-highspeed", "deepseek-flash"])
         self.assertEqual(prefs["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(prefs["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-flash"])
 
     def test_catalog_file_actually_loaded(self):
         import proxy_state
@@ -440,7 +440,7 @@ class TestProxyStateIntegration(unittest.TestCase):
         # moonshot (api.moonshot.cn 开放平台) was removed by decision —
         # kimi (Kimi Code /coding/v1) covers the Kimi models.
         for name in ("glm-5.2", "glm-5.3", "k3", "kimi-for-coding",
-                     "deepseek-v4-pro", "deepseek-v4-flash"):
+                     "deepseek-v4-pro", "deepseek-flash"):
             self.assertIsNotNone(
                 model_registry.get_model(name), "model %r missing from catalog" % name
             )
@@ -522,7 +522,7 @@ class TestRoutePoliciesJson(unittest.TestCase):
         # opus routed to glm-5.3 (Z.ai subscription) with glm-5.3-flash + deepseek chain backup
         self.assertEqual(pj["preferences"]["claude-opus-4-7"]["cloud_model"], "glm-5.3-cn")
         self.assertEqual(pj["preferences"]["claude-opus-4-7"]["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-flash"])
         # 订阅零边际优先: sonnet/haiku 首发 glm-5.3-flash
         self.assertEqual(pj["preferences"]["claude-sonnet-4-6"]["cloud_model"], "glm-5.3-flash-cn")
         self.assertEqual(pj["preferences"]["claude-haiku-4-5"]["cloud_model"], "glm-5.3-flash-cn")
@@ -566,7 +566,7 @@ class TestV1ModelsMetadata(unittest.TestCase):
         self.assertEqual(meta["price"]["input"], 0)   # subscription marginal cost
         # 2026-08-29: 国内站(zhipu-cn)置首, 链上备援 glm-5.3 + kimi-for-coding + glm-5.3-flash, deepseek 兜底
         self.assertEqual(meta["fallback_models"],
-                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-v4-flash"])
+                         ["glm-5.3", "kimi-for-coding", "glm-5.3-flash", "deepseek-flash"])
         self.assertTrue(meta["direct_capable"])       # zhipu has an Anthropic endpoint
 
     def test_sonnet_flash_metadata(self):

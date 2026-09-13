@@ -1658,7 +1658,7 @@ class TestCatalogRequestQuirks(unittest.TestCase):
         self.assertEqual(ctx.openai_body["temperature"], 1)
 
     def test_non_quirk_model_keeps_temperature(self):
-        ctx = FormatConverter().process(self._ctx("cloud", "deepseek-v4-flash"))
+        ctx = FormatConverter().process(self._ctx("cloud", "deepseek-flash"))
         self.assertEqual(ctx.openai_body["temperature"], 0.7)
         self.assertEqual(ctx.openai_body["thinking"], {"type": "disabled"})
 

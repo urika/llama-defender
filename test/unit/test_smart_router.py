@@ -677,8 +677,8 @@ class TestRouteNotificationFull(unittest.TestCase):
         notice = result.messages[-1]["content"][0]["text"]
         # Must contain dynamic cost info from catalog price, not hardcoded
         self.assertIn("¥", notice)
-        self.assertIn("¥3.00/M", notice)  # catalog deepseek-v4-flash input (2026-08-17 分时高峰价)
-        self.assertIn("¥9.00/M", notice)  # catalog deepseek-v4-flash output
+        self.assertIn("¥0.50/M", notice)  # mock env 价格(route notice 用 PROXY_CLOUD_PRICE_*, 与目录价解耦)
+        self.assertIn("¥1.50/M", notice)  # mock env output 价(与目录价解耦)
         # Should NOT contain the old hardcoded string
         self.assertNotIn("¥0.01-0.04", notice)
 
