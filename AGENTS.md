@@ -132,7 +132,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 **旁路观测/信号层（不改变主数据流，只读或失败静默）**：
 - **H_BE 探针**（`hbe_probe.py`）：成功本地响应后，搭 prefix cache 便车追加双探针锚定提问，`top_logprobs` 截断熵落盘 `logs/diag/hbe.jsonl`；只测不动。
 - **IFC 信号层**（`ifc_metrics.py` + `diagnostics.py` + `memory_stores.py`）：相邻轮发送视图差分 + 台账动作序列派生 `retention`/`rationale_ratio`/`action_div`/`reread_pressure`；无 per-stage 钩子。
-- **PDC 披露召回**（`ctx_recall.py` + `memory_stores.py`）：被 fifo/epoch 丢弃的单元写入 manifest（可寻址索引行），模型经 `ctx_recall` 工具查询（L1 内存子串 + L2 FTS5 trigram + archive 全文恢复），微轮自答同请求重派。**自闭环 auto-recall**（stage 12.5，`PROXY_AUTO_RECALL_ENABLED` 默认关，2026-09-05 设计）：台账 `dup_queries` 检测同 Read 目标 ≥3 次 + manifest 确认已折叠 → 代理代答取回并以 `[System: AUTO-RECALL]` user 尾消息注入（每轮至多 1 条、每会话限 5 次、同目标去重；阈值/上限/注入长度均 reloadable）——实测模型主动召回 0 调用后的主动兜底，详见 `docs/01-requirements-product/ctx-recall-auto-closed-loop-20260905.md`。**墓碑召回**（`PROXY_TOMBSTONE_RECALL_ENABLED` 默认关，2026-09-06）：客户端历史改写把旧 tool_result 丢成悬空调用（工具结果单轮生命周期，EXP-2 实锤 transcript 级证据），stage 20 配对补洞注入的墓碑附 ctx_recall 取回提示（被动）+ AutoRecallStage 按悬空 call_id 直查 manifest 寄存并代答回填（主动，末条 assistant 未决调用豁免）——写入期压缩实测已寄存 ~40% 墓碑化内容。
+- **PDC 披露召回**（`ctx_recall.py` + `memory_stores.py`）：被 fifo/epoch 丢弃的单元写入 manifest（可寻址索引行），模型经 `ctx_recall` 工具查询（L1 内存子串 + L2 FTS5 trigram + archive 全文恢复），微轮自答同请求重派。**自闭环 auto-recall**（stage 12.5，`PROXY_AUTO_RECALL_ENABLED` 默认关，2026-09-05 设计）：台账 `dup_queries` 检测同 Read 目标 ≥3 次 + manifest 确认已折叠 → 代理代答取回并以 `[System: AUTO-RECALL]` user 尾消息注入（每轮至多 1 条、每会话限 5 次、同目标去重；阈值/上限/注入长度均 reloadable）——实测模型主动召回 0 调用后的主动兜底，详见 `docs/01-requirements-product/ctx-recall-auto-closed-loop-20260905.md`。**墓碑召回**（`PROXY_TOMBSTONE_RECALL_ENABLED` 默认关，2026-09-06）：客户端历史改写把旧 tool_result 丢成悬空调用（工具结果单轮生命周期，EXP-2 实锤 transcript 级证据），stage 20 配对补洞注入的墓碑附 ctx_recall 取回提示（被动）+ AutoRecallStage 按悬空 call_id 直查 manifest 寄存并代答回填（主动，末条 assistant 未决调用豁免）——写入期压缩实测已寄存 ~40% 墓碑化内容。2026-09-07 增强（DEF-310/seq5 落地）：①auto-recall 注入升级为**结构感知摘录**（AST 骨架+focus 命中块，修复 Read 行号前缀致 ast 失效的上游 bug）+ **卡死型升级转径**（已注入目标仍重读达 阈值+STUCK_EXTRA 时改注入换路线提示）；②**关键事实钉住**（IFC-12）：折叠收编时提取 token/key=值 行常驻台账头；③**断言值核对**（IFC-13）：模型断言值与登记事实矛盾时下轮注入 VALUE-CHECK 更正；④**反编造禁令**（IFC-11）进 RECALL_CUE。EXP recall-r2 机制实证 6 次注入；治理曲线见 DEF-312。
 - **队列**（`queue_manager.py`）：`PROXY_QUEUE_ENABLED` 时叠加在 `_llama_lock` 之上按 interactive/standard/large/huge 分桶排队。
 
 > **认知编排器 / Protocol Layer（P1-P5，`post_governance.py`/`escalate.py`/`decompose.py`/`verification_chain.py`/`idempotency.py`/`protocol_orchestrator.py`/`protocol_types.py`/`signal_types.py`/`contract_registry.py`）**：按三层架构规范（`docs/02-architecture-design/three-layer-architecture-spec-20260830.md`）与认知编排器设计（`cognitive-orchestrator-design-doc-20260830.md`）实现，**当前为 agent_go 集成契约 §3.3 R17/R18/R19 的参考实现冻结版**。Signal 层（ifc_metrics/diagnostics/hbe_probe/memory_stores/ctx_recall）已生产挂载；Protocol 层（decompose/verify/escalate/recall）为编排闭环的待接线部分，其任务工程 / 工具形态 / 是否接入运行时 pipeline 的决策归 agent_go。本仓库不再主动扩展编排器本体，仅吸收可拆解到已有组件的增强（如 PDC-L1/L2、ifc_metrics 信号口径）。
@@ -496,6 +496,7 @@ git commit --no-verify               # 绕过所有钩子
 **选择建议**：
 - **balanced**: 日常 coding 任务，兼顾质量与性能
 - **aggressive**: 长上下文 agentic 场景，优先控制 token 消耗
+- **⚠ 云端路由不再建议 aggressive**（2026-09-07 per-route 定案）：云端由客户端自管上下文，代理压缩造成双重管理错乱；压缩仅限本地路由（engine-on 已接管）。参考 ctx-case 设计文档 §10.1 per-route 豁免
 - **conservative**: 质量敏感任务（代码审查、文档生成），优先保留上下文完整性
 
 ### 11.2 本地模式关键参数
@@ -546,7 +547,7 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_QUEUE_ENABLED` | `false` | 启用优先级请求队列；默认关闭 = 原信号量行为（`qwen3.8-27b-4bit` 与 `ornith-oq4e` 已开启；后者为缓解 haiku 强制本地后长会话饿死小请求） |
 | `PROXY_QUEUE_TIMEOUT_SECONDS` | `300` | 排队超时，超时返回 503 + `Retry-After` |
 | `PROXY_QUEUE_LARGE_THRESHOLD_CHARS` | `80000` | large bucket 阈值（低优先级排队） |
-| `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理 |
+| `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理。**engine-on 会话豁免（2026-09-07 TC28）**：先按引擎视图 est_tokens 复检，视图≤折叠预算 S 则 waive 放行（原始 chars 不再代表后端负载） |
 | `PROXY_QUEUE_HUGE_ACTION` | `cloud` | huge 处理：`cloud`（强制路由云端，需 `PROXY_ROUTE_ENABLED=true`）/ `reject`（413） |
 
 ### 11.6 诊断数据面参数（R13-R16，全部 reloadable）
