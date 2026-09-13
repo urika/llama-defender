@@ -224,6 +224,8 @@ EXP-2 唯一成功注入（seq 5，test_psrp.py，采纳 ✓）走的是**写入
 
 **非目标**：不承诺 f2p 提升（成本实验）；订阅臂不适用；短会话不适用。
 
+> **政策决定（2026-09-07，用户拍板）**：pfcm 双臂实测（CM on Σinput ×2、两臂均 resolved）后，**云端访问默认透传定为长期策略**——`PROXY_CLOUD_CM_ENABLED` 维持 false 为常态。EXP-3 若重启需显式按臂开启并说明为何推翻本决定；按模型/按请求覆盖（catalog `context_managed_by` / X-Proxy-Context-Managed-By）保留，用于单模型灰度等例外场景。
+
 ## 13. DEF-308（L-13）prefix cache 击穿与轨道①修复（2026-09-06）
 
 EXP-2R 值守观测 + 日志取证（s38beef8）：46K tokens/轮 × TTFT p50 215s ≈ 每轮全额

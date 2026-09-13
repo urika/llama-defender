@@ -1216,6 +1216,9 @@ cmd_status() {
     else
         echo "代理 (anthropic_proxy.py): ${RED}未运行${NC}"
     fi
+
+    # 辅助引擎状态（独立启停，与主后端共存）
+    _aux_status_lines
 }
 
 # ============================================================
@@ -1637,6 +1640,165 @@ cmd_stop_backend() {
 
     error "无法停止本地后端 (PID: $pid)"
     return 1
+}
+
+# ============================================================
+# 独立辅助引擎 (aux engine)：在独立端口加载另一模型，与主后端共存
+# 用法: ./manage.sh start-aux <name> / stop-aux <name>
+#   <name> = configs/<name>.conf 的文件名（如 minicpm5-2b）
+# PID/日志隔离在 logs/backend-<name>.{pid,log}，与主后端互不影响。
+# ============================================================
+_aux_pidfile() {
+    echo "$SCRIPT_DIR/logs/backend-$1.pid"
+}
+
+_aux_logfile() {
+    echo "$SCRIPT_DIR/logs/backend-$1.log"
+}
+
+cmd_start_aux() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        error "用法: ./manage.sh start-aux <name>   # <name> = configs/<name>.conf"
+        return 1
+    fi
+
+    local conf="$SCRIPT_DIR/configs/$name.conf"
+    if [[ ! -f "$conf" ]]; then
+        error "辅助引擎配置不存在: $conf"
+        return 1
+    fi
+
+    # 与当前激活配置同名时提示走 start-backend（同端口会冲突）
+    local active_target
+    active_target=$(readlink "$ACTIVE_CONF" 2>/dev/null || true)
+    if [[ "${active_target##*/}" == "$name.conf" ]]; then
+        warn "$name 是当前激活配置，请改用: ./manage.sh start-backend"
+        return 1
+    fi
+
+    local pidfile
+    pidfile=$(_aux_pidfile "$name")
+    local logfile
+    logfile=$(_aux_logfile "$name")
+
+    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+        warn "辅助引擎 $name 已在运行 (PID: $(cat "$pidfile"))"
+        return 0
+    fi
+    rm -f "$pidfile"
+
+    info "启动辅助引擎: ${CYAN}$name${NC} (配置: $conf)"
+
+    # 子 shell 中加载 aux 配置: 覆盖 LLAMA_*/RAPID_MLX_* 变量并隔离
+    # PIDFILE/LOGFILE，不污染主后端状态; 函数在子 shell 中仍可用。
+    (
+        # shellcheck source=/dev/null
+        source "$conf"
+        PIDFILE="$pidfile"
+        LOGFILE="$logfile"
+        # 子 shell 内重定义: 配置名/地址显示用 aux 自己的，避免误导
+        _current_config_name() { echo "$name (aux)"; }
+        _aux_addr() { echo "http://$LLAMA_HOST:$LLAMA_PORT"; }
+        case "$LLAMA_BACKEND" in
+            rapid-mlx|vllm-mlx)
+                _start_rapid_mlx || exit 1
+                ;;
+            dflash-mlx|dflash)
+                _start_dflash_mlx || exit 1
+                ;;
+            *)
+                error "辅助引擎暂不支持后端类型: $LLAMA_BACKEND (仅 rapid-mlx/dflash-mlx)"
+                exit 1
+                ;;
+        esac
+        _aux_addr > "$SCRIPT_DIR/logs/.aux-$name.addr"
+        _log_lifecycle_event "service_start" "aux=$name backend=$LLAMA_BACKEND component=aux_backend"
+    ) || return 1
+
+    local addr
+    addr=$(cat "$SCRIPT_DIR/logs/.aux-$name.addr" 2>/dev/null || echo "http://127.0.0.1:未知")
+    rm -f "$SCRIPT_DIR/logs/.aux-$name.addr"
+    info "✅ 辅助引擎 $name 已启动: $addr"
+    info "   与主后端互不影响; 停止: ./manage.sh stop-aux $name"
+}
+
+cmd_stop_aux() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        error "用法: ./manage.sh stop-aux <name>   # <name> = configs/<name>.conf"
+        return 1
+    fi
+
+    local pidfile
+    pidfile=$(_aux_pidfile "$name")
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null) || true
+
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        warn "辅助引擎 $name 未在运行"
+        rm -f "$pidfile"
+        return 0
+    fi
+
+    info "停止辅助引擎 $name (PID: $pid)..."
+
+    # 优雅停止优先，避免 Metal 死锁 (参见 cmd_stop_backend)
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in {1..15}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            info "✅ 辅助引擎 $name 已停止 (GPU 内存已释放)"
+            rm -f "$pidfile"
+            _log_lifecycle_event "service_stop" "aux=$name component=aux_backend"
+            return 0
+        fi
+        sleep 1
+    done
+
+    warn "优雅停止超时，强制终止..."
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        info "✅ 辅助引擎 $name 已强制停止"
+        rm -f "$pidfile"
+        _log_lifecycle_event "service_stop" "aux=$name component=aux_backend"
+        return 0
+    fi
+
+    error "无法停止辅助引擎 $name (PID: $pid)"
+    return 1
+}
+
+# 扫描 logs/backend-*.pid，在 status 中展示所有辅助引擎
+_aux_status_lines() {
+    local pidfile name pid aux_conf
+    for pidfile in "$SCRIPT_DIR"/logs/backend-*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        name=$(basename "$pidfile" .pid)
+        name=${name#backend-}
+        pid=$(cat "$pidfile" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            aux_conf="$SCRIPT_DIR/configs/$name.conf"
+            local port host model
+            port=$(grep -E '^LLAMA_PORT=' "$aux_conf" 2>/dev/null | cut -d= -f2 | tr -d '"')
+            host=$(grep -E '^LLAMA_HOST=' "$aux_conf" 2>/dev/null | cut -d= -f2 | tr -d '"')
+            host=${host:-127.0.0.1}
+            local api_status
+            if curl -s --max-time 3 "http://$host:${port:-8082}/v1/models" >/dev/null 2>&1; then
+                api_status="${GREEN}正常${NC}"
+            else
+                api_status="${YELLOW}无响应${NC}"
+            fi
+            echo "辅助引擎 ($name):"
+            echo "  状态:     运行中 (API $api_status)"
+            echo "  PID:      $pid"
+            echo "  地址:     http://$host:${port:-8082}"
+            echo "  停止:     ./manage.sh stop-aux $name"
+        else
+            rm -f "$pidfile"
+        fi
+    done
 }
 
 # ============================================================
@@ -2211,8 +2373,10 @@ llama.cpp / Rapid-MLX 服务管理脚本
   status               查询后端和代理状态
   restart              重启后端和代理
   reload               热重载代理配置（SIGHUP，不重启进程）
-  start-backend        仅启动本地模型（独立于代理，用于热切换）
-  stop-backend         仅停止本地模型（释放 GPU 内存）
+   start-backend        仅启动本地模型（独立于代理，用于热切换）
+   stop-backend         仅停止本地模型（释放 GPU 内存）
+   start-aux <name>     启动独立辅助引擎（configs/<name>.conf，独立端口，与主后端共存）
+   stop-aux <name>      停止独立辅助引擎
   watchdog [--daemon]  监控后端健康状态，性能衰减时自动重启（--daemon 后台运行）
   stop-watchdog        停止 watchdog 后台进程
   watchdog-status      查看 watchdog 运行状态 (JSON)
@@ -2365,6 +2529,12 @@ main() {
             ;;
         stop-backend)
             _with_manage_lock cmd_stop_backend
+            ;;
+        start-aux)
+            _with_manage_lock cmd_start_aux "$2"
+            ;;
+        stop-aux)
+            _with_manage_lock cmd_stop_aux "$2"
             ;;
         logs)
             cmd_logs "${2:-50}"

@@ -361,6 +361,8 @@
 | **误判修正** | 「hybrid 架构天然不能复用 KV」不成立——Mamba 类层限制的是**部分截断**（trim），整条复用不受影响；门禁时代 0.92-0.98 命中即同一架构取得 |
 | **修复方向（三轨）** | ①**P1 主攻：发送视图字节稳定化**——引擎 absorb 对客户端改写保持「新观测追加」纪律的同时，配对修复/墓碑注入**不得回写已发送前缀**（新内容只进增量段）；决定性小实验：递增 prompt 连发（预期整条 HIT）vs 收缩/改写 prompt 连发（预期 MISS 复现）②**驱逐缓解**：`--cache-memory-mb` 8192 上调 + gpu-mem 0.70→0.75 A/B（需后端重启，EXP-2R 批后）③**止血**：aux 小请求不 cache_store（rapid-mlx 侧特性/上游 issue） |
 | **影响** | 不阻塞 EXP-2R 判读（两臂同条件）；与 v4/EXP-2 同 regime（历史基线同源）；命中率权威口径 = llama-server.log `cache_fetch` 行（不依赖 usage 回传，L-5 缓解） |
+| **受控实验实证（2026-09-07，tools/probe_prefix_cache.py）** | 三组各 3 轮直连后端：EXP1 递增追加→r2/r3 墙钟 19.4s→6.0s（整条 HIT，**非架构失效实锤**）；EXP2 收缩→MISS + `LCP unavailable shared=4103 requested=4155`（**主因复现：视图收缩 × non_trimmable**）；EXP3 恒定→0.2s 稳定 HIT（对照）。三因量化闭环。 |
+| **修复落地（轨道② 2026-09-07）** | 生产 conf：`--cache-memory-mb` 8192→**12288**、gpu-mem 0.70→**0.75**（后端已重启生效，cache_persist 跨重启恢复）。驱逐率观察窗开启——待真实长会话流量对比 `prefix-pressure-evict` 频率 |
 | **修复落地（轨道① 2026-09-06）** | `PROXY_CTX_VIEW_STABLE_ENABLED`（默认关，conf 就绪）：engine absorb 跳过/剥离已应答 exchange 的客户端改写副本（`_classify_rewrite` + `answered_tids` 增量账本），视图只增不缩；stage 19 `_fix_tool_pairings` 重复 tool_result 改 **keep-first**（去破坏性兜底，无旗标始终生效）。验收：test_view_stable.py 6 场景（前缀字节稳定/完整版保留/混合剥离/新结果不误伤/旗标关回旧轨/keep-first）+ 全量 1611 绿。**上线顺序**：EXP-2R 批后 → probe_prefix_cache.py 三组实验 → conf 开旗标 + restart → 观测 cache_fetch HIT 率与 TTFT |
 
 ---

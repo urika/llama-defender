@@ -140,6 +140,16 @@ _SESSION_TOOL_FREQ: dict[str, dict[str, int]] = {}
 _AUTO_RECALL_STATE: dict[str, dict] = {}
 _AUTO_RECALL_STATE_MAX = 128
 
+# ADR-013 T1 admin 注入队列（admin-inject-primitive-design-20260909 §3.5）：
+# 会话 → 待注入块列表 [{"tag", "text", "queued_at"}...]。治理模式同
+# _AUTO_RECALL_STATE：会话数超 _ADMIN_INJECT_MAX_SESSIONS 时入队方 FIFO
+# 驱逐最老；单会话队列达 _ADMIN_INJECT_PER_SESSION_MAX 入队方拒绝（429）。
+# 内存态不持久化——代理重启队列静默清空（T0 契约已声明）。
+_ADMIN_INJECT_QUEUE: dict[str, list] = {}
+_ADMIN_INJECT_LOCK = threading.Lock()
+_ADMIN_INJECT_MAX_SESSIONS = 128
+_ADMIN_INJECT_PER_SESSION_MAX = 8
+
 # ---------------------------------------------------------------------------
 # Semantic content compression (Phase 2)
 # ---------------------------------------------------------------------------
@@ -566,6 +576,15 @@ PROXY_CTX_VIEW_STABLE_ENABLED = os.environ.get(
 # 悬空调用→manifest 寄存→代答注入（主动）。默认关，与 dup 触发解耦。
 PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
     "PROXY_TOMBSTONE_RECALL_ENABLED", get_default("PROXY_TOMBSTONE_RECALL_ENABLED")).lower() in ("1", "true", "yes")
+
+# ADR-013 T1 admin 注入原语（admin-inject-primitive-design-20260909 §4/§6）：
+# PROXY_ADMIN_TOKEN 默认空 = 与既有 admin 端点对齐（localhost-only，行为
+# 零变化）；配置后 /admin/inject 要求 Bearer/X-Admin-Token 匹配，否则 401。
+# PROXY_INJECT_MAX_CHARS：注入 text 上限，超限 413 拒绝（不截断——截断的
+# 处方比没有更危险）；保护 DEF-311 钉住预算（8000）不被单个巨段挤占。
+PROXY_ADMIN_TOKEN = os.environ.get("PROXY_ADMIN_TOKEN", "")
+PROXY_INJECT_MAX_CHARS = int(os.environ.get(
+    "PROXY_INJECT_MAX_CHARS", get_default("PROXY_INJECT_MAX_CHARS")))
 
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
@@ -1215,6 +1234,9 @@ _RELOAD_SPEC = [
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
     ("PROXY_DIAG_TIMINGS_SOURCE", "PROXY_DIAG_TIMINGS_SOURCE", "str", "auto", "auto"),
+    # ADR-013 T1 admin 注入原语（reloadable；默认空 token=localhost-only）
+    ("PROXY_ADMIN_TOKEN", "PROXY_ADMIN_TOKEN", "str", "", ""),
+    ("PROXY_INJECT_MAX_CHARS", "PROXY_INJECT_MAX_CHARS", "int", "4000", "4000"),
 ]
 
 
@@ -1388,6 +1410,8 @@ __all__ = [
     "PROXY_CTX_VIEW_STABLE_ENABLED",
     "PROXY_AUX_ISOLATION_STRICT",
     "PROXY_CLOUD_CM_ENABLED",
+    # ADR-013 T1 admin 注入原语
+    "PROXY_ADMIN_TOKEN", "PROXY_INJECT_MAX_CHARS",
     # Keyword index
     "PROXY_HISTORY_INDEX", "PROXY_HISTORY_TOP_K", "PROXY_HISTORY_MAX_CHARS",
     # Semantic priority

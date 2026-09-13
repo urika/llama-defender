@@ -94,6 +94,8 @@ Additional commands (see `./manage.sh help`):
 ./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
 ./manage.sh models                          # Model catalog overview (providers/models/routes, key readiness, hash)
 ./manage.sh models-validate                 # Validate configs/models.json (non-zero exit on bad file)
+./manage.sh start-aux <name>                # Start an independent aux engine from configs/<name>.conf (own port/PID/log, coexists with main backend)
+./manage.sh stop-aux <name>                 # Stop the aux engine (graceful, same as stop-backend)
 ./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
 ./manage.sh fix-template <dir>        # Repair Qwen chat_template (DEF-007: prevents system message crashes)
 ```
@@ -110,6 +112,7 @@ Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` 
 | `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative，tool clearing off |
 | `gemma4-26b` | rapid-mlx | gemma-4-26b-it | ~14–16 GB | Gemma 4 26B, concurrency=2, temp 0.2 |
 | `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | N/A | Cloud API, no local backend |
+| `minicpm5-2b` | rapid-mlx | `~/models/MiniCPM5-2B-MLX-4bit`（本地路径） | ~2 GB | 轻量辅助引擎，独立端口 8082，`start-aux/stop-aux` 独立启停、与主后端共存（dense Llama 2.5B，无 MTP/DSpark） |
 
 Each config sets `LLAMA_*` env vars (backend, model, port, context, sampling, KV-cache type, thinking mode) plus backend-specific vars: `RAPID_MLX_*` (rapid-mlx: tool/reasoning parsers, prefix cache, KV quantization, `--hybrid-cache-entries 8` for hybrid models) or `DFLASH_*` (dflash-mlx: `DFLASH_DRAFT_MODEL`, `DFLASH_ENABLE_THINKING=false`, `DFLASH_EXTRA_ARGS`). Metadata fields (`CONFIG_NAME`, `CONFIG_DESC`, `CONFIG_MEMORY`) are read by `./manage.sh list`. Defaults for any unset variable are applied in `manage.sh` itself.
 
@@ -148,6 +151,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/backend/props` / `/api/backend/slots` | llama-server native endpoints, read-only reverse proxy | JSON or 501 `{"supported": false}` when backend lacks them |
 | POST | `/admin/route/force-local` / `force-cloud` | Session-level route override | JSON |
 | POST | `/admin/reload` | HTTP hot-reload, equivalent to `manage.sh reload` (R12) | JSON: `reloaded`, `active_profile`, `api_version` |
+| POST | `/admin/inject` | Admin injection primitive (ADR-013 T1): queue `<{tag}>…</{tag}>` block for a session's next request (once; engine-on persists to canonical, engine-off view-only); 200=queued, delivery proof via `X-Proxy-Feedback-Injected` header / R16 ledger | JSON: `ok`, `queued`, `session_key`; 400/401/404/413/429 per design |
 | GET | `/status` | Human-readable HTML status page | HTML |
 
 - `/api/status` returns `200` when `state` is `healthy` or `starting`, otherwise `503` with the same JSON body. `state` enum: `healthy | starting | backend_down | proxy_down | model_drift | down`.

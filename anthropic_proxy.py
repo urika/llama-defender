@@ -65,6 +65,8 @@ from pipeline import (
     InstrumentedPipeline,
     RequestParser,
     ContextEngineStage,
+    AdminInjectStage,
+    _INJECT_TAG_RE,
     _ctx_engine_on,
     LifecycleClassifier,
     DynamicMaxTokens,
@@ -806,6 +808,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/admin/reload":
                 self._handle_admin_reload()
                 return
+            # ADR-013 T1: admin 注入原语——与 /admin/reload 同款前置分支
+            # (dedup 之前: 重复注入相同处方是合法用法, 不应被去重窗口 429;
+            # admin-inject-primitive-design-20260909 §2)
+            if self.path == "/admin/inject":
+                self._handle_admin_inject()
+                return
             # R18: 任务上下文证据包（契约冻结版; 语义封装面, 机制面走 admin/debug）
             if self.path == "/api/task-context":
                 self._handle_task_context()
@@ -1274,6 +1282,7 @@ class Handler(BaseHTTPRequestHandler):
         InstrumentedPipeline([
             RequestParser(),              # 0
             ContextEngineStage(),         # 0.5 — 上下文工程引擎(默认关;开启时 7/14/17 跳过)
+            AdminInjectStage(),           # 0.6 — admin 注入原语(ADR-013 T1)
             LifecycleClassifier(),        # 1
             DynamicMaxTokens(),           # 2
             SmartRouter(),                # 2.5 — route decision (local vs cloud)
@@ -1719,7 +1728,8 @@ class Handler(BaseHTTPRequestHandler):
         # 注: thinking 模型的 reasoning_content 会作为文本增量先发 →
         # text_block_started=True → 自动回落路径 A(生产配置 thinking off 不受影响)。
         if (not text_block_started and not content_tools_pending
-                and tool_calls_buffer):
+                and tool_calls_buffer
+                and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
             _dispatch = getattr(self, '_micro_recall_dispatch', None)
             if _dispatch is not None:
                 _follow = None
@@ -2083,6 +2093,86 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": {"type": "storage_fault", "message": str(e)[:200]}},
                 503, extra_headers={"Retry-After": "5"})
 
+    def _handle_admin_inject(self):
+        """ADR-013 T1: POST /admin/inject — 按 session_key 排队注入块
+        （admin-inject-primitive-design-20260909，机制面无任务语义）。
+
+        200=入队（投递凭证以 X-Proxy-Feedback-Injected 头/R16 落盘为准, §5）。
+        鉴权（§4）: PROXY_ADMIN_TOKEN 非空时要求 Bearer/X-Admin-Token 匹配,
+        默认空 = 与既有 admin 端点对齐（localhost-only）。fail-open（§2）:
+        会话未知 404; text 超 PROXY_INJECT_MAX_CHARS 413（不截断——截断的
+        处方比没有更危险）; 单会话队列满 429; 全局会话数超上限 FIFO 驱逐最老。
+        """
+        # §4 鉴权
+        token = _ps.PROXY_ADMIN_TOKEN
+        if token:
+            auth = self.headers.get("Authorization", "") or ""
+            x_tok = self.headers.get("X-Admin-Token", "") or ""
+            if auth != "Bearer " + token and x_tok != token:
+                self._respond_json({"error": {"type": "unauthorized",
+                                              "message": "admin token required"}},
+                                   401)
+                return
+        try:
+            raw = getattr(self, "_post_body", "") or "{}"
+            body = json.loads(raw) if raw.strip() else {}
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as e:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": str(e)[:200]}}, 400)
+            return
+        session_key = body.get("session_key")
+        tag = body.get("tag")
+        text = body.get("text")
+        once = body.get("once", True)
+        if not isinstance(session_key, str) or not session_key:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": "session_key must be a non-empty string"}}, 400)
+            return
+        if not isinstance(tag, str) or not _INJECT_TAG_RE.fullmatch(tag):
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": "tag must match ^[a-z][a-z0-9-]{1,31}$"}}, 400)
+            return
+        if not isinstance(text, str) or not text:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": "text must be a non-empty string"}}, 400)
+            return
+        if once is not True:
+            # v1 唯一支持 once=true（设计 §2）
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": "only once=true is supported in v1"}}, 400)
+            return
+        max_chars = int(getattr(_ps, "PROXY_INJECT_MAX_CHARS", 4000))
+        if len(text) > max_chars:
+            # §2/§6: 拒绝不截断, 调用方重发精简版
+            self._respond_json({"error": {"type": "payload_too_large",
+                                          "message": "text exceeds PROXY_INJECT_MAX_CHARS",
+                                          "max_chars": max_chars}}, 413)
+            return
+        # §2 会话存在性: 引擎/台账(含档案)/请求计数任一认识该 key
+        if not _inject_session_known(session_key):
+            self._respond_json({"error": {"type": "not_found",
+                                          "message": "unknown session_key"}}, 404)
+            return
+        with _ps._ADMIN_INJECT_LOCK:
+            queue = _ps._ADMIN_INJECT_QUEUE
+            if session_key not in queue \
+                    and len(queue) >= _ps._ADMIN_INJECT_MAX_SESSIONS:
+                queue.pop(next(iter(queue)), None)  # §3.5: FIFO 驱逐最老
+            items = queue.setdefault(session_key, [])
+            if len(items) >= _ps._ADMIN_INJECT_PER_SESSION_MAX:
+                self._respond_json({"error": {"type": "rate_limited",
+                                              "message": "inject queue full for session"}},
+                                   429)
+                return
+            items.append({"tag": tag, "text": text, "once": True,
+                          "queued_at": time.time()})
+            queued = len(items)
+        log("  -> [admin/inject] queued tag=%s chars=%d session=%s (pending=%d)"
+            % (tag, len(text), session_key, queued))
+        self._respond_json({"ok": True, "queued": queued,
+                            "session_key": session_key})
     def _handle_admin_reload(self):
         """R12: POST /admin/reload — HTTP equivalent of `manage.sh reload` (SIGHUP).
 

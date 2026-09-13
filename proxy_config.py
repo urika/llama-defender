@@ -1046,6 +1046,21 @@ CONFIG_REGISTRY = {
                "dangling calls from manifest deposits (active). Off = bare "
                "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
     },
+    "PROXY_ADMIN_TOKEN": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "ADR-013 T1 admin 注入鉴权（admin-inject-primitive-design-"
+               "20260909 §4）: 默认空 = 与既有 admin 端点对齐(localhost-only,"
+               "行为零变化); 配置后 /admin/inject 要求 Authorization: Bearer "
+               "或 X-Admin-Token 匹配, 不匹配 401。v1 只罩 /admin/inject。",
+    },
+    "PROXY_INJECT_MAX_CHARS": {
+        "defaults": {"all": "4000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "ADR-013 T1 admin 注入 text 字符上限（§6 注入卫生）: 超限 "
+               "413 拒绝(不截断——截断的处方比没有更危险, 调用方重发精简版); "
+               "保护 DEF-311 钉住预算(8000)不被单个巨段挤占。",
+    },
     "PROXY_CTX_VIEW_STABLE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",

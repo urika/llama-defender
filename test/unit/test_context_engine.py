@@ -221,6 +221,65 @@ class TestCanonicalSession(unittest.TestCase):
         self.assertGreater(pin_end, pin_start)
         self.assertEqual(whole[pin_start:pin_end].count("运行单元测试"), 1)
 
+    def test_epoch_pins_cloud_consult_tag(self):
+        """ADR-013 T9: <cloud-consult> 标签同享钉住——combo 升级/审查的
+        处方注入(标签包裹)跨折叠存活(EXP-6 escalate/verifier 臂依赖)。
+        段落落在 [policy pinned from collapsed rounds] 块中且去重生效。"""
+        card = ("<cloud-consult>顾问处方：根因假设 A，先看 X 再改 Y"
+                "</cloud-consult>")
+        msgs = [{"role": "system", "content": "SYS"}]
+        msgs += _tu("任务背景\n" + card)
+        # 同一处方段在两个被收编轮次重复出现 → 钉住块内去重只留一份
+        msgs += _tu("再次确认\n" + card)
+        body = "BODY-" + ("x" * 4000)
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, body)
+        self.sess.absorb(msgs)
+        triggered, final = self.sess.maybe_epoch(
+            self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        whole = json.dumps(final, ensure_ascii=False)
+        pin_start = whole.find("[policy pinned from collapsed rounds]")
+        pin_end = whole.find("turn 1:", pin_start)
+        self.assertGreater(pin_start, 0)
+        self.assertGreater(pin_end, pin_start)
+        self.assertIn("顾问处方", whole[pin_start:pin_end])   # 钉在台账头部
+        # 去重不变量: 钉住块内同段只出现一次
+        self.assertEqual(whole[pin_start:pin_end].count("顾问处方"), 1)
+
+    def test_proxy_injected_excluded_from_sync_order(self):
+        """ADR-013 T1 §3.2: _proxy_injected 注入消息不进 sent_set/sent_order;
+        含注入消息的会话折叠后 sent_order 尾部对齐不漂移。"""
+        msgs = [{"role": "system", "content": "SYS"}]
+        for i in range(30):
+            msgs += _tu("q%d" % i) + _tool_round(
+                "t%d" % i, "Bash", {"command": "c%d" % i}, "o" * 4000)
+        self.sess.absorb(msgs)
+        # 注入块进 canonical 尾部(模拟 stage 0.6 engine-on 路径)
+        injected = self.sess.append_injected(
+            "<cloud-consult>\n处方\n</cloud-consult>")
+        self.assertTrue(injected.get("_proxy_injected"))
+        self.assertIs(self.sess.canonical[-1] is not injected, True)  # 冻结副本
+        import unit_model as _um
+        self.assertNotIn(_um.msg_hash(injected), self.sess.sent_set)
+        pre_len = len(self.sess.sent_order)
+        triggered, final = self.sess.maybe_epoch(
+            self.sess._real_scale() // 4, 5)
+        self.assertTrue(triggered)
+        # 折叠后 sent_order = keep 窗口对应客户端指纹——注入消息不参与
+        # keep 计数(被排除), 故 sent_order 只含客户端消息指纹
+        import unit_model as _um2
+        order_set = set(self.sess.sent_order)
+        self.assertNotIn(_um2.msg_hash(injected), order_set)
+        self.assertLess(len(self.sess.sent_order), pre_len)
+        self.assertTrue(all(isinstance(h, str) for h in self.sess.sent_order))
+        # 注入消息本身是否留在 keep 窗口尾部都不破坏后续 absorb 对齐:
+        # 客户端重发原历史(不含注入块) → 尾部匹配, 无假 mismatch
+        canon2, mism, n = self.sess.absorb(list(msgs))
+        self.assertFalse(mism)
+        self.assertEqual(n, 0)
+
     def test_epoch_token_budget_retention(self):
         """L-9/DEF-313: 保留口径 token 化——keep 预算内轮次保留, 超预算
         旧轮收编; 视图按预算收敛而非按轮数。"""

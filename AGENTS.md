@@ -55,7 +55,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 |------|------|
 | [`manage.sh`](manage.sh) | 服务管理器：start/stop/restart/reload/switch/status/watchdog/wizard，以及本地/云端路由强制切换 |
 | [`anthropic_proxy.py`](anthropic_proxy.py) | HTTP 代理入口：`ThreadingHTTPServer` + `Handler`（~1480 行）；流式/非流式响应处理、双协议端点；请求处理逻辑已全部下沉到 `pipeline.py` |
-| [`pipeline.py`](pipeline.py) | 管线抽象：24 个可独立测试的 `PipelineStage`，把 `_handle_messages` 拆成 RequestParser、LifecycleClassifier、SmartRouter、ContentCompressor、ContextTruncator、BackendDispatcher 等阶段 |
+| [`pipeline.py`](pipeline.py) | 管线抽象：25 个可独立测试的 `PipelineStage`，把 `_handle_messages` 拆成 RequestParser、LifecycleClassifier、SmartRouter、ContentCompressor、ContextTruncator、BackendDispatcher 等阶段 |
 | [`proxy_state.py`](proxy_state.py) | 单一真相源：所有 `PROXY_*` / `LLAMA_*` 常量、共享可变状态、线程本地上下文、`_RELOAD_SPEC`、模型别名、路由状态 |
 | [`proxy_config.py`](proxy_config.py) | `CONFIG_REGISTRY`：每个环境变量的默认值（区分 local/cloud）、类型、作用域、文档说明；配置统一阶段一起为默认值唯一权威（`get_default()` / `validate_startup()` / `write_defaults_sh()`） |
 | [`backend_strategy.py`](backend_strategy.py) | `BackendStrategy` / `LocalStrategy` / `CloudStrategy`：把 38+ 处 `if IS_CLOUD` 收敛为策略类 |
@@ -97,9 +97,10 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
   → anthropic_proxy.py:Handler.do_POST()
   → _llama_lock 获取并发许可
   → Handler._handle_messages()
-  → InstrumentedPipeline 依次执行 24 个 stage（编号为代码注释中的历史层号）
+  → InstrumentedPipeline 依次执行 25 个 stage（编号为代码注释中的历史层号）
        0. RequestParser
        0.5. ContextEngine (上下文工程引擎, 默认关; 开启时 6/7/14/17 跳过)
+       0.6. AdminInjectStage (admin 注入原语, ADR-013 T1; /admin/inject 队列非空才运行)
        1. LifecycleClassifier
        2. DynamicMaxTokens
        2.5. SmartRouter (local/cloud 路由决策)
@@ -145,6 +146,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | `configs/active.conf` | 指向当前激活配置的符号链接（当前 → `ornith-oq4e.conf`） |
 | `configs/ornith-oq4e.conf` | rapid-mlx + Ornith-1.5-35B-A3B-oQ4e-fixed-mtp（**当前激活**，oQ4e imatrix 混合精度 20.1GB，质量优于均匀 4-bit；基于 Qwen3.5 hybrid 架构，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off，decode ~80 tok/s，prefix cache 增量轮秒级；见 docs/05-operations-changelog/ornith-15-integration-20260826.md） |
 | `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
+| `configs/minicpm5-2b.conf` | rapid-mlx + MiniCPM5-2B-MLX-4bit（本地路径 `~/models/`，dense Llama 2.5B 4bit ~1.35GB，131K ctx；**辅助引擎**，独立端口 8082，`start-aux/stop-aux` 独立启停、与主后端共存；无 MTP 层，官方 DSpark drafter 仅 SGLang 支持不在本机可用） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
 | `configs/qwen3.8-27b-4bit.conf` | rapid-mlx + Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80，prefix cache 增量轮秒级） |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
@@ -175,6 +177,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 ./manage.sh start --profile aggressive  # 压缩策略：balanced（默认）/ aggressive / conservative
 ./manage.sh start-cloud        # 仅启动代理，转发到云端 API
 ./manage.sh start-backend / stop-backend # 单独启停本地后端（优先用 stop-backend 优雅停止，避免 Metal 死锁）
+./manage.sh start-aux <name> / stop-aux <name> # 独立辅助引擎启停（configs/<name>.conf，独立端口/进程，与主后端共存；如 start-aux minicpm5-2b）
 ./manage.sh stop               # 优雅停止后端和代理
 ./manage.sh restart            # stop + start
 ./manage.sh reload             # SIGHUP 热重载代理配置（不重启 proxy 进程，约 0.5s）
@@ -237,6 +240,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 | GET | `/api/backend/props` / `/api/backend/slots` | llama-server 原生端点只读反代；后端不支持时 501 结构化降级 |
 | POST | `/admin/route/force-local` / `force-cloud` | 会话级路由覆盖 |
 | POST | `/admin/reload` | HTTP 热重载（R12，等效 `manage.sh reload`，含模型目录重载） |
+| POST | `/admin/inject` | 会话注入原语（ADR-013 T1）：按 session_key 排队注入块，下一请求以 `<{tag}>` 块追加 user 尾部（once；engine-on 进 canonical 跨轮存活，engine-off 单轮）；错误码 400/401/404/413/429。详见 [设计文档](docs/02-architecture-design/admin-inject-primitive-design-20260909.md) |
 | GET | `/status` | 人类可读 HTML 状态页 |
 
 - `/api/status` 在 `state` 为 `healthy` 或 `starting` 时返回 200，否则 503（同 JSON body）。`state` 枚举：`healthy | starting | backend_down | proxy_down | model_drift | down`。
@@ -561,6 +565,13 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_CTX_EPOCH_TRIGGER_TOKENS` | `0` | epoch 预算 S（tokens）；0=auto → min(65%×ctx/4, 70K) |
 | `PROXY_CTX_WINDOW_K` | `0` | epoch 重切保留最近 K 轮；0=auto → 24 |
 | `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
+
+### 11.7 admin 注入原语参数（ADR-013 T1，reloadable）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_ADMIN_TOKEN` | `""` | `/admin/inject` 鉴权；默认空 = localhost-only（同既有 admin 端点） |
+| `PROXY_INJECT_MAX_CHARS` | `4000` | 注入 text 上限，超限 413（不截断） |
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 
