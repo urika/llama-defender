@@ -1,4 +1,5 @@
 """Auto-extracted tool_filter module."""
+import os
 import re
 import proxy_state as _ps
 
@@ -31,7 +32,11 @@ def _apply_tool_denylist(tools):
     只剥定义不动历史消息: 历史 tool_use 不在 tools 定义里是合法状态
     (tools 只约束新调用), 不碰消息对避免配对断裂。
     """
-    deny = getattr(_ps, "PROXY_TOOLS_DENYLIST", "") or ""
+    # 2026-09-15 修正: proxy_state 对新 registry 项无手写物化行(属性不存在,
+    # getattr 默认空串使 denylist 永远空转——seq47 MCP 泄漏实锤)。改为直读
+    # env(CONFIG_REGISTRY 注册项的运行时值即 env, reload 场景由 conf 热载)。
+    deny = os.environ.get("PROXY_TOOLS_DENYLIST", "") or getattr(
+        _ps, "PROXY_TOOLS_DENYLIST", "") or ""
     names = {n.strip() for n in deny.split(",") if n.strip()}
     if not names or not tools:
         return tools, 0
