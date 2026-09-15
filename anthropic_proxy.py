@@ -2262,6 +2262,26 @@ class Handler(BaseHTTPRequestHandler):
                 # 带 input_tokens, message_delta 带 output_tokens)——此前该路径
                 # 不解析, zhipu 流式 run 的 token 账本是零(200126 实证)。
                 _parse_anthropic_sse_usage(raw, usage_acc)
+                # L-23b(2026-09-16, seq139 实证): 云端直通同样回填 usage——
+                # bigmodel 的 message_start 若 input_tokens=0/缺失, CLI compact
+                # 在云端路径同样失明(seq139 云端会话 55 轮撞 32MB 死亡, 与本地
+                # A4 同病理)。拦截 message_start 原文注入估算(与本地路径同源
+                # _estimate_prompt_tokens); 云端真实值若已回填则不动。
+                if b'"message_start"' in raw and anthropic_body is not None:
+                    try:
+                        _ms = json.loads(raw[raw.find(b"{"):].decode(
+                            "utf-8", "replace"))
+                        _u = ((_ms.get("message") or {}).get("usage") or {})
+                        if not _u.get("input_tokens"):
+                            _u["input_tokens"] = _estimate_prompt_tokens(
+                                anthropic_body)
+                            raw = raw[:raw.find(b"{")] + json.dumps(
+                                _ms, ensure_ascii=False).encode("utf-8")
+                            log("  -> [L-23b] passthrough message_start "
+                                "usage 回填: %d tokens(est)"
+                                % _u["input_tokens"])
+                    except Exception as _e:
+                        _warn_diag("l23b_passthrough", _e)
                 if (PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL
                         and not _tail_written and b"message_stop" in raw):
                     _tail_written = self._write_diag_sse_tail()
