@@ -5,6 +5,10 @@
 > 本补丁**仅在 0.12.12/0.12.13 时代需要**，无法沿用到 0.14.x。升级决策与验收口径
 > 转换见 `docs/05-operations-changelog/ornith-oq4e-optimization-runbook-post-exp9-20260920.md`
 > 附录 B2（含上游 vs 本地机制对照表与 off 臂开关改名）。
+> **观测面缺口已提请跨仓联合协调 0920-12**（swe-eval `joint-coordination-llamacpp.md`，
+> 待办 #9）：上游 CacheStats 无检查点计数（升级后实时归因倒退）+ 本补丁日志
+> `LCP snapdown:` 在 0.14.3 改为 `snapped to checkpoint:`（`lcp_trace_analyzer.py`
+> 两条正则需适配）——建议 Step 3 同窗补上游计数，避免二次动引擎。
 
 > 来源：llama-defender 上下文工程设计 §11（agent_go 仓库 docs/design/llama-defender-context-engineering-design.md）
 > 日期：2026-09-06 起　|　目标版本：rapid-mlx 0.12.12（vllm_mlx 包）
