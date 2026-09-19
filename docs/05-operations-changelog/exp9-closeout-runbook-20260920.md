@@ -47,6 +47,14 @@ print('D5 激活验证通过:', {k: ctx[k] for k in ('auto_recall_enabled','pd_m
 
 ## 3. EXP-8 窗口：换模重启 + LCP off 臂对照（双方协调）
 
+> **0920-12 条件注记**：若 EXP-8 窗口在 rapid-mlx 0.14.3 升级（Step 3）**之后**执行，
+> 本节开关名作废——off 臂改用 `RAPID_MLX_HYBRID_CHECKPOINT_MAX=0`（原
+> `PROXY_CACHE_LCP_SNAPDOWN` 随本地 5 文件补丁作废）；**两臂必须同引擎版本**。
+> 升级窗的替换决策/窗口差异/验收口径见
+> `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` 附录 B2（本手册与其
+> 分工：本手册管收官日+EXP-8 窗口序列，B2 管 Step 3 升级本身）。
+> `lcp_trace_analyzer` 已双格式兼容（0920-13）。
+
 ```bash
 # ① 换模到 Qwen3.8-27B conf（EXP-8 主批用，27b conf 现成）
 ./manage.sh switch qwen3.8-27b-4bit && ./manage.sh stop-backend

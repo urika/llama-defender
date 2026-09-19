@@ -5,6 +5,7 @@
 diagnostics-dataplane D2 的"lcp_trace 统计"交付物）：
   [lcp_boundaries] candidates=N boundaries=[...] total=T msgs=M
   [cache_fetch] LCP snapdown: B=X reused=X remaining=Y (entry_len=E lcp=L)
+  [cache_fetch] LCP snapped to checkpoint: shared=S resumed_at=R remaining=Y  (0.14.3 上游口径)
   [cache_fetch] LCP unavailable: shared=S entry_len=E requested_len=R non_trimmable=True
 
 输出: 命中率 / 复用 token 分布 / 失配分型（trivial=小条目不值得 snap-down
@@ -34,6 +35,10 @@ TRIVIAL_TOKENS = 1024
 RE_BOUND = re.compile(r"\[lcp_boundaries\] candidates=(\d+) boundaries=\[([\d, ]*)\] total=(\d+) msgs=(\d+)")
 RE_SNAP = re.compile(r"\[cache_fetch\] LCP snapdown: B=(\d+) reused=(\d+) remaining=(\d+) \(entry_len=(\d+) lcp=(\d+)\)")
 RE_MISS = re.compile(r"\[cache_fetch\] LCP unavailable: shared=(\d+) entry_len=(\d+) requested_len=(\d+) non_trimmable=(\w+)")
+# 0.14.3 上游内置检查点的日志口径（联合协调 0920-12 事实③）：命中行变为
+# "LCP snapped to checkpoint: shared=… resumed_at=… remaining=…"（shared≈复用量）；
+# [lcp_boundaries] 行在该版本消失（chunk 级自动捕获）——双格式并存，历史归档仍可解析。
+RE_SNAP_V143 = re.compile(r"\[cache_fetch\] LCP snapped to checkpoint: shared=(\d+) resumed_at=(\d+) remaining=(\d+)")
 
 
 def parse_lines(lines):
@@ -41,6 +46,7 @@ def parse_lines(lines):
     out = {
         "boundary_events": 0, "boundary_candidates": 0, "boundary_total_tokens": 0,
         "snap_hits": 0, "snap_reused": [], "snap_remaining": [], "snap_saved_pct": [],
+        "snap_hits_v143": 0,  # 0.14.3 上游口径命中（与本地补丁口径分开计数）
         "miss_total": 0, "miss_trivial": 0, "miss_meaningful": 0,
         "miss_meaningful_samples": [],
     }
@@ -59,6 +65,18 @@ def parse_lines(lines):
             out["snap_remaining"].append(remaining)
             if b > 0:
                 out["snap_saved_pct"].append(round(100.0 * reused / b, 1))
+            continue
+        m = RE_SNAP_V143.search(line)
+        if m:
+            # 0.14.3 口径：shared≈复用量（含公共前缀+检查点续算），remaining 同义
+            shared, resumed, remaining = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            out["snap_hits_v143"] += 1
+            out["snap_hits"] += 1
+            out["snap_reused"].append(shared)
+            out["snap_remaining"].append(remaining)
+            total = shared + remaining
+            if total > 0:
+                out["snap_saved_pct"].append(round(100.0 * shared / total, 1))
             continue
         m = RE_MISS.search(line)
         if m:
@@ -94,6 +112,7 @@ def summarize(stats):
             if stats["boundary_events"] else None,
         "hit_rate_pct": round(100.0 * hits / lcp_events, 1) if lcp_events else None,
         "snap_hits": hits,
+        "snap_hits_v143_upstream": stats["snap_hits_v143"],
         "reused_tokens_total": sum(reused),
         "reused_tokens_p50": _pct(reused, 0.5),
         "reused_tokens_p90": _pct(reused, 0.9),
@@ -162,7 +181,7 @@ def main():
         print("边界计算事件      : %s (平均 %.1f boundaries/请求)" % (
             r["boundary_events"], r["avg_boundaries_per_req"] or 0))
         print("LCP cache_fetch   : %d 事件" % r["lcp_events"])
-        print("  snapdown 命中    : %d  (%s%%)" % (r["snap_hits"], r["hit_rate_pct"]))
+        print("  snapdown 命中    : %d  (%s%%)  [其中 0.14.3 上游口径: %d]" % (r["snap_hits"], r["hit_rate_pct"], r["snap_hits_v143_upstream"]))
         print("  非琐碎命中率     : %s%%  (剔除 trivial 小条目失配 %d 次)" % (
             r["nontrivial_hit_rate_pct"], r["miss_trivial_small_entries"]))
         print("  meaningful 失配  : %d" % r["miss_meaningful"])
