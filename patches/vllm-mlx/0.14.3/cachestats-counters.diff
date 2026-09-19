@@ -1,0 +1,79 @@
+--- src/rapid_mlx/memory_cache.py	2026-09-18 20:07:28
++++ memory_cache.patched.py	2026-09-20 01:21:28
+@@ -1102,6 +1102,14 @@
+     # rather than silently leaking. Cumulative, same carry-over contract as
+     # ``load_skipped``.
+     non_trimmable_skips: int = 0
++    # P1a-cnts (llama-defender 0920-12a, joint-coordination #9): checkpoint-
++    # snap hits on the hybrid recurrent-state path (_snap_hybrid_trim), split
++    # out from the generic ``hits``/``tokens_saved`` so /metrics can attribute
++    # checkpoint reuse in real time. Same names as the 0.12.x local patch for
++    # dashboard continuity. Follows the ``hits`` reset contract (resets with
++    # stats; the /metrics accumulator keeps the Prometheus series monotonic).
++    snapdown_hits: int = 0
++    snapdown_tokens_saved: int = 0
+ 
+     @property
+     def hit_rate(self) -> float:
+@@ -1136,6 +1144,9 @@
+             "max_memory_bytes": int(self.max_memory_bytes),
+             "memory_utilization": round(self.memory_utilization, 4),
+             "entry_count": self.entry_count,
++            # P1a-cnts: checkpoint-snap counters → /metrics.
++            "snapdown_hits": self.snapdown_hits,
++            "snapdown_tokens_saved": self.snapdown_tokens_saved,
+             # R10-D: cumulative count of entries the loader rejected for
+             # any per-entry corruption signal — drives the
+             # ``rapid_mlx_prefix_cache_load_skipped_total`` Prometheus
+@@ -2088,6 +2099,8 @@
+                     self._entries.move_to_end(best_super.tokens)
+                     self._stats.hits += 1
+                     self._stats.tokens_saved += position
++                    self._stats.snapdown_hits += 1
++                    self._stats.snapdown_tokens_saved += position
+                     self._last_match_type = "supersequence"
+                     logger.info(
+                         "[cache_fetch] supersequence snapped to checkpoint: "
+@@ -2217,6 +2230,8 @@
+                     self._entries.move_to_end(best_lcp_entry.tokens)
+                     self._stats.hits += 1
+                     self._stats.tokens_saved += position
++                    self._stats.snapdown_hits += 1
++                    self._stats.snapdown_tokens_saved += position
+                     self._last_match_type = "lcp"
+                     logger.info(
+                         "[cache_fetch] LCP snapped to checkpoint: shared=%d "
+--- src/rapid_mlx/routes/metrics.py	2026-09-18 20:07:28
++++ metrics.patched.py	2026-09-20 01:22:06
+@@ -1781,6 +1781,31 @@
+                     "bounded trim-free reuse (#1103)."
+                 ),
+             ),
++            (
++                # P1a-cnts (llama-defender 0920-12a): checkpoint-snap hits on
++                # the hybrid recurrent-state path — the ``_snap_hybrid_trim``
++                # rescues of otherwise-unreusable non-trimmable entries
++                # (LCP + supersequence). Split from generic ``hits`` so the
++                # checkpoint-reuse share of prefix-cache savings is graphable
++                # in real time (log-line offline analysis remains the deep
++                # forensic path). Same names as the 0.12.x local patch.
++                "snapdown_hits",
++                "rapid_mlx_prefix_cache_snapdown_hits_total",
++                (
++                    "Prefix-cache hits served by hybrid checkpoint snap-"
++                    "down (LCP / supersequence recurrent-state resume), "
++                    "not by a plain trimmable prefix match."
++                ),
++            ),
++            (
++                "snapdown_tokens_saved",
++                "rapid_mlx_prefix_cache_snapdown_tokens_saved_total",
++                (
++                    "Prompt tokens skipped thanks to hybrid checkpoint "
++                    "snap-down resume (sum of checkpoint resume positions)."
++                ),
++            ),
++
+         ):
+             raw = int(_coerce_number(cache_stats.get(raw_key)))
+             monotonic = _cache_counter_accumulator.advance(metric_name, raw)
