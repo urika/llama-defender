@@ -141,7 +141,7 @@ docs/
 | `rapid-mlx-cache-analysis.md` | Rapid-MLX Prefix Cache 命中问题分析报告 |
 | `rapid-mlx-cache-analysis-supplement.md` | 补充分析：源码级验证 4 种匹配策略 |
 | `rapidmlx-kvcache-mechanism-20260903.md` | rapid-mlx KV Cache 机制分析（**§10 增补 2026-09-20：LCP snap-down 检查点打通 ④ 路径**——机制/三处调试修复/Gate A 29.7×/生产 0.1189） |
-| `ornith-oq4e-performance-bottleneck-analysis-20260920.md` | Ornith-oQ4e 长上下文性能瓶颈分析（Metal 压力驱逐/KV dequant）+ 优化方案与预期指标 + Ornith vs Qwen3.8-27B 选型对比 + Qwen3.8 上游优化进展（rapid-mlx 0.13/0.14） |
+| `ornith-oq4e-performance-bottleneck-analysis-20260920.md` | Ornith-oQ4e 长上下文性能瓶颈分析（Metal 压力驱逐/KV dequant）+ 优化方案与预期指标 + Ornith vs Qwen3.8-27B 选型对比 + Qwen3.8/Ornith 上游优化进展（rapid-mlx 0.13/0.14、MTP 头、oMLX） |
 | `rapid-mlx-0.11.5-gemma4-chat-template-regression.md` | rapid-mlx 0.11.5 Gemma4 chat template 回归分析 |
 | `prefix-cache-analysis-20260605.md` | Prefix Cache 深度分析与 TurboQuant 测试记录 |
 | `prompt-instability-mechanism-analysis.md` | Agentic 截断策略导致 Prompt 不稳定的机制分析 |
@@ -168,6 +168,7 @@ docs/
 |------|------|
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
 | `exp9-closeout-runbook-20260920.md` | EXP-9 收官日操作手册（D5 激活/取证/LCP ladder 序列） |
+| `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` | Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）：pin-system-prompt+gpu0.80 / HBE off+S=50K / 升 rapid-mlx 0.14.3 三步，含判定与回滚 |
 | `dflash-mlx-integration-20260826.md` | dflash-mlx 新后端集成（35B ~117 tok/s） |
 | `ornith-15-integration-20260826.md` | Ornith-1.5-35B 集成变更 |
 | `model-catalog-multi-cloud-20260815.md` | 多云模型目录 Phase A-D 全量落地变更记录 |
