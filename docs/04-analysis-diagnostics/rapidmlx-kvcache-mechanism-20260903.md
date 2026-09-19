@@ -1,6 +1,8 @@
 # rapid-mlx KV Cache 机制调研与匹配方式
 
-> 日期：2026-09-03 ｜ 源码：rapid-mlx 0.12.12（homebrew），`vllm_mlx/` 包
+> 日期：2026-09-03（**2026-09-20 增补：④ LCP 路径已通过 LCP snap-down 补丁打通**，见 §10；
+> 原文 §2/§4/§6/§7 中「④ 结构性拒绝」的表述以 §10 为准）
+> 源码：rapid-mlx 0.12.12（homebrew），`vllm_mlx/` 包
 > 模块：`memory_cache.py`（MemoryAwarePrefixCache）/ `prefix_cache.py`（BlockAware，备用）/
 >        `engine/batched.py`（boundary snapshot）/ `scheduler.py`（快照触发）
 
@@ -16,15 +18,17 @@
 ├─ ② prefix 匹配  entry ⊂ T（严格前缀）→ 复用 entry，只 prefill 增量 remaining
 │                                     ← 这是 agent 逐轮增长想走的路
 ├─ ③ supersequence entry ⊃ T        → 需 trim 掉 excess → non-trimmable 拒绝
-└─ ④ LCP          entry 与 T 共享前缀后分叉 → 需 trim → non-trimmable 拒绝
+└─ ④ LCP          entry 与 T 共享前缀后分叉 → 原生需 trim 被拒；
+                  **LCP snap-down 补丁（§10）：查边界检查点 B≤LCP 降档复用**
 ```
 
 ## 2. hybrid non-trimmable 的确切语义（#427/#1075/#1103）
 
 Ornith-35B（GatedDeltaNet）与 9B（dense GatedDeltaNet）的缓存层都是 `ArraysCache` —— **无 `trim` 能力**（`is_trimmable()=False`）。因此：
 
-- **③④ 两条路径结构性拒绝**——存储条目比请求长、或与请求分叉时无法裁剪状态续算，只能全量 prefill
-- **唯一可行的复用 = ② prefix 匹配**（entry 恰好是请求的严格前缀，续算不需 trim）
+- **③④ 两条路径原生结构性拒绝**——存储条目比请求长、或与请求分叉时无法裁剪状态续算，只能全量 prefill
+- **② prefix 匹配仍是最优路径**（entry 恰好是请求的严格前缀，续算不需 trim）
+- **④ 已由 LCP snap-down 补丁打通**（2026-09-20，§10）：递归态不可回卷但**可检查点**——B ≤ LCP 的消息边界处线性态对共享前缀请求是合法续算状态，fetch 降档到检查点复用
 - 源码注释原话（`batched.py`）：“the prefix cache finds the LCP match but can't crop the Mamba state at the cut point, so a stored full-prompt+output entry is unusable for a turn-2 prompt that shares only the prefix”
 
 ## 3. 边界快照机制（让 ② 成立的关键，PR #435/#427）
@@ -44,7 +48,10 @@ Ornith-35B（GatedDeltaNet）与 9B（dense GatedDeltaNet）的缓存层都是 `
 |---|---|---|
 | `HIT cached=28847 remaining=957` | ② prefix | 上一轮 boundary 快照是本轮严格前缀 → 只 prefill 增量 |
 | `[boundary_snapshot] saved N` | 每轮结束保存 | 为下一轮备料 |
-| `LCP unavailable: shared=14017 entry_len=14094 requested_len=15060 non_trimmable=True` | ④ LCP 拒绝 | 候选 entry（完整 store，含上轮 assistant 回复）与请求分叉；trim 不允许 → 全冷 |
+| `LCP unavailable: shared=14017 entry_len=14094 requested_len=15060 non_trimmable=True` | ④ LCP 拒绝（**仅无检查点时**） | 候选 entry 与请求分叉且无检查点可用 → 全冷 |
+| `LCP snapdown: B=13848 reused=13848 remaining=415` | ④ 检查点降档（§10） | 候选无 trim 但带检查点 → 从 B 续算，**只 prefill B 之后** |
+| `[lcp_boundaries] candidates=N boundaries=[...]` | 生产侧多边界计算 | chat 路由为长 prompt 规划的检查点位置（flag 开时每请求一行） |
+| `[lcp_checkpoint] request=xxx B=N layers=30` | 检查点现场捕获 | N 段 prefill 每过一边界，快照该处线性态（30 层 = nontrim 层数） |
 | `cached 停滞 28847 多轮` | ② 但快照滞后 | 命中边界停在一个较旧的 boundary，增量每轮增长（remaining 1953→3917） |
 
 **折叠后的重建期**（epoch 后 5-6 轮连续 unavailable）：折叠使请求变短（32780→13096）→ 所有旧 entry 变 supersequence（③拒绝）；新快照逐轮重建中，若候选选中"含 assistant 回复的完整 store"而非 boundary 快照 → 分叉 → ④拒绝。**这正是用户实测 0.7-1K tok/s 的轮次**。
@@ -104,6 +111,11 @@ KV cache 优化 = **让请求形态匹配 ② prefix 路径**：
 5. 长期：dense 模型规避 non-trimmable 约束（E）
 
 **A+B 是本机立刻能做的两项**，预计把 gate 35B 的折叠重建期从 5-6 轮全冷压缩到 1 轮，非 epoch 命中率从 0.949 进一步向 0.99 靠。
+
+> **2026-09-20 增补**：第 6 项——**LCP snap-down 补丁打通 ④ 路径**（§10），分叉场景
+> 不再必然全冷。② 仍是最优路径（零重算 vs 降档的部分重算），上表五项纪律继续有效；
+> 但「前缀分叉 = 全冷」的成本判断已过时——分歧点在历史中后段时，snap-down 可复用
+> 到最近检查点（实测单请求复用 97.1%）。
 
 
 ## 8. 实验验证记录（2026-09-03）
@@ -217,3 +229,53 @@ qwen3_coder_xml 路径不同。对照价值限于「前缀命中率/TTFT」单�
    `X-Proxy-Route-To: local` 头**（tools/gate_test_ctx_engine.py 已加）。
 3. hbe 探针（SAMPLE_EVERY=2）在 gate 期间给后端加 50% 请求流量，验证窗口临时
    关闭（PROXY_HBE_ENABLED=false → reload），验证后已恢复 true。
+
+## 10. LCP snap-down：检查点打通 ④ 路径（2026-09-20 增补）
+
+> 补丁：`patches/vllm-mlx/0.12.12/`（5 文件）；下线开关 `PROXY_CACHE_LCP_SNAPDOWN`
+> （引擎进程 env，非代理 env）；验收工具 `tools/gate_a_lcp_snapdown.py`。
+> 详细设计：agent_go `docs/design/llama-defender-context-engineering-design.md` §11。
+
+### 10.1 机制
+
+递归态不可回卷（`ArraysCache.is_trimmable()=False` 是数学事实），但**可检查点**：
+消息边界 B 处的线性态快照，对共享前缀 ≥ B 的任何请求都是合法续算状态。
+
+```text
+生产侧（flag 开 + 长上下文 ≥4K）：chat 路由按消息切点截断渲染求 token LCP
+  → select_checkpoint_positions（去重/最小间距 1024/最近 8 个）
+  → N 段 insert_segments；每过一边界 end_of_segment → snapshot_linear_states 现场捕获
+  → 全量 store 时挂载 linear_checkpoints（仅线性态，MB 级；KV 层可 trim 不存）
+
+fetch 侧：LCP 候选无 trim 但带检查点 → 找 B ≤ lcp 的最大检查点
+  → KV 层切片到 B + 递归层恢复检查点态 → 从 B 续算（remaining = T[B:]）
+  → 无检查点/结构损坏 → 安全回退全量（纯增益路径，失败只损性能不损正确性）
+```
+
+### 10.2 关键实测事实
+
+| 事实 | 数据 | 影响 |
+|---|---|---|
+| 单边界检查点仅救 2.6% | 6,918 个历史 LCP 事件的逐条量化 | **多边界捕获是必做项**（现有 boundary_snapshot 位置几乎总在发散点之后） |
+| 中位发散点在请求 81% 处 | 同上 | 检查点须覆盖中后段历史 → `select_checkpoint_positions` limit 取**最后** N 个 |
+| 检查点只需存线性态 | KV 层可切片 | 内存 MB 级 vs 条目 GB 级（v0.1 设计「检查点 ≈ KV@B」的估算作废） |
+| Gate A 正确性 | snap 9.4s vs cold 279.0s（**29.7×**），输出逐 token 一致 | 检查点复用 ≡ 全量 prefill（greedy 50/50 tokens） |
+| 生产运行（EXP-9 批期） | 增量占比 **0.1189**（3.2 万请求窗口）；snapdown 行使 7,332 次；对照全史 0.3689 | 3.1× 改善，稳定达标（<0.15） |
+
+### 10.3 三处调试修复（有实证，勿回退）
+
+1. **模板守卫**：Qwen3.5 模板对截断渲染自动追加 assistant 标记、对无 user 结尾抛
+   `TemplateError` → 严格守卫（`lcp == len(r_tokens)`）致候选全空。正确性由 fetch 侧
+   `B ≤ lcp` 不变式独立保证，守卫已放宽为 `256 < lcp < total`
+2. **候选选择**：多会话混缓存时带检查点条目未必是 bisect 紧邻（扫描窗口 ±4）；
+   全局最优候选为 non-trimmable 且无检查点（必全量 MISS）时改选带检查点候选
+3. **边界条目**：`_snapshot_boundary_segments` 存的条目也要挂检查点（LCP 候选常是它）
+
+### 10.4 与本文档前序章节的关系
+
+- §6 优化项 A（entries 32）/ C（零漂移纪律）继续有效且**放大 snap-down 收益**
+  （候选更多、发散更少）
+- §6 优化项 B（折叠后预热轮）优先级下降——折叠重建期的分叉轮现在可由 snap-down
+  部分复用，不再必然全冷
+- §11.4 依赖（字节级确定性）：epoch 压缩区跨 epoch 渲染若不一致，发散点前移，
+  snap-down 复用点随之前移（收益下降但仍为正）
