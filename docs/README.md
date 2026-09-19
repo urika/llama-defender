@@ -258,3 +258,10 @@ docs/
 | 重构回归保障 | `03-experiments-testing/refactor-test-strategy.md` |
 | 优化性能指标 | `06-reference-metrics/` 查看 KPI 定义 → `04-analysis-diagnostics/` 查看历史分析 |
 | 查看版本规划 | `07-project-board/` |
+
+## 跨仓协作
+
+- **swe-eval ↔ llama.cpp 联合协调记录（唯一权威）**：
+  `~/APP/swe-eval/docs/joint-coordination-llamacpp.md`——两线会话的共识/决议/待办对账
+  （分工、EXP 排程、召回 A/B / LCP 方案、批期红线）。本仓库侧相关改动以此文档对账，
+  改前先读最新版。
