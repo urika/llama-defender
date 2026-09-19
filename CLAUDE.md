@@ -56,6 +56,7 @@ Progressive-disclosure context serving: folded/degraded units stay addressable a
 | `signal_types.py` / `protocol_types.py` / `contract_registry.py` | Data contracts for the signal/protocol layers + registry metadata (SLA per product) |
 | `escalate.py` / `decompose.py` / `idempotency.py` / `protocol_orchestrator.py` / `verification_chain.py` / `post_governance.py` | Cognitive orchestrator v1: P1 decompose (capacity/entropy criteria), P5 escalate (state machine + circuit breaker + decision table), 3-level verification chain (mechanical/semantic/ledger), idempotency caches, entry-layer calibration + pattern compilation. **Frozen reference implementation** for the agent_go contract §3.3 R17–R19: standalone modules + unit tests; wiring/task-engine decisions are owned by agent_go. |
 | `hbe_probe.py` | Shadow belief-entropy probe (measure-only, rides completed responses) |
+| `autotune.py` | BVR autotune loop Phase 1 (design `bvr-autotune-loop-design-20260916`): failure-event → proposal extractor rules (loop/amnesia/prefix_break/oom_evict/dup_reread/off_track) → gate (failure-binding/prediction/rate-limit/capability-raise demotion) → tiered signature (low auto / medium·high human) → audit `logs/diag/autotune/`. Standalone CLI `./manage.sh autotune`, never enters the proxy runtime path (fail-open). |
 
 Key behaviors (all default-off unless noted): folded placeholders carry the ctx_recall hint (L1); wasted-call/HARD-BLOCK hints point at ctx_recall (L2); in-place compression prepends `[ctx:<type> ~N→M chars key=r:x]` and registers the original (recoverable compression, `PROXY_TRUNCATE_REPLAYABLE_DROP` adds a replayable tier for Read results with a second-drop keeps-original dup guard); `PROXY_PD_MICRO_TURN_ENABLED` self-answers ctx_recall calls in-request; cross-batch manifest rotation keeps retrieval clean. Pending changes take effect at the next proxy restart.
 
@@ -94,6 +95,7 @@ Additional commands (see `./manage.sh help`):
 ./manage.sh route-force-cloud <session_id>  # Force session to cloud (override throttle)
 ./manage.sh models                          # Model catalog overview (providers/models/routes, key readiness, hash)
 ./manage.sh models-validate                 # Validate configs/models.json (non-zero exit on bad file)
+./manage.sh autotune help                   # BVR autotune loop CLI (generate/list/apply/rollback/status; design bvr-autotune-loop-design-20260916)
 ./manage.sh start-aux <name>                # Start an independent aux engine from configs/<name>.conf (own port/PID/log, coexists with main backend)
 ./manage.sh stop-aux <name>                 # Stop the aux engine (graceful, same as stop-backend)
 ./manage.sh monitor [N]               # Metal memory live monitor (refresh every N sec, default 5)
@@ -221,6 +223,8 @@ Model ID → route preference mapping (preference only, safety always overrides;
 | `tools/stress_test.py` | Stress test: sustained concurrent requests against the proxy |
 | `tools/context_stress_test.py` | Context-stress test: escalating payload sizes to test OOM boundaries |
 | `tools/cache_analyzer.py` | Prefix cache efficiency analysis (hit rate, miss patterns) |
+| `tools/lcp_trace_analyzer.py` | LCP snap-down telemetry analysis (hit rate / reuse distribution / miss taxonomy from backend log; `--archive` guards against log rotation) |
+| `tools/exp9_watch.py` | EXP-9 batch watch: driver liveness, turn freshness, semaphore audit, sessions.jsonl rotation-guard archiving |
 | `tools/monitor.py` | Periodic performance monitoring + Claude semantic action analysis |
 | `tools/trace_requirements.py` | Trace which requirements (R1-R12) are exercised by live traffic |
 | `tools/monitor_proxy_live.sh` | Live HTTP traffic monitor for the proxy |

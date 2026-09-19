@@ -89,6 +89,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`escalate.py`](escalate.py) | P5 升级协议：验证失败后的策略切换决策（决策表 + 幂等闸 + 熔断器 + `TaskState` 有限状态机） |
 | [`post_governance.py`](post_governance.py) | 后治理基础版 + 数据质量监控：入场层校准（`EntryLayerCalibrator` 按历史推荐入场层 0-3）、模式编译（`PatternCompiler` 成功模式 ≥3 次下沉为 Skill）、数据质量 SLA（`DataQualityMonitor`）；对齐 L0-rules/L1-prompts/L2-memory/L3-control 分层语义 |
 | [`protocol_orchestrator.py`](protocol_orchestrator.py) | 五协议编排器（P1 Decompose→P2 Execute→P3 Verify→P4 Recall→P5 Escalate 闭环）：`TaskState` 状态机跟踪 + 非法转换抛异常 + 幂等 + 死循环防御（全局迭代上限 + 单子任务重试上限）；执行器/召回器为注入 callable（Phase 1 stub / Phase 2 接 pipeline 真实模型调用） |
+| [`autotune.py`](autotune.py) | BVR 自调优闭环 Phase 1（`bvr-autotune-loop-design-20260916`）：失败事件 → 提案提取器规则引擎（loop/amnesia/prefix_break/oom_evict/dup_reread/off_track）→ 兑现闸门（失败面绑定/预言/限速/扩能力降权）→ 分级签名（low auto / medium・high human）→ 审计落盘 `logs/diag/autotune/`；纯旁路 CLI（`./manage.sh autotune`），不进入 proxy 运行路径 |
 
 ### 3.2 数据流
 
@@ -160,7 +161,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 
 ### 3.4 工具与文档
 
-- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）、DFlash drafter 蒸馏（`dflash_distill_mlx.py`，dflash-mlx 0.1.8 API 适配版，2026-08-26 Ornith 实验：acceptance 2.34→2.66 但线上无增益，见 changelog）等。
+- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`、`exp9_watch.py`——EXP-9 批期值守：驱动存活/turn 新鲜度/信号量审计/sessions.jsonl 轮转防护归档，2026-09-20）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）、LCP 遥测分析（`lcp_trace_analyzer.py`，2026-09-20：后端日志切命中率/复用分布/失配分型，`--archive` 防轮转，Gate B 判读工具）、DFlash drafter 蒸馏（`dflash_distill_mlx.py`，dflash-mlx 0.1.8 API 适配版，2026-08-26 Ornith 实验：acceptance 2.34→2.66 但线上无增益，见 changelog）等。
 - `docs/`：按 7 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标、项目看板 `07-project-board/`）。入口 [`docs/README.md`](docs/README.md)；根级关键文档含 `llama-defender-integration-requirements.md`（agent_go 集成契约）、`DEFECT-LIST.md`、`requirement-matrix.md`。
 - `test/`：自动化测试，见下节。
 - `logs/`：运行时日志、测试日志、metrics、快照（git-ignored）。
@@ -196,6 +197,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 ./manage.sh models             # 模型目录总览（providers/models/routes、key 就绪状态、hash）
 ./manage.sh models-validate    # 校验 configs/models.json（坏文件非零退出）
 ./manage.sh config-lint [file] # 校验配置文件与 CONFIG_REGISTRY 一致性（默认 active.conf）
+./manage.sh autotune help      # BVR 自调优闭环 CLI（generate/list/apply/rollback/status，设计文档 bvr-autotune-loop-design-20260916）
 ./manage.sh fix-template <dir> # 修复 Qwen chat_template
 ```
 
@@ -468,6 +470,7 @@ git commit --no-verify               # 绕过所有钩子
 | 测试布局 | [`test/README.md`](test/README.md) |
 | 需求追踪 | [`docs/requirements.yaml`](docs/requirements.yaml) + [`tools/trace_requirements.py`](tools/trace_requirements.py) |
 | Claude Code 专用指南 | [`CLAUDE.md`](CLAUDE.md) |
+| swe-eval ↔ llama.cpp 联合协调（跨仓） | `~/APP/swe-eval/docs/joint-coordination-llamacpp.md`（共识/决议 J-系/待办对账唯一权威，改前先读最新版） |
 
 ---
 
@@ -566,6 +569,7 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_CTX_EPOCH_TRIGGER_TOKENS` | `0` | epoch 预算 S（tokens）；0=auto → min(65%×ctx/4, 70K) |
 | `PROXY_CTX_WINDOW_K` | `0` | epoch 重切保留最近 K 轮；0=auto → 24 |
 | `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
+| `PROXY_CACHE_LCP_SNAPDOWN` | `1` | LCP snap-down（GDN 线性态检查点续算，Gate A 验证 29.7×）；生产画像见 `tools/lcp_trace_analyzer.py` 归档 |
 
 ### 11.7 admin 注入原语参数（ADR-013 T1，reloadable）
 
@@ -573,6 +577,14 @@ git commit --no-verify               # 绕过所有钩子
 |------|--------|------|
 | `PROXY_ADMIN_TOKEN` | `""` | `/admin/inject` 鉴权；默认空 = localhost-only（同既有 admin 端点） |
 | `PROXY_INJECT_MAX_CHARS` | `4000` | 注入 text 上限，超限 413（不截断） |
+
+### 11.8 BVR 自调优参数（bvr-autotune-loop-design-20260916，reloadable）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_AUTOTUNE_ENABLED` | `false` | 自调优总开关；默认关 = 纯旁路 CLI（`autotune.py` 不进入 proxy 运行路径） |
+| `PROXY_AUTOTUNE_DAILY_LIMIT` | `5` | 每日晋级提案上限（T4 限速，gate 返回 `over_daily_limit`） |
+| `PROXY_AUTOTUNE_SESSION_LIMIT` | `1` | 单会话晋级提案上限（gate 返回 `over_session_limit`） |
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 
