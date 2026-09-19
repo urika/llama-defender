@@ -181,6 +181,10 @@ curl -s http://127.0.0.1:4000/api/status | python3 -c "import json,sys;print(jso
 
 ### 5.4 B2 修正（窗口 adequacy / 验收口径 / off 臂开关）
 
+0. **观测面前置（联合待办 #9）**：按 §10.3 应用 `patches/vllm-mlx/0.14.3/cachestats-counters.diff`，
+   并断言 `/metrics` 出现 `snapdown_*` 字段——否则升级后**实时归因倒退**（上游无检查点计数）。
+   `tools/lcp_trace_analyzer.py` 的新日志口径适配仍待办，过渡期以 `/metrics` 为准。
+
 1. **实测窗口够不够**：E1 实测中位发散点在请求长度 **81% 处**（距尾 ~19%）；上游默认窗口 ~8K，
    40K 请求时发散点可能**落在窗口外 → 回退全冷**。**先在 ~40K 请求上测 `snapped to checkpoint` 是否触发**；
    不够则调大 `RAPID_MLX_HYBRID_CHECKPOINT_MAX` / `STRIDE`（注意检查点内存占用）。
@@ -282,8 +286,8 @@ bash test/run_tests.sh --promptfoo
 
 | 层 | 载体 | 资源 | 生产在跑时可并行 | 验证内容 |
 |---|---|---|---|---|
-| **T0 静态** | 无 | ~0 | ✅ 随时 | 包改名/`rapid_mlx` 导入/flag 存在性/`hybrid_state_checkpoints.py`/P1a 补丁覆盖对照 |
-| **T1 小模型** | `ornith-ai/Ornith-1.5-9B-MLX-4bit`（**同族 GDN hybrid**，~5GB，已缓存） | ~5GB | ✅ 通常可（内存紧张则等空闲） | boot/工具/流式/推理/prefix 复用/**checkpoint 机制是否生效** |
+| **T0 静态** | 无 | ~0 | ✅ 随时 | 包改名/`rapid_mlx` 导入/flag 存在性/`hybrid_state_checkpoints.py`/P1a 补丁覆盖对照/**snapdown 计数补丁已应用**（§10.3） |
+| **T1 小模型** | `ornith-ai/Ornith-1.5-9B-MLX-4bit`（**同族 GDN hybrid**，~5GB，已缓存） | ~5GB | ✅ 通常可（内存紧张则等空闲） | boot/工具/流式/推理/prefix 复用/**checkpoint 机制是否生效 + `/metrics` snapdown 字段** |
 | **T2 真模型影子** | 同 oQ4e 35B | ~27GB | ❌ **需生产后端让位**（48GB 装不下两台 35B） | ~40K A/B：decode/TTFT/`snapped to checkpoint`/**窗口 adequacy（B2 核心未知）** |
 | **T3 生产切换** | 生产 | — | — | 原子切换 + 回退（§11） |
 
@@ -295,7 +299,38 @@ python3 -m venv .venv-rapidmlx-0143
 .venv-rapidmlx-0143/bin/python -c "import rapid_mlx,vllm_mlx;print(rapid_mlx.__version__)"  # 改名 + shim
 .venv-rapidmlx-0143/bin/rapid-mlx serve --help | grep -iE 'hybrid|checkpoint|pin-system|pflash'
 ls .venv-rapidmlx-0143/lib/python*/site-packages/rapid_mlx/hybrid_state_checkpoints.py
+# B2 观测面：#9(a) snapdown 计数补丁已编写入库，须在 Step 3 窗应用——见 §10.3
 ```
+
+### 10.3 B2 观测面缺口（联合待办 #9）——补丁已编写，应用+运行验证待 Step 3
+
+**缺口**：上游 0.14.3 `CacheStats` **无检查点计数**（`_snap_hybrid_trim` 命中只记通用 `hits`/`tokens_saved`），
+且日志口径从 `LCP snapdown` 变为 `snapped to checkpoint`，导致 `tools/lcp_trace_analyzer.py` **失效**。
+
+**现状**（`a15f9b8`，并行线）：补丁**已编写入库**，但**未应用、未运行时验证**，按设计留 Step 3 升级窗。
+
+| 项 | 状态 |
+|---|---|
+| 补丁 | `patches/vllm-mlx/0.14.3/cachestats-counters.diff`（+ `memory_cache.py` / `routes_metrics.py` / `README.md`） |
+| 内容 | `CacheStats` +`snapdown_hits`/`snapdown_tokens_saved`（随 hits reset 契约）；`to_dict` 输出；LCP + supersequence 两命中点递增；`routes/metrics` counter +2（`rapid_mlx_prefix_cache_snapdown_*_total`） |
+| 离线验证 | ✅ `py_compile` + 语义自检 5/5（基准 = PyPI 0.14.3 wheel） |
+| **应用 / 运行验证** | ❌ **待 Step 3 窗执行** |
+
+**Step 3 前置断言（加在 §5.3 ⓪ 后）**
+```bash
+# 应用补丁（照 patches/vllm-mlx/0.14.3/README.md，勿盲目套 diff：版本漂移注意）
+ls .venv-rapidmlx-0143/lib/python*/site-packages/rapid_mlx/memory_cache.py
+grep -n 'snapdown_hits' .venv-rapidmlx-0143/lib/python*/site-packages/rapid_mlx/memory_cache.py
+
+# 起影子后断言 /metrics 出现新字段
+curl -s localhost:8090/metrics | grep -c 'snapdown'     # 期望 ≥1（或用 /metrics 全量键检查）
+```
+
+**仍待处理（不在本次补丁内）**：`tools/lcp_trace_analyzer.py` 对**新日志口径**（`snapped to checkpoint`）的适配——
+未适配前该工具的实时归因不可用，Step 3 后须以 `/metrics` 新字段为准（并找回该工具）。
+
+**触发**：EXP-9 收官 + Step 3 升级窗（联合协调 0920-12 / 待办 #9）。
+
 
 **T1（小模型，隔离端口 8090）**
 ```bash
@@ -326,7 +361,7 @@ kill %1
 > **Step 2（HBE off + S）为纯代理、reloadable**，无需影子：生产上 `./manage.sh reload` 即生效，
 > 秒级回退（§11.1）。其「全冷轮代价」用 §2④ 计数在判定时一并量。
 
-### 10.3 回退演练（T2 窗口顺带）
+### 10.4 回退演练（T2 窗口顺带）
 改配置 → 起影子 → 测 → **回退** → 再起，实测回退耗时（目标 ≤5 min），确认回退后 §2 指标回到基线。
 
 ---
@@ -378,6 +413,7 @@ cp /tmp/ornith-oq4e.conf.bak-<ts> configs/ornith-oq4e.conf
 影子制品      .venv-rapidmlx-0143（并行 venv）｜ /tmp/ornith-staging/{state,logs}（§10）
 配置备份      /tmp/ornith-oq4e.conf.bak-<ts>（§11）
 本地补丁      patches/vllm-mlx/0.12.12/（P1a，5 文件；0.14.3 改名后不可沿用，被上游取代）
+              patches/vllm-mlx/0.14.3/cachestats-counters.diff（#9(a) snapdown 计数；待 Step 3 窗应用）
 上游机制      rapid_mlx/hybrid_state_checkpoints.py（RAPID_MLX_HYBRID_CHECKPOINT_MAX=4 / _STRIDE=2048）
 安全门        manage.sh:534-547（DEF-006，gpu-mem >0.85 拒绝）；manage.sh:623（引擎二进制解析）
 后端日志      logs/llama-server.log（`snapped to checkpoint` / `LCP unavailable` / `prefix-pressure-evict`）
