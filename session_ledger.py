@@ -117,6 +117,10 @@ def normalize_target(tool_name, args):
 
     确定性、无 LLM(设计 §4.2 规则 2): dup 判定的基础。
     search→query 小写压空白; file→路径; fetch→URL; 其余→首个可用参数。
+    L-15(2026-09-19): 文件类工具的 offset/limit 分页参数参与哈希——
+    同文件不同窗口的分页读不再误计 dup, 同窗口重读仍计。仅改
+    target_hash(dup 分组键), 展示串不变(materials 分组零扰动)。
+    参数缺席 = 首窗, 与显式窗口视为不同组(确定性优先, 不做语义归并)。
     """
     tool = (tool_name or "").lower()
     args = args if isinstance(args, dict) else {}
@@ -133,15 +137,20 @@ def normalize_target(tool_name, args):
                 target = str(v).strip()
                 break
     norm = target
+    page_sig = ""
     if any(t in tool for t in _SEARCH_TOOLS):
         norm = re.sub(r'\s+', ' ', target.lower())
     elif any(t in tool for t in _FILE_TOOLS):
         norm = target.rstrip('/')
+        off = args.get("offset")
+        lim = args.get("limit")
+        if off is not None or lim is not None:
+            page_sig = "|o=%s|l=%s" % (off, lim)
     elif any(t in tool for t in _FETCH_TOOLS):
         norm = target.split('?')[0].lower().rstrip('/')
     else:
         norm = re.sub(r'\s+', ' ', target)[:200]
-    h = hashlib.md5(f"{tool}|{norm}".encode("utf-8")).hexdigest()[:12]
+    h = hashlib.md5(f"{tool}|{norm}{page_sig}".encode("utf-8")).hexdigest()[:12]
     return norm[:200], h
 
 

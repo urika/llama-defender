@@ -33,6 +33,33 @@ class TestNormalizeTarget(unittest.TestCase):
         t, h = sl.normalize_target("Read", {"file_path": "/a/b/c.py"})
         self.assertEqual(t, "/a/b/c.py")
 
+    # ---- L-15(2026-09-19): 分页参数感知——分页读≠dup, 同窗重读=dup ----
+
+    def test_read_pagination_windows_not_dup(self):
+        # 同文件不同窗口(分页读) → 不同 dup 组
+        _, h1 = sl.normalize_target("Read", {"file_path": "/a.py", "offset": 0, "limit": 100})
+        _, h2 = sl.normalize_target("Read", {"file_path": "/a.py", "offset": 100, "limit": 100})
+        self.assertNotEqual(h1, h2)
+
+    def test_read_same_window_still_dup(self):
+        # 同窗口重读 → 同组(真重复信号保留)
+        _, h1 = sl.normalize_target("Read", {"file_path": "/a.py", "offset": 100, "limit": 100})
+        _, h2 = sl.normalize_target("Read", {"file_path": "/a.py", "offset": 100, "limit": 100})
+        self.assertEqual(h1, h2)
+
+    def test_read_limit_alone_distinct(self):
+        # 仅 limit 不同(窗口宽度不同) → 不同组; 参数缺席(首窗)与显式窗亦不同
+        _, h0 = sl.normalize_target("Read", {"file_path": "/a.py"})
+        _, h1 = sl.normalize_target("Read", {"file_path": "/a.py", "limit": 50})
+        _, h2 = sl.normalize_target("Read", {"file_path": "/a.py", "limit": 200})
+        self.assertNotEqual(h1, h2)
+        self.assertNotEqual(h0, h1)
+
+    def test_read_display_unchanged_by_paging(self):
+        # 展示串不含分页后缀(materials 分组零扰动, 仅哈希感知)
+        t, _ = sl.normalize_target("Read", {"file_path": "/a.py", "offset": 100, "limit": 100})
+        self.assertEqual(t, "/a.py")
+
     def test_url_strips_query(self):
         t1, h1 = sl.normalize_target("fetch", {"url": "https://x.com/a?ts=1"})
         t2, h2 = sl.normalize_target("fetch", {"url": "https://x.com/a?ts=2"})
