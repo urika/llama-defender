@@ -15,7 +15,7 @@ logs/diag/lcp_trace/（防日志轮转蒸发——联合文档风险节"证据�
   python3 tools/lcp_trace_analyzer.py                     # 汇总当前日志
   python3 tools/lcp_trace_analyzer.py --archive           # 汇总+原始行归档
   python3 tools/lcp_trace_analyzer.py --tail-bytes 52428800 --json
-纯离线读日志，零引擎交互（透明类·离线档，联合协调 J-D6.1 三档制）。
+纯离线读日志，零引擎交互（透明类·离线档，联合协调 J6.1 三档制）。
 """
 import argparse
 import json
