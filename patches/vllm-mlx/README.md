@@ -1,5 +1,11 @@
 # vllm-mlx 引擎补丁：P1a LCP 边界检查点复用（snap-down）
 
+> ⚠️ **升级路径提示（2026-09-20 实测）**：rapid-mlx **0.14.3 上游已内置同族机制**
+> （`rapid_mlx/hybrid_state_checkpoints.py`，包名 `vllm_mlx → rapid_mlx` 已改名）——
+> 本补丁**仅在 0.12.12/0.12.13 时代需要**，无法沿用到 0.14.x。升级决策与验收口径
+> 转换见 `docs/05-operations-changelog/ornith-oq4e-optimization-runbook-post-exp9-20260920.md`
+> 附录 B2（含上游 vs 本地机制对照表与 off 臂开关改名）。
+
 > 来源：llama-defender 上下文工程设计 §11（agent_go 仓库 docs/design/llama-defender-context-engineering-design.md）
 > 日期：2026-09-06 起　|　目标版本：rapid-mlx 0.12.12（vllm_mlx 包）
 > 状态（2026-09-20 更新）：**全链路上线运行中** —— Gate A 通过（`b77f643`，29.7×，逐 token 一致）、
