@@ -70,6 +70,11 @@ python3 tools/lcp_trace_analyzer.py --archive  # on 段归档
 
 ## 4. 值守例行动作（窗口全程）
 
+> **2026-09-20 起已自动化**：`tools/exp9_watch.py` 每 2 小时定时执行（驱动存活/turn
+> 新鲜度/信号量审计/水位/**sessions.jsonl 轮转防护归档**——轮转只留 1 备份，EXP-9
+> 剩余时段预计再转 2+ 次，归档目录 `logs/diag/evidence-exp9/`）；驱动消失时自动
+> 终扫归档并报收官信号。手动复查命令如下。
+
 ```bash
 ipcs -s | wc -l                             # L-30 信号量审计（P0 风险）
 python3 tools/lcp_trace_analyzer.py         # 增量遥测速览
