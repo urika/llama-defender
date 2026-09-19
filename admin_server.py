@@ -446,6 +446,11 @@ def _build_status_json():
             "compression_profile": getattr(_ps, "PROXY_COMPRESSION_PROFILE", None),
             "bm25_enabled": bool(getattr(_ps, "PROXY_BM25_ENABLED", False)),
             "feedback_injection_enabled": False,  # 合成负反馈 Phase 2 落地后接线
+            # 联合协调 D5(2026-09-19): 召回类开关现值入快照——召回 A/B 臂元数据
+            # 自包含(此前判读只能从 conf 快照兜底取)。代码先进仓库,激活=收官
+            # reload 点(批期零 reload,红线 1)。
+            "auto_recall_enabled": bool(getattr(_ps, "PROXY_AUTO_RECALL_ENABLED", False)),
+            "pd_micro_turn_enabled": bool(getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)),
             "epoch_S": _ctx_engine_values()[0],
             "window_K": _ctx_engine_values()[1],
             # §3.5 KV 可观测(2026-09-01): 前缀破碎计数(每会话 fifo/紧急截断

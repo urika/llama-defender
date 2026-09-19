@@ -199,6 +199,14 @@ class TestBuildStatusJson(unittest.TestCase):
         self.assertIsInstance(ctx["compress_enabled"], bool)
         self.assertIsInstance(ctx["bm25_enabled"], bool)
 
+    def test_ctx_config_recall_switches_snapshot(self):
+        """联合协调 D5: 召回类开关现值入快照——召回 A/B 臂元数据自包含。"""
+        status = admin_server._build_status_json()
+        ctx = status.get("ctx_config")
+        for field in ("auto_recall_enabled", "pd_micro_turn_enabled"):
+            self.assertIn(field, ctx, f"ctx_config missing '{field}'")
+            self.assertIsInstance(ctx[field], bool)
+
     def test_state_is_valid_enum(self):
         status = admin_server._build_status_json()
         self.assertIn(status["state"], (
