@@ -5,6 +5,7 @@
 > 分析依据：[`docs/04-analysis-diagnostics/ornith-oq4e-performance-bottleneck-analysis-20260920.md`](../04-analysis-diagnostics/ornith-oq4e-performance-bottleneck-analysis-20260920.md)（§5 / §10 / §11）
 > 排程约束：[`exp9-closeout-runbook-20260920.md`](exp9-closeout-runbook-20260920.md)、跨仓联合协调文档 J 系决议
 > 评审记录：附录 B（2026-09-20，commit `6de2218`，LCP snap-down 补丁线并行会话）；**B1/B2/B3 已折入正文 §2–§8**
+> 隔离与回退：**§10 零影响验证（T0–T3，并行 venv + 影子端口 + 状态隔离）｜ §11 回退设计（分层制品 + 原子切换 + 决策闸）**
 
 ---
 
@@ -235,6 +236,8 @@ curl -s http://127.0.0.1:4000/api/status | python3 -c "import json,sys;print(jso
 
 ## 8. 影子环境预跑（推荐）
 
+> **更完整的「零影响分层验证 + 回退」设计见 §10 / §11**——本节仅为快捷入口。
+
 三步骤可先在影子代理验证，避免扰动生产状态：
 
 ```bash
@@ -259,12 +262,121 @@ bash test/run_tests.sh --promptfoo
 
 ---
 
+## 10. 升级前隔离验证设计（零影响）
+
+**目标**：在**不触碰生产**（不改 `configs/active.conf`、不重启生产后端、不写共享 HF/状态缓存）的前提下，
+把引擎升级（Step 3）与引擎参数（Step 1）验证到「可切换」状态；生产切换只在最后一步、原子完成（§11.2）。
+
+### 10.1 零影响三不变量
+
+| # | 不变量 | 落实 |
+|---|---|---|
+| I1 | 不重启/不改生产后端（:8081） | 影子引擎走**独立端口 :8090**、独立进程 |
+| I2 | 不改生产配置 | **不改** `configs/active.conf` 与 `configs/ornith-oq4e.conf`；影子用命令行参数 |
+| I3 | 不污染共享缓存/状态 | `HF_HUB_OFFLINE=1` + `RAPID_MLX_STATE_DIR=/tmp/ornith-staging/state`；日志落 `/tmp` |
+
+**并行 venv（关键）**：**不升级** `.venv-rapidmlx`（生产在用，且被 `qwen3.8-27b-4bit.conf` 引用），
+而是新建 `.venv-rapidmlx-0143` 装 0.14.3；brew 0.12.12 原样保留。**任何影子步骤都不写生产 venv/brew**。
+
+### 10.2 分层验证（按资源代价递增）
+
+| 层 | 载体 | 资源 | 生产在跑时可并行 | 验证内容 |
+|---|---|---|---|---|
+| **T0 静态** | 无 | ~0 | ✅ 随时 | 包改名/`rapid_mlx` 导入/flag 存在性/`hybrid_state_checkpoints.py`/P1a 补丁覆盖对照 |
+| **T1 小模型** | `ornith-ai/Ornith-1.5-9B-MLX-4bit`（**同族 GDN hybrid**，~5GB，已缓存） | ~5GB | ✅ 通常可（内存紧张则等空闲） | boot/工具/流式/推理/prefix 复用/**checkpoint 机制是否生效** |
+| **T2 真模型影子** | 同 oQ4e 35B | ~27GB | ❌ **需生产后端让位**（48GB 装不下两台 35B） | ~40K A/B：decode/TTFT/`snapped to checkpoint`/**窗口 adequacy（B2 核心未知）** |
+| **T3 生产切换** | 生产 | — | — | 原子切换 + 回退（§11） |
+
+**T0（任意时刻，零内存）**
+```bash
+python3 -m venv .venv-rapidmlx-0143
+.venv-rapidmlx-0143/bin/pip install "rapid-mlx==0.14.3"
+.venv-rapidmlx-0143/bin/rapid-mlx --version                 # 应 0.14.3
+.venv-rapidmlx-0143/bin/python -c "import rapid_mlx,vllm_mlx;print(rapid_mlx.__version__)"  # 改名 + shim
+.venv-rapidmlx-0143/bin/rapid-mlx serve --help | grep -iE 'hybrid|checkpoint|pin-system|pflash'
+ls .venv-rapidmlx-0143/lib/python*/site-packages/rapid_mlx/hybrid_state_checkpoints.py
+```
+
+**T1（小模型，隔离端口 8090）**
+```bash
+STG=/tmp/ornith-staging; mkdir -p $STG/state $STG/logs
+HF_HUB_OFFLINE=1 RAPID_MLX_STATE_DIR=$STG/state \
+  .venv-rapidmlx-0143/bin/rapid-mlx serve ornith-ai/Ornith-1.5-9B-MLX-4bit \
+  --no-mllm --port 8090 --gpu-memory-utilization 0.20 --cache-memory-mb 2048 \
+  --max-num-seqs 1 --hybrid-cache-entries 8 > $STG/logs/engine-9b.log 2>&1 &
+curl -s localhost:8090/v1/models | head -c 200              # 影子就绪
+# 冒烟：工具调用 / 流式 / 两轮前缀复用；grep 日志 checkpoint 行
+kill %1                                                      # 仅退出影子进程
+```
+
+**T2（真模型影子，生产让位窗口 —— 预验证阶段唯一的生产中断点）**
+```bash
+./manage.sh stop-backend                                     # 生产中断开始
+HF_HUB_OFFLINE=1 RAPID_MLX_STATE_DIR=$STG/state \
+  .venv-rapidmlx-0143/bin/rapid-mlx serve pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp \
+  --no-mllm --port 8090 --gpu-memory-utilization 0.80 --cache-memory-mb 12288 \
+  --max-num-seqs 1 --default-repetition-penalty 1.0 --hybrid-cache-entries 32 \
+  --pin-system-prompt > $STG/logs/engine-35b.log 2>&1 &
+# A/B：基线臂 = brew 0.12.12 同命令（无 --pin-system-prompt）；对照臂 = 0.14.3（含之）
+# 直连 :8090，各跑 ~40K 请求；采集 §2 指标 + grep 'snapped to checkpoint' / 'LCP unavailable'
+kill %1
+./manage.sh start-backend                                    # 生产中断结束（回现状）
+```
+
+> **Step 2（HBE off + S）为纯代理、reloadable**，无需影子：生产上 `./manage.sh reload` 即生效，
+> 秒级回退（§11.1）。其「全冷轮代价」用 §2④ 计数在判定时一并量。
+
+### 10.3 回退演练（T2 窗口顺带）
+改配置 → 起影子 → 测 → **回退** → 再起，实测回退耗时（目标 ≤5 min），确认回退后 §2 指标回到基线。
+
+---
+
+## 11. 回退设计（可回退保证）
+
+### 11.1 分层与不可变制品
+
+| 层 | 变更 | 不可变制品 / 备份 | 回退动作 | 生效时间 |
+|---|---|---|---|---|
+| 引擎 | 0.14.3 | **并行 venv** `.venv-rapidmlx-0143`（生产 venv/brew 不动） | 删 `LLAMA_SERVER_BIN` 行（回 brew 0.12.12）或指回旧 venv | 重启后端 |
+| 配置 | conf 行 | `cp configs/ornith-oq4e.conf /tmp/ornith-oq4e.conf.bak-<ts>` | `cp` 回 + `restart`/`reload` | 秒–分钟 |
+| 代理行为 | `PROXY_HBE_ENABLED true→false`、`PROXY_CTX_EPOCH_TRIGGER_TOKENS 70000→50000` | §3/§4 diff 记录原值 | 改回原值 + `./manage.sh reload` | **秒级** |
+| 模型 | 无（复用缓存） | — | — | — |
+| 文档/代码 | git | commit / tag | `git revert <sha>` | — |
+
+### 11.2 原子切换
+生产侧所有变更集中为**一次**操作：`configs/ornith-oq4e.conf` 加 `LLAMA_SERVER_BIN` +
+（可选）`--pin-system-prompt` / `gpu 0.80` → `./manage.sh stop-backend && ./manage.sh start-backend`。
+失败即：
+
+```bash
+cp /tmp/ornith-oq4e.conf.bak-<ts> configs/ornith-oq4e.conf
+./manage.sh stop-backend && ./manage.sh start-backend
+```
+
+### 11.3 回退决策闸（任一触发即回退）
+- 冷 prefill 回归 **>20%**，或 ~40K decode **低于现状**；
+- 工具调用失败率↑ / `L3` 循环↑ / 解析器异常；
+- `snapped to checkpoint` **从未触发**（= B2 窗口不足）；
+- TTFT p95 恶化；Metal `watchdogd` panic。
+
+### 11.4 回退后验证
+跑 §2 采集，确认 decode/TTFT/驱逐数回到基线；`/api/status` `state=healthy`；工具调用冒烟通过。
+
+### 11.5 制品清单（可追溯）
+- venv：`.venv-rapidmlx-0143`（`pip freeze > /tmp/ornith-staging/manifest.txt`）
+- 配置备份：`/tmp/ornith-oq4e.conf.bak-<ts>`
+- 影子日志/状态：`/tmp/ornith-staging/logs/*.log`、`/tmp/ornith-staging/state`（可随时删除，不影响生产）
+
+---
+
 ## 附录：涉及文件
 
 ```
 配置          configs/ornith-oq4e.conf（RAPID_MLX_EXTRA_ARGS / PROXY_HBE_* / PROXY_CTX_EPOCH_TRIGGER_TOKENS；
                Step 3 须新增 LLAMA_SERVER_BIN，未设时 manage.sh:623 回退 brew）
 引擎二进制    当前 = /opt/homebrew/bin/rapid-mlx（brew 0.12.12）｜ 目标 = .venv-rapidmlx（0.14.3）
+影子制品      .venv-rapidmlx-0143（并行 venv）｜ /tmp/ornith-staging/{state,logs}（§10）
+配置备份      /tmp/ornith-oq4e.conf.bak-<ts>（§11）
 本地补丁      patches/vllm-mlx/0.12.12/（P1a，5 文件；0.14.3 改名后不可沿用，被上游取代）
 上游机制      rapid_mlx/hybrid_state_checkpoints.py（RAPID_MLX_HYBRID_CHECKPOINT_MAX=4 / _STRIDE=2048）
 安全门        manage.sh:534-547（DEF-006，gpu-mem >0.85 拒绝）；manage.sh:623（引擎二进制解析）

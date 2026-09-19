@@ -168,7 +168,7 @@ docs/
 |------|------|
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
 | `exp9-closeout-runbook-20260920.md` | EXP-9 收官日操作手册（D5 激活/取证/LCP ladder 序列） |
-| `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` | Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）：pin-system-prompt+gpu0.80 / HBE off+S=50K / 升 rapid-mlx 0.14.3 三步，含判定与回滚 |
+| `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` | Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）：pin-system-prompt+gpu0.80 / HBE off+S=50K / 升 rapid-mlx 0.14.3 三步；含零影响隔离验证（T0-T3）与回退设计 |
 | `dflash-mlx-integration-20260826.md` | dflash-mlx 新后端集成（35B ~117 tok/s） |
 | `ornith-15-integration-20260826.md` | Ornith-1.5-35B 集成变更 |
 | `model-catalog-multi-cloud-20260815.md` | 多云模型目录 Phase A-D 全量落地变更记录 |
