@@ -84,6 +84,9 @@ tail -c 3000000 logs/llama-server.log | grep -c 'LCP unavailable'               
 **判定（对照分析文档 §6）**：
 - ✅ 通过：`prefix-pressure-evict` **计数归零**；Metal `peak < cap`；长上下文纯 decode 从 ~20 → **≥25 tok/s**
 - ⚠️ 注意：`--gpu-memory-utilization > 0.85` 被 `manage.sh:542`（DEF-006）拒绝；0.80 会打印警告但放行
+- 🔴 **关键前提（2026-09-20 实测修正）**：**必须先抬高 `iogpu.wired_limit_mb`，否则本步无效**——
+  `cap = max_recommended_working_set_size × util`（`vllm_mlx/scheduler.py:4417`），默认 base 仅
+  **37.44 GiB** → 0.80 只得 30.2GB，**仍低于实际 peak 31.0GB** → 驱逐照旧。详见 §12.7。
 - 📌 **B3**：此前 0.80 变差的「前科」已消失——现为单引擎（辅助端口 8084 无监听），
   `rapidmlx-kvcache-mechanism` §8.2 的退化是**双引擎 Metal 竞争**所致，本步可放心重试。
   且条目存活↑ → 检查点存活↑ → snap 收益同向放大（判定时按 §2④ 区分收益来自驱逐消除还是 snap）。
@@ -331,7 +334,6 @@ curl -s localhost:8090/metrics | grep -c 'snapdown'     # 期望 ≥1（或用 /
 
 **触发**：EXP-9 收官 + Step 3 升级窗（联合协调 0920-12 / 待办 #9）。
 
-
 **T1（小模型，隔离端口 8090）**
 ```bash
 STG=/tmp/ornith-staging; mkdir -p $STG/state $STG/logs
@@ -418,10 +420,7 @@ cp /tmp/ornith-oq4e.conf.bak-<ts> configs/ornith-oq4e.conf
 
 ---
 
----
-
 ## 12. T2 实测结果（2026-09-20 执行完毕）
-
 > 状态：**已完成**。生产已恢复（新后端 PID 94938，`state=healthy`）。原始数据
 > `/tmp/ornith-staging/logs/{T2-RESULTS.md,t2c-*.log,t2c-*-r*.json}`；执行器 `tools/t2_gate_watch.sh`。
 > 放行依据：**`exp-20260919-select-gate/finale-20260920-055914`（全部步骤 rc=0）** + 用户确认取证完成。
@@ -493,6 +492,79 @@ cp configs/ornith-oq4e.conf /tmp/ornith-oq4e.conf.bak-$(date +%s)
    → 改为**先查 `.finale-watch.pid` 进程是否存活**，仅存活时才判 `state`。
 
 ---
+
+## 13. Step 1 小窗口实测结果（2026-09-20 执行完毕）
+
+> 状态：**已执行**（配置当前生效中）。原始数据 `/tmp/ornith-staging/logs/{STEP1-RESULTS.md,step1*.log}`。
+
+### 13.1 结论：✅ 驱逐归零 —— 但决定性杠杆是 `iogpu.wired_limit_mb`，不是 `--gpu-memory-utilization`
+
+| 指标 | 基线 | Step 1（旧 cap 30.2GB） | Step 1（**新 cap 36.1GB**） |
+|---|---|---|---|
+| `prefix-pressure-evict` | 974 | 464（未消除） | **0** ✅ |
+| `adaptive_prefill →256` | 598 | 301（未消除） | **0** ✅ |
+| Metal cap | 30.2GB | **30.2GB（完全未变）** | **36.1GB** |
+| Metal active / peak | 27.1 / 31.0GB | 27.1 / 31.0GB | 23.8 / **26.7GB** |
+| append-only 会话耗时 | 常有 10–265s | — | **1.27–1.28s（连续 HIT）** |
+
+### 13.2 机制（源码级，重要认知修正）
+
+`vllm_mlx/scheduler.py:4417 _resolve_metal_cap_bytes()`：
+
+```python
+base = mx.device_info()["max_recommended_working_set_size"]
+cap  = int(base * gpu_memory_utilization)
+```
+
+本机实测与推算：
+
+| 条件 | base | util 0.80 → cap | 结果 |
+|---|---|---|---|
+| 默认（`iogpu.wired_limit_mb=0`） | **37.44 GiB** | **30.2GB** | **< peak 31.0GB → 每请求驱逐** |
+| `iogpu.wired_limit_mb=43008` 后 | **45.1 GB** | **36.1GB** | **> peak → 驱逐归零** ✅ |
+
+启动日志证据：`Metal memory limits set: allocation_limit=36.1GB (80% of 45.1GB)`
+
+**教训**：
+1. **`--gpu-memory-utilization` 的基数是 macOS 的 `max_recommended_working_set_size`（默认仅 37.44GiB，不是物理 48GiB）** —— 单纯调 util 无法突破该封顶，Step 1 单独执行**无效**。
+2. **`--pin-system-prompt` 保护的是条目优先级，不是容量** —— 容量驱逐下无济于事。
+3. **决定性手段 = §5.C `sudo sysctl iogpu.wired_limit_mb=43008`（抬高 base）**，须在重启后端**前**设置。
+4. **`wired_limit` 是运行时参数，重启失效** → 需持久化（§13.4）。
+
+### 13.3 测试设计教训（避免误判回归）
+
+首次用「每轮内容全不同、递增长度」的压力序列，观测到耗时线性劣化（18.9s→183.4s）且
+`HIT` 为空 —— 这是**测试设计问题**（内容无前缀关系 → 每轮全冷），**不是回归**。
+改用**真实 agent 形态（固定 system 前缀 + append-only 逐轮增长）**后，连续 HIT、耗时稳定 ~1.3s：
+```
+HIT prompt_tokens=1125 cached=819  remaining=306
+HIT prompt_tokens=1445 cached=1139 remaining=306
+HIT prompt_tokens=1765 cached=1459 remaining=306
+```
+→ **验证性能必须用 append-only 会话形态**（Runbook §2 采集口径补充）。
+
+### 13.4 待办：`wired_limit` 持久化（§5.C 落地）
+
+运行时 `sysctl` 重启丢失，需 LaunchDaemon plist：
+```bash
+sudo tee /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.local.iogpu-wired-limit</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/sbin/sysctl</string><string>iogpu.wired_limit_mb=43008</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+EOF
+sudo launchctl load /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
+```
+⚠️ 48GB 档上限 43008（留 ~6GB 给系统）；**贴近上限有 `watchdogd` panic 风险**（参见
+`turboquant-mlx` 实测），需持续观察。
+
+### 13.5 当前生产状态
+- 后端 **PID 7757**，配置 = Step 1（`gpu 0.80` + `--pin-system-prompt`）+ `wired_limit=43008`
+- 回退：`/tmp/ornith-staging/ornith-oq4e.conf.prestep1`（删 pin + 回 0.75）；`wired_limit` 回退 `=0`
 
 ---
 
@@ -566,7 +638,5 @@ shared=... resumed_at=...`）。
   收益/代价会算错。
 - **§8 影子环境**："避免扰动生产状态"仅在代理状态层面成立：promptfoo 推理仍打
   共享后端 8081（`--max-num-seqs 1`）——**批期禁跑**（并发排队干扰批跑与验收窗口）。
-
----
 
 ---
