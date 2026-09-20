@@ -108,8 +108,13 @@ def _epoch_collapse_by_session():
     return out
 
 
-def _wall_times_from_sessions(since_ts=None):
-    """从 sessions.jsonl 抽取最近 turn 墙钟（若有 duration_ms）。"""
+def _wall_times_from_sessions(since_ts=None, limit=200):
+    """从 sessions.jsonl 抽取最近 turn 墙钟（duration_ms）。
+
+    关键：必须按 since_ts 过滤，否则读到全量历史（含 EXP-9 灾难期 15min/run
+    长尾），before/after 样本池几乎相同 → wall_ratio≈1.0 永远 PASS，
+    检测不出真实劣化（0921-4 自查修正）。
+    """
     p = os.path.join(REPO, "logs", "diag", "sessions.jsonl")
     if not os.path.exists(p):
         return []
@@ -121,7 +126,7 @@ def _wall_times_from_sessions(since_ts=None):
                     d = json.loads(line)
                 except Exception:
                     continue
-                ts = d.get("ts") or d.get("timestamp") or ""
+                ts = d.get("ts") or ""
                 if since_ts and ts and ts < since_ts:
                     continue
                 ms = d.get("duration_ms") or d.get("wall_ms")
@@ -129,7 +134,7 @@ def _wall_times_from_sessions(since_ts=None):
                     rows.append(float(ms))
     except OSError:
         return []
-    return rows[-50:]
+    return rows[-limit:]
 
 
 def snapshot(out_path):
@@ -140,6 +145,8 @@ def snapshot(out_path):
         "ctx_config": _proxy_ctx(),
         "epoch_collapse_by_session": _epoch_collapse_by_session(),
         "wall_samples_ms": _wall_times_from_sessions(),
+        "wall_median_ms": (sorted(_wall_times_from_sessions())[len(_wall_times_from_sessions())//2]
+                           if _wall_times_from_sessions() else None),
     }
     if out_path:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -170,14 +177,22 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
             epoch_delta[sid] = d
     epoch_total = sum(epoch_delta.values())
 
-    # 墙钟
-    wb = before.get("wall_samples_ms") or []
-    wa = after.get("wall_samples_ms") or []
+    # 墙钟：只取 before 快照之后的样本（避免历史长尾污染，0921-4 修正）
+    before_ts = before.get("ts")
+    wa_all = _wall_times_from_sessions(since_ts=before_ts)
     wall_ratio = None
-    if wb and wa:
-        mb = sum(wb) / len(wb)
-        ma = sum(wa) / len(wa)
-        wall_ratio = (ma / mb) if mb > 0 else None
+    wall_stat = None
+    if wa_all:
+        # 中位数抗长尾（历史有 15min/run 灾难期样本）
+        ws = sorted(wa_all)
+        med = ws[len(ws) // 2]
+        # 基线参考：EXP-9 后期普通轮 48–100s（0921-3 旁证），但以本批实测中位为准
+        wall_stat = {"n": len(wa_all), "median_ms": med,
+                     "p90_ms": ws[int(len(ws) * 0.9)], "max_ms": ws[-1]}
+        # 若 before 快照带基线中位，则计算比
+        bmed = before.get("wall_median_ms")
+        if bmed:
+            wall_ratio = med / bmed if bmed > 0 else None
 
     # ctx_config 漂移（S/window_k）
     bc_cfg, ac_cfg = before.get("ctx_config", {}), after.get("ctx_config", {})
@@ -206,7 +221,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         "delta": delta,
         "epoch_collapse_delta": epoch_delta,
         "wall_ratio": wall_ratio,
-        "wall_samples": {"before_n": len(wb), "after_n": len(wa)},
+        "wall_stat": wall_stat,
         "ctx_config_drift": cfg_drift,
         "metrics_after": am,
         "thresholds": {
