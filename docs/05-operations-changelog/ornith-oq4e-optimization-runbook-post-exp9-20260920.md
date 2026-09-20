@@ -873,6 +873,73 @@ EXP-9 重跑操作点（64K 长会话）恰落在未复验区。
 
 ---
 
+## 19. 影响二终局：重跑前置门（首轮 gate）+ 降 GPU 占用（2026-09-21）
+
+### 19.1 结论修正：合成 pilot 不能替代真实操作点
+
+0920-16/§18.4 的 append-only pilot（28K，117 驱逐）与 e8 影子对照（0 驱逐）**均为合成形态**。
+swe-eval 0921-1/0921-3 指出并已证实：
+
+- **EXP-9 死于 64K 多工具 agentic 形态**，该形态在**生产配置下从未复验**
+- **影子与生产不可比**：同 16GiB，影子 0 驱逐 vs 生产 **103 驱逐 + Metal pressure 反升**
+- 故合成 pilot **不构成重跑放行证据**
+
+### 19.2 重跑前置门（`tools/rerun_gate.py`，`6aaebb2`）
+
+**形态**：批跑前 2–3 个**真实 run** 校验，不达标**立刻停批**（成本数十分钟 vs 重赔 38–49h）。
+
+```bash
+python3 tools/rerun_gate.py snapshot --out before.json    # 批前快照
+# ... 跑 2-3 个真实 run ...
+python3 tools/rerun_gate.py check --before before.json    # exit 0=PASS / 1=STOP
+```
+
+**四件套判据**（一律以 `/metrics` 计数器增量为准，非日志行——日志受窗口截断低估）：
+
+| 项 | 源 | 默认阈值 |
+|---|---|---|
+| `pressure_evictions` 增量 | `/metrics` | >0 即 STOP |
+| `lru_evictions` 增量 | `/metrics` | >200 |
+| 墙钟比 | `sessions.jsonl` duration_ms | >1.5× |
+| `epoch_collapse` 增量 | `logs/diag/manifest/` | >0 |
+
+另检 `ctx_config` 漂移（`epoch_S`/`window_K`/`engine_enabled`）。三路径单测通过。
+
+### 19.3 降 GPU 占用：`--hybrid-cache-entries 32→8`（`d5f2e98`）
+
+影子三臂实测：
+
+| entries | active | peak | cache current | 墙钟 | pressure evict |
+|---|---|---|---|---|---|
+| 32 | 29.3GB | 31.1GB | 12.4GB | 5.0–5.1s | 177 |
+| 16 | 29.3GB | 31.1GB | 12.4GB | 3.9–5.2s | 91 |
+| **8** ✅ | **25.6GB** | **27.4GB** | **7.1GB** | **3.4s** | **0** |
+
+**三赢**：降 GPU 占用 **-3.7GB**、pressure 驱逐归零、墙钟 **-32%**。
+生产已落地，append pilot 压力驱逐 0、直连+代理功能验证通过。
+回退点 `/tmp/ornith-staging/ornith-oq4e.conf.prehybrid8`。
+
+**注**：此为合成形态结果，**不构成重跑放行**（见 19.1）——真实 64K agentic 形态待 gate 首轮。
+
+### 19.4 当前世代（最终值）
+
+```
+引擎     rapid-mlx 0.14.3 (.venv-rapidmlx-0143)
+模型     Ornith-1.5-35B-A3B-oQ4e-fixed-mtp (20.1GB)
+KV       bf16 (A1)
+cache    --cache-memory-mb 12288 (12GB)
+hybrid   --hybrid-cache-entries 8      ← 本次变更
+gpu      --gpu-memory-utilization 0.80 → cap 36.1GB
+flags    --pin-system-prompt --max-num-seqs 1
+系统     iogpu.wired_limit_mb=43008
+代理     S=70000 / HBE off / KEEP=40000
+落点     2026-09-21 05:4x 后端重启
+```
+
+**注**：世代戳建议附 conf 关键值哈希（0921-3 ④），避免时间戳法漂移。
+
+---
+
 ## 附录：涉及文件
 
 ```
