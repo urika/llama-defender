@@ -944,6 +944,54 @@ flags    --pin-system-prompt --max-num-seqs 1
 
 ---
 
+## 20. 交接：swe-eval 侧待办（llama.cpp 侧视角，2026-09-21）
+
+> 本文档绝对路径：
+> **`/Users/jinsongwang/APP/llama.cpp/docs/05-operations-changelog/ornith-oq4e-optimization-runbook-post-exp9-20260920.md`**
+> 联合协调文档绝对路径：
+> **`/Users/jinsongwang/APP/swe-eval/docs/joint-coordination-llamacpp.md`**
+
+### 20.1 llama.cpp 侧已完成（不再需要 swe 动作）
+
+| # | 项 | 证据 |
+|---|---|---|
+| L1 | 引擎升级 0.14.3 + bf16 KV | PID `.venv-rapidmlx-0143`，§15 |
+| L2 | `wired_limit=43008` 持久化 | LaunchDaemon plist，§13 |
+| L3 | `--hybrid-cache-entries 8` | §19.3，active -3.7GB/evict 0/墙钟 -32% |
+| L4 | S 回 70K（余量比恢复） | §18.3，`epoch_S=70000` |
+| L5 | **`ca50fba` 已激活** | 代理 9-21 06:18 重启，`auto_recall_enabled`/`pd_micro_turn_enabled` 两字段已出现 |
+| L6 | **gate 脚本就位** | `tools/rerun_gate.py`（`6aaebb2`+`5c68f10`），12/12 单测通过 |
+| L7 | 世代戳快照 | 已写 `results/experiments/exp-20260921-select-gate-r2/engine-generation-stamp-llamacpp.json` |
+| L8 | 文档漂移修复 | §10.3/§12.5/§15.6 + patches README |
+
+### 20.2 **swe-eval 侧待办**（阻塞 r2 放行）
+
+| # | 事项 | 为什么需要 swe-eval | 建议做法 |
+|---|---|---|---|
+| **S1** | **驱动 2–3 个真实 64K agentic run** | gate 校验的**对象**是真实操作点；`run_agent.py` 属 swe-eval 域，llama.cpp 无法自造真实 run | 用 r2 frozen 的 task set 跑 2–3 run（64K 形态） |
+| **S2** | **重跑 preflight 或显式 skip** | `results/preflight.json` 是 **35h 前**的（记录旧引擎 pid 3979）；按 15 分钟新鲜度规则应拒绝启动 | 重跑 preflight（记新引擎 PID 3491）或 `--skip-preflight` |
+| **S3** | **调用 gate 判读** | gate 的 snapshot/check 需在真实 run 前后各一次 | `rerun_gate.py snapshot --out before.json` → 跑 run → `check --before before.json`；**exit 1 = 停批** |
+| **S4** | **manifest `frozen` 并入引擎世代戳** | r2 manifest 仅含 `code_commit`，无引擎版本/KV/S/hybrid-entries | 并入 L7 的 `engine-generation-stamp-llamacpp.json` |
+| **S5** | **世代落点更新** | r2 manifest 创建于 06:21，引擎重启 06:18（e8 落地）；`ca50fba` 激活同窗口 | manifest 记「0.14.3 + bf16 + cache 12GB + hybrid-entries 8 + S=70K + 落点 9-21 06:18」 |
+| **S6** | **7d「引擎世代戳」采集口径** | 0921-3 ③ 定的 7d 项 | 双计数并落：`pressure_evictions` + `lru_evictions`；采集脚本用 `rerun_gate.py` 或 `pilot_long_session._metrics_snap` |
+
+### 20.3 放行判定（联合）
+
+```
+gate check 输出 PASS  → r2 重跑放行
+gate check 输出 STOP  → 停批，回滚（S→70K 已定；如需再降 hybrid-entries / cache）
+```
+
+**四件套阈值**（可在 `check` 调）：`pressure_evictions` >0 STOP ｜ `lru_evictions` >200 ｜ 墙钟比 >1.5× ｜ `epoch_collapse` >0。
+
+### 20.4 明确不属于 swe-eval 的事项
+
+- llama.cpp 侧配置/引擎变更（已完成，冻结）
+- `ca50fba` 激活（已完成）
+- gate 脚本本身（已交付）
+
+---
+
 ## 附录：涉及文件
 
 ```
