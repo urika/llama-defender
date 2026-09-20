@@ -360,9 +360,23 @@ kill %1
 
 > **Step 2（HBE off + S）为纯代理、reloadable**，无需影子：生产上 `./manage.sh reload` 即生效，
 > 秒级回退（§11.1）。其「全冷轮代价」用 §2④ 计数在判定时一并量。
-
 ### 10.4 回退演练（T2 窗口顺带）
+
 改配置 → 起影子 → 测 → **回退** → 再起，实测回退耗时（目标 ≤5 min），确认回退后 §2 指标回到基线。
+
+### 10.5 T2 执行要点（实测得出，勿踩）
+
+- **分叉深度必须精确控制**：B2 问的是「上游 checkpoint 窗口 vs 真实发散点」。首次测试把分叉点放在
+  **token 4**（head 处）→ `LCP unavailable` + `snapdown_hits=0` → 得到**假阴性**。
+  正确做法：构造 **共享 HEAD（~81%）+ 分叉 MID + 共享 TAIL**，分叉点落在 E1 实测的中位深度。
+  ```python
+  content_A = f"{HEAD} {MID_A} {TAIL}"   # HEAD 占 ~81%
+  content_B = f"{HEAD} {MID_B} {TAIL}"   # 仅 MID 不同 → LCP shared ≈ len(HEAD)
+  ```
+- **并发观察 `/metrics`**：`rapid_mlx_prefix_cache_snapdown_hits_total` 与日志
+  `LCP snapped to checkpoint: shared=... resumed_at=... remaining=...` 应同步出现。
+- **venv 建站需 Python ≥3.10**：`python3` 在本机是 **3.9**，必须用
+  `/opt/homebrew/bin/python3.14 -m venv`（否则 `pip install rapid-mlx` 报「no matching distribution」）。
 
 ---
 
@@ -401,6 +415,84 @@ cp /tmp/ornith-oq4e.conf.bak-<ts> configs/ornith-oq4e.conf
 - venv：`.venv-rapidmlx-0143`（`pip freeze > /tmp/ornith-staging/manifest.txt`）
 - 配置备份：`/tmp/ornith-oq4e.conf.bak-<ts>`
 - 影子日志/状态：`/tmp/ornith-staging/logs/*.log`、`/tmp/ornith-staging/state`（可随时删除，不影响生产）
+
+---
+
+---
+
+## 12. T2 实测结果（2026-09-20 执行完毕）
+
+> 状态：**已完成**。生产已恢复（新后端 PID 94938，`state=healthy`）。原始数据
+> `/tmp/ornith-staging/logs/{T2-RESULTS.md,t2c-*.log,t2c-*-r*.json}`；执行器 `tools/t2_gate_watch.sh`。
+> 放行依据：**`exp-20260919-select-gate/finale-20260920-055914`（全部步骤 rc=0）** + 用户确认取证完成。
+
+### 12.1 结论（B2 已解答）
+
+**上游 0.14.3 checkpoint 窗口在 81% 分叉处成功命中——无需调大 `CHECKPOINT_MAX/STRIDE`。**
+
+### 12.2 A/B（同一 ~31K prompt，81% 深度分叉）
+
+| 指标 | brew 0.12.12（现状） | 0.14.3 + pin | 提升 |
+|---|---|---|---|
+| A 冷 prefill | 77.5s | **30.7s** | **2.5×** |
+| B 81% 分叉 | **78.5s（`LCP unavailable` 全冷）** | **8.8s（snap 命中）** | **8.9×** |
+| `snapdown_hits` | 0（机制不存在） | **1** | — |
+| `tokens_saved` | 0 | **24576** | — |
+| 复用率 | 0% | **79%**（24576/30976） | — |
+
+关键日志：`[cache_fetch] LCP snapped to checkpoint: shared=25069 entry_len=30752 resumed_at=24576 remaining=6400`
+
+### 12.3 判读
+
+1. **升级是数量级收益**：现状在长会话**每次前缀分叉都全冷**（78.5s）；0.14.3 仅 8.8s。直接命中
+   本 Runbook 要治的瓶颈（§0 目的达成）。
+2. **B2 窗口 adequacy ✅**：81% 分叉命中 → 默认窗口够用，不必调参（此项此前是最大未知）。
+3. **B2 计数补丁运行时验证 ✅**：`snapdown_*` 已实时出现在 `/metrics`；观测面缺口 #9(a) 闭合。
+4. **B1 补充**：brew 0.12.12 **自身也有 `--pin-system-prompt`** —— pin 不是升级独有，差异在 checkpoint 机制。
+5. **disk-stream**：0.14.3 registry 仍**无 `qwen3_5_moe`** → Ornith 依旧不可用（维持 §5.D 观察项结论）。
+
+### 12.4 落地到生产的清单（待用户决策，§5/§11）
+
+```bash
+# ① 生产环境引入 0.14.3 引擎（B1：必须显式指定二进制，否则回退 brew）
+#    configs/ornith-oq4e.conf 增行：
+LLAMA_SERVER_BIN="/Users/jinsongwang/APP/llama.cpp/.venv-rapidmlx-0143/bin/rapid-mlx"
+
+# ② 应用 B2 计数补丁到生产 venv（照 patches/vllm-mlx/0.14.3/README.md）
+cp patches/vllm-mlx/0.14.3/memory_cache.py   .venv-rapidmlx-0143/lib/python3.14/site-packages/rapid_mlx/memory_cache.py
+cp patches/vllm-mlx/0.14.3/routes_metrics.py .venv-rapidmlx-0143/lib/python3.14/site-packages/rapid_mlx/routes/metrics.py
+
+# ③ 原子切换（§11.2）
+cp configs/ornith-oq4e.conf /tmp/ornith-oq4e.conf.bak-$(date +%s)
+./manage.sh stop-backend && ./manage.sh start-backend
+# 断言：ps 命令含 .venv-rapidmlx-0143；/metrics 有 snapdown_* 字段
+
+# ④ EXP-8 off 臂开关改写（B2 第 3 项）
+#    PROXY_CACHE_LCP_SNAPDOWN=0  →  RAPID_MLX_HYBRID_CHECKPOINT_MAX=0
+```
+
+### 12.5 遗留
+
+| 项 | 状态 |
+|---|---|
+| `tools/lcp_trace_analyzer.py` 新日志口径适配 | ✅ **已完成**（`RE_SNAP_V143`/`RE_SUPER_SNAP_V143` 已在库；T2 日志实测解析正确：snapdown=1、复用 24576、节省 79.3%、粒度损失 p50 493） |
+| `tools/t2_gate_watch.sh` 门控 bug | ✅ **已修**（G1 用驱动特征名 + 排除自身 PID；G2 改扫全部 exp 目录且「新鲜」改为可选 `T2_REQUIRE_FRESH`；G3 以 watcher **进程存活**为准；G2b 拒绝 rc≠0 的取证件）。三分支单测通过（OPEN/CLOSED/rc=1→CLOSED） |
+| 生产切换决策 | ⏳ 待用户（证据见 12.2） |
+| T1 影子 / 门控 watcher | 已全部停止；生产后端已恢复（PID 94938） |
+
+### 12.6 门控脚本修复说明（复盘）
+
+本次 T2 为**人工绕过**放行，原因三条，均已在脚本中修正：
+
+1. **G1 假阳性**：`pgrep -f 'exp9'` 匹配到 watcher 自身命令行（含 `t2_gate`+日志路径）。
+   → 改为匹配驱动特征名（`batch_finale\.py` 等）并 `grep -v "^$$$"` 排除自身；另支持 `T2_DRIVER_PID`。
+2. **G2 过期目录**：硬编码 `exp-20260907-claimtest`，该目录在收官后**已被清理** → 永远找不到。
+   → 改为 `find "$EXP_ROOT"` 扫全部 exp 取最新；「文件比 watcher 新」的时序要求改为
+   **可选** `T2_REQUIRE_FRESH=1`（否则 watcher 晚于取证启动时会永久卡住）。
+3. **G3 僵尸尾行**：finale-watch 进程已死，但日志尾行遗留 `state=running` → 永久卡门。
+   → 改为**先查 `.finale-watch.pid` 进程是否存活**，仅存活时才判 `state`。
+
+---
 
 ---
 
@@ -474,3 +566,7 @@ shared=... resumed_at=...`）。
   收益/代价会算错。
 - **§8 影子环境**："避免扰动生产状态"仅在代理状态层面成立：promptfoo 推理仍打
   共享后端 8081（`--max-num-seqs 1`）——**批期禁跑**（并发排队干扰批跑与验收窗口）。
+
+---
+
+---
