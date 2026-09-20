@@ -1,7 +1,9 @@
 # 0.14.3 补丁：CacheStats 检查点计数（P1a-cnts，联合协调 0920-12a / 待办 #9）
 
-> 状态：**编写完成 + 离线验证（py_compile + 语义自检 5/5），未应用**——应用与
-> 运行时验证在 Step 3 升级窗（EXP-9 收官后，B2 runbook 序列内）。
+> 状态：**已应用 + 运行时验证通过**（2026-09-20，Step 3 升级窗随 0.14.3 落地）。
+> 应用位置：`.venv-rapidmlx-0143/.../rapid_mlx/{memory_cache.py,routes/metrics.py}`；
+> 运行时证据：`:8081/metrics` 已出 `rapid_mlx_prefix_cache_snapdown_{hits,tokens_saved}_total`，
+> 且长会话实测 `snapdown_hits=1 / tokens_saved=24576`（见 runbook §12/§15）。
 > 来源：swe-eval `joint-coordination-llamacpp.md` 0920-12 提请 / 0920-14 登记。
 > 基准：PyPI `rapid_mlx-0.14.3-py3-none-any.whl`（09-20 下载，pip 需 Python ≥3.10）。
 
@@ -45,6 +47,8 @@ cp routes_metrics.py <venv>/lib/python3.14/site-packages/rapid_mlx/routes/metric
 
 - ✅ py_compile（venv Python 3.14）
 - ✅ 语义自检 5/5（字段/to_dict/两递增/两导出/raw_key 对齐）
-- ⏳ 运行时验证（计数真出现在 /metrics）——Step 3 窗口
-- ⚠️ 若 Step 3 采用的版本 ≠ 0.14.3（如 0.14.4+），需对本 diff 重定位
+- ✅ **运行时验证（2026-09-20 完成）**：`:8081/metrics` 出
+  `rapid_mlx_prefix_cache_snapdown_hits_total` / `..._tokens_saved_total`，
+  长会话命中实测 `snapdown_hits=1`、`snapdown_tokens_saved=24576`
+- ⚠️ 若采用的版本 ≠ 0.14.3（如 0.14.4+），需对本 diff 重定位
   （锚点均为唯一字符串，冲突概率低）

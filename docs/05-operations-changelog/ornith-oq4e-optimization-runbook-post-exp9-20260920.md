@@ -302,22 +302,23 @@ python3 -m venv .venv-rapidmlx-0143
 .venv-rapidmlx-0143/bin/python -c "import rapid_mlx,vllm_mlx;print(rapid_mlx.__version__)"  # 改名 + shim
 .venv-rapidmlx-0143/bin/rapid-mlx serve --help | grep -iE 'hybrid|checkpoint|pin-system|pflash'
 ls .venv-rapidmlx-0143/lib/python*/site-packages/rapid_mlx/hybrid_state_checkpoints.py
-# B2 观测面：#9(a) snapdown 计数补丁已编写入库，须在 Step 3 窗应用——见 §10.3
+# B2 观测面：#9(a) snapdown 计数补丁已应用（随 Step 3 落地）——见 §10.3
 ```
 
-### 10.3 B2 观测面缺口（联合待办 #9）——补丁已编写，应用+运行验证待 Step 3
+### 10.3 B2 观测面缺口（联合待办 #9）——补丁已应用 + 运行时验证通过
 
 **缺口**：上游 0.14.3 `CacheStats` **无检查点计数**（`_snap_hybrid_trim` 命中只记通用 `hits`/`tokens_saved`），
 且日志口径从 `LCP snapdown` 变为 `snapped to checkpoint`，导致 `tools/lcp_trace_analyzer.py` **失效**。
 
-**现状**（`a15f9b8`，并行线）：补丁**已编写入库**，但**未应用、未运行时验证**，按设计留 Step 3 升级窗。
+**现状**（`a15f9b8` 编写 → 2026-09-20 Step 3 窗应用，已闭合）：补丁已应用到 `.venv-rapidmlx-0143`，
+运行时验证通过（`/metrics` 出 `snapdown_*`，长会话 `snapdown_hits=1`）。详见 §15。
 
 | 项 | 状态 |
 |---|---|
 | 补丁 | `patches/vllm-mlx/0.14.3/cachestats-counters.diff`（+ `memory_cache.py` / `routes_metrics.py` / `README.md`） |
 | 内容 | `CacheStats` +`snapdown_hits`/`snapdown_tokens_saved`（随 hits reset 契约）；`to_dict` 输出；LCP + supersequence 两命中点递增；`routes/metrics` counter +2（`rapid_mlx_prefix_cache_snapdown_*_total`） |
 | 离线验证 | ✅ `py_compile` + 语义自检 5/5（基准 = PyPI 0.14.3 wheel） |
-| **应用 / 运行验证** | ❌ **待 Step 3 窗执行** |
+| **应用 / 运行验证** | ✅ **已完成**（2026-09-20，随 Step 3；`/metrics` 实测 snapdown 计数） |
 
 **Step 3 前置断言（加在 §5.3 ⓪ 后）**
 ```bash
@@ -476,7 +477,7 @@ cp configs/ornith-oq4e.conf /tmp/ornith-oq4e.conf.bak-$(date +%s)
 |---|---|
 | `tools/lcp_trace_analyzer.py` 新日志口径适配 | ✅ **已完成**（`RE_SNAP_V143`/`RE_SUPER_SNAP_V143` 已在库；T2 日志实测解析正确：snapdown=1、复用 24576、节省 79.3%、粒度损失 p50 493） |
 | `tools/t2_gate_watch.sh` 门控 bug | ✅ **已修**（G1 用驱动特征名 + 排除自身 PID；G2 改扫全部 exp 目录且「新鲜」改为可选 `T2_REQUIRE_FRESH`；G3 以 watcher **进程存活**为准；G2b 拒绝 rc≠0 的取证件）。三分支单测通过（OPEN/CLOSED/rc=1→CLOSED） |
-| 生产切换决策 | ⏳ 待用户（证据见 12.2） |
+| 生产切换决策 | ✅ 已完成（§15，0.14.3 + A1 落地） |
 | T1 影子 / 门控 watcher | 已全部停止；生产后端已恢复（PID 94938） |
 
 ### 12.6 门控脚本修复说明（复盘）
@@ -608,7 +609,7 @@ sudo launchctl load /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 ### 14.4 当前生产状态（Step 1 + Step 2 叠加）
 - 后端 PID 7757：`gpu 0.80` + `--pin-system-prompt` + `cap 36.1GB`
 - 系统：`iogpu.wired_limit_mb=43008`
-- 代理：`HBE_ENABLED=false`、`PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000`
+- 代理：`HBE_ENABLED=false`、`PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000`（**注：后经 0920-15 影响三定案回 70000**，见 §18）
 
 ---
 
@@ -692,7 +693,7 @@ KV     bf16 (A1)
 GPU    0.80 → cap 36.1GB
 flags  --pin-system-prompt --hybrid-cache-entries 32
 系统   iogpu.wired_limit_mb=43008（LaunchDaemon 持久化）
-代理   HBE off, PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000
+代理   HBE off, PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000（后回 70000，见 §18）
 ```
 
 ---
@@ -812,6 +813,66 @@ decode 从短上下文 ~55 衰减至 160K 的 23.4（-58%）。
 
 ---
 
+## 18. 对联合文档 0920-15 的响应（2026-09-20）
+
+> 来源：`~/APP/swe-eval/docs/joint-coordination-llamacpp.md` §五 0920-15(swe-eval)（提交 `6f5feb4`）。
+
+### 18.1 已核实事实（接受）
+
+| 项 | 状态 |
+|---|---|
+| 引擎换代 `.venv-rapidmlx-0143`（PID 25033，`gpu 0.80` + `--pin-system-prompt`） | ✅ 即本 runbook §15 落地 |
+| `iogpu.wired_limit_mb=43008` LaunchDaemon 持久化 | ✅ |
+| 代理 `S=50000` 生效、HBE 停采 | ✅（后 S 回 70K，见 18.3） |
+| **#9(a) 已应用且运行时可见** | ✅ **文档漂移已修**（`patches/vllm-mlx/0.14.3/README.md` + 本文 §10.3 原写"未应用"） |
+| L-15 dup 口径 9-19 19:36:59 生效 | ✅（接受，以 AGENTS.md 为准） |
+
+### 18.2 影响一：世代边界 —— 接受，无本仓动作
+
+13 run 双世代混合（9 个重启前 / 4 个后）；优化为**双变世代**（S 变更 + 引擎换代）→
+EXP-9 的 A0 作废、重跑范围（72 vs 108）由 swe-eval 侧认领定案。本仓已提供世代戳补件建议（18.4）。
+
+### 18.3 影响三：S/keep 比例 —— **已定案：回 S=70000** ✅
+
+**决策依据**：`S=50000` + `KEEP_TOKEN_BUDGET=40000` 余量仅 10K（原设计 40K 是"S=70K 的余量分配"），
+折叠频率约 3×，且落在 §14.3 自认"未验证"的 regime。
+
+**执行**（2026-09-20）：
+
+```diff
+-export PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000
++export PROXY_CTX_EPOCH_TRIGGER_TOKENS=70000
+```
+
+`./manage.sh reload` 后 `/api/status` 断言：**`epoch_S=70000`、`window_K=24`** ✅
+（`KEEP_TOKEN_BUDGET=40000` 保留 → 恢复 40K/70K 原余量比）
+回退点：`/tmp/ornith-staging/ornith-oq4e.conf.prepilot-s70k`
+
+### 18.4 影响二：操作点未复验 —— **进行中**（本仓认领）
+
+0920-15 指出：0.14.3 进程段仍有 **11 次 `[prefix-pressure-evict]`**（`metal_cap=36.1GB, cache_max=11.6GB`），
+同段 prompt 达 32,828 / 65,521 / 104,473 tokens；§13「驱逐归零」系**小窗**（峰值 31.0GB）实测，
+EXP-9 重跑操作点（64K 长会话）恰落在未复验区。
+
+**本仓动作**：跑**长会话操作点试点**（≥50K 视图），采集四件套——
+`epoch_collapse` / `[prefix-pressure-evict]` / 引擎 `/metrics` 驱逐+snapdown 计数 / 每轮墙钟。
+**不通过则先回滚再重跑**（避免 38–49h 批次二次作废）。结果见 §19（待补）。
+
+### 18.5 提请 (c)：引擎世代戳进证据链 —— 接受
+
+现 manifest.frozen 仅含 swe-eval `code_commit`，run 记录无引擎版本/KV/S/`wired_limit`。
+**建议批首或 finale 增**：引擎 `:8081/metrics` 快照 + 版本 + 世代戳，使"跨世代标注"可机读自证。
+（本仓可提供采集脚本；落盘位置由 swe-eval 侧定。）
+
+### 18.6 未核实声明的本仓立场
+
+- **11 次驱逐归属**：0920-15 称发生在"引擎团队自身长 prompt 测试窗（非 swe-eval 批）"——
+  从时间戳看主体落在本会话 §12/§17 的 T2/基线测试期，**与 swe-eval 批无关**，本仓确认
+- **post-fold token 数**：同意"折叠倍率应以试点 `epoch_collapse` 实测为准"，不采信算术推算
+- **A5×4 与 POST 世代 run 是否同集**：属 swe-eval 工件，本仓无映射数据
+
+---
+
 ## 附录：涉及文件
 
 ```
@@ -821,7 +882,7 @@ decode 从短上下文 ~55 衰减至 160K 的 23.4（-58%）。
 影子制品      .venv-rapidmlx-0143（并行 venv）｜ /tmp/ornith-staging/{state,logs}（§10）
 配置备份      /tmp/ornith-oq4e.conf.bak-<ts>（§11）
 本地补丁      patches/vllm-mlx/0.12.12/（P1a，5 文件；0.14.3 改名后不可沿用，被上游取代）
-              patches/vllm-mlx/0.14.3/cachestats-counters.diff（#9(a) snapdown 计数；待 Step 3 窗应用）
+              patches/vllm-mlx/0.14.3/cachestats-counters.diff（#9(a) snapdown 计数；已随 Step 3 应用）
 上游机制      rapid_mlx/hybrid_state_checkpoints.py（RAPID_MLX_HYBRID_CHECKPOINT_MAX=4 / _STRIDE=2048）
 安全门        manage.sh:534-547（DEF-006，gpu-mem >0.85 拒绝）；manage.sh:623（引擎二进制解析）
 后端日志      logs/llama-server.log（`snapped to checkpoint` / `LCP unavailable` / `prefix-pressure-evict`）
