@@ -568,6 +568,50 @@ sudo launchctl load /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 
 ---
 
+---
+
+## 14. Step 2 小窗口实测结果（2026-09-20 执行完毕）
+
+> 状态：**已执行**（配置当前生效中）。回退点 `/tmp/ornith-staging/ornith-oq4e.conf.prestep2`。
+> 手段：纯 `./manage.sh reload`（引擎未重启，秒级回退）。
+
+### 14.1 改动与验证
+
+```diff
+-export PROXY_HBE_ENABLED=true
++export PROXY_HBE_ENABLED=false
+-export PROXY_CTX_EPOCH_TRIGGER_TOKENS=70000
++export PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000
+```
+
+`reload` 后 `/api/status` 断言：`epoch_S=50000`、`window_K=24`、`state=healthy` ✅
+
+### 14.2 实测（Step 1 之上叠加）
+
+| 指标 | Step 2 结果 |
+|---|---|
+| HBE 停采 | ✅ `logs/diag/hbe.jsonl` 2630 → 2630（不再增长） |
+| `prefix-pressure-evict` | **0**（Step 1 已归零，Step 2 保持） |
+| append-only 会话耗时 | 2.66s → 1.50s → 1.52s → **1.55s**（稳定） |
+| prefix HIT | `cached=916 → 1366 → 1816`（增量稳定 437）✅ |
+| epoch 折叠 | **0**（60 轮未达 S=50K） |
+
+### 14.3 判读与遗留
+
+- ✅ **pass**：HBE 探针开销消除；会话延迟稳定在 ~1.5s；驱逐保持为 0。
+- ⚠️ **未观测到 S 下调的代价**：本次会话规模小（60 轮 ≈ 2.2K tokens），**远未触发 S=50K 折叠**，
+  故 B3 提出的「折叠频率↑ → 全冷重建轮↑」风险**本次无法验证**。需在**真实长会话**（接近 50K 视图）
+  上补测，判定时按 §2④ 同时记 `snapdown`/`LCP unavailable`/全冷轮计数。
+- ⚠️ HBE 停采的代价：`logs/diag/hbe.jsonl` 断流（标定/实验用途）。如需保留，可改
+  `PROXY_HBE_SAMPLE_EVERY=8` 折中（GLM-4.5 无此选项，仅本地路径）。
+
+### 14.4 当前生产状态（Step 1 + Step 2 叠加）
+- 后端 PID 7757：`gpu 0.80` + `--pin-system-prompt` + `cap 36.1GB`
+- 系统：`iogpu.wired_limit_mb=43008`
+- 代理：`HBE_ENABLED=false`、`PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000`
+
+---
+
 ## 附录：涉及文件
 
 ```
