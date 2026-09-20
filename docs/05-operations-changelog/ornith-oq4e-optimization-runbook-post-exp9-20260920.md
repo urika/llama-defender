@@ -612,6 +612,143 @@ sudo launchctl load /Library/LaunchDaemons/com.local.iogpu-wired-limit.plist
 
 ---
 
+## 15. Step 3 落地记录：0.14.3 + 方案 A1（2026-09-20 执行完毕）
+
+> 状态：**已落地并生产运行**。回退点 `/tmp/ornith-staging/ornith-oq4e.conf.prestep3a1-20260920-214910`。
+
+### 15.1 执行中发现的阻塞：0.14.3 拒绝 hybrid 的 KV 量化
+
+按 §12.4 首次尝试（加 `LLAMA_SERVER_BIN`、保留 `RAPID_MLX_KV_QUANTIZATION=true`）**启动失败**：
+
+```
+rapid_mlx.kv_cache_dtype.KVCacheQuantizationUnsupportedError:
+--kv-cache-dtype int4 cannot be honored ...: the loaded model is incompatible: ArraysCache.
+ERROR: Application startup failed. Exiting.
+```
+
+**根因（源码级）**：
+- `cli.py:5030` `_kv_quant_explicit = bool(args.kv_cache_quantization) or (args.kv_cache_dtype != "bf16")`
+- `scheduler.py:4709` 运行时探测到 `ArraysCache`（GatedDeltaNet recurrent state）→ **显式量化请求 fail closed 抛异常**；
+  非显式请求才静默降级 bf16
+- `_supports_hybrid_partial_quantization()` 的白名单**仅 gemma4**（`model_type in {gemma4, gemma4_assistant, gemma4_unified}`）——
+  Ornith/Qwen3.5/3.8 的 `qwen3_5_moe` **未获豁免**，尽管它们有 10/40 层是全注意力、理论上可部分量化
+
+**0.14.3 KV 量化支持面**：
+
+| 类型 | 支持 | 说明 |
+|---|---|---|
+| `bf16` | ✅ 全机型默认 | — |
+| `int8`/`int4` | ✅ 仅全注意力/兼容机型 | `QuantizedKVCache` + fused attention |
+| hybrid GDN（Ornith/Qwen3.5-3.8） | ❌ 被拒 | 运行时 `ArraysCache` 探测 → fail closed |
+| hybrid 部分量化 | ⚠️ 仅 gemma4 白名单 | `qwen3_5_moe` 不在内 |
+| `--kv-cache-turboquant k8v4` | ✅ 存在（独立路径） | 可能绕过 safelist，未验证；AGENTS.md §8.3 有告诫 |
+
+### 15.2 方案 A1：关闭 KV 量化（bf16）
+
+```diff
++LLAMA_SERVER_BIN="/Users/jinsongwang/APP/llama.cpp/.venv-rapidmlx-0143/bin/rapid-mlx"
+-RAPID_MLX_KV_QUANTIZATION=true
++RAPID_MLX_KV_QUANTIZATION=false
+```
+
+落地断言：
+- `ps` 命令含 `.venv-rapidmlx-0143` ✅（B1 版本断言）
+- `KV cache dtype: bf16 (...) — bf16 selected (no QuantizedKVCache wrap)` ✅
+- `Metal memory limits set (manual): allocation_limit=36.1GB (80% of 45.1GB)` ✅
+- `state=healthy / ready=true` ✅
+
+### 15.3 内存评估（A1 是否够用）
+
+| 配置 | active | peak | cap |
+|---|---|---|---|
+| 旧 0.12.12（int4 KV） | 21.2–21.9GB | 24.3–25.0GB | 36.1GB |
+| **0.14.3（bf16 KV）** | 24.2–26.4GB | **24.3–26.5GB** | 36.1GB |
+
+- 差异 **+0.2 ~ +2.2GB**；**余量 ~10GB**
+- **代价小的原因**：仅 **10/40 层有 KV cache**（30 层 GDN 是固定 recurrent state，KV dtype 不影响）；
+  prefix 复用靠 recurrent-state checkpoint，与 KV dtype 解耦
+- 长上下文阶梯：**60K 冷（69,273 tok）172.3s**；**104K（104,473 tok）129.5s（HIT 复用 69,248）**；
+  **OOM=0、驱逐=1（干净段）** ✅
+
+### 15.4 同口径 A/B（~30K，512 输出，81% 分叉）
+
+| 指标 | 旧 0.12.12（int4 KV） | **0.14.3 + A1（bf16）** | 提升 |
+|---|---|---|---|
+| A 冷 | 99.6s | **43.7s** | **2.28×** |
+| B 81% 分叉 | 101.7s（`LCP unavailable` 全冷） | **28.3s（snap 命中）** | **3.60×** |
+| cached_tokens | 0 | **16384** | — |
+| Metal peak | 31.0GB | **26.5GB** | -4.5GB |
+
+> 注：3.60× 低于 T2 的 8.9×，因本次输出 512 token 摊薄了 prefill 占比；**纯 prefill 维度仍 ~2.3×**。
+
+### 15.5 回归测试（0.14.3）
+基础生成 / 流式 SSE / 工具调用（`get_weather{"city":"Tokyo"}`）/ 代理 :4000 Claude 形态
+（`stop_reason=end_turn`, `REGRESSION_OK`）—— **全部通过，无行为回归**。
+
+### 15.6 当前生产配置（Step 1+2+C+3+A1）
+```
+引擎   .venv-rapidmlx-0143 (0.14.3)
+KV     bf16 (A1)
+GPU    0.80 → cap 36.1GB
+flags  --pin-system-prompt --hybrid-cache-entries 32
+系统   iogpu.wired_limit_mb=43008（LaunchDaemon 持久化）
+代理   HBE off, PROXY_CTX_EPOCH_TRIGGER_TOKENS=50000
+```
+
+---
+
+## 16. MAX/STRIDE 调研与不确定性（2026-09-20）
+
+> 结论：**不采纳调参（保守，保持默认 4/2048）**。MAX/STRIDE 非决定性杠杆，其收益被「LCP 条目选择」掩盖。
+
+### 16.1 参数语义
+
+`rapid_mlx/hybrid_state_checkpoints.py`：
+- `RAPID_MLX_HYBRID_CHECKPOINT_MAX`（默认 **4**）——每层保留的检查点数；超出时**丢弃与前一检查点间隔最小者**，最新者永不丢
+- `RAPID_MLX_HYBRID_CHECKPOINT_STRIDE`（默认 **2048**）——两检查点最小 token 间隔
+- 检查点在 **prefill chunk 边界**按 stride 自动记录（`scheduler.py:5107`），零 API 配合
+
+### 16.2 扫描结果（同口径 A冷 + B 81%分叉）
+
+| MAX | STRIDE | A 冷 | B 分叉 | `resumed_at` | **粒度损失** |
+|---|---|---|---|---|---|
+| 4 | 2048 | 29.5s | 15.7s | 16384 | 7797 |
+| **16** | **512** | 28.3s | **8.8s** | 22528 | **1653** |
+| 8 | 2048 | 30.7s | 30.7s | — | 未触发 |
+| 8 | 1024 | 30.6s | 30.7s | — | 未触发 |
+| 16 | 1024 | 28.8s | 28.2s | — | 未触发 |
+
+### 16.3 稳定性复测 —— 结论反转
+
+`MAX=16/STRIDE=512` 连跑 **3 次**：**3/3 未触发**（`shared=NA`）。
+
+**根因：不是参数，是「LCP 候选条目选择」不稳定**：
+- 失败时日志：`LCP unavailable: shared=1 entry_len=13 requested_len=29888` → 匹配到**小条目**（warmup 残留）→ 拒绝
+- 成功时日志：`LCP snapped to checkpoint: shared=24181 entry_len=29664 resumed_at=20480` → 匹配到 **A 的大条目** → 成功
+- 两轮的 `entries` 数不同（6/7 vs 10），说明 **LRU 排序/条目集合**决定了候选
+
+**结论**：`MAX/STRIDE` 的收益被条目选择掩盖；**调参不可靠**。
+
+### 16.4 决策与后续
+
+- ❌ **不调 MAX/STRIDE**（保持默认 4/2048）：避免引入不可复现的参数
+- ✅ 已落地的 Step 1+2+C+3+A1 收益明确（**2.28× 冷 / 3.60× 分叉**），无需依赖调参
+- 🔬 **待研究（低优先）**：
+  - 为何小条目（`entry_len=13`）会抢占 LCP 候选 → 条目选择/LRU 策略
+  - `--prefix-cache-index radix` 是否改善候选选择
+  - `--cache-memory-mb` 扩大是否让大条目更易存活
+
+### 16.5 测试方法教训（重要）
+
+首版 A/B 构造有缺陷，导致全部 `shared=NA`：
+1. **A/B 必须共享相同 system 消息** —— 否则 token 序列在头部就错位（`shared=23`），
+   即使字符层面 81% 相同也不构成 token 前缀
+2. 分叉点须精确落在 **81% 深度**（E1 实测中位发散点），否则落在 checkpoint 窗口外
+3. 每臂须 **清空 `RAPID_MLX_STATE_DIR`**，否则上轮 cache 状态污染
+4. 检查点落在 **stride × prefill-chunk** 边界，需与分叉位置对齐才可能命中
+
+---
+
 ## 附录：涉及文件
 
 ```
