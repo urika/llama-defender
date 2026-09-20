@@ -87,17 +87,38 @@ def _scan_log(since_bytes):
 
 
 def _metrics_snap(url):
-    """引擎 /metrics 里驱逐 + snapdown 计数。"""
+    """引擎 /metrics 里驱逐 + snapdown 计数。
+
+    引擎实际行形如 ``rapid_mlx_prefix_cache_evictions_total 57`` /
+    ``rapid_mlx_prefix_cache_snapdown_hits_total 12``（**带 rapid_mlx_ 前缀**）。
+    故以关键词直抓，不锚行首、不依赖前缀（0921-1 补正）。
+    """
     try:
         txt = _get(url, "/metrics")
     except Exception as e:
         return {"error": str(e)}
     out = {}
-    for key in ("prefix_cache_evict", "snapdown_hits", "snapdown_tokens_saved",
-                "prefix_cache_hits", "prompt_tokens", "cached_tokens"):
-        m = re.findall(rf"^{key}\w*[^\n]*", txt, re.M | re.I)
+    patterns = {
+        # 压力驱逐（[prefix-pressure-evict] 的计数来源）
+        "pressure_evictions": r"^\s*rapid_mlx_prefix_cache_pressure_evictions_total\s+[\d.eE+-]+",
+        # LRU-on-capacity 驱逐（cache 自身容量驱逐）
+        "lru_evictions": r"^\s*rapid_mlx_prefix_cache_evictions_total\s+[\d.eE+-]+",
+        "snapdown_hits": r"^\s*\S*snapdown_hits\S*\s+[\d.eE+-]+",
+        "snapdown_tokens_saved": r"^\s*\S*snapdown_tokens_saved\S*\s+[\d.eE+-]+",
+        "prefix_cache_hits": r"^\s*rapid_mlx_prefix_cache_hits_total\s+[\d.eE+-]+",
+        "prefix_cache_current_bytes": r"^\s*rapid_mlx_prefix_cache_current_bytes\s+[\d.eE+-]+",
+        "prefix_cache_cap_bytes": r"^\s*rapid_mlx_prefix_cache_cap_bytes\s+[\d.eE+-]+",
+    }
+    for label, pat in patterns.items():
+        m = re.findall(pat, txt, re.M)
         if m:
-            out[key] = m[-1].strip()
+            # 只留指标名 + 数值，去掉前导空白
+            out[label] = m[-1].strip().split()
+    if not out:
+        # 兜底：任何含 rap_mlx/prefix_cache 的计数行
+        fb = re.findall(r"^\s*\S*(?:rapid_mlx|prefix_cache)\S*\s+[\d.eE+-]+", txt, re.M)
+        if fb:
+            out["fallback"] = [l.strip().split() for l in fb[-10:]]
     return out
 
 
@@ -108,10 +129,13 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:8081")
     ap.add_argument("--proxy", default="http://127.0.0.1:4000")
     ap.add_argument("--out", default="/tmp/ornith-staging/logs/pilot-long-session.json")
+    ap.add_argument("--form", choices=("append", "divergent"), default="append",
+                    help="append=append-only 稳定前缀；divergent=多工具分叉 agentic 形态")
     args = ap.parse_args()
 
     model = os.environ.get("BENCH_MODEL") or "pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp"
-    log(f"模型 {model}  目标视图 ~{args.target_tokens} tokens  后端 {args.url}")
+    divergent = args.form == "divergent"
+    log(f"模型 {model}  目标视图 ~{args.target_tokens} tokens  形态={args.form}  后端 {args.url}")
 
     # 引擎起始点
     log_marks = _log_size()
@@ -125,9 +149,14 @@ def main():
 
     while est_tokens < args.target_tokens and turn < 80:
         turn += 1
-        # append-only：新 user 提问 + 上轮 assistant 回复（增长前缀）
-        user = (f"Turn {turn}: append a new section to the running notes. "
-                f"Reference doc-{turn:03d}, list three key points, keep it under 60 words.")
+        if divergent:
+            # 多工具分叉 agentic 形态：每轮重写尾部工具结果 + 新目标（前缀到中段才分叉）
+            # 用 tool 角色消息模拟 agent 轨迹，尾部每轮变化 → LCP 分叉点随轮次后移
+            user = (f"Turn {turn}: inspect file module_{turn:03d}.py, "
+                    f"report its exported symbols and one risk each, max 60 words.")
+        else:
+            user = (f"Turn {turn}: append a new section to the running notes. "
+                    f"Reference doc-{turn:03d}, list three key points, keep it under 60 words.")
         messages.append({"role": "user", "content": user})
 
         body = {"model": model, "max_tokens": args.max_tokens,
