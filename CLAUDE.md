@@ -108,7 +108,7 @@ Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` 
 
 | Config | Backend | Model | Memory | Use case |
 |--------|---------|-------|--------|----------|
-| `ornith-oq4e` (active) | rapid-mlx | pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp | ~16–20 GB | **Ornith-1.5 自改进 MoE，oQ4e imatrix 混合精度（20.1GB）**，质量优于均匀 4-bit，thinking off，decode ~80 tok/s，`--hybrid-cache-entries 8` 必配（无投机解码） |
+| `ornith-oq4e` (active) | rapid-mlx | pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp | ~16–20 GB | **Ornith-1.5 自改进 MoE，oQ4e imatrix 混合精度（20.1GB）**，质量优于均匀 4-bit，thinking off，**rapid-mlx 0.14.3 + bf16 KV，decode ~84 tok/s**，`--hybrid-cache-entries 8` 必配（无投机解码） |
 | `dflash-35b` | dflash-mlx | mlx-community/Qwen3.6-35B-A3B-4bit + z-lab/Qwen3.6-35B-A3B-DFlash | ~20 GB | **DFlash 投机解码（~117 tok/s）**，thinking off，prefix cache 有效 |
 | `qwen3.8-27b-4bit` | rapid-mlx | Qwen3.8-27B 4bit | ~15–18 GB | Qwen3.8 hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 |
 | `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative，tool clearing off |

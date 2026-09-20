@@ -145,7 +145,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | 文件 | 说明 |
 |------|------|
 | `configs/active.conf` | 指向当前激活配置的符号链接（当前 → `ornith-oq4e.conf`） |
-| `configs/ornith-oq4e.conf` | rapid-mlx + Ornith-1.5-35B-A3B-oQ4e-fixed-mtp（**当前激活**，oQ4e imatrix 混合精度 20.1GB，质量优于均匀 4-bit；基于 Qwen3.5 hybrid 架构，`--hybrid-cache-entries 8` 必配，无投机解码；thinking off，decode ~80 tok/s，prefix cache 增量轮秒级；见 docs/05-operations-changelog/ornith-15-integration-20260826.md） |
+| `configs/ornith-oq4e.conf` | rapid-mlx + Ornith-1.5-35B-A3B-oQ4e-fixed-mtp（**当前激活**，oQ4e imatrix 混合精度 20.1GB，质量优于均匀 4-bit；基于 Qwen3.5 hybrid 架构，`--hybrid-cache-entries 8` 必配（**32→8 实测 active/peak -3.7GB + 驱逐归零 + 墙钟 -32%**），无投机解码；thinking off；引擎已升级 **rapid-mlx 0.14.3 + bf16 KV**（上游 checkpoint 机制，替换本地 P1a 补丁），稳态 decode ~84 tok/s，冷 prefill 2.3–3.6×；见 docs/05-operations-changelog/ornith-oq4e-optimization-runbook-post-exp9-20260920.md §17/§19） |
 | `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
 | `configs/minicpm5-2b.conf` | rapid-mlx + MiniCPM5-2B-MLX-4bit（本地路径 `~/models/`，dense Llama 2.5B 4bit ~1.35GB，131K ctx；**辅助引擎**，独立端口 8082，`start-aux/stop-aux` 独立启停、与主后端共存；无 MTP 层，官方 DSpark drafter 仅 SGLang 支持不在本机可用） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
@@ -161,7 +161,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 
 ### 3.4 工具与文档
 
-- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`、`exp9_watch.py`——EXP-9 批期值守：驱动存活/turn 新鲜度/信号量审计/sessions.jsonl 轮转防护归档，2026-09-20）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）、LCP 遥测分析（`lcp_trace_analyzer.py`，2026-09-20：后端日志切命中率/复用分布/失配分型，`--archive` 防轮转，Gate B 判读工具）、DFlash drafter 蒸馏（`dflash_distill_mlx.py`，dflash-mlx 0.1.8 API 适配版，2026-08-26 Ornith 实验：acceptance 2.34→2.66 但线上无增益，见 changelog）等。
+- `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`、`exp9_watch.py`——EXP-9 批期值守：驱动存活/turn 新鲜度/信号量审计/sessions.jsonl 轮转防护归档，2026-09-20）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）、LCP 遥测分析（`lcp_trace_analyzer.py`，2026-09-20：后端日志切命中率/复用分布/失配分型，`--archive` 防轮转，Gate B 判读工具）、**长会话试点**（`pilot_long_session.py`，2026-09-21：append-only/多工具分叉两形态，读引擎 `/metrics` 计数器）、**重跑前置门**（`rerun_gate.py`，2026-09-21：批前 2–3 真实 run 校验驱逐/墙钟/epoch_collapse 四件套，exit 1=STOP 停批）、DFlash drafter 蒸馏（`dflash_distill_mlx.py`，dflash-mlx 0.1.8 API 适配版，2026-08-26 Ornith 实验：acceptance 2.34→2.66 但线上无增益，见 changelog）等。
 - `docs/`：按 7 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标、项目看板 `07-project-board/`）。入口 [`docs/README.md`](docs/README.md)；根级关键文档含 `llama-defender-integration-requirements.md`（agent_go 集成契约）、`DEFECT-LIST.md`、`requirement-matrix.md`。
 - `test/`：自动化测试，见下节。
 - `logs/`：运行时日志、测试日志、metrics、快照（git-ignored）。
@@ -262,7 +262,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 `MODEL_NAME` 也会自动设置（local 默认 `mlx-community/Qwen3.6-35B-A3B-4bit`，cloud 默认 `deepseek-v4-pro`；`deepseek-chat.conf` 显式设为 `deepseek-v4-flash`）。这些默认值由 `backend_strategy.py` 的 `LocalStrategy` / `CloudStrategy` 提供。
 
-> **hybrid 前缀缓存必知**：Qwen3.8-27B / Qwen3.6-35B-A3B / Ornith-1.5-35B-A3B（均 Qwen3.5/3.6/3.8 系 hybrid GatedDeltaNet）在 rapid-mlx 中对 prefix cache 条目标 `non_trimmable`（只整条精确匹配）。必须 `--hybrid-cache-entries 8`（启用 trim-free 前缀复用；0=禁用→每轮全量冷 prefill）；关 `PROXY_CTX_ENGINE_ENABLED` 配合稳定前缀可保命中。另：hybrid 骨干被 rapid-mlx 门控关闭投机解码（MTP/DFlash/DSpark 均不可用，见 issue #1941）。详见 `docs/05-operations-changelog/dflash-mlx-integration-20260826.md` 与 `docs/05-operations-changelog/ornith-15-integration-20260826.md`。
+> **hybrid 前缀缓存必知**：Qwen3.8-27B / Qwen3.6-35B-A3B / Ornith-1.5-35B-A3B（均 Qwen3.5/3.6/3.8 系 hybrid GatedDeltaNet）在 rapid-mlx 中对 prefix cache 条目标 `non_trimmable`（只整条精确匹配）。必须 `--hybrid-cache-entries 8`（启用 trim-free 前缀复用；0=禁用→每轮全量冷 prefill）；关 `PROXY_CTX_ENGINE_ENABLED` 配合稳定前缀可保命中。**0.14.3 起上游内置 hybrid recurrent-state checkpoint**（`RAPID_MLX_HYBRID_CHECKPOINT_MAX`=4/`_STRIDE`=2048，prefill chunk 级快照 + fetch 侧 LCP/supersequence snap），使部分前缀复用成为可能（实测冷 prefill 2.3–3.6×）；**cache 上限勿盲目调大**：`--cache-memory-mb` 12GB→16GB 实测反引入 Metal pressure（cache 上限与 Metal cap 打架），已回退；**降 `--hybrid-cache-entries` 反而三赢**（见 §11.2 表）。另：hybrid 骨干被 rapid-mlx 门控关闭投机解码（MTP/DFlash/DSpark 均不可用，见 issue #1941）。详见 `docs/05-operations-changelog/dflash-mlx-integration-20260826.md` 与 `docs/05-operations-changelog/ornith-15-integration-20260826.md`。
 
 ---
 
@@ -506,7 +506,8 @@ git commit --no-verify               # 绕过所有钩子
 
 | 参数 | 默认值 | 推荐值 | 说明 |
 |------|--------|--------|------|
-| `--hybrid-cache-entries` | `0`（rapid-mlx） | `8` | **hybrid 模型（Qwen3.8/3.6）必配**：trim-free 前缀复用；0=禁用→每轮全量冷 prefill。rapid-mlx `--enable-prefix-cache` 会自动设 8，显式写 8 仅保明确 |
+| `--hybrid-cache-entries` | `0`（rapid-mlx） | `8` | **hybrid 模型（Qwen3.8/3.6/Ornith）必配**：trim-free 前缀复用；0=禁用→每轮全量冷 prefill。rapid-mlx `--enable-prefix-cache` 会自动设 8，显式写 8 仅保明确。**越大≠越好**：2026-09-21 实测 32→8 反而 active/peak -3.7GB、pressure-evict 177→0、墙钟 -32%（条目少→recurrent 快照占用低），见 runbook §19.3 |
+| `--cache-memory-mb` | `12288`（12GB） | `12288` | prefix cache 上限；**勿盲目调大**：12→16GB 实测反引入 Metal pressure（cache 上限与 Metal cap 打架），已回退（runbook §18.4） |
 | `PROXY_MAX_CONCURRENT` | `1` | `1` | 48GB Mac 上推荐 1，OOM 风险 |
 | `PROXY_CTX_TRUNCATE_STRATEGY` | `fifo` | `fifo` | 当前生产策略，prefix cache 友好 |
 | `PROXY_CTX_KEEP_MESSAGES` | `40` | `40` | fifo 窗口大小 |

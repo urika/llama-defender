@@ -1,6 +1,8 @@
 # Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）
 
-> 状态：**计划（未执行）** ｜ 撰写日期：2026-09-20 ｜ 预计执行：EXP-9 收官 + swe-eval 取证完成后
+> 状态：**Step 1/2/3 + A1 均已执行并验证完毕（2026-09-20/21）** ｜ 撰写日期：2026-09-20
+> 执行摘要：§13 Step 1 ✅ ｜ §14 Step 2 ✅ ｜ §15 Step 3+A1 ✅ ｜ §16 MAX/STRIDE（不采纳）｜ §17 性能基线 ｜ §18 响应 0920-15 ｜ **§19 影响二终局（重跑前置门 + e8）**
+> **待办：EXP-9 重跑前置门（§19.2 `tools/rerun_gate.py`）须在真实 64K agentic 形态上跑首轮**——e8 为合成形态结果，不构成放行证据
 > 对象配置：`configs/ornith-oq4e.conf`（当前 `active.conf`）
 > 分析依据：[`docs/04-analysis-diagnostics/ornith-oq4e-performance-bottleneck-analysis-20260920.md`](../04-analysis-diagnostics/ornith-oq4e-performance-bottleneck-analysis-20260920.md)（§5 / §10 / §11）
 > 排程约束：[`exp9-closeout-runbook-20260920.md`](exp9-closeout-runbook-20260920.md)、跨仓联合协调文档 J 系决议
@@ -18,6 +20,8 @@
 | 1 | `--pin-system-prompt` + `--gpu-memory-utilization 0.75→0.80` | 消除每请求驱逐 | `[prefix-pressure-evict]` **计数→0** | 删参数 / 回 0.75 |
 | 2 | `PROXY_HBE_ENABLED=false` + `PROXY_CTX_EPOCH_TRIGGER_TOKENS 70000→50000` | 去附加开销 + 降 live KV | 纯 decode / TTFT 回升 | 改回原值 |
 | 3 | rapid-mlx `0.12.13 → 0.14.3`（`.venv-rapidmlx`，**须加 `LLAMA_SERVER_BIN`**） | **用上游 hybrid checkpoint 机制替换本地 P1a 补丁** + GDN prefill 优化 | `snapped to checkpoint` 触发、decode 升 | 装回 0.12.13 / 删 bin 行 |
+| 4 | `--hybrid-cache-entries 32→8`（`d5f2e98`） | 降 GPU 占用 + 归零驱逐 | active/peak **-3.7GB**、evict→0、墙钟 **-32%** | 回 32（备份 `.prehybrid8`） |
+| 5 | **重跑前置门**（`tools/rerun_gate.py`，§19.2） | 真实 64K agentic 形态首轮校验 | 四件套达标才放行 | STOP 即停批 |
 
 **均不改模型权重、不改输入内容语义、不改客户端配置。**
 
@@ -945,9 +949,11 @@ flags    --pin-system-prompt --max-num-seqs 1
 ```
 配置          configs/ornith-oq4e.conf（RAPID_MLX_EXTRA_ARGS / PROXY_HBE_* / PROXY_CTX_EPOCH_TRIGGER_TOKENS；
                Step 3 须新增 LLAMA_SERVER_BIN，未设时 manage.sh:623 回退 brew）
-引擎二进制    当前 = /opt/homebrew/bin/rapid-mlx（brew 0.12.12）｜ 目标 = .venv-rapidmlx（0.14.3）
+引擎二进制    当前 = .venv-rapidmlx-0143/bin/rapid-mlx（0.14.3，已落地；brew 0.12.12 为旧基线）
 影子制品      .venv-rapidmlx-0143（并行 venv）｜ /tmp/ornith-staging/{state,logs}（§10）
-配置备份      /tmp/ornith-oq4e.conf.bak-<ts>（§11）
+配置备份      /tmp/ornith-staging/ornith-oq4e.conf.{prestep3a1-*,prepilot-s70k,precache16g,prehybrid8}（§11）
+工具          tools/pilot_long_session.py（长会话试点；--form append|divergent；_metrics_snap 读引擎计数器）
+              tools/rerun_gate.py（重跑前置门：snapshot/check，exit 0=PASS/1=STOP）← §19.2
 本地补丁      patches/vllm-mlx/0.12.12/（P1a，5 文件；0.14.3 改名后不可沿用，被上游取代）
               patches/vllm-mlx/0.14.3/cachestats-counters.diff（#9(a) snapdown 计数；已随 Step 3 应用）
 上游机制      rapid_mlx/hybrid_state_checkpoints.py（RAPID_MLX_HYBRID_CHECKPOINT_MAX=4 / _STRIDE=2048）

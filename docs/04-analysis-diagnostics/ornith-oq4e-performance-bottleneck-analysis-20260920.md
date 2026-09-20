@@ -164,7 +164,9 @@ Terminal-Bench 2.1 (Claude Code) 68.5 ｜ SWE-bench Verified 79–80.1 ｜ SWE-b
 | `--kv-cache-turboquant k8v4` | 替代方案（~1.6× prefill，代价 ~12% decode）；与 quantization 互斥，实验性；AGENTS.md §8.3 建议若需跨重启 prefix cache 则勿用 |
 | `--metal-cap-kv-bytes-per-token` | 量化 KV 被自动 fp16 估算高估 → 可能误拒长 prompt；按实测下调（int4 ≈ fp16 的 1/4） |
 | `--pflash auto --pflash-include-tools` | 冷 prefill TTFT **3.87×–8.5×**（PR#287/#649）；默认跳过带 tools 请求；丢中段 ~80% token，仅治冷启 |
-| `--hybrid-cache-entries 32→16` / `--cache-memory-mb 12288→8192` | 降 cache 内存换更少驱逐；可能增冷 prefill |
+| `--hybrid-cache-entries 32→8` / `--cache-memory-mb 12288→8192` | 降 cache 内存换更少驱逐；可能增冷 prefill |
+| **【已落地 e8】** `--hybrid-cache-entries 32→8` | ✅ 2026-09-21 实测三赢：active 29.3→**25.6GB**、peak 31.1→**27.4GB**、pressure-evict 177→**0**、墙钟 5.0→**3.4s**（影子三臂；生产已落地）。见 runbook §19.3 |
+| **【试后回退】** `--cache-memory-mb 12288→16384` | ⚠️ 2026-09-21 试 16GiB 未归零（103 evict）**且引入 Metal pressure**（cache 上限与 Metal 上限打架），已回退 12GB。见 runbook §18.4 |
 
 ### C. 系统级（需 sudo，重启失效）
 
