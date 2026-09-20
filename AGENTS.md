@@ -149,7 +149,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
 | `configs/minicpm5-2b.conf` | rapid-mlx + MiniCPM5-2B-MLX-4bit（本地路径 `~/models/`，dense Llama 2.5B 4bit ~1.35GB，131K ctx；**辅助引擎**，独立端口 8082，`start-aux/stop-aux` 独立启停、与主后端共存；无 MTP 层，官方 DSpark drafter 仅 SGLang 支持不在本机可用） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
-| `configs/qwen3.8-27b-4bit.conf` | rapid-mlx + Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80，prefix cache 增量轮秒级） |
+| `configs/qwen3.8-27b-4bit.conf` | rapid-mlx **0.14.3**（`.venv-rapidmlx-0143`，2026-09-21 #12 升级；EXP-8 LCP off 臂前置）+ Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 + pflash，prefix cache 增量轮秒级）。**KV 量化待定**：0.14.3 对 hybrid GDN 拒绝量化，须关（bf16）或待上游支持 |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
 | `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点（`deepseek-v4-flash`） |

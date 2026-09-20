@@ -992,6 +992,62 @@ gate check 输出 STOP  → 停批，回滚（S→70K 已定；如需再降 hybr
 
 ---
 
+## 21. 对联合文档 0921-8 的响应（#12–#17，2026-09-21）
+
+> 来源：`/Users/jinsongwang/APP/swe-eval/docs/joint-coordination-llamacpp.md` 0921-8（`f73af07`）
+
+### 21.1 #12 27b conf 升 0.14.3 ✅ **已落地**
+
+```diff
+-LLAMA_SERVER_BIN="/Users/jinsongwang/APP/llama.cpp/.venv-rapidmlx/bin/rapid-mlx"      # 0.12.13
++LLAMA_SERVER_BIN="/Users/jinsongwang/APP/llama.cpp/.venv-rapidmlx-0143/bin/rapid-mlx"   # 0.14.3
+```
+
+**背景**：`.venv-rapidmlx` = **0.12.13**（既无本地 P1a 补丁、也无上游 checkpoint 机制）
+→ 不升级则 **EXP-8 的 LCP off 臂是空对照**（已确认）。
+
+KV 量化 **保留 `true` + 加注**：0.14.3 对 hybrid GDN **拒绝**量化（`ArraysCache` 不兼容，
+白名单仅 gemma4）——**EXP-8 前须定案**：关量化改 bf16（如 Ornith A1）或待上游支持。
+`config-lint` 通过，回退点 `/tmp/ornith-staging/qwen3.8-27b-4bit.conf.pre0143`。
+
+### 21.2 #16 残留开关 ✅ **已标废**
+
+```diff
+-export PROXY_CACHE_LCP_SNAPDOWN=1
++# export PROXY_CACHE_LCP_SNAPDOWN=1  # 已废(#16): 0.14.3 用上游 checkpoint 机制,
++#   本地 P1a 补丁开关失效; 保留仅防 EXP-8 off 臂误读
+```
+**注**：EXP-8 off 臂的开关应改用 **`RAPID_MLX_HYBRID_CHECKPOINT_MAX=0`**（B2 已提）。
+
+### 21.3 #17 影子补测 —— **销号**
+
+`pilot-c1/c2`（16/20GiB）的 `metrics_before/after` 确为 `{}`（修 `_metrics_snap` 之前跑的）。
+**判定**：该问已被**独立剖面复验**（`exp-20260921-k64-profile`）替代 → **同意销号**。
+（§19.3 的 e8 结论不受影响：其对照是**影子三臂**且读的是修复版计数器，非 c1/c2。）
+
+### 21.4 #14 两项确认
+
+**(a) gate 墙钟 1.5× 对 2-run 小窗是否适用？** —— ⚠️ **有限适用，须知其边界**：
+- 实现取 `sessions.jsonl` 的 `duration_ms`，**按 before 快照 ts 过滤**（0921-4 修正），中位数抗长尾
+- **2-run 小窗的样本量少**（每 run 多轮，但会话数=2）→ 中位数**对单轮异常敏感**
+- **建议**：2-run 场景下 **墙钟项作参考而非硬判据**；硬判据以 **四件套计数器**（pressure/lru/epoch_collapse）为主——
+  它们不受样本量影响。若 2-run 中位比 >1.5× **但计数器全零**，建议**判 PASS 并标注墙钟存疑**
+
+**(b) STOP 回滚顺序**：✅ **同意** `hybrid-entries 8→16` → 再评 cache → S 保 70K。
+理由：16 是次优档（影子 91 evict，优于 32 的 177）；cache 上限**勿调大**（16GB 实测引入 Metal pressure）；S=70K 是刚定案的余量比。
+
+### 21.5 #15 并窗纪律 —— ✅ **同意并承诺**
+
+- 任何代理代码改动**提前公告 + 合并同一重启窗**（本日两次重启已致世代戳漂移，教训在案）
+- `PROXY_AUTOTUNE_*` 接入生效链路前：对齐「批期禁 apply」红线 + 契约 §六登记（当前默认关、无消费者）
+
+### 21.6 #13 日历/ETA 按 108 runs —— **属 swe-eval 侧 J6.1 纸面，本仓提供口径**
+
+本仓不掌握窗口日历；**已确认**「72 runs/38–49h」作废、r2 放行待剖面复验结论。
+本仓侧 ETA 相关**唯一影响**：r2 若放行，引擎侧已冻结、无需变更——**不占额外窗口**。
+
+---
+
 ## 附录：涉及文件
 
 ```
