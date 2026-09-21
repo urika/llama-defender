@@ -1296,6 +1296,90 @@ KV 量化 **保留 `true` + 加注**：0.14.3 对 hybrid GDN **拒绝**量化（
 
 ---
 
+## 26. r2 批内巡检上报：2 次 Metal 驱逐（2026-09-22）
+
+> 触发：用户要求分析 r2 批期内出现的 2 次 Metal 压力驱逐。
+
+### 26.1 事实（strict 证据）
+
+r2 批期（窗 A 8GB 配置，`cache_max=7.7GB`）日志出现 **2 次**
+`[prefix-pressure-evict] under Metal pressure`（idx 19861 / 19888）——
+**破熔断规则「Metal>0 即停批」**。
+
+| 观测 | 值 |
+|---|---|
+| 驱逐线 | **32.5GB**（36.1 × 0.9） |
+| 驱逐时 `[Metal memory] active` | **31.3GB** |
+| 同刻 `peak` | **32.7GB** |
+| 场景 | 两次均 **~63.7K prompt** agentic 轮（79 msgs / 15 tools） |
+| 触发点 | `adaptive_prefill` 大 chunk（2048）**瞬时激活**越线 |
+
+### 26.2 根因 = 瞬时峰值越线（非持续压力）
+
+日志序列（`chatcmpl-2eb`）：
+```
+prompt=63770, cached=63488 (LCP snap)
+[adaptive_prefill] 2048 -> 1024  (metal=26.0GB)
+[adaptive_prefill] 1024 -> 512   (metal=28.7GB)
+[adaptive_prefill] 512 -> 2048   (metal=29.9GB)
+first token after 1.1s
+[prefix-pressure-evict] 1 entry under Metal pressure  ← 此刻
+[Metal memory] active=31.3GB peak=32.7GB              ← peak 越线
+```
+
+**机理**：8GB 把**常驻**压到 27.8GB（余量 4.7GB）；但 63.7K 视图的
+**prefill 增量重算 + KV 分配**在 `adaptive_prefill` 大 chunk 时**瞬时**吃掉余量
+→ `peak 32.7 > 32.5` → 触发驱逐 → 随后缩块回落。
+
+### 26.3 对照：8GB vs 12GB
+
+| 配置 | 常驻 | 余量 | Metal 驱逐 | 性质 |
+|---|---|---|---|---|
+| 12GB | 31.8GB | 0.7GB | **142** | **持续**撞线 |
+| **8GB** | 27.8GB | 4.7GB | **2** | **瞬时**峰值 |
+
+**质变成立（−98.6%），但非零。**
+
+### 26.4 判定（供裁决）
+
+**倾向「继续 + 阈值调整」**：
+1. 2 次属**长尾瞬时**（vs 12GB 的 142 次持续）
+2. **未致衰**（同轮 `first token 1.1s`、166 tok/6.1s 正常完成）
+3. 要防的是**持续**撞线，非单次瞬时
+
+**建议熔断口径改为**「Metal **持续** >0（连续 N 轮）」或「Metal ≤ 小阈值/run（≤5）」。
+**若判停批**，配合回滚（二元：8GB / 12GB，10GB 已证非折中）。
+
+### 26.5 🆕 上游 HELP 文案错误（需登记）
+
+`rapid_mlx_prefix_cache_pressure_evictions_total` 的 `/metrics` HELP 文案：
+> "Prefix-cache entries evicted by the **Metal-pressure trigger** (D-METAL-PFX)"
+
+**但源码是两触发共用计数**：
+```python
+# scheduler.py:7094 —— 单一递增点
+triggered_metal = False; triggered_cache_self = False
+for ...:
+    if metal_threshold > 0 and active >= metal_threshold:
+        should_evict = True; triggered_metal = True
+    if not should_evict and cache_self_threshold > 0 and current_cache >= threshold:
+        should_evict = True; triggered_cache_self = True
+    self.num_prefix_cache_pressure_evictions += 1   # ← 共用
+```
+
+**→ HELP 文案与代码不符，会误导按 HELP 读取的消费方**（误信 Metal 专属）。
+**正是 gate 必须日志归因的原因**，印证 swe-eval 0921-13 口径正确。
+
+**建议**：(i) 7d 采集说明加「勿信 HELP，按源码语义 = 共用计数 + 日志归因分型」；
+(ii) 修 HELP 属引擎补丁，可入窗口 B / 后续。
+
+### 26.6 复核工具
+
+`tools/rerun_gate.py check`（含 `_log_evict_attribution`，按 `before.log_size_bytes` 限窗）。
+**注意**：`--before` 须用**本批 snapshot**，勿跨期复用（跨期假阳性）。
+
+---
+
 ## 附录：涉及文件
 
 ```
