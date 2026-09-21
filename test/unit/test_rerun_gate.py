@@ -157,17 +157,46 @@ class TestCheckVerdict(unittest.TestCase):
 
 
 class TestEpochCollapseScan(unittest.TestCase):
-    def test_counts_epoch_collapse_lines_per_session(self):
+    """0921-15 B① 口径校准：改数 sessions.jsonl 的 epoch_count（折叠**事件数**），
+    不再数 manifest 条目数（那对长会话恒真、无判别力）。"""
+
+    def _write(self, rows):
         d = tempfile.mkdtemp()
-        with open(os.path.join(d, "sA.jsonl"), "w") as f:
-            f.write(json.dumps({"kind": "epoch_collapse", "turn": 1}) + "\n")
-            f.write(json.dumps({"kind": "other"}) + "\n")
-            f.write(json.dumps({"kind": "epoch_collapse", "turn": 2}) + "\n")
-        with open(os.path.join(d, "sB.jsonl"), "w") as f:
-            f.write(json.dumps({"kind": "other"}) + "\n")
-        with mock.patch.object(rg, "MANIFEST_DIR", d):
+        os.makedirs(os.path.join(d, "logs", "diag"))
+        with open(os.path.join(d, "logs", "diag", "sessions.jsonl"), "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        return d
+
+    def test_takes_latest_epoch_count_per_session(self):
+        """各会话取末次 epoch_count（累计折叠事件数）。"""
+        d = self._write([
+            {"session_key": "sA", "epoch_count": 1},
+            {"session_key": "sA", "epoch_count": 3},   # 后写覆盖 → 3
+            {"session_key": "sB", "epoch_count": 2},
+        ])
+        with mock.patch.object(rg, "REPO", d):
             got = rg._epoch_collapse_by_session()
-        self.assertEqual(got, {"sA": 2})
+        self.assertEqual(got, {"sA": 3, "sB": 2})
+
+    def test_zero_epoch_count_excluded(self):
+        """epoch_count=0 不入表（无折叠的会话不产生噪声键）。"""
+        d = self._write([
+            {"session_key": "sA", "epoch_count": 0},
+            {"session_key": "sB", "epoch_count": 2},
+        ])
+        with mock.patch.object(rg, "REPO", d):
+            got = rg._epoch_collapse_by_session()
+        self.assertEqual(got, {"sB": 2})
+
+    def test_missing_epoch_count_ignored(self):
+        d = self._write([
+            {"session_key": "sA"},
+            {"session_key": "sB", "epoch_count": 4},
+        ])
+        with mock.patch.object(rg, "REPO", d):
+            got = rg._epoch_collapse_by_session()
+        self.assertEqual(got, {"sB": 4})
 
 
 if __name__ == "__main__":

@@ -87,25 +87,32 @@ def _proxy_ctx():
 
 
 def _epoch_collapse_by_session():
-    """从 manifest 文件统计各会话 epoch_collapse 行数。"""
-    out = {}
-    if not os.path.isdir(MANIFEST_DIR):
-        return out
-    for fn in os.listdir(MANIFEST_DIR):
-        if not fn.endswith(".jsonl"):
-            continue
-        sid = fn[:-6]
-        n = 0
-        try:
-            with open(os.path.join(MANIFEST_DIR, fn), "r") as f:
-                for line in f:
-                    if '"epoch_collapse"' in line:
-                        n += 1
-        except OSError:
-            continue
-        if n:
-            out[sid] = n
-    return out
+    """从 sessions.jsonl 统计各会话**折叠事件数**（0921-15 B① 口径校准）。
+
+    原实现数 `logs/diag/manifest/<sid>.jsonl` 的 `epoch_collapse` **条目数**
+    ——那是被收编的 message 行数（一个会话数百行），"条目数 >0" 对任何长会话
+    恒真、**不具判别力**（swe-eval 0921-11/0921-13 指出）。
+    改用 R16 `sessions.jsonl` 的 `epoch_count`（会话级**折叠事件**累计值）：
+    取各会话**末次** epoch_count，即当前累计折叠次数。
+    """
+    p = os.path.join(REPO, "logs", "diag", "sessions.jsonl")
+    if not os.path.exists(p):
+        return {}
+    latest = {}
+    try:
+        with open(p, "r") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                sid = d.get("session_key") or d.get("session") or d.get("key")
+                ec = d.get("epoch_count")
+                if sid and isinstance(ec, int):
+                    latest[sid] = ec          # 后写覆盖先写 → 末次值
+    except OSError:
+        return {}
+    return {k: v for k, v in latest.items() if v}
 
 
 def _wall_times_from_sessions(since_ts=None, limit=200):
