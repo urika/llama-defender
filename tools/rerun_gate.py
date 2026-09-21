@@ -7,11 +7,18 @@
 故重跑前须以**真实形态**跑 2–3 run，校验四件套，不达标停批
 （成本：数十分钟 vs 重赔 38–49h 批次）。
 
-四件套（判据一律以 /metrics **计数器增量**为准，非日志行——日志受窗口截断低估）：
-  1. pressure_evictions 增量（rapid_mlx_prefix_cache_pressure_evictions_total）
-  2. lru_evictions 增量（rapid_mlx_prefix_cache_evictions_total）
-  3. 每轮墙钟（run 记录；劣化 > 阈值即警报）
-  4. epoch_collapse 数（代理台账 manifest；折叠异常即警报）
+四件套判据（2026-09-22 定稿，联合文档 0921-21/0921-22；一律以 /metrics
+**计数器增量**为准，非日志行——日志受窗口截断低估）：
+  1. **Metal = 0 + cache-self 有限**：`pressure_evictions` 是 Metal(R6-H5) 与
+     cache-self(R6-H6) 两触发的**共用计数** → 单看计数器只能判总量；
+     "Metal=0" 需**配合日志归因**（`[prefix-pressure-evict] ... under Metal pressure`）。
+     总量阈值 = **≤2× 窗 A 校准（432/run）**，即 ≤864。理由：两触发同机制
+     （同驱逐函数 + `mx.clear_cache()`），危害同源；Metal 是进程级红线，
+     cache-self 是容器泄压阀（有界）。
+  2. prefix 命中率 ≥90%（请求级口径）
+  3. 每轮墙钟不劣化 >10%（`sessions.jsonl` duration_ms；中位数抗长尾）
+  4. `lru_evictions`（rapid_mlx_prefix_cache_evictions_total）增量
+     ≤2× 窗 A 校准（432），即 ≤864（容量驱逐护栏，与命中率联动）
 
 用法（由 swe-eval 批跑侧编排调用）：
   # 批前快照
@@ -38,6 +45,7 @@ BACKEND_METRICS = "http://127.0.0.1:8081/metrics"
 PROXY_STATUS = "http://127.0.0.1:4000/api/status"
 PROXY_SESSIONS = "http://127.0.0.1:4000/api/sessions"
 MANIFEST_DIR = os.path.join(REPO, "logs", "diag", "manifest")
+BACKEND_LOG = os.path.join(REPO, "logs", "llama-server.log")
 
 # /metrics 计数器名（权威源）
 COUNTERS = {
@@ -144,6 +152,41 @@ def _wall_times_from_sessions(since_ts=None, limit=200):
     return rows[-limit:]
 
 
+METAL_EVICT_RE = re.compile(
+    r"\[prefix-pressure-evict\] evicted (\d+) entries under (Metal\+cache-self|Metal|cache-self) pressure")
+
+
+def _log_evict_attribution(since_bytes=0):
+    """从后端日志分型压力驱逐：Metal / cache-self / 两者。
+
+    判据 (1) 的 "Metal = 0" 无法从共用计数器区分，须靠日志归因
+    （0921-21/0921-22）。日志行受窗口截断低估，**只用于分型佐证**，
+    总量仍以 /metrics 计数器为准。
+    返回 (metal_count, cache_self_count, both_count)。
+    """
+    if not os.path.exists(BACKEND_LOG):
+        return 0, 0, 0
+    try:
+        size = os.path.getsize(BACKEND_LOG)
+        with open(BACKEND_LOG, "rb") as f:
+            if since_bytes > size:
+                since_bytes = 0
+            f.seek(since_bytes)
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0, 0, 0
+    metal = cache_self = both = 0
+    for m in METAL_EVICT_RE.finditer(chunk):
+        n, kind = int(m.group(1)), m.group(2)
+        if kind == "Metal":
+            metal += n
+        elif kind == "cache-self":
+            cache_self += n
+        else:
+            both += n
+    return metal, cache_self, both
+
+
 def snapshot(out_path):
     snap = {
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -154,6 +197,10 @@ def snapshot(out_path):
         "wall_samples_ms": _wall_times_from_sessions(),
         "wall_median_ms": (sorted(_wall_times_from_sessions())[len(_wall_times_from_sessions())//2]
                            if _wall_times_from_sessions() else None),
+        "log_evict_attribution": dict(zip(
+            ("metal", "cache_self", "both"), _log_evict_attribution())),
+        "log_size_bytes": (os.path.getsize(BACKEND_LOG)
+                           if os.path.exists(BACKEND_LOG) else 0),
     }
     if out_path:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -163,7 +210,7 @@ def snapshot(out_path):
 
 
 def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
-          max_epoch_collapse, out_path):
+          max_epoch_collapse, out_path, max_metal_evict=0):
     with open(before_path, "r") as f:
         before = json.load(f)
     after = snapshot(None)
@@ -212,6 +259,14 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
     reasons = []
     if delta.get("pressure_evictions", 0) > max_pressure_evict:
         reasons.append(f"pressure_evictions +{delta['pressure_evictions']} > {max_pressure_evict}")
+    # 判据 (1)："Metal = 0" —— 计数器无法区分两触发，须日志归因（0921-21/22）。
+    # 关键：只扫 before 快照之后的日志增量，否则读到全量历史（数月事件）。
+    since_bytes = int(before.get("log_size_bytes") or 0)
+    metal_n, cache_n, both_n = _log_evict_attribution(since_bytes=since_bytes)
+    metal_delta = metal_n + both_n
+    if metal_delta > max_metal_evict:
+        reasons.append(
+            f"Metal pressure evictions (log attribution) +{metal_delta} > {max_metal_evict}")
     if delta.get("lru_evictions", 0) > max_lru_evict:
         reasons.append(f"lru_evictions +{delta['lru_evictions']} > {max_lru_evict}")
     if wall_ratio is not None and wall_ratio > wall_threshold_ratio:
@@ -226,6 +281,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         "verdict": "PASS" if not reasons else "STOP",
         "reasons": reasons,
         "delta": delta,
+        "log_evict_attribution": {"metal": metal_n, "cache_self": cache_n, "both": both_n},
         "epoch_collapse_delta": epoch_delta,
         "wall_ratio": wall_ratio,
         "wall_stat": wall_stat,
@@ -234,6 +290,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         "thresholds": {
             "wall_threshold_ratio": wall_threshold_ratio,
             "max_pressure_evict": max_pressure_evict,
+            "max_metal_evict": max_metal_evict,
             "max_lru_evict": max_lru_evict,
             "max_epoch_collapse": max_epoch_collapse,
         },
@@ -245,6 +302,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
 
     print(f"[gate] 判定: {verdict['verdict']}")
     print(f"        计数器增量: {delta}")
+    print(f"        日志归因: Metal={metal_n + both_n} cache-self={cache_n}")
     print(f"        epoch_collapse 增量: {epoch_total}")
     print(f"        墙钟比: {wall_ratio}")
     if reasons:
@@ -263,8 +321,12 @@ def main():
     s2 = sub.add_parser("check", help="对比快照并判读")
     s2.add_argument("--before", required=True)
     s2.add_argument("--wall-threshold-ratio", type=float, default=1.5)
-    s2.add_argument("--max-pressure-evict", type=int, default=0)
-    s2.add_argument("--max-lru-evict", type=int, default=200)
+    s2.add_argument("--max-pressure-evict", type=int, default=864,
+                    help="压力驱逐总量上限（默认 864 = 2× 窗 A 校准 432/run）")
+    s2.add_argument("--max-metal-evict", type=int, default=0,
+                    help="Metal 压力驱逐上限（日志归因；默认 0 = 红线）")
+    s2.add_argument("--max-lru-evict", type=int, default=864,
+                    help="容量驱逐上限（默认 864 = 2× 窗 A 校准 432）")
     s2.add_argument("--max-epoch-collapse", type=int, default=0)
     s2.add_argument("--out", default=None)
 
@@ -277,7 +339,8 @@ def main():
               f"window_K={snap['ctx_config'].get('window_K')}")
         return 0
     return check(args.before, args.wall_threshold_ratio, args.max_pressure_evict,
-                 args.max_lru_evict, args.max_epoch_collapse, args.out)
+                 args.max_lru_evict, args.max_epoch_collapse, args.out,
+                 max_metal_evict=args.max_metal_evict)
 
 
 if __name__ == "__main__":
