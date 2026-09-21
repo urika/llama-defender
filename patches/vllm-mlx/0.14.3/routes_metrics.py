@@ -2111,8 +2111,12 @@ def _render_prometheus(cfg: Any) -> str:
                 "rapid_mlx_prefix_cache_pressure_evictions_total",
                 "counter",
                 (
-                    "Prefix-cache entries evicted by the Metal-pressure "
-                    "trigger (D-METAL-PFX). Disjoint from "
+                    "Prefix-cache entries evicted by the pressure "
+                    "trigger (D-METAL-PFX): EITHER the Metal-pressure "
+                    "(R6-H5) OR the cache-self-pressure (R6-H6) trigger; "
+                    "both share this counter. To attribute a spike, read the "
+                    "log line '[prefix-pressure-evict] ... under <Metal|"
+                    "cache-self|Metal+cache-self> pressure'. Disjoint from "
                     "rapid_mlx_prefix_cache_evictions_total which counts "
                     "LRU-on-capacity evictions performed by the cache "
                     "itself."

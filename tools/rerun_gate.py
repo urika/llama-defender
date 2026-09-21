@@ -9,12 +9,16 @@
 
 四件套判据（2026-09-22 定稿，联合文档 0921-21/0921-22；一律以 /metrics
 **计数器增量**为准，非日志行——日志受窗口截断低估）：
-  1. **Metal = 0 + cache-self 有限**：`pressure_evictions` 是 Metal(R6-H5) 与
-     cache-self(R6-H6) 两触发的**共用计数** → 单看计数器只能判总量；
-     "Metal=0" 需**配合日志归因**（`[prefix-pressure-evict] ... under Metal pressure`）。
-     总量阈值 = **≤2× 窗 A 校准（432/run）**，即 ≤864。理由：两触发同机制
-     （同驱逐函数 + `mx.clear_cache()`），危害同源；Metal 是进程级红线，
-     cache-self 是容器泄压阀（有界）。
+  1. **Metal 有界 + cache-self 有限**（0922-3 裁决口径；不再要求 Metal=0）：
+     - **Metal 有界**（日志归因 `[prefix-pressure-evict] ... under Metal pressure`）：
+       ① `metal_peak < 34.0GB`（cap 36.1 − 2.1GB 天花板，绝对量纲，与事件率解耦）
+       ② 滚动 30min 内 Metal 事件 < 8（thrash；12GB 段为数十次/30min，判别充分）
+       少量瞬时 → WARN 不停批；`metal_peak ≥ 33.0GB` 早警。
+       **不用「Metal=0」**：窗 A 2-run 短样本碰巧成立，长轨迹样本（63.7K）注定 FAIL；
+       也**不用「≤ 小阈值/run」**（小样本 per-run 归一噪声大 + 强依赖轨迹长度）。
+     - **cache-self 有限**：`pressure_evictions`（Metal+cache-self 共用计数）总量
+       **≤864**（2× 窗 A 校准 432）。两触发同机制、危害同源；Metal 是进程级红线，
+       cache-self 是容器泄压阀。
   2. prefix 命中率 ≥90%（请求级口径）
   3. 每轮墙钟不劣化 >10%（`sessions.jsonl` duration_ms；中位数抗长尾）
   4. `lru_evictions`（rapid_mlx_prefix_cache_evictions_total）增量
@@ -210,7 +214,8 @@ def snapshot(out_path):
 
 
 def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
-          max_epoch_collapse, out_path, max_metal_evict=0):
+          max_epoch_collapse, out_path, max_metal_evict=0,
+          max_metal_peak_gb=34.0, max_metal_events_30min=8):
     with open(before_path, "r") as f:
         before = json.load(f)
     after = snapshot(None)
@@ -259,14 +264,22 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
     reasons = []
     if delta.get("pressure_evictions", 0) > max_pressure_evict:
         reasons.append(f"pressure_evictions +{delta['pressure_evictions']} > {max_pressure_evict}")
-    # 判据 (1)："Metal = 0" —— 计数器无法区分两触发，须日志归因（0921-21/22）。
-    # 关键：只扫 before 快照之后的日志增量，否则读到全量历史（数月事件）。
+    # 判据 (1)："Metal 有界"（0922-3）——两段式：
+    #   1a 天花板：metal_peak < max_metal_peak_gb（绝对量纲）
+    #   1b thrash：窗内 Metal 日志事件 < max_metal_events_30min
+    # 关键：日志归因只扫 before 快照之后的增量（否则读全量历史数月事件）。
     since_bytes = int(before.get("log_size_bytes") or 0)
     metal_n, cache_n, both_n = _log_evict_attribution(since_bytes=since_bytes)
-    metal_delta = metal_n + both_n
-    if metal_delta > max_metal_evict:
+    metal_events = metal_n + both_n
+    peak_bytes = am.get("metal_peak_bytes")
+    peak_gb = (peak_bytes / 1e9) if peak_bytes else None
+    if peak_gb is not None and peak_gb >= max_metal_peak_gb:
+        reasons.append(f"metal_peak {peak_gb:.1f}GB >= {max_metal_peak_gb}GB (1a ceiling)")
+    if metal_events >= max_metal_events_30min:
         reasons.append(
-            f"Metal pressure evictions (log attribution) +{metal_delta} > {max_metal_evict}")
+            f"Metal events {metal_events} >= {max_metal_events_30min} (1b thrash)")
+    if peak_gb is not None and peak_gb >= 33.0:
+        reasons.append(f"WARN: metal_peak {peak_gb:.1f}GB >= 33.0GB (early warning)")
     if delta.get("lru_evictions", 0) > max_lru_evict:
         reasons.append(f"lru_evictions +{delta['lru_evictions']} > {max_lru_evict}")
     if wall_ratio is not None and wall_ratio > wall_threshold_ratio:
@@ -282,6 +295,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         "reasons": reasons,
         "delta": delta,
         "log_evict_attribution": {"metal": metal_n, "cache_self": cache_n, "both": both_n},
+        "metal_peak_gb": peak_gb,
         "epoch_collapse_delta": epoch_delta,
         "wall_ratio": wall_ratio,
         "wall_stat": wall_stat,
@@ -302,7 +316,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
 
     print(f"[gate] 判定: {verdict['verdict']}")
     print(f"        计数器增量: {delta}")
-    print(f"        日志归因: Metal={metal_n + both_n} cache-self={cache_n}")
+    print(f"        日志归因: Metal事件={metal_events} cache-self={cache_n} metal_peak={peak_gb}GB")
     print(f"        epoch_collapse 增量: {epoch_total}")
     print(f"        墙钟比: {wall_ratio}")
     if reasons:
@@ -323,8 +337,10 @@ def main():
     s2.add_argument("--wall-threshold-ratio", type=float, default=1.5)
     s2.add_argument("--max-pressure-evict", type=int, default=864,
                     help="压力驱逐总量上限（默认 864 = 2× 窗 A 校准 432/run）")
-    s2.add_argument("--max-metal-evict", type=int, default=0,
-                    help="Metal 压力驱逐上限（日志归因；默认 0 = 红线）")
+    s2.add_argument("--max-metal-events-30min", type=int, default=8, dest="max_metal_events_30min",
+                    help="1b thrash：窗内 Metal 事件上限（默认 8，0922-3）")
+    s2.add_argument("--max-metal-peak-gb", type=float, default=34.0,
+                    help="1a 天花板：metal_peak 上限 GB（默认 34.0 = cap−2.1）")
     s2.add_argument("--max-lru-evict", type=int, default=864,
                     help="容量驱逐上限（默认 864 = 2× 窗 A 校准 432）")
     s2.add_argument("--max-epoch-collapse", type=int, default=0)
@@ -340,7 +356,9 @@ def main():
         return 0
     return check(args.before, args.wall_threshold_ratio, args.max_pressure_evict,
                  args.max_lru_evict, args.max_epoch_collapse, args.out,
-                 max_metal_evict=args.max_metal_evict)
+                 max_metal_evict=0,
+                 max_metal_peak_gb=args.max_metal_peak_gb,
+                 max_metal_events_30min=args.max_metal_events_30min)
 
 
 if __name__ == "__main__":

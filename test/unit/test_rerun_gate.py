@@ -95,7 +95,8 @@ class TestCheckVerdict(unittest.TestCase):
         return base
 
     def _run(self, before, after_metrics, wall_after_ms=30000,
-             epoch_after=None, ctx_after=None, metal_log=0, **thresholds):
+             epoch_after=None, ctx_after=None, metal_log=0,
+             metal_peak_bytes=None, **thresholds):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump(before, f); f.close()
         after = {
@@ -104,8 +105,12 @@ class TestCheckVerdict(unittest.TestCase):
             "ctx_config": ctx_after or before["ctx_config"],
             "epoch_collapse_by_session": epoch_after or before["epoch_collapse_by_session"],
         }
+        if metal_peak_bytes is not None:
+            after["metrics"] = dict(after_metrics)
+            after["metrics"]["metal_peak_bytes"] = metal_peak_bytes
         opts = dict(wall_threshold_ratio=1.5, max_pressure_evict=864,
-                    max_lru_evict=864, max_epoch_collapse=0)
+                    max_lru_evict=864, max_epoch_collapse=0,
+                    max_metal_peak_gb=34.0, max_metal_events_30min=8)
         opts.update(thresholds)
         with mock.patch.object(rg, "snapshot", return_value=after), \
              mock.patch.object(rg, "_wall_times_from_sessions",
@@ -114,7 +119,9 @@ class TestCheckVerdict(unittest.TestCase):
                                return_value=(metal_log, 0, 0)):
             rc = rg.check(f.name, opts["wall_threshold_ratio"],
                           opts["max_pressure_evict"], opts["max_lru_evict"],
-                          opts["max_epoch_collapse"], None)
+                          opts["max_epoch_collapse"], None,
+                          max_metal_peak_gb=opts["max_metal_peak_gb"],
+                          max_metal_events_30min=opts["max_metal_events_30min"])
         os.unlink(f.name)
         return rc
 
@@ -130,20 +137,36 @@ class TestCheckVerdict(unittest.TestCase):
                         "snapdown_hits": 0, "prefix_cache_hits": 12})
         self.assertEqual(rc, 1)
 
-    def test_stop_on_metal_log_attribution(self):
-        """判据 (1) Metal=0：计数器未超但日志归因出 Metal → STOP（0921-21）。"""
+    def test_pass_on_few_metal_events(self):
+        """判据 (1)「Metal 有界」：少量瞬时（<8）→ PASS（0922-3 口径）。"""
         rc = self._run(self._before(),
                        {"pressure_evictions": 100, "lru_evictions": 110,
                         "snapdown_hits": 0, "prefix_cache_hits": 12},
-                       metal_log=5)
+                       metal_log=2)
+        self.assertEqual(rc, 0)
+
+    def test_stop_on_metal_thrash(self):
+        """1b thrash：Metal 事件 >= 8 → STOP。"""
+        rc = self._run(self._before(),
+                       {"pressure_evictions": 100, "lru_evictions": 110,
+                        "snapdown_hits": 0, "prefix_cache_hits": 12},
+                       metal_log=8)
+        self.assertEqual(rc, 1)
+
+    def test_stop_on_metal_peak_ceiling(self):
+        """1a 天花板：metal_peak >= 34.0GB → STOP。"""
+        rc = self._run(self._before(),
+                       {"pressure_evictions": 0, "lru_evictions": 110,
+                        "snapdown_hits": 0, "prefix_cache_hits": 12},
+                       metal_log=0, metal_peak_bytes=int(34.5e9))
         self.assertEqual(rc, 1)
 
     def test_pass_when_pressure_bounded_no_metal(self):
-        """cache-self 有界（≤864）且 Metal=0 → PASS（新口径）。"""
+        """cache-self 有界（≤864）且 Metal 有界（0 事件、peak<33）→ PASS。"""
         rc = self._run(self._before(),
                        {"pressure_evictions": 800, "lru_evictions": 800,
                         "snapdown_hits": 0, "prefix_cache_hits": 12},
-                       metal_log=0)
+                       metal_log=0, metal_peak_bytes=int(32.7e9))
         self.assertEqual(rc, 0)
 
     def test_stop_on_lru_over_threshold(self):
