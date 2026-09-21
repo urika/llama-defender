@@ -1380,6 +1380,69 @@ for ...:
 
 ---
 
+## 27. 判据 (1) 改「Metal 有界」+ HELP 文案修正（2026-09-22）
+
+> 来源：联合文档 0922-3（swe-eval 裁决）+ 0922-4（HELP 复现）+ 0922-5（llama.cpp ACK）
+
+### 27.1 判据 (1) 口径变更：Metal = 0 → **Metal 有界**
+
+**swe-eval 裁决 B**（我方 0922-2 ③ 倾向 B 的精确化）。**核心论证**：
+> 「原『Metal>0 即停』**混淆了 regime 失效与长尾瞬时**」——
+> 按字面执行会把有界瞬时（代价 = 丢 1 entry，同轮 TTFT 7.1s/1.1s，run 仍 resolved）
+> 当进程级红线。
+
+**新判据（两段式）**：
+
+| 段 | 判据 | 阈值 |
+|---|---|---|
+| **1a 天花板** | `metal_peak` | **< 34.0GB**（cap−2.1GB，绝对量纲，与事件率解耦） |
+| **1b thrash** | 滚动 30min Metal 事件 | **< 8**（12GB 段数十次/30min，判别充分；8GB 实测 2 次/54min） |
+| 早警 | `metal_peak` | ≥ 33.0GB |
+| 少量瞬时 | — | **WARN 落日志不停批** |
+
+**为何不用「Metal=0」**：窗 A 2-run 短样本碰巧成立；**长轨迹样本（63.7K）注定 FAIL**
+（实测：续跑段 Metal **0** 次、最大 prompt **65904 已复现但不再触发**）。
+
+**为何不用「≤ 小阈值/run」**：小样本 per-run 归一噪声大 + 强依赖轨迹长度
+（同实例不同臂轨迹差数倍 → 长轨迹正常 run 误判）。
+
+**cache-self 判据不变**：总量 ≤864（2× 窗 A 校准 432）。
+
+### 27.2 gate 脚本已同步（`d3ee77e`）
+
+```
+(1) Metal 有界：metal_peak < 34.0GB（1a 天花板）
+              且 窗内 Metal 事件 < 8（1b thrash）
+(2) 命中率 ≥90%   (3) 墙钟不劣化 >10%   (4) LRU ≤864
+```
+新参数：`--max-metal-peak-gb 34.0` / `--max-metal-events-30min 8`。
+保留日志归因（分型），**但不再要求 Metal=0**。单测 **18/18**。
+
+### 27.3 HELP 文案修正（0922-4 定位）
+
+**位置**：`patches/vllm-mlx/0.14.3/routes_metrics.py`（一行字符串）+ 运行时 site-packages 同步。
+
+```diff
+- "Prefix-cache entries evicted by the Metal-pressure trigger (D-METAL-PFX)."
++ "Prefix-cache entries evicted by the pressure trigger (D-METAL-PFX): EITHER
++  the Metal-pressure (R6-H5) OR the cache-self-pressure (R6-H6) trigger;
++  both share this counter. To attribute a spike, read the log line
++  '[prefix-pressure-evict] ... under <Metal|cache-self|Metal+cache-self> pressure'."
+```
+
+**引擎重启后生效**；**批内不动引擎**（红线 1）→ 并入最近并窗。
+
+### 27.4 裁决其他项（确认接受）
+
+| 项 | 处置 |
+|---|---|
+| **C（降 prefill 峰值）** | **批内不做**（引擎重启=世代边界）；并入 r2 收官后与 L-36 同窗；**若 1a/1b 批内触发则提前触发并窗** |
+| **回滚顺序** | 维持（entries 8→16 → 评 cache；S 保 70K；10GB 作废） |
+| **swe-eval 停批机制缺陷**（L-37） | 我方**无同类脚本化停批**（gate 是 check-only 不 kill），无此风险；未来若加则按 v2 形态（证据先落盘→kill -9→零残留核验→失败重试） |
+| **A6 频次** | r2 窗口 400 共 7 次（全 system 位置签名，L-36）；按 1/6 外推 108 runs 约 15–18 需 re-eval |
+
+---
+
 ## 附录：涉及文件
 
 ```
