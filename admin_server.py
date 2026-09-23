@@ -356,7 +356,7 @@ def _get_local_engines_status():
 
 def _build_status_json():
     """Build the structured JSON status payload for agent_go."""
-    backend_info = _get_process_info("rapid-mlx|llama-server|dflash", "Backend")
+    backend_info = _get_process_info("rapid-mlx|llama-server|dflash|splash", "Backend")
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
 
     proxy_alive = proxy_info.get("running", False)
@@ -2155,7 +2155,7 @@ def _get_session_trace():
     return summary + "\n".join(timeline), tools_detail, errors_detail
 # --- _build_status_html ---
 def _build_status_html():
-    backend_info = _get_process_info("rapid-mlx|llama-server|dflash", "Backend")
+    backend_info = _get_process_info("rapid-mlx|llama-server|dflash|splash", "Backend")
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
     mem = _get_system_memory()
     log = _get_log_stats()

@@ -217,12 +217,21 @@ _current_backend() {
             elif [[ "$comm" == "dflash" ]]; then
                 echo "dflash-mlx"
                 return 0
+            elif [[ "$comm" == "python3" || "$comm" == "python" || "$comm" == "python3.1" ]]; then
+                # Splash: PID 文件里是 server.py 前端(python), 用完整命令行判别
+                if ps -p "$pid" -o command= 2>/dev/null | grep -q 'splash.*server.py'; then
+                    echo "splash"
+                    return 0
+                fi
             fi
         fi
     fi
     # fallback: search process
     if pgrep -f "rapid-mlx" >/dev/null 2>&1; then
         echo "rapid-mlx"
+        return 0
+    elif pgrep -f "splash serve" >/dev/null 2>&1; then
+        echo "splash"
         return 0
     elif pgrep -f "dflash serve" >/dev/null 2>&1; then
         echo "dflash-mlx"
@@ -288,6 +297,10 @@ _get_pid() {
         pid=$(lsof -Pi :"${LLAMA_PORT:-8081}" -sTCP:LISTEN -t 2>/dev/null | head -1)
     elif [[ "$backend" == "dflash-mlx" ]]; then
         pid=$(pgrep -f "dflash serve" 2>/dev/null | head -1)
+    elif [[ "$backend" == "splash" ]]; then
+        # Splash: 前端 server.py 持有监听端口(native 引擎是它的子进程, 杀前端即连带退出);
+        # 'splash serve' CLI 启动后 exec/spawn 自身退出, PID 文件里的 pid 已失效 → 端口感知
+        pid=$(lsof -Pi :"${LLAMA_PORT:-8081}" -sTCP:LISTEN -t 2>/dev/null | head -1)
     elif [[ "$backend" == "mlx_vlm" ]]; then
         pid=$(pgrep -f "mlx_vlm" 2>/dev/null | head -1)
     else
@@ -681,6 +694,39 @@ _start_dflash_mlx() {
 }
 
 # ============================================================
+# 启动 Inco Splash（engine built around the model; DFlash2 内置 decode 路径）
+# ============================================================
+_start_splash() {
+    _check_port "$LLAMA_PORT" || return 1
+
+    command -v splash >/dev/null 2>&1 || {
+        error "未找到 splash 命令。安装: brew install incoai/tap/splash"
+        return 1
+    }
+
+    info "启动 Splash..."
+    info "  配置: ${CYAN}$(_current_config_name)${NC}"
+    info "  模型包: $LLAMA_MODEL"
+    info "  地址: $LLAMA_HOST:$LLAMA_PORT"
+
+    local args=(serve --model "$LLAMA_MODEL" --host "${LLAMA_HOST:-127.0.0.1}" --port "${LLAMA_PORT:-8081}")
+    if [[ -n "${SPLASH_EXTRA_ARGS:-}" ]]; then
+        read -ra extra <<< "$SPLASH_EXTRA_ARGS"
+        args+=("${extra[@]}")
+    fi
+    if [[ -n "${SPLASH_API_KEY:-}" ]]; then
+        args+=(--api-key "$SPLASH_API_KEY")
+    fi
+
+    nohup splash "${args[@]}" >> "$LOGFILE" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+
+    info "进程已启动 (PID: $new_pid)，等待就绪（首次含模型校验/内核调优，可达数分钟）..."
+    _wait_for_ready "$new_pid" "Splash"
+}
+
+# ============================================================
 # 启动 MLX-VLM (Vision Language Model 推理服务)
 # ============================================================
 _start_mlx_vlm() {
@@ -986,6 +1032,9 @@ cmd_start() {
     case "$LLAMA_BACKEND" in
         rapid-mlx|vllm-mlx)
             _start_rapid_mlx || return 1
+            ;;
+        splash)
+            _start_splash || return 1
             ;;
         dflash-mlx|dflash)
             _start_dflash_mlx || return 1
@@ -1426,6 +1475,35 @@ EOF
 }
 
 # ============================================================
+# BVR 自调优闭环 (autotune.py CLI, 设计文档 bvr-autotune-loop-design-20260916)
+# ============================================================
+cmd_autotune() {
+    local sub="${1:-help}"
+    if [[ "$sub" == "help" || "$sub" == "-h" ]]; then
+        info "BVR 自调优闭环（autotune）——系统失败产物 → 提案 → 兑现 → 落参数"
+        info "用法: ./manage.sh autotune <generate|list|apply|rollback|status> [参数]"
+        info ""
+        info "  generate <events.jsonl> [--conf <conf>]"
+        info "      失败事件(JSONL) → 提取器 → 提案(落 pending 审计)"
+        info "      事件行: {\"type\": \"loop|amnesia|prefix_break|oom_evict|dup_reread|off_track\","
+        info "               \"ref\": \"fact://<type>/<sid>/<seq>\"}"
+        info "      默认取 configs/active.conf 的当前参数值计算 from/to"
+        info "  list                列出审计台账(全部状态)"
+        info "  apply <id> [--auto|--human]"
+        info "      应用提案——按风险分级签名: low 可 auto, medium/high 必须 --human"
+        info "      low 落地 logs/diag/autotune/overrides.conf (可回滚)"
+        info "  rollback <id>       回滚已应用提案(移除 overrides 行 + 审计)"
+        info "  status              晋级计数(daily/total)"
+        info ""
+        info "禁区: 密钥/权重/治理/主体边界参数永不出现; 无失败引用/无预言提案被拒"
+        info "设计: docs/02-architecture-design/bvr-autotune-loop-design-20260916.md"
+        return 0
+    fi
+    shift
+    python3 "$SCRIPT_DIR/autotune.py" "$sub" "$@"
+}
+
+# ============================================================
 # 切换配置
 # ============================================================
 cmd_switch() {
@@ -1571,6 +1649,9 @@ cmd_start_backend() {
         rapid-mlx|vllm-mlx)
             _start_rapid_mlx || return 1
             ;;
+        splash)
+            _start_splash || return 1
+            ;;
         dflash-mlx|dflash)
             _start_dflash_mlx || return 1
             ;;
@@ -1620,6 +1701,13 @@ cmd_stop_backend() {
     local i
     for i in {1..15}; do
         if ! kill -0 "$pid" 2>/dev/null; then
+            # Splash: server.py(前端) 退出后 serve-native(引擎) 已实测跟随退出;
+            # 兜底清理防万一(不留 GPU 残留)
+            if [[ "$backend" == "splash" ]] && pgrep -f 'serve-native' >/dev/null 2>&1; then
+                warn "Splash serve-native 残留, 兜底清理..."
+                pkill -f 'splash serve-native' 2>/dev/null || true
+                sleep 2
+            fi
             info "✅ 本地后端已停止 (GPU 内存已释放)"
             rm -f "$PIDFILE"
             _log_lifecycle_event "service_stop" "profile=$(_current_config_name) backend=$backend component=backend"
@@ -2399,6 +2487,9 @@ llama.cpp / Rapid-MLX 服务管理脚本
   models               显示模型目录（providers/models/routes、key 就绪状态、hash）
   models-validate      校验 configs/models.json（坏文件非零退出）
 
+自调优（BVR autotune）:
+  autotune help        查看 autotune 用法（generate/list/apply/rollback/status）
+
 快速启动:
   wizard               交互式向导，引导完成首次启动配置
 
@@ -2553,6 +2644,9 @@ main() {
             ;;
         config-lint)
             cmd_config_lint "${2:-}"
+            ;;
+        autotune)
+            cmd_autotune "$2" "${@:3}"
             ;;
         switch)
             _with_manage_lock cmd_switch "$2"
