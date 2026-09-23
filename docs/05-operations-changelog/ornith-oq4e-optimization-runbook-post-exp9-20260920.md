@@ -1443,6 +1443,71 @@ for ...:
 
 ---
 
+## 28. Splash 同机对照（27B 同权重 A/B，2026-09-23）
+
+> 背景：r2 收官（finale `finale-20260923-063037`）→ 并窗纪律解除 → 执行 Splash 试装计划
+> （`docs/03-experiments-testing/splash-trial-plan-20260922.md`）。
+
+### 28.1 对照设计（同权重，纯栈对照）
+
+**manifest `upstream` 实测**：Splash 包的 target = `mlx-community/Qwen3.8-27B-4bit@3e6447f0`
+—— **与我方 `qwen3.8-27b-4bit.conf` 同一上游** → 同权重同 tokenizer，差异纯在引擎/栈。
+
+### 28.2 结果（M5 Pro 48GB / AC / powermode AC=0）
+
+| 指标 | **Splash 1.0.2（int8 KV）** | **rapid-mlx 0.14.3（bf16 KV）** | 比值 |
+|---|---|---|---|
+| **decode 短** | **38.8 tok/s** | 17.6 tok/s | **Splash 2.2×** |
+| 16K 冷 TTFT | 56.4s | 56.3s | 打平 |
+| 32K 冷 TTFT | 65.1s | 65.1s | 打平 |
+| **32K 热 TTFT** | **0.36s** | 6.24s | **Splash 17×** |
+| prefill 32K | 610.7 tok/s | 611.3 tok/s | 打平 |
+
+原始数据：`logs/baselines/splash-vs-rapidmlx-27b-20260923.json`
+
+### 28.3 过程修正（诚实记录）
+
+- **首轮 Splash 19.8 tok/s 判无效**：根因 **`pmset powermode 1`（低电量模式）**，
+  AC 下也开着 → 压 GPU 频率。用户关闭后重测 **38.8（+96%）**。
+- **残余差距**（官方 74 vs 我方 38.8）：Chrome 85% CPU 抢占 + prompt 分布
+  （SPEED-Bench/reasoning-on 口径），未做清洁复测。
+- **A2（`--kv-format bf16`）跳过**：1.0.2 **未实现该旗标**（README 领先实现）。
+
+### 28.4 结论
+
+| 结论 | 依据 |
+|---|---|
+| **decode：Splash 2.2×** | DFlash 2 内置投机解码 + 特化 kernel（我方无 draft） |
+| **热 TTFT：Splash 17×**（32K） | paged KV + prefix 索引复用 vs 我方整条目精确匹配 |
+| **冷 prefill：打平** | 瓶颈在模型/IO，非 chunk 策略 |
+| **官方 74 vs 38.8** | 环境残差（Chrome/口径），非引擎差距证伪 |
+
+**与我方 Ornith 基线的关系**：Ornith（35B-A3B MoE）84.1 tok/s vs
+Splash Qwen3.6-35B-A3B 官方 210 tok/s —— **若 Splash 支持 Ornith，理论空间 ~2.5×**。
+
+### 28.5 连带定案与窗口 B 输入
+
+1. **27b conf KV 量化 → false（bf16）**：0.14.3 拒 hybrid 量化 **fail-closed 实测触发**
+   （`KVCacheQuantizationUnsupportedError: ArraysCache`）—— #12 注释预警兑现。
+   **#18 完成一半**（另一半 = vs 0.12.13 的 off 臂对照，并入窗口 B）。
+2. **HELP 文案修正**已在 patch 树 + 运行时（`d3ee77e`），**待窗口 B 重启生效**。
+3. **C（降 prefill 峰值）优先级建议重估**：两引擎 32K prefill 打平（611 tok/s）
+   → 冷 prefill 瓶颈在模型/IO 而非 chunk 策略。
+
+### 28.6 生产恢复
+
+`ornith-oq4e` + reload → proxy **healthy/ready** ✅（27B 试装期间代理 404 窗口约 40min）。
+
+### 28.7 工具入库
+
+| 文件 | 用途 |
+|---|---|
+| `tools/splash_trial.sh` | 阶段化试装（download/baseline/splash/bench/report） |
+| `tools/splash_par_download.sh` | curl+manifest 分片下载（SHA-256 校验） |
+| `tools/splash_curl_download.sh` | 顺序版下载器 |
+
+---
+
 ## 附录：涉及文件
 
 ```
