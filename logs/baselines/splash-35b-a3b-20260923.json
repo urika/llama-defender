@@ -1,0 +1,38 @@
+{
+  "tag": "splash-27b-int8-vs-35b",
+  "date": "2026-09-23",
+  "model": "incoai/Qwen3.6-35B-A3B-Splash",
+  "engine": "Splash 1.0.2",
+  "kv": "int8 (default)",
+  "prose_decode_tok_s": [
+    117.5,
+    121.5,
+    112.1
+  ],
+  "prose_avg": 117.0,
+  "code_decode_tok_s": [
+    228.6,
+    264.8
+  ],
+  "code_avg": 246.7,
+  "ladder": {
+    "16K": {
+      "cold_ttft_s": 8.61,
+      "warm_ttft_s": 0.11,
+      "prefill_tok_s": 2312
+    },
+    "32K": {
+      "cold_ttft_s": 12.67,
+      "warm_ttft_s": 0.1,
+      "prefill_tok_s": 3139
+    }
+  },
+  "official": {
+    "decode_short": 210,
+    "prefill_32k": 2011,
+    "cached_ttft_32k_ms": 123,
+    "concurrent4": 357,
+    "decode_32k": 143
+  },
+  "vs_rapidmlx_ornith_841": "1.39x (prose); code gap larger (DFlash2 acceptance)"
+}
