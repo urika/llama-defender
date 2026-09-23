@@ -1235,7 +1235,7 @@ cmd_status() {
         else
             api_status="${RED}无响应${NC}"
         fi
-        echo "  API ($LLAMA_HOST:$LLAMA_PORT): $api_status"
+        echo -e "  API ($LLAMA_HOST:$LLAMA_PORT): $api_status"
 
         local model_info
         model_info=$(curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" 2>/dev/null | \
@@ -1259,7 +1259,7 @@ cmd_status() {
             proxy_status="${YELLOW}无响应${NC}"
         fi
         echo "代理 (anthropic_proxy.py):"
-        echo "  状态:     $proxy_status"
+        echo -e "  状态:     $proxy_status"
         echo "  PID:      $proxy_pid"
         echo "  地址:     http://$PROXY_HOST:$PROXY_PORT"
     else
