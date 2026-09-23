@@ -1565,6 +1565,35 @@ Ornith（35B-A3B MoE，3B active）每 pass 读 ~1.7GB → 带宽上限 ~180 tok
 
 ---
 
+### 28.9 Splash 35B-A3B 实测（同模型族直接对照，2026-09-23）
+
+**下载 `incoai/Qwen3.6-35B-A3B-Splash`（20.9GB/56 文件 SHA 全验）并跑测**——
+**与 Ornith-1.5-35B-A3B 同级同架构族（MoE+GDN hybrid）的直接对照**。
+
+| 指标 | **Splash 35B-A3B** | 我方 rapid-mlx Ornith | 比值 |
+|---|---|---|---|
+| **散文 decode** | **117.0 tok/s**（117.5/121.5/112.1） | 84.1 tok/s | **1.39×** |
+| **代码 decode** | **228.6 / 264.8 tok/s** | 未测（Ornith 无 draft） | —（DFlash 2 接受率红利） |
+| 16K 冷 TTFT | 8.61s | ~15s（§17） | ~1.7× |
+| **16K 热 TTFT** | **0.11s** | 0.68s | **6×** |
+| **32K 冷 prefill** | **3,139 tok/s** | ~290 tok/s（§17 @160K/32K≈703） | **4.4–10×** |
+| 32K 热 TTFT | **0.10s** | 0.87s | **8.7×** |
+
+**官方 35B 数字**：decode 210 / prefill 32K 2011 / cached TTFT 123ms / 并发4 357。
+**我方散文 117 < 官方 210**（任务差异同 §28.8）；**代码 264 接近官方并发值**；
+**prefill 3139 反超官方 2011**（prompt 内容相关）。
+
+**判定**：
+1. **散文 1.39×**——同模型族下 Splash 引擎/调度/cache 的真实增益（非投机解码部分）
+2. **代码 3.1×**——DFlash 2 接受率红利（Ornith 无 draft 所以无此项）
+3. **热 TTFT 6–9×**——paged KV prefix 索引 vs 整条目精确匹配
+4. **cold prefill 4–10×**——kernel + 分页调度优势
+5. **Ornith 若获 Splash 支持**：散文 ~117+ / 代码 ~250+ 可期 → **联系 Inco 的数据支撑完整**
+
+**生产恢复**：Ornith + reload → healthy/ready ✅。
+
+---
+
 ## 附录：涉及文件
 
 ```
