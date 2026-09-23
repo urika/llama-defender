@@ -1200,8 +1200,8 @@ cmd_status() {
     fi
 
     if [[ "$is_cloud" == "true" ]]; then
-        echo "状态: ${GREEN}云端模式${NC}"
-        echo "  后端类型: ${CYAN}云端 API${NC}"
+        echo -e "状态: ${GREEN}云端模式${NC}"
+        echo -e "  后端类型: ${CYAN}云端 API${NC}"
         echo "  API 端点: $LLAMA_BASE_URL"
         echo "  模型:     ${MODEL_NAME:-deepseek-chat}"
         if [[ -n "${LLAMA_API_KEY:-}" ]]; then
@@ -1211,18 +1211,18 @@ cmd_status() {
     else
         # 本地模式：检查后端进程
         if ! pid=$(_get_pid 2>/dev/null); then
-            echo "状态: ${RED}未运行${NC}"
+            echo -e "状态: ${RED}未运行${NC}"
             echo "  PID 文件: $PIDFILE"
             echo "  日志文件: $LOGFILE"
-            echo "  当前配置: ${CYAN}$(_current_config_name)${NC}"
+            echo -e "  当前配置: ${CYAN}$(_current_config_name)${NC}"
             return 1
         fi
 
         backend=$(_current_backend 2>/dev/null || echo "unknown")
 
-        echo "状态: ${GREEN}运行中${NC}"
-        echo "  后端:     ${CYAN}$backend${NC}"
-        echo "  配置:     ${CYAN}$(_current_config_name)${NC}"
+        echo -e "状态: ${GREEN}运行中${NC}"
+        echo -e "  后端:     ${CYAN}$backend${NC}"
+        echo -e "  配置:     ${CYAN}$(_current_config_name)${NC}"
         echo "  PID:      $pid"
 
         local proc_info
@@ -1239,7 +1239,7 @@ cmd_status() {
 
         local model_info
         model_info=$(curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" 2>/dev/null | \
-            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('models',[{}])[0].get('model','?'))" 2>/dev/null || echo "?")
+            python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('data') or d.get('models') or [{}])[0].get('id') or d.get('model','?'))" 2>/dev/null || echo "?")
         echo "  模型:     $model_info"
 
         if [[ -f "$LOGFILE" ]]; then
@@ -1263,7 +1263,7 @@ cmd_status() {
         echo "  PID:      $proxy_pid"
         echo "  地址:     http://$PROXY_HOST:$PROXY_PORT"
     else
-        echo "代理 (anthropic_proxy.py): ${RED}未运行${NC}"
+        echo -e "代理 (anthropic_proxy.py): ${RED}未运行${NC}"
     fi
 
     # 辅助引擎状态（独立启停，与主后端共存）
