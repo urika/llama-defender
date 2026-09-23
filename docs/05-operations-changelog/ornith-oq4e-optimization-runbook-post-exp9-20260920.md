@@ -1641,6 +1641,73 @@ switch splash-qwen36-35b → start-backend（Ready 5s）
 
 ---
 
+## 30. 云端会话 epoch 豁免 + ctx_recall split 自答（2026-09-24）
+
+> 背景：6c53db70（bank-risk-report，57 轮）云端轮被 epoch 折叠（208K est → 65K 视图）
+> + ctx_recall 混合批次泄漏（No such tool available 循环）。用户裁决方案 A + 执行 B/C。
+
+### 30.1 云端 epoch 豁免（方案 ③ 根治）
+
+**时序缺口**：ContextEngine(0.5) 先于 SmartRouter(2.5) → `_route_target` 当轮恒 local →
+`_context_exempt` 的 cloud 判定失效 → 云端会话照跑 epoch（与 0907「云端客户端自管」定案冲突）。
+
+**修法**：`_context_exempt()` 补第三条件：
+
+```python
+or _ps._SESSION_ROUTE_MAP.get(ctx.session_id or '') == "cloud"
+```
+
+**上一轮会话路由记忆**做前馈（粘滞路由下上一轮=本轮；切回本地自动恢复治理）。
+一处修改覆盖全部 6 个调用点（stage 0.5/7/14/17）。零 stage 顺序改动。
+
+**语义**：
+- 云端会话 → exempt=True → 0.5 跳过（absorb/记账/epoch 全不跑）→ 逐字透传
+- `CLOUD_CM_ENABLED=true` 可强制代理治理（有意覆盖，语义不变）
+- 与并行会话的「半豁免」发现互相印证（其方案③ = 我方实现）
+
+### 30.2 ctx_recall 混合批次根治（split micro-turn）
+
+**根因**：模型把 ctx_recall 与 google_search 同轮并行 → 旧 `build_follow_up_messages`
+全有或全无（混有其他工具返回 None）→ 整响应透传 → 客户端 No such tool available → 循环。
+
+**修法**：`split_follow_up_messages()`——抽 cr 子集自答：
+
+```
+follow_up = [assistant(全量 tool_calls), tool(cr 结果)...]
+```
+
+- assistant **保留全量 tool_calls**（tool_use/result 配对完整，后端不 400）
+- 其余工具由模型在重派轮重新发起（等价透传）
+- 接入流式（anthropic_proxy）+ 非流式（pipeline）两路
+- 单测 5 项（混合/纯 cr/无 cr/坏参数/空）
+
+### 30.3 三层防御（ctx_recall 泄漏）
+
+| 层 | 机制 | 提交 |
+|---|---|---|
+| 预防 | TOOL_SCHEMA【调用纪律】必须单独调用 | `ebf3de2` |
+| 自愈 | split 自答（混合批次不再泄漏） | `c9613fb` |
+| 纠偏 | LOOP Lev1 专属提示（泄漏后下轮注入） | `c9613fb` |
+
+### 30.4 附带：413 回归根因（测试隔离）
+
+排查中发现 `test_payload_limit` 受**跨测试状态污染**：前测试残留
+`_SESSION_ROUTE_MAP['cli_cd3b']='cloud'` → exempt=True → 0.5 跳过 →
+请求仅 1 条孤立 tool_result → stage 19 `_fix_tool_pairings` 清空 →
+body 141B 不触发 413 → 404/401/503。
+
+**修**：setUp 清路由 map/请求计数/引擎 sessions（`8300e0c`）。
+**该污染路径本身证明 30.1 豁免逻辑真实生效**（exempt 链路按设计工作）。
+
+### 30.5 部署
+
+`manage.sh restart`（PID 29545）→ 断言 engine=True/S=70000/micro_turn=True。
+全量单测 **1741 passed**。联合文档 0924-1。
+
+**未核实**：6c53db70 下一轮真实流量的端到端豁免确认（等该会话再来请求）。
+
+---
+
 ## 附录：涉及文件
 
 ```
