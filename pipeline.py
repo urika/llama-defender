@@ -3839,7 +3839,8 @@ class BackendDispatcher(PipelineStage):
                             import ctx_recall as _cr
                             _tcs = ((openai_resp.get("choices") or [{}])[0]
                                     .get("message", {}).get("tool_calls") or [])
-                            _follow = _cr.build_follow_up_messages(
+                            # 0923 split: 同流式路径——混合批次抽 cr 自答
+                            _follow, _split = _cr.split_follow_up_messages(
                                 getattr(ctx, 'session_id', '') or '', _tcs)
                         except Exception as _e:
                             _warn_diag("micro_turn_build", _e)

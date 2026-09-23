@@ -388,6 +388,24 @@ def _apply_loop_intervention(
         }]
         return new_messages, new_tools, 2, tool_name
 
+    if tool_name == "ctx_recall":
+        # 0923 混合批次泄漏(0923 会话 be6274e9 实测): ctx_recall 必须单独调用,
+        # 与其他工具并行会被客户端以 No such tool available 拒绝(代理无法代答
+        # 混合批次)。Lev1 即注入专属纪律, 不等 Lev2。
+        new_messages = list(raw_messages) + [{
+            "role": "user",
+            "content": [{"type": "text", "text":
+                f"[System notice: ctx_recall is a PROXY-SIDE tool that is answered "
+                f"automatically. It MUST be called ALONE - never batch it with other "
+                f"tools in the same turn (parallel batches are rejected by the client "
+                f"with 'No such tool available'). You have now repeated it {max_run} "
+                f"times without success: STOP retrying the same query; either issue "
+                f"ctx_recall alone with a DIFFERENT query/anchor, or continue without "
+                f"that content.]"
+            }]
+        }]
+        return new_messages, raw_tools, 1, tool_name
+
     new_messages = list(raw_messages) + [{
         "role": "user",
         "content": [{"type": "text", "text":

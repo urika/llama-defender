@@ -1737,8 +1737,15 @@ class Handler(BaseHTTPRequestHandler):
                     import ctx_recall as _cr
                     _tcs = [tool_calls_buffer[i] for i in sorted(tool_calls_buffer)
                             if tool_calls_buffer[i].get("function", {}).get("name")]
-                    _follow = _cr.build_follow_up_messages(
+                    # 0923 split: 混合批次(ctx_recall+其他)不再整单放弃——
+                    # 抽 cr 子集自答，其余工具让模型重派轮重新发起。
+                    _follow, _split = _cr.split_follow_up_messages(
                         getattr(_log_ctx, 'session_id', None) or '', _tcs)
+                    if _follow is not None and _split and any(
+                            (tc.get("function") or {}).get("name") != "ctx_recall"
+                            for tc in _tcs):
+                        log("  -> [MICRO_TURN] mixed batch split: ctx_recall "
+                            "self-answered, other tools re-issued by model")
                 except Exception as _e:
                     _warn_diag("micro_turn_build", _e)
                 if _follow is not None:

@@ -1227,9 +1227,87 @@ def build_follow_up_messages(session_key, tool_calls):
     return follow_up
 
 
+def split_follow_up_messages(session_key, tool_calls):
+    """混合批次的拆分自答（B 根治，0923）。
+
+    模型把 ctx_recall 与其他工具并行调用时，全有或全无的
+    build_follow_up_messages 会返回 None → 整响应透传 → 客户端
+    'No such tool available'。本函数改为：
+      - 抽出 ctx_recall 子集并自答，生成 follow_up：
+        [assistant(tool_calls=全部tc), tool(ctx_recall结果)...]
+        —— assistant 保留全部调用（tool_use/result 配对完整，后端不 400），
+        其余工具的结果由模型在重派轮重新发起（等价透传）。
+      - 只要含至少一个 ctx_recall 就返回 (follow_up, True)；否则 (None, False)。
+    """
+    if not session_key or not tool_calls:
+        return None, False
+    cr_tcs = [tc for tc in tool_calls
+              if (tc.get("function") or {}).get("name") == "ctx_recall"]
+    if not cr_tcs:
+        return None, False
+    follow_up = build_follow_up_messages(session_key, tool_calls)
+    if follow_up is not None:
+        return follow_up, True
+    # build 失败只可能因混有其他工具/参数坏——这里手工构造：
+    assistant_tc = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                args = {}
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        assistant_tc.append({
+            "id": tc.get("id") or "call_%s" % os.urandom(8).hex(),
+            "type": "function",
+            "function": {"name": fn.get("name") or "unknown",
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    follow_up = [{"role": "assistant", "content": "", "tool_calls": assistant_tc}]
+    for tc in cr_tcs:
+        fn = tc.get("function") or {}
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                args = {}
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        query = str(args.get("query", "")).strip()
+        if not query:
+            result = ("ctx_recall: missing query param. Usage: {\"query\": "
+                      "\"path/tool/keyword/anchor(@offset for paging)\", "
+                      "\"kind\": \"tool_use|tool_result|text\", \"limit\": 8}")
+        else:
+            try:
+                kind = args.get("kind") or None
+                if kind in ("", "any", "all"):
+                    kind = None
+                try:
+                    limit = max(1, min(int(args.get("limit") or 8), 20))
+                except (TypeError, ValueError):
+                    limit = 8
+                base_q, paged_off = parse_query_offset(query)
+                lines = lookup(session_key, base_q, kind=kind, limit=limit)
+                result = format_recall_result(lines, base_q, session_key,
+                                              offset=paged_off)
+            except Exception as e:
+                result = "ctx_recall: lookup failed(%s)." % e
+        follow_up.append({
+            "role": "tool",
+            "tool_call_id": tc.get("id") or "call_%s" % os.urandom(8).hex(),
+            "content": result[:MICRO_TURN_RESULT_MAX_CHARS],
+        })
+    return follow_up, True
+
+
+
 __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
     "line_text", "recover_full_content", "DEFAULT_LIMIT",
-    "build_follow_up_messages", "MICRO_TURN_RESULT_MAX_CHARS",
+    "build_follow_up_messages", "split_follow_up_messages",
+    "MICRO_TURN_RESULT_MAX_CHARS",
     "auto_recall_for_target",
 ]
