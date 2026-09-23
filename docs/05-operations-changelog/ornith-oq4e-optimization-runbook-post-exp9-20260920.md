@@ -1594,6 +1594,53 @@ Ornith（35B-A3B MoE，3B active）每 pass 读 ~1.7GB → 带宽上限 ~180 tok
 
 ---
 
+## 29. Splash 生产配置接入（2026-09-23）
+
+> 提交 `319e735`。两个 Splash conf 与 ornith-oq4e **同等地位**，`./manage.sh switch` 随时互切。
+
+### 29.1 新增配置
+
+| conf | 模型包 | 实测 | 适用 |
+|---|---|---|---|
+| `splash-qwen36-35b.conf` | `incoai/Qwen3.6-35B-A3B-Splash`（20.9GB） | 散文 117 / 代码 264 tok/s；热 TTFT 32K **0.10s**；prefill 32K 3139 | 长散文 agentic（全面优于 Ornith） |
+| `splash-qwen38-27b.conf` | `incoai/Qwen3.8-27B-Splash`（17.4GB） | 代码 78–86 tok/s；热 TTFT 32K **0.36s**；散文 38.8（dense 带宽极限） | 代码任务档 |
+
+### 29.2 manage.sh 改动
+
+1. **`_start_splash()`**：`nohup splash serve --model … --port $LLAMA_PORT`（透传 `SPLASH_EXTRA_ARGS` / `SPLASH_API_KEY`）
+2. **case 分支**：`LLAMA_BACKEND=splash`
+3. **`_current_backend` / `_get_pid` splash 分支（关键）**：splash CLI 启动后 spawn `server.py`(前端,持有监听端口) + `serve-native`(引擎,子进程) 后**自身退出** → PID 文件失效。改**按 `LLAMA_PORT` 端口感知**定位前端；杀前端则 native 连带退出（实测确认）+ stop 兜底清理
+4. **admin_server.py**：backend 进程匹配模式加 `splash`（修复 `/api/status` 误报 `backend_down`——需**代理重启**生效，SIGHUP 不加载代码）
+
+### 29.3 验证链（全过）
+
+```
+switch splash-qwen36-35b → start-backend（Ready 5s）
+→ 代理重启 → /api/status = healthy（模型名 incoai/Qwen3.6-35B-A3B-Splash）
+→ 烟测 OK → stop-backend（端口感知定位前端 7570）
+→ 零残留（无 serve-native / server.py / :8081 释放）
+→ 切回 ornith-oq4e → healthy + 端到端 OK
+```
+
+### 29.4 使用方式与注意
+
+```bash
+./manage.sh switch splash-qwen36-35b && ./manage.sh restart   # 切 Splash 35B
+./manage.sh switch ornith-oq4e       && ./manage.sh restart   # 切回 Ornith
+```
+
+- **互斥**：48GB 单引擎（Ornith 20GB / Splash 35B 21GB / 27B 18GB），切换即停旧起新
+- **切换窗口**：代理 404 约 1–2 分钟（模型加载）；r2 类批期禁切（红线 1）
+- **诊断降级**：Splash 无 `snapdown_*`/R13-R16 依赖的 rapid-mlx 计数器；`/metrics` 为 Prometheus（TTFT/decode 聚合直方图）
+- **API**：OpenAI Chat + Anthropic Messages 原生；代理 model 字段透传兼容（`model is optional`）
+
+### 29.5 遗留
+
+- 清洁环境复测（Chrome 全退 + reasoning-on 口径）验证 Splash 74 tok/s 是否可达
+- Ornith Splash 打包：已发 contact@inco.ai（草稿 `inco-contact-email-draft-20260923.md`）
+
+---
+
 ## 附录：涉及文件
 
 ```
