@@ -1226,8 +1226,24 @@ cmd_status() {
         echo "  PID:      $pid"
 
         local proc_info
-        proc_info=$(ps -p "$pid" -o rss=,etime=,pcpu= 2>/dev/null | awk '{printf "  内存: %.1f GB\n  运行时间: %s\n  CPU: %s%%", $1/1024/1024, $2, $3}')
+        # splash: 前端(server.py)只是壳, 统计须并引擎子进程 serve-native;
+        # 权威内存用 :PORT/status memory_actual.current_bytes（sparse mmap 下 RSS 失真）
+        local stats_pid="$pid"
+        if [[ "$backend" == "splash" ]]; then
+            local native_pid
+            native_pid=$(pgrep -f 'serve-native' 2>/dev/null | head -1)
+            if [[ -n "$native_pid" ]]; then
+                stats_pid="$pid,$native_pid"
+            fi
+        fi
+        proc_info=$(ps -p "$stats_pid" -o rss=,etime=,pcpu= 2>/dev/null | awk '{rss+=$1; if($2>et)et=$2; cpu+=$3} END {printf "  进程 RSS: %.1f GB\n  运行时间: %s\n  CPU: %s%%", rss/1024/1024, et, cpu}')
         echo "$proc_info"
+        if [[ "$backend" == "splash" ]]; then
+            local splash_mem
+            splash_mem=$(curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/status" 2>/dev/null | \
+                python3 -c "import json,sys; d=json.load(sys.stdin); m=d.get('memory_actual',{}); print(f\"{m.get('current_bytes',0)/1024**3:.1f} GB (Metal 实际) / 峰值 {m.get('peak_bytes',0)/1024**3:.1f} GB\")" 2>/dev/null)
+            [ -n "$splash_mem" ] && echo "  内存(Splash): $splash_mem"
+        fi
 
         local api_status
         if curl -s --max-time 3 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
