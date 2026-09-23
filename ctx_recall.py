@@ -43,6 +43,10 @@ TOOL_SCHEMA = {
         "query=锚点#sym:函数名 直接取该函数源码（如 r:call_x#sym:_load_extras），"
         "query=路径::函数名（如 plugins/psrp.py::load_extras）可定位符号；"
         "大文件原文分页披露——续读用 锚点@偏移（如 r:call_x@4000）。"
+        "【调用纪律】本工具由推理代理代答：必须单独调用——"
+        "同一轮不要与其他任何工具并行调用（并行批次无法代答，会被客户端"
+        "以 No such tool available 拒绝并浪费轮次）；需要多项信息时先单独"
+        "发 ctx_recall，等结果返回后再发其他工具调用。"
     ),
     "input_schema": {
         "type": "object",
