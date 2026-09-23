@@ -359,7 +359,6 @@ class InstrumentedPipeline(Pipeline):
             if span is not None and stage.name in _CONTEXT_TRACE_STAGES:
                 trace_ctx_before = _trace_unit_map(ctx.messages)
             try:
-                _msgn_before = len(ctx.messages) if getattr(ctx, "messages", None) else 0
                 ctx = stage.process(ctx)
             except Exception as e:
                 trace_context.finish_span(span, status="error", error=e)
