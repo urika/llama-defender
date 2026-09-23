@@ -2,7 +2,8 @@
 
 > 收件人：contact@inco.ai
 > 主题：**Splash packaging request: Ornith-1.5-35B-A3B (MoE + GatedDeltaNet hybrid, same family as Qwen3.6-35B-A3B)**
-> 状态：**草稿待用户审阅** ｜ 撰写：2026-09-23
+> 状态：**✅ 已发送**（2026-09-23，经 QQ Mail SMTP → contact@inco.ai，用户指令「直接发」）
+> 附件未随附（benchmark JSON 可后续提供；草稿末清单中「姓名/角色/联系方式」占位未填即发——落款为空，等待 Inco 回信后补签名）
 
 ---
 
