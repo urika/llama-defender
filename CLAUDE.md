@@ -110,7 +110,9 @@ Configs live in `configs/*.conf` as bash-sourcable files. `configs/active.conf` 
 |--------|---------|-------|--------|----------|
 | `ornith-oq4e` (active) | rapid-mlx | pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp | ~16–20 GB | **Ornith-1.5 自改进 MoE，oQ4e imatrix 混合精度（20.1GB）**，质量优于均匀 4-bit，thinking off，**rapid-mlx 0.14.3 + bf16 KV，decode ~84 tok/s**，`--hybrid-cache-entries 8` 必配（无投机解码） |
 | `dflash-35b` | dflash-mlx | mlx-community/Qwen3.6-35B-A3B-4bit + z-lab/Qwen3.6-35B-A3B-DFlash | ~20 GB | **DFlash 投机解码（~117 tok/s）**，thinking off，prefix cache 有效 |
-| `qwen3.8-27b-4bit` | rapid-mlx | Qwen3.8-27B 4bit | ~15–18 GB | Qwen3.8 hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 |
+| `qwen3.8-27b-4bit` | rapid-mlx | Qwen3.8-27B 4bit | ~15–18 GB | Qwen3.8 hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80，KV bf16（0.14.3 拒 hybrid 量化） |
+| `splash-qwen36-35b` | **Splash 1.0.2** | incoai/Qwen3.6-35B-A3B-Splash | ~21 GB | **Inco Splash（DFlash 2 内置）**：散文 117/代码 264 tok/s，热 TTFT 32K 0.10s；与 Ornith **互斥单引擎**（switch+restart），诊断降级（无 /metrics 驱逐计数） |
+| `splash-qwen38-27b` | **Splash 1.0.2** | incoai/Qwen3.8-27B-Splash | ~18 GB | Splash 27B：代码 78–86 tok/s（散文 38.8=带宽极限）；互斥同上 |
 | `qwen3.6-27b-4bit` | rapid-mlx | Qwen3.6-27B dense 4bit | ~13–16 GB | Dense alternative，tool clearing off |
 | `gemma4-26b` | rapid-mlx | gemma-4-26b-it | ~14–16 GB | Gemma 4 26B, concurrency=2, temp 0.2 |
 | `deepseek-chat` | cloud (DeepSeek) | `deepseek-v4-flash` | N/A | Cloud API, no local backend |

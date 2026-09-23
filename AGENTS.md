@@ -149,7 +149,10 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | `configs/ornith-9b.conf` | rapid-mlx + Ornith-1.5-9B-MLX-4bit（dense hybrid ~5GB，262K 原生上下文，文档处理/轻量任务定位；`--no-mllm` 纯文本——该 MLX 构建无视觉塔；无投机解码：2026-08-29 实测 llama.cpp DFlash 对 9B 档无净收益；`--hybrid-cache-entries 8` 必配，thinking off） |
 | `configs/minicpm5-2b.conf` | rapid-mlx + MiniCPM5-2B-MLX-4bit（本地路径 `~/models/`，dense Llama 2.5B 4bit ~1.35GB，131K ctx；**辅助引擎**，独立端口 8082，`start-aux/stop-aux` 独立启停、与主后端共存；无 MTP 层，官方 DSpark drafter 仅 SGLang 支持不在本机可用） |
 | `configs/dflash-35b.conf` | dflash-mlx + Qwen3.6-35B-A3B-4bit + z-lab DFlash（DFlash 投机解码 ~117 tok/s，thinking off，drafter 需 config 补丁，见 docs/05-operations-changelog/dflash-mlx-integration-20260826.md） |
-| `configs/qwen3.8-27b-4bit.conf` | rapid-mlx **0.14.3**（`.venv-rapidmlx-0143`，2026-09-21 #12 升级；EXP-8 LCP off 臂前置）+ Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 + pflash，prefix cache 增量轮秒级）。**KV 量化待定**：0.14.3 对 hybrid GDN 拒绝量化，须关（bf16）或待上游支持 |
+| `configs/qwen3.8-27b-4bit.conf` | rapid-mlx **0.14.3**（`.venv-rapidmlx-0143`，2026-09-21 #12 升级；EXP-8 LCP off 臂前置）+ Qwen3.8-27B 4bit（hybrid，`--hybrid-cache-entries 8` + gpu-mem 0.80 + pflash，prefix cache 增量轮秒级）。**KV 量化已定案 bf16**（2026-09-23：0.14.3 对 hybrid GDN 拒绝量化 fail-closed 实测，`KV_QUANTIZATION=false`） |
+| `configs/splash-qwen36-35b.conf` | **Inco Splash 1.0.2**（DFlash 2 内置 decode 路径）+ Qwen3.6-35B-A3B-Splash 包（20.9GB，含专用 draft）：**散文 117 / 代码 264 tok/s，热 TTFT 32K 0.10s，32K 冷 prefill 3139 tok/s**；`LLAMA_BACKEND=splash`，与 ornith-oq4e **互斥单引擎**（switch+restart）；同机对照见 runbook §28/§28.9 |
+| `configs/splash-qwen38-27b.conf` | **Inco Splash 1.0.2** + Qwen3.8-27B-Splash 包（17.4GB）：代码任务 78–86 tok/s（散文 38.8=带宽极限+接受率），热 TTFT 32K 0.36s；与 ornith-oq4e 互斥 |
+| `configs/ornith-oq4e-256k.conf` | llama-server + Ornith-oQ4e GGUF（**256K 非交互档**）：禁头截断+大 KV（12.8–16GB）+原文寄存；冷 prefill 8–10min 可容忍、暖轮 10–30s；**批处理/长文档专用** |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
 | `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点（`deepseek-v4-flash`） |
@@ -261,6 +264,17 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 - 否则 → `local`（含 rapid-mlx / dflash-mlx / llama-server，均走 `http://127.0.0.1:8081/v1`）
 
 `MODEL_NAME` 也会自动设置（local 默认 `mlx-community/Qwen3.6-35B-A3B-4bit`，cloud 默认 `deepseek-v4-pro`；`deepseek-chat.conf` 显式设为 `deepseek-v4-flash`）。这些默认值由 `backend_strategy.py` 的 `LocalStrategy` / `CloudStrategy` 提供。
+
+### 4.5 Splash 引擎（2026-09-23 接入，runbook §29）
+
+`LLAMA_BACKEND=splash`（`configs/splash-qwen36-35b.conf` / `splash-qwen38-27b.conf`）：Inco AI 开源引擎，**DFlash 2 投机解码内置于 decode 路径**，`splash serve` 启动。
+
+- **进程模型（与 rapid-mlx 关键差异）**：splash CLI spawn `server.py`（前端，持 :8081 LISTEN）+ `serve-native`（引擎子进程）后**自身退出** → manage.sh 按端口感知前端 PID；杀前端→native 连带退出，stop 兜底 `pkill serve-native`
+- **互斥单引擎**：与 Ornith（rapid-mlx）不可同跑，切换 = `switch <name> && restart`
+- **诊断降级**：rapid-mlx 的 `/metrics`（snapdown/驱逐计数）、timings、KV dtype 在 Splash 无对应物；`/api/status` 的 backend 进程匹配已加 `splash`
+- **性能参照**（27B/35B-A3B，M5 Pro 48GB）：代码任务 78–264 tok/s（DFlash2 接受率红利）、32K 热 TTFT 0.10–0.36s、32K 冷 prefill 611–3139 tok/s；散文受带宽极限（27B 38.8 = 上限）
+- **模型格式封闭**：仅 `incoai/*-Splash` 专有包（`splash-packed-q4[-moe]`），普通 MLX/HF 权重不加载
+- **切换纪律**：批跑期禁切（红线 1）；admin_server.py 的 splash 匹配需代理重启生效
 
 > **hybrid 前缀缓存必知**：Qwen3.8-27B / Qwen3.6-35B-A3B / Ornith-1.5-35B-A3B（均 Qwen3.5/3.6/3.8 系 hybrid GatedDeltaNet）在 rapid-mlx 中对 prefix cache 条目标 `non_trimmable`（只整条精确匹配）。必须 `--hybrid-cache-entries 8`（启用 trim-free 前缀复用；0=禁用→每轮全量冷 prefill）；关 `PROXY_CTX_ENGINE_ENABLED` 配合稳定前缀可保命中。**0.14.3 起上游内置 hybrid recurrent-state checkpoint**（`RAPID_MLX_HYBRID_CHECKPOINT_MAX`=4/`_STRIDE`=2048，prefill chunk 级快照 + fetch 侧 LCP/supersequence snap），使部分前缀复用成为可能（实测冷 prefill 2.3–3.6×）；**cache 上限勿盲目调大**：`--cache-memory-mb` 12GB→16GB 实测反引入 Metal pressure（cache 上限与 Metal cap 打架），已回退；**降 `--hybrid-cache-entries` 反而三赢**（见 §11.2 表）。另：hybrid 骨干被 rapid-mlx 门控关闭投机解码（MTP/DFlash/DSpark 均不可用，见 issue #1941）。详见 `docs/05-operations-changelog/dflash-mlx-integration-20260826.md` 与 `docs/05-operations-changelog/ornith-15-integration-20260826.md`。
 
