@@ -1508,6 +1508,63 @@ Splash Qwen3.6-35B-A3B 官方 210 tok/s —— **若 Splash 支持 Ornith，理�
 
 ---
 
+### 28.8 🔬 38.8 归因修正：带宽极限 + DFlash 接受率（2026-09-23 复测）
+
+**外部调研 + 复测推翻 §28.4 的「环境残差」归因**。
+
+#### 28.8.1 M5 Pro 带宽理论极限（Reddit Open-Adhesives-86 分析，我方实测吻合）
+
+> dense 27B（17.4GB）每 forward 必读全部权重；M5 Pro 带宽 ~307GB/s
+> → **纯 decode 上限 ≈ 17–18 tok/s**
+
+**我方 rapid-mlx 27B 实测 17.6 tok/s = 已榨干带宽极限**（正面结论，非缺陷）。
+
+#### 28.8.2 Splash 增益本质 = DFlash 2 接受率（任务依赖）
+
+| 任务 | Splash 实测 | 每 pass 接受 token | 对照 |
+|---|---|---|---|
+| **散文**（技术 essay） | **38.8 tok/s** | ~2.2 | — |
+| **代码**（HumanEval 风格） | **78.5–85.9 tok/s** | **~4.5** | 官方 "mean acceptance 4.80" 吻合 ✅ |
+| 代码（算法/LRU） | 58.6–63.7 tok/s | ~3.5 | — |
+
+#### 28.8.3 三个数字全部闭合
+
+```
+17.6       = M5 Pro 带宽极限（rapid-mlx 已到顶）
+38.8       = Splash + 散文（接受率 ~2.2/pass）
+78.5–85.9  = Splash + 代码（接受率 ~4.5/pass）≈ 官方 74 口径 ✅（反超因 reasoning=off）
+```
+
+#### 28.8.4 官方 74 的完整口径（vramcalculator 复核 + MTPLX 作者评估）
+
+- **SPEED-Bench coding prompts**（DFlash 接受率最高的任务）+ reasoning on(medium) + P50 中位数
+- **第三方（MTPLX 作者 Youssofal_）**：「benchmark 是 coding prompts——draft 被接受最多的时候；
+  其他类型文本的速度才是该盯的数字」（同时认可 Inco 基准透明、无作弊）
+- 144 tok/s 是 **M5 Max**（带宽 2×）的 demo，非 M5 Pro
+
+#### 28.8.5 修正后的 §28.4 结论表
+
+| 结论 | 修正后 |
+|---|---|
+| decode 2.2× | **任务依赖**：代码任务 2.2–4.9×；散文 2.2×；均源于 DFlash 2 接受率 |
+| 热 TTFT 17× | 不变（paged KV + prefix 索引） |
+| 冷 prefill 打平 | 不变（瓶颈在模型/IO） |
+| ~~环境残差~~ | **降级为次要因素**；主因 = **prompt 类型 → 接受率** |
+
+#### 28.8.6 附带发现：Qwen3.8-27B 默认 reasoning = xhigh
+
+HF 官方讨论确认：**默认所有 prompt 用 xhigh**（overthinking，烧 8K–32K thinking token）。
+我方 27B conf 已有 `LLAMA_THINKING=false` + R12-T1F auto-disable 兜底 ✅；
+**任何启用 thinking 的场景须显式设 effort**，勿信默认。
+
+#### 28.8.7 对 Ornith 的最终推算
+
+Ornith（35B-A3B MoE，3B active）每 pass 读 ~1.7GB → 带宽上限 ~180 tok/s；
+我方 rapid-mlx 84.1 + DFlash 2（若有 draft，代码任务接受 ~4.5）→ **理论 150–250+ tok/s**。
+**联系 Inco 的依据充分**（contact@inco.ai 明示接受 fine-tune 打包请求）。
+
+---
+
 ## 附录：涉及文件
 
 ```
