@@ -1061,6 +1061,25 @@ CONFIG_REGISTRY = {
                "413 拒绝(不截断——截断的处方比没有更危险, 调用方重发精简版); "
                "保护 DEF-311 钉住预算(8000)不被单个巨段挤占。",
     },
+    "PROXY_AUTOTUNE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "BVR 自调优闭环总开关（bvr-autotune-loop-design-20260916）: "
+               "默认关 = 纯旁路（autotune.py 独立 CLI, 不进入 proxy 运行路径）; "
+               "开 = 允许低风险提案按分级签名落 overrides.conf。",
+    },
+    "PROXY_AUTOTUNE_DAILY_LIMIT": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "BVR 自调优每日晋级提案上限（T4 限速）: 超限 gate 返回 "
+               "over_daily_limit。",
+    },
+    "PROXY_AUTOTUNE_SESSION_LIMIT": {
+        "defaults": {"all": "1"},
+        "type": "int", "scope": "reloadable",
+        "doc": "BVR 自调优单会话晋级提案上限（T4 限速）: 超限 gate 返回 "
+               "over_session_limit。",
+    },
     "PROXY_CTX_VIEW_STABLE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
