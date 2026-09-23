@@ -51,6 +51,19 @@ class TestPayloadSizeLimit(unittest.TestCase):
         proxy_state._DIAG_DIR = self._tmp
         proxy_state._DIAG_SESSIONS_PATH = os.path.join(self._tmp, "sessions.jsonl")
         proxy_state._LIFECYCLE_EVENTS_PATH = os.path.join(self._tmp, "lifecycle.jsonl")
+        # 0923 修复: 测试间模块级状态污染——cloud 路由测试把 session 写进
+        # _SESSION_ROUTE_MAP, 下个测试(oversized) exempt=True 跳过 0.5 引擎,
+        # canonical 不再 absorb 重建 → tool_use/result 残缺被 stage19 配对修复
+        # 清空 → openai_body.messages=[] → 413 不触发 → 503。
+        # 修法: 每 test 清跨测试状态(与 stage 0.5 的 absorb 建立等价前提)。
+        proxy_state._SESSION_ROUTE_MAP.clear()
+        proxy_state._SESSION_REQUEST_COUNT.clear()
+        try:
+            import context_engine as _ce
+            if getattr(_ce, "ENGINE", None) is not None:
+                _ce.ENGINE.sessions.clear()
+        except Exception:
+            pass
 
     def tearDown(self):
         (proxy_state._DIAG_DIR, proxy_state._DIAG_SESSIONS_PATH,

@@ -359,6 +359,7 @@ class InstrumentedPipeline(Pipeline):
             if span is not None and stage.name in _CONTEXT_TRACE_STAGES:
                 trace_ctx_before = _trace_unit_map(ctx.messages)
             try:
+                _msgn_before = len(ctx.messages) if getattr(ctx, "messages", None) else 0
                 ctx = stage.process(ctx)
             except Exception as e:
                 trace_context.finish_span(span, status="error", error=e)
@@ -598,8 +599,13 @@ def _context_exempt(ctx):
             return cm == "client"
     except Exception:
         pass
+    # 0923 补时序缺口: stage 0.5 先于 SmartRouter(2.5), _route_target 恒
+    # local——云端会话(会话粘滞记忆)在此永远判不出 cloud → epoch 照样折叠
+    # (6c53db70 实测: 云端 208K est 被折叠成 65K)。补看上一轮会话路由记忆;
+    # 粘滞路由下上一轮=本轮。切回本地自动恢复引擎治理。
     cloud = (getattr(ctx, '_route_target', 'local') == 'cloud'
-             or getattr(ctx, '_route_header_override', '') == 'cloud')
+             or getattr(ctx, '_route_header_override', '') == 'cloud'
+             or _ps._SESSION_ROUTE_MAP.get(ctx.session_id or '') == "cloud")
     if cloud:
         return not getattr(_ps, "PROXY_CLOUD_CM_ENABLED", False)
     return False
