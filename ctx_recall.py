@@ -1234,9 +1234,10 @@ def split_follow_up_messages(session_key, tool_calls):
     build_follow_up_messages 会返回 None → 整响应透传 → 客户端
     'No such tool available'。本函数改为：
       - 抽出 ctx_recall 子集并自答，生成 follow_up：
-        [assistant(tool_calls=全部tc), tool(ctx_recall结果)...]
-        —— assistant 保留全部调用（tool_use/result 配对完整，后端不 400），
-        其余工具的结果由模型在重派轮重新发起（等价透传）。
+        [assistant(tool_calls=仅cr子集), tool(ctx_recall结果)...]
+        —— assistant 只含 cr 调用（一一配对，后端不 400；
+        OpenAI 要求每个 tool_call 都有对应 tool 消息，全量保留反而 400），
+        其余工具丢弃，由模型在重派轮重新发起（等价透传）。
       - 只要含至少一个 ctx_recall 就返回 (follow_up, True)；否则 (None, False)。
     """
     if not session_key or not tool_calls:
@@ -1248,9 +1249,10 @@ def split_follow_up_messages(session_key, tool_calls):
     follow_up = build_follow_up_messages(session_key, tool_calls)
     if follow_up is not None:
         return follow_up, True
-    # build 失败只可能因混有其他工具/参数坏——这里手工构造：
+    # build 失败只可能因混有其他工具/参数坏——这里手工构造（仅 cr 子集）：
+    # id 先稳定一次，assistant/tool 两处复用同一 id（缺 id 时防配对错位）。
     assistant_tc = []
-    for tc in tool_calls:
+    for tc in cr_tcs:
         fn = tc.get("function") or {}
         raw_args = fn.get("arguments") or "{}"
         try:
@@ -1262,19 +1264,12 @@ def split_follow_up_messages(session_key, tool_calls):
         assistant_tc.append({
             "id": tc.get("id") or "call_%s" % os.urandom(8).hex(),
             "type": "function",
-            "function": {"name": fn.get("name") or "unknown",
+            "function": {"name": "ctx_recall",
                          "arguments": json.dumps(args, ensure_ascii=False)},
         })
     follow_up = [{"role": "assistant", "content": "", "tool_calls": assistant_tc}]
-    for tc in cr_tcs:
-        fn = tc.get("function") or {}
-        raw_args = fn.get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args)
-            if not isinstance(args, dict):
-                args = {}
-        except (json.JSONDecodeError, ValueError):
-            args = {}
+    for tc in assistant_tc:
+        args = json.loads(tc["function"]["arguments"])
         query = str(args.get("query", "")).strip()
         if not query:
             result = ("ctx_recall: missing query param. Usage: {\"query\": "

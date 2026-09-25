@@ -1673,13 +1673,14 @@ or _ps._SESSION_ROUTE_MAP.get(ctx.session_id or '') == "cloud"
 **修法**：`split_follow_up_messages()`——抽 cr 子集自答：
 
 ```
-follow_up = [assistant(全量 tool_calls), tool(cr 结果)...]
+follow_up = [assistant(仅 cr 子集 tool_calls), tool(cr 结果)...]
 ```
 
-- assistant **保留全量 tool_calls**（tool_use/result 配对完整，后端不 400）
-- 其余工具由模型在重派轮重新发起（等价透传）
+- assistant **只含 cr 调用**（一一配对，后端不 400；全量保留反而因缺 tool
+  应答触发 OpenAI 400——P1 review 修正）
+- 其余工具丢弃，由模型在重派轮重新发起（等价透传）
 - 接入流式（anthropic_proxy）+ 非流式（pipeline）两路
-- 单测 5 项（混合/纯 cr/无 cr/坏参数/空）
+- 单测 6 项（混合/配对完整/纯 cr/无 cr/坏参数/空）
 
 ### 30.3 三层防御（ctx_recall 泄漏）
 
