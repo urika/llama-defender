@@ -25,19 +25,30 @@ def _run(cmd, timeout=3):
 # --- _get_process_info ---
 def _get_process_info(pattern, name, fallback_port=None):
     """Return dict with pid, rss_mb, cpu, elapsed for a process matching pattern."""
-    # Try pgrep first
-    pid = _run(f"pgrep -f '{pattern}' | head -1")
-    # Fallback: detect by listening port (for proxy itself)
-    # Use -sTCP:LISTEN to only match the listening process, not client connections
-    if not pid and fallback_port:
+    # Port holder first: it is the unique truth. pgrep -f is ambiguous when
+    # shadow/aux copies of the same script run concurrently (e.g. promptfoo
+    # shadow proxy on :4021), which misattributed /api/status pid/uptime
+    # to the shadow instead of the production proxy (2026-09-27).
+    pid = ""
+    name_pid = ""
+    if fallback_port:
         pid = _run(f"lsof -i :{fallback_port} -sTCP:LISTEN -t | head -1")
+        # L-49 残余缺口收口 (2026-09-28): 给了端口即以端口持有者为唯一权威,
+        # 不再回退 pgrep —— 否则并发的 shadow/测试实例(如 promptfoo :4021)会把
+        # "生产代理已死" 伪装成 alive。pgrep 结果仅留作诊断(name_scan_pid)。
+        name_pid = _run(f"pgrep -f '{pattern}' | head -1")
+    else:
+        pid = _run(f"pgrep -f '{pattern}' | head -1")
     if not pid:
-        return {"running": False, "name": name}
+        info = {"running": False, "name": name}
+        if name_pid:
+            info["name_scan_pid"] = name_pid
+        return info
     info = _run(f"ps -o pid=,rss=,pcpu=,etime= -p {pid}")
     parts = info.split()
     if len(parts) >= 4:
         rss_kb = int(parts[1])
-        return {
+        result = {
             "running": True,
             "name": name,
             "pid": parts[0],
@@ -45,6 +56,9 @@ def _get_process_info(pattern, name, fallback_port=None):
             "cpu": parts[2],
             "elapsed": parts[3],
         }
+        if name_pid and name_pid != parts[0]:
+            result["name_scan_pid"] = name_pid
+        return result
     return {"running": False, "name": name}
 # --- _current_active_profile ---
 def _current_active_profile():

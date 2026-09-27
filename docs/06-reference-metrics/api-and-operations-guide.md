@@ -109,7 +109,7 @@ curl -s http://127.0.0.1:4000/api/status | python3 -m json.tool
 
 ```json
 {
-  "api_version": "1",
+  "api_version": "2",
   "proxy": {
     "pid": 12345,
     "uptime_sec": 3600,
@@ -121,13 +121,24 @@ curl -s http://127.0.0.1:4000/api/status | python3 -m json.tool
     "alive": true,
     "model_name": "Qwen3.6-35B-A3B-UD-MLX-4bit",
     "backend_type": "rapid-mlx",
-    "base_url": "http://127.0.0.1:8081/v1"
+    "base_url": "http://127.0.0.1:8081/v1",
+    "name": "ornith-oq4e"
   },
+  "local_engines": [
+    {"provider": "local", "base_url": "http://127.0.0.1:8081/v1", "alive": true,
+     "pid": 23456, "model_name": "Qwen3.6-35B-A3B-UD-MLX-4bit"}
+  ],
   "active_profile": "rapid-mlx-35b-opt",
   "state": "healthy",
   "ready": true
 }
 ```
+
+`proxy.pid` 恒为 **4000 端口持有者**，不取进程名扫描结果——同名影子/测试实例
+（如 promptfoo 影代理 `:4021`）在场时不会顶替，端口无持有者即如实 `alive=false`
+（L-49，2026-09-28）。当名字扫描结果与端口持有者不一致时，`proxy` 段附带
+**可选诊断字段** `name_scan_pid`（并存实例的 pid），用于区分"谁在服务 4000"
+与"还有谁同名在跑"。
 
 `state` 枚举：
 
@@ -300,4 +311,4 @@ watchdog 状态持久化到 `logs/watchdog_state.json`。
 
 - 所有结构化 API 字段名为 `snake_case`，稳定不更名；更名属于 breaking change。
 - 端点不存在或字段缺失时，调用方应 fail-open（回退到 `/v1/models` 或 HTML 解析），不阻断任务。
-- `api_version` 固定为 `"1"`，便于后续演进。
+- `api_version` 现值 `"2"`，仅在**新增端点**时递增；纯字段新增（含可选诊断字段）不升版本，调用方按 fail-open 处理缺字段。

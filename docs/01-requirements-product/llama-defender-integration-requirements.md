@@ -85,6 +85,10 @@ R13-R16 已于 2026-08-19 按 `timings 透传 → R13 → R16 → R14 → R15` �
 - `state` 枚举：`healthy | starting | backend_down | proxy_down | model_drift | down`（对应 S3 诊断分级）。
 - `model_name` 为后端**真实加载**的模型名（S2 感知与计量映射依赖）。
 - `active_profile` 为 active.conf 软链目标名（S5 漂移检测依赖：`model_name` 对应配置 ≠ `active_profile` → `model_drift`）。
+- `proxy.pid` 恒为 **4000 端口持有者**，不是进程名扫描结果：端口无持有者即 `alive=false`，
+  不因同名影子/测试实例（如 promptfoo 影代理 `:4021`）在场而虚报 alive（L-49，2026-09-28）。
+  `proxy.name_scan_pid` 为**可选诊断字段**，仅当名字扫描结果与端口持有者不一致时出现，
+  用于暴露并存实例；属"仅增字段"级演进，不涉及 `api_version` 变更。
 - 响应 < 1s，失败返回非 200 + JSON error body。
 
 ### R2（P0）：明确的就绪（readiness）语义

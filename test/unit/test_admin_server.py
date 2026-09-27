@@ -389,6 +389,87 @@ class TestGetCacheStats(unittest.TestCase):
         self.assertEqual(cs["total"], cs["hit"] + cs["miss"])
 
 
+class TestGetProcessInfo(unittest.TestCase):
+    """Port holder wins over pgrep (2026-09-27: shadow-proxy misattribution)."""
+
+    def _fake_run(self, lsof_pid, pgrep_pid):
+        def fake(cmd, timeout=3):
+            if cmd.startswith("lsof"):
+                return lsof_pid
+            if cmd.startswith("pgrep"):
+                return pgrep_pid
+            if cmd.startswith("ps "):
+                # ps -o pid=,rss=,pcpu=,etime= -p <pid>
+                pid = cmd.rsplit(None, 1)[-1]
+                return f"{pid}  102400  1.0  01:00:00"
+            raise AssertionError(f"unexpected command: {cmd}")
+        return fake
+
+    def test_port_holder_preferred_over_pgrep(self):
+        """生产代理与影子代理同名并存时, 必须返回端口持有者而非 pgrep 首个."""
+        from unittest import mock
+        with mock.patch.object(admin_server, "_run",
+                               side_effect=self._fake_run("39765", "63660")):
+            info = admin_server._get_process_info(
+                "anthropic_proxy.py", "Proxy", fallback_port=4000)
+        self.assertTrue(info["running"])
+        self.assertEqual(info["pid"], "39765")
+        # L-49: 名字扫描另有其人 -> 诊断字段暴露差异
+        self.assertEqual(info["name_scan_pid"], "63660")
+
+    def test_port_empty_reports_down_with_name_scan_diagnostic(self):
+        """L-49 残余缺口: :4000 无持有者即如实报 down, 不再回退 pgrep 被影子实例伪装.
+
+        旧行为（本测试 2026-09-28 前）为沿用 pgrep 命中并报 running=True——
+        那会让"生产代理已死 + 测试实例(如 promptfoo :4021)尚存"伪装成 alive。
+        """
+        from unittest import mock
+        with mock.patch.object(admin_server, "_run",
+                               side_effect=self._fake_run("", "39765")):
+            info = admin_server._get_process_info(
+                "anthropic_proxy.py", "Proxy", fallback_port=4000)
+        self.assertFalse(info["running"])
+        self.assertNotIn("pid", info)
+        # 伪装源仍可见（诊断用途），但不参与 running/pid 判定
+        self.assertEqual(info["name_scan_pid"], "39765")
+
+    def test_name_scan_pid_absent_when_same_process(self):
+        """正常态（端口持有者 == 名字扫描结果）不引入诊断噪声."""
+        from unittest import mock
+        with mock.patch.object(admin_server, "_run",
+                               side_effect=self._fake_run("39765", "39765")):
+            info = admin_server._get_process_info(
+                "anthropic_proxy.py", "Proxy", fallback_port=4000)
+        self.assertTrue(info["running"])
+        self.assertEqual(info["pid"], "39765")
+        self.assertNotIn("name_scan_pid", info)
+
+    def test_no_port_uses_pgrep_only(self):
+        """无端口参数（后端探测路径）只走 pgrep，不调 lsof."""
+        from unittest import mock
+        calls = []
+        def fake(cmd, timeout=3):
+            calls.append(cmd)
+            if cmd.startswith("pgrep"):
+                return "39641"
+            if cmd.startswith("ps "):
+                return "39641  102400  1.0  01:00:00"
+            raise AssertionError(f"unexpected command: {cmd}")
+        with mock.patch.object(admin_server, "_run", side_effect=fake):
+            info = admin_server._get_process_info("rapid-mlx|llama-server", "Backend")
+        self.assertTrue(info["running"])
+        self.assertEqual(info["pid"], "39641")
+        self.assertNotIn("name_scan_pid", info)
+        self.assertFalse(any(c.startswith("lsof") for c in calls))
+
+    def test_nothing_found_reports_not_running(self):
+        from unittest import mock
+        with mock.patch.object(admin_server, "_run", return_value=""):
+            info = admin_server._get_process_info("no-such-proc", "X", fallback_port=4000)
+        self.assertFalse(info["running"])
+        self.assertNotIn("name_scan_pid", info)
+
+
 class TestMcPut(unittest.TestCase):
 
     def test_no_active_metrics_context_noop(self):
