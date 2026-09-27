@@ -586,6 +586,20 @@ class TestWindowLookupL53(unittest.TestCase):
         self.assertIsNone(cr.window_lookup([], "def run"))
         self.assertIsNone(cr.window_lookup(msgs, ""))
 
+    def test_window_lookup_ignores_recall_call_self_match(self):
+        # 自命中回归锚（集成测试实锤缺陷）：recall 调用自身的 input 含查询词，
+        # 不得据此判"在窗口"——扫描须剔除 tool_use 调用参数与 recall 自身结果。
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "rc9", "name": "ctx_recall",
+                 "input": {"query": "def run terms variables kwargs"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "rc9",
+                 "content": [{"type": "text", "text": "Error: unknown tool"}]}]},
+        ]
+        hint = cr.window_lookup(msgs, "def run terms variables kwargs")
+        self.assertFalse(hint["found"])
+
     def test_miss_text_found_variant(self):
         hint = {"found": True, "index": 4, "total": 10, "hits": 2}
         r = cr.format_recall_result([], "def run", window_hint=hint)
@@ -605,6 +619,81 @@ class TestWindowLookupL53(unittest.TestCase):
         self.assertIn("只检索", r)                 # 只检索已折叠内容（语义边界入文案）
         self.assertIn("先在窗口内查找", r)
         self.assertNotIn("可能从未被丢弃", r)
+
+
+class TestRecallRewriteWiringL53(unittest.TestCase):
+    """L-53 P2 接线集成测试：未命中折叠库 → window_lookup → 三段式 tool_result 改写。
+
+    覆盖 content_compressor.rewrite_ctx_recall_results 的空结果分支（此前该函数
+    无任何测试——接线是本次修复的运行时入口）。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="ifc_recall_wire_")
+        self._orig_dir = _ps._DIAG_DIR
+        _ps._DIAG_DIR = self._tmp
+        self._orig_pd = getattr(_ps, "PROXY_PD_ENABLED", True)
+        _ps.PROXY_PD_ENABLED = True
+        ms.MANIFEST.reset()
+
+    def tearDown(self):
+        _ps._DIAG_DIR = self._orig_dir
+        _ps.PROXY_PD_ENABLED = self._orig_pd
+        ms.MANIFEST.reset()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    _QUERY = "def run(self, terms, variables, **kwargs)"
+
+    def _msgs(self, window_text):
+        return [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "rc1", "name": "ctx_recall",
+                 "input": {"query": self._QUERY}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "rc1",
+                 "content": [{"type": "text",
+                              "text": "Error: unknown tool ctx_recall"}]}]},
+            {"role": "user", "content": [{"type": "text", "text": window_text}]},
+        ]
+
+    def _rewrite_and_read(self, messages, session_key):
+        from content_compressor import rewrite_ctx_recall_results
+        out = rewrite_ctx_recall_results(messages, session_key)
+        for msg in out:
+            if msg.get("role") != "user":
+                continue
+            for block in (msg.get("content") or []):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    content = block.get("content")
+                    if isinstance(content, list):
+                        return " ".join(b.get("text", "") for b in content
+                                        if isinstance(b, dict))
+                    return content or ""
+        return ""
+
+    def test_miss_with_content_in_window_rewrites_to_window_hit(self):
+        text = self._rewrite_and_read(
+            self._msgs("... 源码：def run(self, terms, variables, **kwargs): ..."),
+            "s-l53-hit")
+        self.assertIn("仍在你的当前上下文", text)   # 命中窗口态
+        self.assertIn("勿重读文件", text)
+        self.assertNotIn("可能从未被丢弃", text)     # hedge 不得复现
+
+    def test_miss_without_content_rewrites_to_absent(self):
+        text = self._rewrite_and_read(
+            self._msgs("完全不相关的内容"), "s-l53-absent")
+        self.assertIn("不在你的当前上下文中", text)
+        self.assertNotIn("可能从未被丢弃", text)
+
+    def test_store_hit_keeps_normal_recall_result(self):
+        # 折叠库有货 → 正常命中输出，窗口核验不介入
+        ms.record_dropped_messages(
+            "s-l53-store", turn=1, reason="fifo_drop",
+            messages=[{"role": "user", "content": [{"type": "text",
+                       "text": "def run(self, terms, variables, **kwargs): pass"}]}])
+        text = self._rewrite_and_read(self._msgs("窗口无关文本"), "s-l53-store")
+        self.assertIn("命中", text)
+        self.assertNotIn("仍在你的当前上下文", text)
 
 
 if __name__ == "__main__":

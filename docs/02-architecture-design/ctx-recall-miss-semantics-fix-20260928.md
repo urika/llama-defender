@@ -33,9 +33,17 @@
 
 ## 3. 验证与测试
 
-- 新增 7 例（`test/unit/test_ctx_recall.py::TestWindowLookupL53`、`test/unit/test_recall_cue.py::TestCueContractL53`）：
-  命中/不在/不可判三态、三段式文案、**回归锚**（`"可能从未被丢弃"` 不得复现、`"Recall first"` 不得复现、IFC-11 前置条件在位）。
-- 全量单测 **1783 passed / 0 failed**（2026-09-28）。
+- 新增 **11 例**：
+  - 单元（`TestWindowLookupL53` / `TestCueContractL53`）：命中/不在/不可判三态、三段式文案、
+    **回归锚**（`"可能从未被丢弃"` 不得复现、`"Recall first"` 不得复现、IFC-11 前置条件在位）。
+  - **接线集成（`TestRecallRewriteWiringL53`，覆盖 `rewrite_ctx_recall_results` 空结果分支——该函数此前无任何测试）**：
+    miss+窗口命中→改写为"仍在当前上下文"／miss+窗口无关→"不在当前上下文"／折叠库命中→正常结果且窗口核验不介入。
+  - **自命中回归锚**：recall 调用自身的 input 含查询词，不得判"在窗口"。
+- **集成测试实锤并修复一处缺陷**：`window_lookup` 初版对整个消息 JSON 做子串匹配，
+  会把 **recall 调用自身**（`tool_use.input` 即查询词）计为命中 ⇒ 永远 `found=True`。
+  已改：扫描只取**内容块**（`text`/`tool_result`），剔除全部 `tool_use` 调用参数与
+  recall 自身的结果块（`_scan_text_of` + `recall_ids` 过滤）。
+- 全量单测 **1787 passed / 0 failed**（2026-09-28）。
 - **待激活后实证**（验收挂钩 swe-eval 侧）：同参数重读率（roadmap L-15 v2 指标）在同类会话上下降；miss 后"翻窗优先"行为可于 run 台账核对。
 
 ## 4. 激活与约束

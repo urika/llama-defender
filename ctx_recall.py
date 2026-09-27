@@ -1075,6 +1075,44 @@ def build_task_context_bundle(task_descriptor, session_key=None,
             "total_chars": total, "budget_remaining": max(0, budget - total)}
 
 
+def _scan_text_of(msg):
+    """消息 → 窗口核验扫描文本：只取**内容块**（text / tool_result）。
+
+    刻意剔除 tool_use 块——它们承载模型的**查询参数**而非内容：recall 调用自身
+    的 input 就含查询词，若计入会"永远命中"（L-53 集成测试实锤的自命中缺陷）；
+    此前 Grep/Grep 类调用的入参同理是假阳性源。tool_result 的配对 id 由调用方
+    先剔除 recall 自身结果（见 window_lookup）。
+    """
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False, default=str)
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+            continue
+        btype = block.get("type")
+        if btype == "tool_use":
+            continue                       # 调用参数≠内容（自命中/查询词假阳性源）
+        if btype == "tool_result":
+            inner = block.get("content")
+            if isinstance(inner, list):
+                parts.extend(b.get("text", "") for b in inner
+                             if isinstance(b, dict))
+            elif isinstance(inner, str):
+                parts.append(inner)
+            continue
+        if btype == "text":
+            parts.append(block.get("text") or "")
+            continue
+        parts.append(json.dumps(block, ensure_ascii=False, default=str))
+    return " ".join(parts)
+
+
 def window_lookup(messages, query):
     """L-53 P2: 在**折叠后视图**中检查 query 内容是否仍在（窗口在场性）。
 
@@ -1085,18 +1123,41 @@ def window_lookup(messages, query):
       found=False → 确认不在窗口（已折叠进存储或更早/从未出现）
       None        → 不可判（无 messages / 无有效 token）
 
-    口径：查询 token（≥3 字符，沿用 _query_tokens）**过半命中**同一消息即计该
-    消息命中；返回首个命中消息序号（0 基）+ 总消息数 + 命中处数。
+    口径：查询 token（≥3 字符，沿用 _query_tokens）**过半命中**同一消息的
+    内容块（text/tool_result，剔除 tool_use 调用参数——recall 调用自身含查询
+    词会自命中，集成测试出典）即计该消息命中；返回首个命中消息序号（0 基）
+    + 总消息数 + 命中处数。
     """
     tokens = _query_tokens(query)
     if not tokens or not messages:
         return None
+    # 收集 recall 自身的调用 id → 其 tool_result 亦属"元数据"非内容
+    recall_ids = set()
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for block in (msg.get("content") or []):
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and "ctx_recall" in str(block.get("name") or ""):
+                recall_ids.add(block.get("id"))
     need = max(1, (len(tokens) + 1) // 2)
     hits = []
     for idx, msg in enumerate(messages):
-        try:
-            blob = json.dumps(msg, ensure_ascii=False, default=str).lower()
-        except (TypeError, ValueError):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    and b.get("tool_use_id") in recall_ids
+                    for b in content):
+                # 整条消息若只承载 recall 自身结果 → 跳过；混合内容消息降级为
+                # 拼接非 recall 部分（罕见，保守处理）
+                msg = dict(msg)
+                msg["content"] = [b for b in content
+                                  if not (isinstance(b, dict)
+                                          and b.get("type") == "tool_result"
+                                          and b.get("tool_use_id") in recall_ids)]
+        blob = _scan_text_of(msg).lower()
+        if not blob:
             continue
         matched = sum(1 for t in tokens if t in blob)
         if matched >= need:
