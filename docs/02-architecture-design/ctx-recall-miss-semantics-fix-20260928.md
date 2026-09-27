@@ -52,3 +52,27 @@
 - 落地走**三件套**（AGENTS.md 红线 1 增补条款）：公告 + OBSERVATION 落档 + 一次窗一次戳。
 - 行为类变更（层间接口契约 §5.x）：激活后同批/后续批如做对照，按 A/B 纪律；`RECALL_CUE` 变更同时改变 A/B 两路注入文本（唯一源头，字节一致不变）。
 - 不做（本次范围外）：给模型做"内容在窗口哪一条"的稳定寻址语言（当前只给序号提示）；把窗口核验扩展成通用检索服务。
+
+---
+
+## 5. 激活与活体验证记录（2026-09-28 00:30 重启，三件套已执行）
+
+- **激活**：代理 00:30:xx 重启（EXP-8 停批切 Splash 栈同窗，`active.conf → splash-qwen38-27b.conf`），
+  晚于本件两个提交（`37d838f` 00:21 / `fe01b36` 00:28）⇒ 新代码已加载。公告=会话注册表 intent；
+  戳=本节（含进程起时与探针证据）。
+- **前提核验**：无批跑进程（`exp _exec|run_agent` 计数 0）；栈新起且空闲；`PROXY_CTX_ENGINE_ENABLED=true`、
+  `PROXY_PD_MICRO_TURN_ENABLED=true`（探针路径全开）。
+
+### 活体探针（全过，观察通道=sent_view 档案 `logs/diag/archive/`）
+
+| 探针 | 构造 | 期望 | 实测（档案内 payload 逐字） |
+|---|---|---|---|
+| A `l53probeA1` | ctx_recall 调用 + error result + **窗口内含查询内容** | 窗口命中态 | ✅ `…已核验折叠后视图：**该内容仍在你的当前上下文中**（第 4 条消息附近 / 共 4 条，命中 1 处）——请直接使用上下文中的原文，勿重读文件。`（旧 hedge 无） |
+| B `l53probeB1` | 同上但**窗口无该内容** | 确认不在态 | ✅ `…**不在你的当前上下文中**——折叠库亦未命中：先换关键词重试一次 recall；仍无再重读/repo 检索…`；**且自命中修复实证**（调用自身 input 含查询词仍正确判"不在"） |
+| C `l53probeC3` | 251K 字符 × 70 消息（est×1.6≈100K > S=70K） | 折叠触发 + 新 cue 注入 | ✅ `injections=[epoch_collapse…]`、msgs 70→28；面板含 **新 cue**（`Order of effort: (1) look in your current context … (3) re-read files only as a last resort … confirmed absent from your current context`），**`Recall first` 旧序零命中** |
+
+- 旁证：C1/C2 为尺寸校准失败（90.9K/156.9K 字符均未达折叠阈，正常服务无副作用）；
+  校准实测 est≈chars/4（157,442→39,254）。
+- **行为边界登记**：本修复为行为类变更，自 00:30 起对该栈全部会话生效——跨该时刻的 A/B 对照须计入
+  （RECALL_CUE 文本变化同时改变 A/B 两路折叠注入字节与 prefix-cache 内容；激活窗本身为冷启，无额外热缓存损失）。
+- **未覆盖**：真实 run 内的行为改善（同参数重读率下降）——验收钩子挂 swe-eval roadmap L-53（L-15 v2 指标），随下一批实测。
