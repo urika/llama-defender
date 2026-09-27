@@ -662,9 +662,20 @@ def rewrite_ctx_recall_results(messages, session_key):
                 # 调用真实检索(分页续读: query "r:x@4000" → base+offset)
                 base_q, paged_off = parse_query_offset(query)
                 results = lookup(session_key, base_q, kind=kind, limit=limit)
+                # L-53 P2: 未命中折叠库时核验"是否仍在当前窗口"——此处
+                # messages 已经是 ContextEngine(0.5) 写回的折叠后视图
+                # （pipeline.py 发送副本），即模型将看到的同一视图。
+                window_hint = None
+                if not results:
+                    try:
+                        from ctx_recall import window_lookup
+                        window_hint = window_lookup(messages, base_q)
+                    except Exception:
+                        window_hint = None
                 real_text = format_recall_result(results, query,
                                                  session_key=session_key,
-                                                 offset=paged_off)
+                                                 offset=paged_off,
+                                                 window_hint=window_hint)
 
                 # 改写 tool_result
                 if isinstance(block.get("content"), list):

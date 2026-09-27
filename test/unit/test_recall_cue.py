@@ -87,5 +87,22 @@ class TestPathBCue(unittest.TestCase):
         self.assertFalse([m for m in out if m.get("_ctx_engine_epoch")])
 
 
+class TestCueContractL53(unittest.TestCase):
+    """L-53 P1: RECALL_CUE 的 post-miss 契约修正（窗口优先序 + 不可得前置条件）。"""
+
+    def test_window_first_order_and_conditional_give_up(self):
+        cue = ctx_recall.RECALL_CUE
+        self.assertNotIn("Recall first", cue)          # 回归锚：旧"召回优先"序已移除
+        self.assertIn("look in your current context", cue)
+        self.assertIn("last resort", cue)
+        self.assertIn("confirmed absent from your current context", cue)  # IFC-11 前置条件
+
+    def test_cue_keeps_single_source_header(self):
+        # 唯一源头约定不变：A/B 两路仍按常量标识引用（字节一致）
+        import truncation  # noqa: F401  (path A deferred import 不炸)
+        self.assertTrue(ctx_recall.RECALL_CUE.startswith(
+            "Full text of folded content is preserved"))
+
+
 if __name__ == "__main__":
     unittest.main()

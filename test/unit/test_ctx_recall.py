@@ -555,5 +555,57 @@ class TestRecoverFullContentFallback(unittest.TestCase):
         self.assertTrue(got2.startswith("NEW"))
 
 
+class TestWindowLookupL53(unittest.TestCase):
+    """L-53 P2: 未命中折叠库时的窗口在场性核验（三态文案 + hedge 移除回归锚）。
+
+    出典: 2026-09-27 EXP-8 6cc97447 会话——内容连续 119 轮在窗口，模型 ctx_recall
+    重复调用 7 次（同 query dup 1/2/3）+ 同目标重读 55 次（Grep 35/Bash grep 20）。
+    """
+
+    def test_window_lookup_found(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t9", "name": "Read",
+                 "input": {"file_path": "lib/ansible/plugins/loader.py"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t9",
+                 "content": [{"type": "text",
+                              "text": "def run(self, terms, variables, **kwargs): pass"}]}]},
+        ]
+        hint = cr.window_lookup(msgs, "def run(self, terms, variables, kwargs)")
+        self.assertTrue(hint["found"])
+        self.assertEqual(hint["index"], 1)
+        self.assertEqual(hint["total"], 2)
+        self.assertGreaterEqual(hint["hits"], 1)
+
+    def test_window_lookup_absent_and_unjudgeable(self):
+        msgs = [{"role": "user", "content": "unrelated content only"}]
+        hint = cr.window_lookup(msgs, "def run terms variables kwargs")
+        self.assertFalse(hint["found"])
+        self.assertIsNone(hint["index"])
+        self.assertIsNone(cr.window_lookup([], "def run"))
+        self.assertIsNone(cr.window_lookup(msgs, ""))
+
+    def test_miss_text_found_variant(self):
+        hint = {"found": True, "index": 4, "total": 10, "hits": 2}
+        r = cr.format_recall_result([], "def run", window_hint=hint)
+        self.assertIn("无匹配", r)
+        self.assertIn("仍在你的当前上下文", r)
+        self.assertIn("勿重读文件", r)
+        self.assertNotIn("可能从未被丢弃", r)      # L-53 回归锚：hedge 措辞已移除
+
+    def test_miss_text_absent_variant(self):
+        hint = {"found": False, "index": None, "total": 10, "hits": 0}
+        r = cr.format_recall_result([], "def run", window_hint=hint)
+        self.assertIn("不在你的当前上下文中", r)
+        self.assertNotIn("可能从未被丢弃", r)
+
+    def test_miss_text_without_hint_is_assertive(self):
+        r = cr.format_recall_result([], "q", None)
+        self.assertIn("只检索", r)                 # 只检索已折叠内容（语义边界入文案）
+        self.assertIn("先在窗口内查找", r)
+        self.assertNotIn("可能从未被丢弃", r)
+
+
 if __name__ == "__main__":
     unittest.main()

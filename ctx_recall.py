@@ -95,11 +95,15 @@ RECALL_CUE = (
     "use ctx_recall to recover instead of re-reading files, "
     "e.g. ctx_recall(query='<file-path-or-keyword>') or "
     "ctx_recall(query='<anchor>'). "
-    "Recall first; re-read only if ctx_recall returns nothing. "
-    "When asked for a specific value (token/key/number/config) that is not "
-    "in your current context: you MUST recall it via ctx_recall first; if "
-    "recall finds nothing, say explicitly that the information is no longer "
-    "available — NEVER guess or invent a value. (IFC-11 2026-09-07)"
+    "Order of effort: (1) look in your current context — content that was "
+    "never folded is still in your window; (2) ctx_recall for content missing "
+    "from your window; (3) re-read files only as a last resort. "
+    "When asked for a specific value (token/key/number/config) that is missing "
+    "from your current context: you MUST recall it via ctx_recall first; only "
+    "if recall finds nothing AND the value is confirmed absent from your "
+    "current context, say explicitly that the information is no longer "
+    "available — NEVER guess or invent a value. "
+    "(IFC-11 2026-09-07; L-53 2026-09-28 窗口优先序＋不可得前置条件)"
 )
 
 # 面板附带查询键上限（精确 anchor 优先；多了费 token 且无收益）
@@ -1071,13 +1075,53 @@ def build_task_context_bundle(task_descriptor, session_key=None,
             "total_chars": total, "budget_remaining": max(0, budget - total)}
 
 
-def format_recall_result(lines, query, session_key=None, offset=0):
-    """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。"""
+def window_lookup(messages, query):
+    """L-53 P2: 在**折叠后视图**中检查 query 内容是否仍在（窗口在场性）。
+
+    调用方传入的 messages 应为其后实际发送的视图（engine-on 路径在
+    ContextEngine stage 后、MessageConverter stage 中改写 recall 结果，
+    ctx.messages 即折叠后视图——pipeline.py 的写回点）。语义：
+      found=True  → 内容从未被折叠，模型当前窗口内仍有（可直接翻窗引用）
+      found=False → 确认不在窗口（已折叠进存储或更早/从未出现）
+      None        → 不可判（无 messages / 无有效 token）
+
+    口径：查询 token（≥3 字符，沿用 _query_tokens）**过半命中**同一消息即计该
+    消息命中；返回首个命中消息序号（0 基）+ 总消息数 + 命中处数。
+    """
+    tokens = _query_tokens(query)
+    if not tokens or not messages:
+        return None
+    need = max(1, (len(tokens) + 1) // 2)
+    hits = []
+    for idx, msg in enumerate(messages):
+        try:
+            blob = json.dumps(msg, ensure_ascii=False, default=str).lower()
+        except (TypeError, ValueError):
+            continue
+        matched = sum(1 for t in tokens if t in blob)
+        if matched >= need:
+            hits.append(idx)
+    return {"found": bool(hits),
+            "index": hits[0] if hits else None,
+            "total": len(messages),
+            "hits": len(hits)}
+
+
+def format_recall_result(lines, query, session_key=None, offset=0,
+                         window_hint=None):
+    """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。
+
+    window_hint（L-53 P2，可选）= window_lookup() 结果：未命中折叠库时按
+    "是否仍在当前窗口"给出**可判定、可执行**的三态文案（旧版是 hedged 猜测，
+    实测致模型 55 次同目标盲重读——出典见 roadmap L-53）。
+    """
     if not lines:
         # S1(2026-09-01): 空结果附存储概况——模型需要区分"换词重查有意义"
         # 还是"存储里根本没有"; 空结果是最需要给线索的时刻(压召回 churn)。
+        # L-53: 仅在"窗口未命中/不可判"时附概况（窗口命中时下一步=翻窗，
+        # 不是换词重查）。
         hint = ""
-        if session_key:
+        if session_key and not (window_hint and window_hint.get("found")):
             try:
                 all_lines = memory_stores.MANIFEST.lines(session_key)
                 if all_lines:
@@ -1094,8 +1138,22 @@ def format_recall_result(lines, query, session_key=None, offset=0):
                             + "。可改用上述路径/关键词重查。")
             except Exception:
                 pass
-        return ("ctx_recall: 无匹配的已折叠单元（query=%s）。该信息可能从未被丢弃，"
-                "或在本会话开始前。%s" % (query, hint))
+        if window_hint and window_hint.get("found"):
+            return ("ctx_recall: 无匹配的已折叠单元（query=%s）。已核验折叠后视图："
+                    "**该内容仍在你的当前上下文中**（第 %d 条消息附近 / 共 %d 条，"
+                    "命中 %d 处）——请直接使用上下文中的原文，勿重读文件。"
+                    % (query, (window_hint.get("index") or 0) + 1,
+                       window_hint.get("total") or 0,
+                       window_hint.get("hits") or 0))
+        if window_hint is not None:
+            return ("ctx_recall: 无匹配的已折叠单元（query=%s）。已核验折叠后视图："
+                    "**不在你的当前上下文中**——折叠库亦未命中：先换关键词重试一次 "
+                    "recall；仍无再重读/repo 检索（或该信息确实不可得，勿编造）。%s"
+                    % (query, hint))
+        return ("ctx_recall: 无匹配的已折叠单元（query=%s）。ctx_recall 只检索"
+                "**已折叠**内容——未命中说明它从未被折叠：若你在对话中见过它，"
+                "它仍在你的当前上下文里——先在窗口内查找，勿直接重读文件。%s"
+                % (query, hint))
     out = ["ctx_recall: 命中 %d 条已折叠上下文索引:" % len(lines)]
 
     # 收集需要补充的配对 tool_result 行(tool_use 命中时拉取对应的 result)
@@ -1301,6 +1359,7 @@ def split_follow_up_messages(session_key, tool_calls):
 
 __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
+    "window_lookup",
     "line_text", "recover_full_content", "DEFAULT_LIMIT",
     "build_follow_up_messages", "split_follow_up_messages",
     "MICRO_TURN_RESULT_MAX_CHARS",
