@@ -4,6 +4,12 @@
 > `https://api.commandcode.ai/provider/v1/systemone`。落地点：**本仓（llama.cpp）**——
 > jev 仪器在此仓，swe-eval 侧只登记前置条件与指针。
 > 起因：2026-09-27 swe-eval 的 ex04 批量排序被 `HTTP 429` 全量挡住，需要能**看得见额度**。
+>
+> **落地状态（2026-09-27）：已落地。** `tools/jev_quota.py`（`--check`/`--json`/`--plan`，
+> 退出码 0/3/4/5）＋ `tools/jev_mcp_server.py`（MCP 工具 `jev_usage`、429 错误体白名单提取）
+> ＋ `test/unit/test_jev_quota.py`（15 例）与既有 MCP 测试更新；全量 unit 层 1772 passed /
+> 11 skipped，并已用真实 stdio 会话端到端验证（`tools/list` → `jev_usage` 真读额度）。
+> 下文 §4 保留为设计记录（与实现一致）。
 
 ## 0. 结论速览（每条都有实测支撑）
 

@@ -121,7 +121,9 @@ class TestJevMcpProtocol(unittest.TestCase):
         self.assertIn("tools", initialized["result"]["capabilities"])
         listed = jev._handle_message({"jsonrpc": "2.0", "id": 2,
                                      "method": "tools/list"}, "")
-        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], [jev.TOOL_NAME])
+        # 2026-09-27：新增额度工具 jev_usage（只读元数据）后为两个工具。
+        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]],
+                         [jev.TOOL_NAME, jev.QUOTA_TOOL_NAME])
         self.assertEqual(listed["result"]["tools"][0]["inputSchema"], jev.TOOL["inputSchema"])
 
     def test_tool_call_returns_structured_result(self):
