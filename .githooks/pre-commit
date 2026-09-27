@@ -118,6 +118,19 @@ echo "✅ pre-commit: refactoring regression checks passed."
 # 前置条件相应改为真实后端可达(模型内容断言的依赖); 后端不可达时跳过,
 # 保持无后端时提交快速。
 BACKEND_URL="${LLAMA_BASE_URL:-http://127.0.0.1:8081}"
+if pgrep -f "exp _exec" >/dev/null 2>&1 \
+   || pgrep -f "run_agent.py" >/dev/null 2>&1; then
+  # 2026-09-27 (swe-eval L-49, 批期保护): swe-eval 评测批次在跑时跳过本层——
+  # 影子代理本身端口/状态已隔离(promptfoo_env.sh: PF_PROXY_PORT=4021, engine=off),
+  # 但层的模型内容断言要打**真实后端**(8081), 会与被测批次争推理资源, 且批期
+  # 提交是 L-49 的触发路径。单元层(CPU-only, 秒级)不受影响, 已在上方执行。
+  # 检测=批次驱动(exp _exec)或 run_agent 在跑; 复核: swe-test health batch。
+  echo ""
+  echo "⏸️  pre-commit: 评测批次在跑(exp _exec/run_agent 存活)——跳过 Promptfoo 回归层, 避免与批次争引擎"
+  echo "   批次收官后补跑: bash test/run_tests.sh --promptfoo"
+  echo ""
+  exit 0
+fi
 if curl -sf --max-time 2 "$BACKEND_URL/v1/models" >/dev/null 2>&1 \
    || curl -sf --max-time 2 "$BACKEND_URL/models" >/dev/null 2>&1; then
   echo ""
