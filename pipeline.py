@@ -681,6 +681,16 @@ class ContextEngineStage(ConditionalStage):
             # 断点轮换不再误报, 此 WARN 恢复为真正的客户端改写信号
             log("  -> [context_engine] client tail divergence (report-only, "
                 "canonical unchanged)", level="WARN")
+        # L-59: 请求 tools 是否含 ctx_recall（客户端白名单面）——折叠召回 cue
+        # 的门控旗标（context_engine 侧缺省 True=fail-open，取不到 tools 时
+        # 保持现行为）。
+        try:
+            sess.recall_tool_available = any(
+                isinstance(t, dict)
+                and ((t.get("function") or {}).get("name")) == "ctx_recall"
+                for t in ((getattr(ctx, "body", None) or {}).get("tools") or []))
+        except Exception:
+            pass
         triggered, final = sess.maybe_epoch(
             context_engine.effective_trigger_tokens(),
             context_engine.effective_window_k())

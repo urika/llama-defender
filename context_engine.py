@@ -614,26 +614,35 @@ class CanonicalSession(object):
         # （ctx_recall.RECALL_CUE 唯一源头）；键取被收编轮次 anchor（复用
         # truncation pin 跳过的 unit_anchors 写法）。fail-open：失败则无 cue
         # 后缀，面板主体不受影响。
+        # L-59(2026-09-29) cue 门控：RECALL_CUE 指示模型调用 ctx_recall，但该
+        # 工具由代理微轮/次请求改写自答，**不在客户端工具注册表**——请求 tools
+        # 未含 ctx_recall 时，模型循 cue 调用必然 "No such tool available"
+        # （EXP-12 轮1 实测单会话 38 次连环空转、0 成功；跨批 25/25 全错）。
+        # 旗标由 ContextEngineStage 逐请求写入（pipeline 侧读请求 tools 数组）；
+        # 缺省 True=现行为（fail-open，其余调用路径/测试不受影响）。
         try:
-            from ctx_recall import RECALL_CUE as _RECALL_CUE
-            from ctx_recall import recall_keys_line as _recall_keys_line
-            import ifc_metrics as _ifm
-            _fold_anchors = []
-            for rnd in collect:
-                for m in rnd:
-                    try:
-                        _units = _ifm.unit_anchors(m)
-                    except Exception:
-                        _units = []
-                    for u in _units:
-                        a = u.get("anchor", "") if isinstance(u, dict) else ""
-                        if (isinstance(a, str) and a[:2] in ("r:", "u:")
-                                and a not in _fold_anchors):
-                            _fold_anchors.append(a)
-            _cue_suffix = "\n" + _RECALL_CUE
-            _keys_suffix = _recall_keys_line(_fold_anchors)
-            if _keys_suffix:
-                _cue_suffix += "\n" + _keys_suffix
+            if not getattr(self, "recall_tool_available", True):
+                _cue_suffix = ""
+            else:
+                from ctx_recall import RECALL_CUE as _RECALL_CUE
+                from ctx_recall import recall_keys_line as _recall_keys_line
+                import ifc_metrics as _ifm
+                _fold_anchors = []
+                for rnd in collect:
+                    for m in rnd:
+                        try:
+                            _units = _ifm.unit_anchors(m)
+                        except Exception:
+                            _units = []
+                        for u in _units:
+                            a = u.get("anchor", "") if isinstance(u, dict) else ""
+                            if (isinstance(a, str) and a[:2] in ("r:", "u:")
+                                    and a not in _fold_anchors):
+                                _fold_anchors.append(a)
+                _cue_suffix = "\n" + _RECALL_CUE
+                _keys_suffix = _recall_keys_line(_fold_anchors)
+                if _keys_suffix:
+                    _cue_suffix += "\n" + _keys_suffix
         except Exception:
             _cue_suffix = ""
         out = []
