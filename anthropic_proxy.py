@@ -1573,7 +1573,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 验收门禁 1: cached_tokens 回填引擎会话(流式路径; 需要
                 # FormatConverter 的 stream_options.include_usage 使后端发本块)
                 if _ctx_engine_on():
-                    _sid = getattr(_log_ctx, 'session_id', None)
+                    # DEF-309 口径对齐(2026-09-28 批期实测 + 2026-09-29 探针复现):
+                    # 引擎 key 必须与 pipeline ctx.session_id 同源——pipeline.py:443
+                    # 明确"优先取全量 session_key"; 旧实现取 _log_ctx.session_id(8 字符
+                    # 日志显示 id), 致 usage 回填写进**另一个**引擎会话对象, 触发口径
+                    # 退化为只剩 est×1.6 (实测: 同会话 usage 行 hit 非空而
+                    # msgs=… last_real≈0, 有效触发 ≈83K 真实 token vs 名义 70K)。
+                    _sid = (getattr(_log_ctx, 'session_key', None)
+                            or getattr(_log_ctx, 'session_id', None))
                     if _sid:
                         try:
                             import context_engine
