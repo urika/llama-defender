@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 
 import proxy_state as _ps
 
@@ -1418,6 +1419,115 @@ def split_follow_up_messages(session_key, tool_calls):
 
 
 
+# ---------------------------------------------------------------------------
+# ctx_recall 结局台账（P0(ii)，2026-09-30）
+# ---------------------------------------------------------------------------
+
+class _RecallStats:
+    """会话级 ctx_recall 结局台账：命中/未命中/有界回退 + 复发-交错连败。
+
+    为什么只能在代答路径记账：客户端视图里 ctx_recall 的结果**永远**是
+    error tool_result（CLI 工具白名单不含它），真实结局（命中/未命中/回退）
+    只有代理改写处知道（content_compressor.rewrite_ctx_recall_results）。
+    故"失败计数"必须在此记；消息扫描只能数调用次数/查询词。
+
+    去重：客户端每轮重发全量历史 ⇒ 同一 tool_use_id 的 error result 每轮都
+    会被重改写一遍，按 call_id 只记**首次**结局（= 调用当时的结局，历史真实）。
+
+    连败（fail_streak）：按结局序列自最新往回数非命中项，**交错的其它工具
+    调用不打断**——这正是精确重复判据（consecutive，key=tool:args）抓不到
+    L-61 型"检索空转"的原因（换关键词 ⇒ key 不同）。一次命中即清零。
+
+    有界：会话数上限 + 每会话条目上限 + TTL（复用 PROXY_DIAG_SESSION_TTL_MIN）。
+    """
+
+    _MAX_SESSIONS = 256
+    _MAX_ENTRIES = 2000
+    _OUTCOMES = ("hit", "miss", "fallback")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key -> {"entries": {call_id: outcome}, "order": [call_id...],
+        #         "last_turn": int, "ts": float}
+        self._sessions = {}
+
+    def record(self, session_key, call_id, outcome, turn=0):
+        """记一次新调用结局；同一 call_id 重复（历史重改写）返回 False 不重记。"""
+        if not session_key or not call_id or outcome not in self._OUTCOMES:
+            return False
+        now = time.time()
+        with self._lock:
+            self._evict_locked(now)
+            st = self._sessions.get(session_key)
+            if st is None:
+                st = {"entries": {}, "order": [], "last_turn": 0, "ts": now}
+                self._sessions[session_key] = st
+            st["ts"] = now
+            st["last_turn"] = max(st["last_turn"], int(turn or 0))
+            if call_id in st["entries"]:
+                return False
+            if len(st["order"]) >= self._MAX_ENTRIES:
+                # FIFO：丢最旧条目，保留计数口径"最近 2000 次"
+                st["entries"].pop(st["order"].pop(0), None)
+            st["entries"][call_id] = outcome
+            st["order"].append(call_id)
+            return True
+
+    def snapshot(self, session_key):
+        """结局计数快照；无记录 → {}（消费方按 unavailable 处理）。"""
+        with self._lock:
+            st = self._sessions.get(session_key)
+            if not st:
+                return {}
+            outcomes = [st["entries"][i] for i in st["order"]]
+            streak = 0
+            for o in reversed(outcomes):
+                if o == "hit":
+                    break
+                streak += 1
+            return {
+                "calls": len(outcomes),
+                "hits": outcomes.count("hit"),
+                "misses": outcomes.count("miss"),
+                "fallbacks": outcomes.count("fallback"),
+                "failures": sum(1 for o in outcomes if o != "hit"),
+                "fail_streak": streak,
+                "last_outcome": outcomes[-1] if outcomes else None,
+                "last_turn": st.get("last_turn", 0),
+            }
+
+    def streak_meta(self, session_key, current_turn=0, stale_turns=2):
+        """连败元信息 + 新鲜度闸：最新调用距当前轮 > stale_turns ⇒ fresh=False
+        （空转已停，不该继续重复注入纪律提示）。空会话返回零值同形 dict，
+        消费方不必分支。"""
+        snap = self.snapshot(session_key)
+        if not snap:
+            return {"calls": 0, "failures": 0, "fail_streak": 0,
+                    "last_outcome": None, "last_turn": 0, "fresh": False}
+        snap["fresh"] = ((int(current_turn or 0) - int(snap.get("last_turn") or 0))
+                         <= max(0, int(stale_turns)))
+        return snap
+
+    def _evict_locked(self, now):
+        ttl = max(60, getattr(_ps, "PROXY_DIAG_SESSION_TTL_MIN", 240)) * 60
+        for k in [k for k, v in self._sessions.items() if now - v["ts"] > ttl]:
+            self._sessions.pop(k, None)
+        extra = len(self._sessions) - self._MAX_SESSIONS
+        if extra > 0:
+            oldest = sorted(self._sessions.items(), key=lambda kv: kv[1]["ts"])
+            for k, _ in oldest[:extra]:
+                self._sessions.pop(k, None)
+
+    def reset(self):
+        """测试用：清空全部会话状态。"""
+        with self._lock:
+            self._sessions.clear()
+
+
+CTX_RECALL_STATS = _RecallStats()
+
+
+
 __all__ = [
     "TOOL_SCHEMA", "lookup", "fts_search", "format_recall_result",
     "window_lookup",
@@ -1425,4 +1535,5 @@ __all__ = [
     "build_follow_up_messages", "split_follow_up_messages",
     "MICRO_TURN_RESULT_MAX_CHARS",
     "auto_recall_for_target",
+    "CTX_RECALL_STATS",
 ]

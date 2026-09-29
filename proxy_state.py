@@ -349,6 +349,21 @@ PROXY_TEXT_LOOP_THRESHOLD_VERY_LONG = int(os.environ.get("PROXY_TEXT_LOOP_THRESH
 PROXY_BLOCKER_THRESHOLD_LONG = int(os.environ.get("PROXY_BLOCKER_THRESHOLD_LONG", "3"))
 PROXY_BLOCKER_THRESHOLD_VERY_LONG = int(os.environ.get("PROXY_BLOCKER_THRESHOLD_VERY_LONG", "3"))
 
+# P0(ii) ctx_recall 复发-交错计数（2026-09-30，L-61 出典）
+# 精确重复计数（consecutive，key=tool:args）对 ctx_recall 失效：模型换关键词
+# 重试 ⇒ key 不同；交错的其它工具调用又会把早前失败挤出 15 条尾部窗 ⇒
+# "检索空转"完全不计（081154 实测 38 次调用零触发）。此组按**结局**
+# （命中/未命中/回退）数 ctx_recall 自身连败，交错的其它工具不打断。
+PROXY_CTX_RECALL_STREAK_ENABLED = os.environ.get(
+    "PROXY_CTX_RECALL_STREAK_ENABLED",
+    get_default("PROXY_CTX_RECALL_STREAK_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_CTX_RECALL_STREAK_THRESHOLD = int(os.environ.get(
+    "PROXY_CTX_RECALL_STREAK_THRESHOLD",
+    get_default("PROXY_CTX_RECALL_STREAK_THRESHOLD")))
+PROXY_CTX_RECALL_STREAK_STALE_TURNS = int(os.environ.get(
+    "PROXY_CTX_RECALL_STREAK_STALE_TURNS",
+    get_default("PROXY_CTX_RECALL_STREAK_STALE_TURNS")))
+
 # Session continuation
 PROXY_SESSION_CONTINUATION_ENABLED = os.environ.get(
     "PROXY_SESSION_CONTINUATION_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -522,6 +537,9 @@ PROXY_PD_MICRO_TURN_ENABLED = os.environ.get(
     "PROXY_PD_MICRO_TURN_ENABLED", get_default("PROXY_PD_MICRO_TURN_ENABLED")).lower() in ("1", "true", "yes")
 PROXY_PD_MICRO_TURN_MAX = int(os.environ.get(
     "PROXY_PD_MICRO_TURN_MAX", get_default("PROXY_PD_MICRO_TURN_MAX")))
+PROXY_PD_MICRO_TURN_HOLD_TEXT = os.environ.get(
+    "PROXY_PD_MICRO_TURN_HOLD_TEXT",
+    get_default("PROXY_PD_MICRO_TURN_HOLD_TEXT")).lower() in ("1", "true", "yes")
 
 # R19 上下文钉扎（X-Proxy-Pin-Context，集成契约 §3.3 冻结版 2026-09-02）
 PROXY_PIN_ENABLED = os.environ.get(
@@ -1216,6 +1234,12 @@ _RELOAD_SPEC = [
     ("PROXY_PD_ENABLED", "PROXY_PD_ENABLED", "bool", "true", "true"),
     ("PROXY_PD_MICRO_TURN_ENABLED", "PROXY_PD_MICRO_TURN_ENABLED", "bool", "false", "false"),
     ("PROXY_PD_MICRO_TURN_MAX", "PROXY_PD_MICRO_TURN_MAX", "int", "2", "2"),
+    # L-62(2026-09-30): 旁白文本持有——微轮自答对"文本+ctx_recall"响应同样可用
+    ("PROXY_PD_MICRO_TURN_HOLD_TEXT", "PROXY_PD_MICRO_TURN_HOLD_TEXT", "bool", "true", "true"),
+    # P0(ii) ctx_recall 复发-交错计数（2026-09-30）
+    ("PROXY_CTX_RECALL_STREAK_ENABLED", "PROXY_CTX_RECALL_STREAK_ENABLED", "bool", "true", "true"),
+    ("PROXY_CTX_RECALL_STREAK_THRESHOLD", "PROXY_CTX_RECALL_STREAK_THRESHOLD", "int", "3", "3"),
+    ("PROXY_CTX_RECALL_STREAK_STALE_TURNS", "PROXY_CTX_RECALL_STREAK_STALE_TURNS", "int", "2", "2"),
     ("PROXY_PIN_ENABLED", "PROXY_PIN_ENABLED", "bool", "false", "false"),
     ("PROXY_PIN_BUDGET_RATIO", "PROXY_PIN_BUDGET_RATIO", "float", "0.05", "0.05"),
     ("PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_ENABLED", "bool", "false", "false"),
@@ -1379,6 +1403,8 @@ __all__ = [
     "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE",
     # Loop detection
     "PROXY_LOOP_THRESHOLD", "PROXY_LOOP_LEVEL2", "PROXY_LOOP_LEVEL3",
+    "PROXY_CTX_RECALL_STREAK_ENABLED", "PROXY_CTX_RECALL_STREAK_THRESHOLD",
+    "PROXY_CTX_RECALL_STREAK_STALE_TURNS",
     "PROXY_LOOP_CHARS_LONG", "PROXY_LOOP_CHARS_VERY_LONG",
     "PROXY_LOOP_SESSION_SHORT_BOUND", "PROXY_LOOP_SESSION_LONG_BOUND",
     "PROXY_LOOP_THRESHOLD_LONG", "PROXY_LOOP_THRESHOLD_VERY_LONG",

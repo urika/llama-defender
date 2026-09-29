@@ -907,6 +907,50 @@ CONFIG_REGISTRY = {
         "doc": "Max micro-turn re-dispatches per request (bounds recursion; each costs "
                "one incremental prefill).",
     },
+    # L-62(2026-09-30): 微轮自答的旁白持有。EXP-12 081154 实测 38/38 次
+    # ctx_recall 调用都伴随模型旁白("I'm stuck in a loop…", 182–1828 chars)；
+    # 旧行为在首个工具 delta 处把缓冲文本补发给客户端 ⇒ text_block_started=True
+    # ⇒ 微轮门槛(`not text_block_started`)不过 ⇒ 幽灵调用漏给客户端
+    # (No such tool available) ⇒ 死环自持(该 run 烧 38 轮；同批另两会话因
+    # 调用落在无文本响应而正常开火 17/6 次)。开启: 该旁白不先发射，随
+    # follow-up 的 assistant 消息交给模型；客户端只见微轮重派后的最终流。
+    # 预算耗尽/构造失败/开关关闭/混有非 cr 工具 → 发射前统一补发(fail-open，
+    # 顺序 text(index0)→tools 不变)。
+    "PROXY_PD_MICRO_TURN_HOLD_TEXT": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "L-62: hold narration text across a ctx_recall micro-turn so the "
+               "client-transparent self-answer also works for text+call responses "
+               "(EXP-12 081154: 38/38 calls were text-accompanied ⇒ gate never "
+               "fired). Off = legacy (any streamed text ⇒ path A via client error).",
+    },
+
+    # ---- ctx_recall 复发-交错计数（P0(ii)，2026-09-30）----
+    # 精确重复判据（consecutive，key=tool:args）对 ctx_recall 先天性失效：
+    # 模型每次换关键词重试 ⇒ key 不同；且被交错的其它工具调用挤出 15 条
+    # 尾部窗 ⇒ L-61 型"检索空转"完全不计入 loop 判据（081154 实测 38 次
+    # 调用零触发）。此组按**结局**（命中/未命中/有界回退）在会话级数
+    # ctx_recall 自身的连败，交错的其它工具不打断，一次命中即清零。
+    "PROXY_CTX_RECALL_STREAK_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "P0(ii): count ctx_recall outcome streak (hit/miss/fallback) per "
+               "session, interleave-tolerant, and inject the stop-retrying notice "
+               "at threshold. Off = legacy exact-repeat-only detection.",
+    },
+    "PROXY_CTX_RECALL_STREAK_THRESHOLD": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Consecutive non-hit ctx_recall outcomes (miss/fallback) before the "
+               "recall discipline notice is injected.",
+    },
+    "PROXY_CTX_RECALL_STREAK_STALE_TURNS": {
+        "defaults": {"all": "2"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Streak only acts if the newest ctx_recall attempt is within this many "
+               "session turns (staleness guard: a stopped spiral must not keep "
+               "re-injecting the notice).",
+    },
 
     # ---- L-22 会话拯救（2026-09-12，EXP-3 v2 失败归因）----
     # 纯文本响应（无任何工具调用）使 CLI 判"只说不做"直接 end_turn：

@@ -657,6 +657,22 @@ def rewrite_ctx_recall_results(messages, session_key):
                 kind = tool_input.get("kind")
                 limit = tool_input.get("limit", 8)
 
+                def _record_outcome(_outcome):
+                    """P0(ii) 配套指标（2026-09-30）: 结局台账记账。
+
+                    客户端视图里 ctx_recall 的结果恒为 error tool_result，
+                    真实结局（命中/未命中/回退）只有此处知道；按 call_id
+                    去重（历史每轮重改写 ⇒ 同一次调用只记首次结局）。
+                    fail-open：台账异常绝不能影响改写本身。
+                    """
+                    try:
+                        from ctx_recall import CTX_RECALL_STATS as _crs
+                        _crs.record(session_key, tid, _outcome,
+                                    turn=proxy_state._SESSION_REQUEST_COUNT.get(
+                                        session_key, 0))
+                    except Exception:
+                        pass
+
                 def _ctx_recall_fallback(_blk, _reason):
                     """P0(2026-09-28): 改写失败/不可用时给模型一个有界的、
                     不邀请无限重试的回退文案——同时把模型拽回"陈述假设/换工具"
@@ -668,6 +684,7 @@ def rewrite_ctx_recall_results(messages, session_key):
                         _blk["content"] = [{"type": "text", "text": _text}]
                     else:
                         _blk["content"] = _text
+                    _record_outcome("fallback")
                     import sys as _s
                     print("[ctx_recall-rewrite] 已落有界回退: %s" % _reason,
                           file=_s.stderr)
@@ -703,7 +720,8 @@ def rewrite_ctx_recall_results(messages, session_key):
                     changed = True
                     continue
 
-                # 改写 tool_result
+                # 改写 tool_result（结局记账：命中/未命中，P0(ii)）
+                _record_outcome("hit" if results else "miss")
                 if isinstance(block.get("content"), list):
                     block["content"] = [{"type": "text", "text": real_text}]
                 else:

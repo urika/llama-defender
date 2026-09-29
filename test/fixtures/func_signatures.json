@@ -329,7 +329,8 @@
       "is_text_loop",
       "text_loop_run",
       "session_id",
-      "total_chars"
+      "total_chars",
+      "ctx_recall_meta"
     ],
     "defaults": {
       "threshold": null,
@@ -339,7 +340,8 @@
       "is_text_loop": false,
       "text_loop_run": 0,
       "session_id": "",
-      "total_chars": 0
+      "total_chars": 0,
+      "ctx_recall_meta": null
     }
   },
   "_apply_rounds_truncation": {

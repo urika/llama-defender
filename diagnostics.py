@@ -439,6 +439,13 @@ def finalize_request(mc):
             "mode": ((mc or {}).get("pipeline", {}).get("truncate", {}) or {}).get("strategy"),
             "ratio": (mc or {}).get("compression_ratio"),
         },
+        # P0(ii) 配套指标（2026-09-30）: 会话级"无效重复劳动"事实。
+        # ctx_recall = 调用/查询词（客户端视图扫描，单调）+ 结局分型/连败
+        # （代答台账，stage 20 刷新后）；reread = 同文件重读无编辑计数。
+        # 消费方（/api/session/<key>/metrics → swe-eval mechanism_signals）
+        # 逐键取 max：会话内单调，代理中途重启则退化为下界（口径诚实）。
+        "ctx_recall": getattr(ctx, "ctx_recall_stats", None),
+        "reread": getattr(ctx, "reread_stats", None),
         "trace": None,
         # ① 配置指纹: 数据自带产生条件(队列识别/实验归因)
         "config": None,

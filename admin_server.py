@@ -2899,6 +2899,35 @@ def _build_session_metrics_json(session_key, records):
         "feedback_injected": r.get("feedback_injected"),
         "canonical_mismatch": r.get("canonical_mismatch"),
     } for r in records[-200:]]
+
+    # P0(ii) 配套指标（2026-09-30）: ctx_recall 结局分型 + 同文件重读无编辑。
+    # 会话内逐轮单调（全量历史扫描/累加台账）⇒ 逐键取 max 即会话总量；代理
+    # 中途重启致台账清零时退化为下界（口径诚实，不编造）。字符串键取最后一个
+    # 非空（last_outcome 是状态而非计数）。
+    _counts_max = {}
+    _last_str = {}
+    for r in records:
+        for sec in ("ctx_recall", "reread"):
+            item = r.get(sec)
+            if not isinstance(item, dict):
+                continue
+            for k, v in item.items():
+                key = f"{sec}.{k}"
+                if isinstance(v, bool) or v is None:
+                    continue
+                if isinstance(v, (int, float)):
+                    if key not in _counts_max or v > _counts_max[key]:
+                        _counts_max[key] = v
+                elif isinstance(v, str) and v:
+                    _last_str[key] = v
+    _counts_max.update(_last_str)
+    counts = {}
+    for key, v in _counts_max.items():
+        sec, _, name = key.partition(".")
+        counts.setdefault(sec, {})[name] = v
+    ctx_recall_stats = counts.get("ctx_recall") or None
+    reread_stats = counts.get("reread") or None
+
     return {
         "session_key": session_key,
         "turns": len(records),
@@ -2919,6 +2948,9 @@ def _build_session_metrics_json(session_key, records):
         "epoch_count": (records[-1].get("epoch_count") if records else None),
         "injection_counts": injection_counts,
         "canonical_mismatch_count": sum(1 for r in records if r.get("canonical_mismatch")),
+        # P0(ii): 无记录（旧代理/无调用）→ None，消费方按 unavailable 处理
+        "ctx_recall": ctx_recall_stats,
+        "reread": reread_stats,
         "series": series,
     }
 

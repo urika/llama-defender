@@ -54,6 +54,31 @@ def _import_loop_detection():
     return loop_detection
 
 
+def _assemble_ctx_recall_stats(ctx):
+    """P0(ii) 配套指标（2026-09-30）: 合流 ctx_recall 的调用侧与结局侧事实。
+
+    两端口径互补，缺一不可：
+      - 调用侧（attempts/distinct_queries/last_query）＝客户端视图扫描：
+        客户端每轮重发全量历史，重启也不失忆，可核验"模型花了几次"。
+      - 结局侧（hits/misses/fallbacks/failures/fail_streak）＝代答台账
+        （ctx_recall.CTX_RECALL_STATS）：客户端视图里结果恒为
+        "No such tool available"，真实结局只有改写处知道。
+    tally 缺（无调用/未启用/旧代理）时结局键置 0 而非编造——attempts 仍真实。
+    """
+    loop_detection = _import_loop_detection()
+    stats = dict(loop_detection._count_ctx_recall_calls(ctx.messages))
+    try:
+        import ctx_recall as _cr
+        snap = _cr.CTX_RECALL_STATS.snapshot(ctx.session_id or "")
+    except Exception:
+        snap = {}
+    for k in ("calls", "hits", "misses", "fallbacks", "failures",
+              "fail_streak", "last_turn"):
+        stats[k] = int(snap.get(k) or 0)
+    stats["last_outcome"] = snap.get("last_outcome")
+    return stats
+
+
 def _import_tool_filter():
     import tool_filter
     return tool_filter
@@ -1798,6 +1823,21 @@ class ToolLoopDetector(PipelineStage):
         ctx.consecutive = consecutive
         ctx.max_run = max_run
         ctx.pattern_tool_name = pattern_tool_name
+        # P0(ii) 配套指标（2026-09-30）: 会话级"无效重复劳动"事实——
+        # ① ctx_recall 调用/查询词（客户端视图扫描，重启不失忆）
+        # ② 同文件重读无编辑（结构式判据，L-53 的 55 次盲重读由此可核验）
+        # 结局侧（命中/未命中/回退）在代答路径记账，stage 20 改写后回写刷新。
+        try:
+            ctx.ctx_recall_stats = _assemble_ctx_recall_stats(ctx)
+        except Exception as _e:
+            _warn_diag("ctx_recall_stats", _e)
+            ctx.ctx_recall_stats = None
+        try:
+            ctx.reread_stats = _import_loop_detection()._count_rereads_without_edit(
+                ctx.messages)
+        except Exception as _e:
+            _warn_diag("reread_stats", _e)
+            ctx.reread_stats = None
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
@@ -1906,8 +1946,31 @@ class LoopIntervention(PipelineStage):
     name = "loop_detect"
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
+        # P0(ii) 复发-交错（2026-09-30，L-61 出典）: ctx_recall 结局连败必须在
+        # **精确重复阈值之下**也能触发 Lev1——换关键词重试使 key 每次都不同，
+        # 交错的其它工具调用又把早前失败挤出 15 条尾部窗，consecutive/max_run
+        # 对这类空转结构性失明（081154 实测 38 次调用零触发）。台账由 stage 20
+        # 代答路径记账 ⇒ 此处读到的结局到"上一轮"为止（一轮滞后，螺旋是持续性
+        # 的，可接受）；fresh 闸防"空转已停仍反复注入"。
+        cr_meta = None
+        if _ps.PROXY_CTX_RECALL_STREAK_ENABLED and ctx.session_id:
+            try:
+                import ctx_recall as _ctx_recall_mod
+                cr_meta = _ctx_recall_mod.CTX_RECALL_STATS.streak_meta(
+                    ctx.session_id,
+                    _ps._SESSION_REQUEST_COUNT.get(ctx.session_id, 0),
+                    _ps.PROXY_CTX_RECALL_STREAK_STALE_TURNS)
+            except Exception as _e:
+                _warn_diag("ctx_recall_streak_meta", _e)
+        cr_trigger = bool(
+            cr_meta and cr_meta.get("fresh")
+            and int(cr_meta.get("fail_streak") or 0)
+            >= int(_ps.PROXY_CTX_RECALL_STREAK_THRESHOLD))
+        ctx.ctx_recall_streak = int((cr_meta or {}).get("fail_streak") or 0)
+
         # Only intervene above threshold
-        if ctx.max_run < _ps.PROXY_LOOP_THRESHOLD and not ctx.is_text_loop:
+        if ctx.max_run < _ps.PROXY_LOOP_THRESHOLD and not ctx.is_text_loop \
+                and not cr_trigger:
             # No intervention needed. Reset session loop state if it was previously set.
             if ctx.session_id:
                 session_loop = _ps._LOOP_SESSION_STATE.get(ctx.session_id, {"level": 0, "triggers": 0})
@@ -1927,6 +1990,7 @@ class LoopIntervention(PipelineStage):
             text_loop_run=ctx.text_loop_run,
             session_id=ctx.session_id,
             total_chars=ctx.total_chars,
+            ctx_recall_meta=cr_meta if cr_trigger else None,
         )
 
         if loop_level >= 1:
@@ -1937,12 +2001,28 @@ class LoopIntervention(PipelineStage):
                 try:
                     import diagnostics
                     # kind 契约: loop_l1/l2/l3 或 text_loop(设计 D6,agent_go metering 依赖)
+                    # P0(ii): ctx_recall 连败走 loop_l1(契约不变), 来源经 DEF-310
+                    # detail 区分——旧消费方读计数不受影响。
+                    _inj_detail = None
+                    if loop_tool_name == "ctx_recall_streak":
+                        _inj_detail = {
+                            "site": "ctx_recall_streak",
+                            "streak": int((cr_meta or {}).get("fail_streak") or 0),
+                            "misses": int((cr_meta or {}).get("misses") or 0),
+                            "fallbacks": int((cr_meta or {}).get("fallbacks") or 0),
+                        }
                     diagnostics.record_injection(
-                        "text_loop" if loop_tool_name == "text_loop" else f"loop_l{loop_level}")
+                        "text_loop" if loop_tool_name == "text_loop" else f"loop_l{loop_level}",
+                        _inj_detail)
                 except Exception as _e:
                     _warn_diag("inject_loop_intervention", _e)
             if loop_tool_name == "text_loop":
                 log(f"  -> TEXT LOOP LEVEL {loop_level}: text_run={ctx.text_loop_run} max_run={ctx.max_run}")
+            elif loop_tool_name == "ctx_recall_streak":
+                log(f"  -> LOOP LEVEL {loop_level}: tool=ctx_recall_streak "
+                    f"streak={(cr_meta or {}).get('fail_streak')} "
+                    f"misses={(cr_meta or {}).get('misses')} "
+                    f"fallbacks={(cr_meta or {}).get('fallbacks')}")
             else:
                 # #52(2026-08-29): 原 f-string 内联 {{k: v for ...}}——双花括号是
                 # 字面量, 日志打出的是推导式原文而非实际计数。先求值再嵌入。
@@ -2936,6 +3016,14 @@ class FormatConverter(PipelineStage):
                     ctx.messages, ctx.session_id or "")
             except Exception:
                 pass
+            # P0(ii) 配套指标（2026-09-30）: 改写已记账（命中/未命中/回退），
+            # 此刻刷新快照——finalize_request 落盘的就是"含本轮结局"的会话事实。
+            try:
+                _snap = _assemble_ctx_recall_stats(ctx)
+                if _snap:
+                    ctx.ctx_recall_stats = _snap
+            except Exception as _e:
+                _warn_diag("ctx_recall_stats_refresh", _e)
 
         # 1. Convert messages
         messages = msg_converter.convert_anthropic_messages_to_openai(ctx.messages)

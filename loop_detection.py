@@ -273,6 +273,119 @@ def _build_blocker_message(tool_name, error_type, run_length):
             ),
         }],
     }
+# --- _count_ctx_recall_calls ---
+def _count_ctx_recall_calls(messages, max_messages=None):
+    """客户端视图的 ctx_recall 调用计数（P0(ii) 配套指标，2026-09-30）。
+
+    只数**调用/查询词**，不判结局——客户端视图里 ctx_recall 的 tool_result
+    恒为 "No such tool available"（CLI 工具白名单不含该工具），真实结局
+    （命中/未命中/回退）由代答路径记入 ctx_recall.CTX_RECALL_STATS。
+    按 tool_use_id 去重（客户端每轮重发全量历史）；无 id 的调用逐次计数。
+    """
+    scan = messages if not max_messages else messages[-max_messages:]
+    seen = set()
+    queries = []
+    attempts = 0
+    for msg in scan:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") != "ctx_recall":
+                continue
+            tid = block.get("id") or ""
+            if tid:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+            attempts += 1
+            inp = block.get("input")
+            q = str((inp or {}).get("query") or "") if isinstance(inp, dict) else ""
+            if q:
+                queries.append(q)
+    return {
+        "attempts": attempts,
+        "distinct_queries": len(set(queries)),
+        "last_query": queries[-1] if queries else "",
+    }
+
+
+# --- _count_rereads_without_edit ---
+_WASTED_RESULT_MARKERS = ("未发生变化", "wasted call")
+_WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def _count_rereads_without_edit(messages, max_messages=None):
+    """同文件重读无编辑计数（P0(ii) 配套指标，2026-09-30）。
+
+    L-53 出典里"55 次同目标盲重读"到 2026-09-29 仍只有定性描述，此函数把
+    它变成可核验的 run 级数：结构式判据（不依赖客户端自报的 Wasted call）。
+
+      - key = (file_path, offset, limit)：分页参数参与（L-15 口径——分页读
+        不同切片是新内容，不算浪费；同窗重读才算）；
+      - 某 key 已读过、且此后**无**对该 file_path 的写 ⇒ 该次 Read 记
+        no_edit_rereads += 1（no_edit_targets 记去重文件路径）；
+      - 写操作清掉该文件全部已读标记（内容已变，再读不是浪费）。
+    附 wasted_calls：结果文本已被判定为无效读的次数（客户端原文
+    "Wasted call" 或翻译层改写后的 "未发生变化"）。
+    """
+    scan = messages if not max_messages else messages[-max_messages:]
+    read_keys = set()
+    reads = 0
+    no_edit = 0
+    targets = set()
+    writes = 0
+    wasted = 0
+    for msg in scan:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if role == "assistant" and block.get("type") == "tool_use":
+                name = block.get("name") or ""
+                inp = block.get("input")
+                inp = inp if isinstance(inp, dict) else {}
+                fp = inp.get("file_path") or inp.get("path") or ""
+                if name == "Read" and fp:
+                    reads += 1
+                    key = (fp, str(inp.get("offset") or ""),
+                           str(inp.get("limit") or ""))
+                    if key in read_keys:
+                        no_edit += 1
+                        targets.add(fp)
+                    read_keys.add(key)
+                elif name in _WRITE_TOOLS and fp:
+                    writes += 1
+                    for k in [k for k in read_keys if k[0] == fp]:
+                        read_keys.discard(k)
+            elif role == "user" and block.get("type") == "tool_result":
+                text = block.get("content")
+                if isinstance(text, list):
+                    text = " ".join(b.get("text", "") for b in text
+                                    if isinstance(b, dict))
+                if not isinstance(text, str):
+                    text = str(text or "")
+                low = text.lower()
+                if any(m in low for m in _WASTED_RESULT_MARKERS):
+                    wasted += 1
+    return {
+        "reads": reads,
+        "writes": writes,
+        "no_edit_rereads": no_edit,
+        "no_edit_targets": len(targets),
+        "wasted_calls": wasted,
+    }
+
+
 # --- _build_tool_use_map ---
 def _build_tool_use_map(messages):
     """Build a mapping from tool_use_id to tool name across all messages."""
@@ -293,7 +406,7 @@ def _apply_loop_intervention(
     threshold=None, level2_threshold=None,
     level3_threshold=None, pattern_tool_name=None,
     is_text_loop=False, text_loop_run=0, session_id="",
-    total_chars=0,
+    total_chars=0, ctx_recall_meta=None,
 ):
     """Escalating loop intervention (R2.1). Returns (messages, tools, level, tool_name).
 
@@ -312,7 +425,23 @@ def _apply_loop_intervention(
         level2_threshold = threshold * 2  # follows existing LEVEL2 = THRESHOLD * 2 pattern
     if level3_threshold is None:
         level3_threshold = threshold * 3  # follows existing LEVEL3 = THRESHOLD * 3 pattern
-    if max_run < threshold:
+
+    # P0(ii) 复发-交错（2026-09-30，L-61 出典）：ctx_recall 结局连败在**精确
+    # 重复阈值以下**也触发 Lev1——换关键词重试使 key 每次都不同，交错的其它
+    # 工具调用又把早前失败挤出 15 条尾部窗，故 consecutive/max_run 结构性抓
+    # 不到这类空转（081154 实测 38 次调用零触发）。streak 由代答路径的结局
+    # 台账给出，交错的其它工具不打断，一次命中即清零；fresh=False（空转已
+    # 停）即不触发。置于 L2/L3 之后、通用 Lev1 之前：工具摘除降级仍优先，
+    # 而这条专属提示优先于"重复同一动作"泛化文案。
+    _cr = ctx_recall_meta or {}
+    _cr_streak = int(_cr.get("fail_streak") or 0)
+    _cr_trigger = bool(
+        getattr(_ps, "PROXY_CTX_RECALL_STREAK_ENABLED", True)
+        and _cr.get("fresh", True)
+        and _cr_streak >= int(getattr(_ps, "PROXY_CTX_RECALL_STREAK_THRESHOLD", 3))
+    )
+
+    if max_run < threshold and not is_text_loop and not _cr_trigger:
         return raw_messages, raw_tools, 0, ""
 
     # Text loop detection: different intervention for repeated similar text
@@ -354,6 +483,11 @@ def _apply_loop_intervention(
             return new_messages, raw_tools, 1, "text_loop"
 
     # Tool loop detection (original logic)
+    # 无精确重复触发且无 ctx_recall 连败 ⇒ 工具路径无事可做（文本环已在上面
+    # 返回；此处恢复改造前的早退语义，避免 max_run=0 时误发通用 Lev1）。
+    if max_run < threshold and not _cr_trigger:
+        return raw_messages, raw_tools, 0, ""
+
     loop_keys = [k for k, v in consecutive.items() if v >= threshold]
     high_count_tools = sorted(set(k.split(":")[0] for k in loop_keys))
     tool_name = high_count_tools[0] if high_count_tools else (pattern_tool_name or "unknown")
@@ -387,6 +521,26 @@ def _apply_loop_intervention(
             }]
         }]
         return new_messages, new_tools, 2, tool_name
+
+    if _cr_trigger:
+        # P0(ii) 复发-交错专属提示（L-61）：不邀请换关键词重试——存储里没有
+        # 就是没有；把模型拽回"陈述已知 + 单次定向取用 + 明确继续"。
+        _q = (_cr.get("last_query") or "").strip()[:60]
+        _breakdown = "misses=%d" % int(_cr.get("misses") or 0)
+        if int(_cr.get("fallbacks") or 0):
+            _breakdown += ", fallbacks=%d" % int(_cr.get("fallbacks") or 0)
+        new_messages = list(raw_messages) + [{
+            "role": "user",
+            "content": [{"type": "text", "text":
+                f"[System notice: ctx_recall 已连续 {_cr_streak} 次未取回内容"
+                f"（{_breakdown}"
+                + (f"；最近 query={_q!r}" if _q else "") + "）。"
+                "不要再换关键词重试 recall——该内容不在折叠存储里。"
+                "改为：用一句话写下你已知的事实与假设，然后要么对目标文件 "
+                "Read/Grep 一次，要么明确说明该信息不可得并继续推进。]"
+            }]
+        }]
+        return new_messages, raw_tools, 1, "ctx_recall_streak"
 
     if tool_name == "ctx_recall":
         # 0923 混合批次泄漏(0923 会话 be6274e9 实测): ctx_recall 必须单独调用,
@@ -426,6 +580,8 @@ __all__ = [
     "_build_blocker_message",
     "_build_tool_use_map",
     "_apply_loop_intervention",
+    "_count_ctx_recall_calls",
+    "_count_rereads_without_edit",
     "_effective_session_tier",
     "_effective_loop_threshold",
     "_effective_text_loop_threshold",
