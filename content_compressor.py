@@ -656,26 +656,52 @@ def rewrite_ctx_recall_results(messages, session_key):
                 query = tool_input.get("query", "")
                 kind = tool_input.get("kind")
                 limit = tool_input.get("limit", 8)
+
+                def _ctx_recall_fallback(_blk, _reason):
+                    """P0(2026-09-28): 改写失败/不可用时给模型一个有界的、
+                    不邀请无限重试的回退文案——同时把模型拽回"陈述假设/换工具"
+                    (语义重锚), 而非留给它一个永远 No such tool 的假出口。"""
+                    _text = ("ctx_recall 检索不可用(%s)：勿重复此查询。"
+                             "改用 Grep/git 找回早前结论，或先用一句话写下你认为"
+                             "的根因与下一步要验证的那一个测试。" % _reason)
+                    if isinstance(_blk.get("content"), list):
+                        _blk["content"] = [{"type": "text", "text": _text}]
+                    else:
+                        _blk["content"] = _text
+                    import sys as _s
+                    print("[ctx_recall-rewrite] 已落有界回退: %s" % _reason,
+                          file=_s.stderr)
+                
                 if not query:
+                    _ctx_recall_fallback(block, "缺少 query 参数")
+                    changed = True
                     continue
 
                 # 调用真实检索(分页续读: query "r:x@4000" → base+offset)
-                base_q, paged_off = parse_query_offset(query)
-                results = lookup(session_key, base_q, kind=kind, limit=limit)
-                # L-53 P2: 未命中折叠库时核验"是否仍在当前窗口"——此处
-                # messages 已经是 ContextEngine(0.5) 写回的折叠后视图
-                # （pipeline.py 发送副本），即模型将看到的同一视图。
-                window_hint = None
-                if not results:
-                    try:
-                        from ctx_recall import window_lookup
-                        window_hint = window_lookup(messages, base_q)
-                    except Exception:
-                        window_hint = None
-                real_text = format_recall_result(results, query,
-                                                 session_key=session_key,
-                                                 offset=paged_off,
-                                                 window_hint=window_hint)
+                try:
+                    base_q, paged_off = parse_query_offset(query)
+                    results = lookup(session_key, base_q, kind=kind, limit=limit)
+                    # L-53 P2: 未命中折叠库时核验"是否仍在当前窗口"——此处
+                    # messages 已经是 ContextEngine(0.5) 写回的折叠后视图
+                    # （pipeline.py 发送副本），即模型将看到的同一视图。
+                    window_hint = None
+                    if not results:
+                        try:
+                            from ctx_recall import window_lookup
+                            window_hint = window_lookup(messages, base_q)
+                        except Exception:
+                            window_hint = None
+                    real_text = format_recall_result(results, query,
+                                                     session_key=session_key,
+                                                     offset=paged_off,
+                                                     window_hint=window_hint)
+                except Exception as _re:
+                    # P0(2026-09-28): 检索/格式化异常不再静默留下"死局"error
+                    # tool_result(模型会无限重试假逃生门; exp-20260928 5-run
+                    # 实测 47/47 No such tool available / 081154 烧 38 轮)。
+                    _ctx_recall_fallback(block, "lookup/format 异常: %r" % (_re,))
+                    changed = True
+                    continue
 
                 # 改写 tool_result
                 if isinstance(block.get("content"), list):
@@ -685,10 +711,18 @@ def rewrite_ctx_recall_results(messages, session_key):
                 changed = True
 
         if changed:
+            # 改写已就地生效（block["content"] 已替换）。原此处 touch
+            # proxy_state._DIAG_ENABLED 系历史遗留名——该属性不存在，会在
+            # **成功路径**抛 AttributeError 并被外层静默吞掉；P0 诊断落地后这条
+            # 误报会以 "fail-open 异常" 混进日志（2026-09-29 激活验收实测），故
+            # 改读真实旗标：保留"引用 DIAG 状态"的意图，且不可能抛错。
             import proxy_state as _ps_local
-            _ps_local._DIAG_ENABLED = _ps_local._DIAG_ENABLED  # no-op, keep reference
-    except Exception:
-        pass  # fail-open: 改写失败不影响正常路径
+            _ = _ps_local.PROXY_DIAG_ENABLED
+    except Exception as _ex:
+        # P0(2026-09-28): fail-open 但必须留痕——否则"改写没兑现"这一契约
+        # 错位完全无声(exp-20260928 实测 47 次调用零日志), 判读只能靠翻 payload
+        import sys as _sys
+        print("[ctx_recall-rewrite] fail-open 异常: %r" % (_ex,), file=_sys.stderr)
 
     return messages
 
