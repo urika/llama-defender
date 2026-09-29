@@ -39,7 +39,7 @@ info() { echo -e "${CYAN}→${NC} $1"; }
 PROXY_PID=""; MOCK_PID=""
 cleanup() {
   set +e
-  diag_cleanup "$REPO_ROOT" "itesthin" "itestp3"
+  diag_cleanup "$REPO_ROOT" "$SID" "itestp3"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.3

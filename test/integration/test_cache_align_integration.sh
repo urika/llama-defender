@@ -46,7 +46,7 @@ MOCK_PID=""
 
 cleanup() {
   set +e
-  diag_cleanup "$REPO_ROOT" "itest-ca"
+  diag_cleanup "$REPO_ROOT" "itest-cache-align"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.2

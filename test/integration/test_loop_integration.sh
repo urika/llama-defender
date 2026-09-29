@@ -43,11 +43,17 @@ info() { echo -e "${CYAN}→${NC} $1"; }
 
 PROXY_PID=""
 MOCK_PID=""
-SESSION_ID="loop-test-$(date +%s)"
+# L-58(2026-09-29): ①SID 前缀改 `itest-*`（哨兵只扫 itest*/pfshadow*，旧的
+# loop-test-/persist-test- 命名泄了也看不见）；②把校验用的 SID 收进 CLEANUP_SIDS，
+# trap 按实际值清理——旧实现传的是 `"loop-tes" "persist-"` 两个不存在的名字，
+# 一次跑漏 8 件 archive/ledger（实测 loop-test-1790624254 等）。
+CLEANUP_SIDS=()
+SESSION_ID="itest-loop-$(date +%s)"
+CLEANUP_SIDS+=("$SESSION_ID")
 
 cleanup() {
   set +e
-  diag_cleanup "$REPO_ROOT" "loop-tes" "persist-"
+  diag_cleanup "$REPO_ROOT" "${CLEANUP_SIDS[@]}"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.2
@@ -208,7 +214,8 @@ test_no_loop_below_threshold() {
 test_cross_request_persistence() {
   info "TC5: cross-request — Level 2 persists across requests"
   local body1 body2
-  SESSION_ID="persist-test-$(date +%s)"
+  SESSION_ID="itest-persist-$(date +%s)"
+  CLEANUP_SIDS+=("$SESSION_ID")
   body1=$(build_loop_body 6 10)
   send_request "$body1" || { fail "TC5.1 curl failed"; return; }
   assert_tool_count 10 "TC5.1 first request: Read removed (11→10)"

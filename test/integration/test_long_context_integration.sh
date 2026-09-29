@@ -50,7 +50,7 @@ MOCK_PID=""
 
 cleanup() {
   set +e
-  diag_cleanup "$REPO_ROOT" "itest-lo"
+  diag_cleanup "$REPO_ROOT" "itest-longctx"
   [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null
   [[ -n "$MOCK_PID"  ]] && kill "$MOCK_PID"  2>/dev/null
   sleep 0.3
