@@ -1,6 +1,6 @@
 # Admin 注入原语设计（/admin/inject + DEF-311 钉住扩展）
 
-> **状态**：已接受（Track A 实现依据）
+> **状态**：已接受（Track A 实现依据）；**注入链活体验证 2026-10-04**（见 §10 验收附注）
 > **日期**：2026-09-09
 > **上游契约**：swe-eval `docs/adr/ADR-013-local-cloud-combo-exp6.md` §9.0（T0 冻结稿）
 > **任务编号**：ADR-013 T1（注入原语）+ T9（钉住正则扩展），Track A / llama.cpp 仓
@@ -161,6 +161,13 @@ canonical 自然重放；engine-off 路径注入消失属 §3.1 已声明语义�
   （新 stage 属新增节点，快照按工具流程更新）；
 - **红线 1 兼容**：代码化合入但不重启代理；EXP-3 v2 批次期集成验收顺延至
   收官重启窗口（T10 联调）。
+
+> **验收附注（2026-10-04，swe-eval 会话 s-20260929-16e243）**：注入全链已在**在役栈**
+> （engine-on）活体演练闭环，五环全过——入队 200／投递头 `X-Proxy-Feedback-Injected=admin_inject`／
+> R16 `injection_counts.admin_inject` 计数／sent 视图含 `<watchdog-nudge>` 块／once 清除且
+> canonical 跨轮存活。演练件与判读指引＝swe-eval `results/patches/watchdog-nudge-e2e-20261004/`
+> （`probe-nudge-e2e.py` 可复跑 + DRILL 档）；watchdog 检测侧的活体触发（本表 T1 单测之外的
+> "T10 联调"剩余部分）仍以 EXP-12 轮 2 批内首个 rabbit_hole 事件为准（r2 清单行"两个计数器必查"）。
 
 ## 11. 风险
 
