@@ -1,6 +1,7 @@
 # ctx_recall 自闭环（auto-recall）落地设计
 
 > 日期：2026-09-05 · 状态：已评审修订（评审修正见各节标注），落地中 · 来源：swe-eval 方差验证 v4 + 架构决策分析（见 `docs/02-architecture-design/llama-defender-context-engineering-design.md` §14）
+> **〔2026-10-04 状态更新（swe-eval ADR-016 / L-59 P1 裁决）〕**：本设计（`AutoRecallStage`，已实现默认关）经 PM 四点拍板成为召回通道**终局载体**（B 目标态）——生产默认前须过 R-AB 复活 A/B 门（负迁移一票否决）；通过后 conf 置 true 灰度，另窗退役模型侧 `ctx_recall` 虚拟工具面（cue 经 cd107d4 门控自动常闭）。与 ADR-010（2026-09-07 挂起）的关系：挂起的是收益假设投入，本裁决重开的是通道形态；若 A/B 否决则回退 MCP 化 fallback。权威链见 swe-eval `docs/adr/ADR-016-ctx-recall-retire-tool-face-view-injection.md`。
 > 一句话：把"重复读取检测 → 召回决策 → 召回执行 → 结果注入 → 行为验证"五环收进代理内部闭环，不依赖模型主动调用 ctx_recall、不依赖 client 压缩功能。
 
 ## 1. 背景与证据（为什么做）
