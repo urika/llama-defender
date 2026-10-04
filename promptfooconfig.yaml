@@ -133,6 +133,9 @@ tests:
   - description: 'TC7-上下文连续性'
     vars:
       prompt: '用户：我叫张三。助手：你好张三。用户：请重复我刚才说的名字。'
+      # L-64: 理想回答="张三"（2 字）——长度护栏下限按例声明为 2
+      # （出典=swe-eval results/quality/promptfoo-tc7-len-floor-20260929.md）
+      min_output_len: 2
     assert:
       - type: contains
         value: '张三'
@@ -228,9 +231,15 @@ defaultTest:
     - type: javascript
       value: "output.length > 0"
       weight: 0.05
-    # 断言：响应长度在合理范围（>=5 适应简短回答如"你的名字叫张三。"）
+    # 断言：响应长度在合理范围（截断护栏）。
+    # 下限按用例可调：默认 >=5（适应简短回答如"你的名字叫张三。"）；
+    # 用例可用 vars.min_output_len 声明自己的下限——TC7 最短正确答案为
+    # 2 字（"张三"），旧版全局 >=5 对最短正确回答误伤（L-64，出典=
+    # swe-eval results/quality/promptfoo-tc7-len-floor-20260929.md）。
     - type: javascript
-      value: "output.length >= 5 && output.length <= 4096"
+      value: |
+        const floor = Number((context.vars && context.vars.min_output_len) || 5);
+        return output.length >= floor && output.length <= 4096;
       weight: 0.05
     # 断言：不包含常见错误标记
     - type: not-contains
