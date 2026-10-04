@@ -601,6 +601,8 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_AUTOTUNE_DAILY_LIMIT` | `5` | 每日晋级提案上限（T4 限速，gate 返回 `over_daily_limit`） |
 | `PROXY_AUTOTUNE_SESSION_LIMIT` | `1` | 单会话晋级提案上限（gate 返回 `over_session_limit`） |
 
+> **2026-10-05 裁决（hub 0925-2①，域负责人拍板"分工"）**：autotune **降格为纯提案器**——`generate/list` 保留，`apply/rollback` 冻结（提案一律进 swe-eval E 期周闸门人审，采纳后经 goal.yaml 管控的 knob 路径生效）；参数白名单唯一权威＝`configs/goal.yaml`（version 递增），白名单外提案拒绝。**批期禁 autotune apply**（同批期红线 1 族）。生效链路（overrides.conf/reload 钩子）如需接通，先按契约 §六登记（roadmap #15）。
+
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 
 > 完整参数列表及详细文档见 [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`。
