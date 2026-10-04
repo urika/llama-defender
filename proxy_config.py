@@ -915,14 +915,18 @@ CONFIG_REGISTRY = {
     # 调用落在无文本响应而正常开火 17/6 次)。开启: 该旁白不先发射，随
     # follow-up 的 assistant 消息交给模型；客户端只见微轮重派后的最终流。
     # 预算耗尽/构造失败/开关关闭/混有非 cr 工具 → 发射前统一补发(fail-open，
-    # 顺序 text(index0)→tools 不变)。
+    # 顺序 text(index0)→tools 不变)。**默认 false**：代码先落地、行为中立，
+    # 激活由 conf 置 true + reload 单独决定(见 results/patches/
+    # ctx-recall-narration-microturn-20260930/README.md §五)。
     "PROXY_PD_MICRO_TURN_HOLD_TEXT": {
-        "defaults": {"all": "true"},
+        "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
         "doc": "L-62: hold narration text across a ctx_recall micro-turn so the "
                "client-transparent self-answer also works for text+call responses "
                "(EXP-12 081154: 38/38 calls were text-accompanied ⇒ gate never "
-               "fired). Off = legacy (any streamed text ⇒ path A via client error).",
+               "fired). Off = legacy (any streamed text ⇒ path A via client error). "
+               "默认 false=代码落地不改变在役行为; 激活=conf 置 true + SIGHUP reload"
+               "(无需重启, 与批界解耦)。",
     },
 
     # ---- ctx_recall 复发-交错计数（P0(ii)，2026-09-30）----

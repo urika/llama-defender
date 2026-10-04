@@ -1457,6 +1457,32 @@ class Handler(BaseHTTPRequestHandler):
             getattr(_ps, "PROXY_RESCUE_ENABLED", True))
         _pending_text = []
 
+        # L-62(2026-09-30): 旁白持有——首个工具 delta 是 ctx_recall 且微轮可用时
+        # 暂不补发文本。旧行为在此处补发 ⇒ text_block_started=True ⇒ 微轮门槛
+        # (`not text_block_started`)永不过 ⇒ 幽灵调用漏给客户端(EXP-12 081154:
+        # 38/38 次带旁白调用零开火, 客户端 38/38 回 No such tool available,
+        # 死环烧 38 轮; 同批落在无文本响应的会话正常开火 17/6 次)。
+        # 判定不通过/微轮不成立时在发射前统一补发(fail-open, 见流末)。
+        _hold_text_for_micro_turn = False
+
+        def _hold_eligible():
+            return bool(
+                getattr(_ps, "PROXY_PD_MICRO_TURN_HOLD_TEXT", False)
+                and getattr(_ps, "PROXY_PD_ENABLED", True)
+                and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False))
+
+        def _is_ctx_recall_delta(tc_delta):
+            """本批工具 delta 是否正流出 ctx_recall（工具名可能分片到达）。"""
+            for _tc in tc_delta or []:
+                _nm = ((_tc.get("function") or {}).get("name") or "").strip()
+                if not _nm:
+                    _ix = _tc.get("index", 0)
+                    _nm = (((tool_calls_buffer.get(_ix) or {})
+                            .get("function") or {}).get("name") or "").strip()
+                if _nm and "ctx_recall".startswith(_nm):
+                    return True
+            return False
+
         def _flush_text_delta(t):
             """Emit a text delta SSE event, opening the text block lazily."""
             nonlocal text_block_started, total_text, output_char_count, output_force_stopped
@@ -1611,8 +1637,14 @@ class Handler(BaseHTTPRequestHandler):
             if tc_delta:
                 # L-22 rescue: 首个工具 delta → 前段文本属正常 agent 轮, 补发
                 # (顺序 text(index 0)→tools(index 1+), 块序不变)
+                # L-62: ctx_recall 的首个 delta 例外——暂不补发, 留给微轮门槛
+                # 判定(补发即 text_block_started=True, 微轮永不触发); 判定
+                # 不通过时在发射前统一补发(fail-open, 见流末)。
                 if _pending_text:
-                    _flush_pending_text()
+                    if _hold_eligible() and _is_ctx_recall_delta(tc_delta):
+                        _hold_text_for_micro_turn = True
+                    else:
+                        _flush_pending_text()
                 for tc in tc_delta:
                     idx = tc.get("index", 0)
                     if idx not in tool_calls_buffer:
@@ -1648,8 +1680,15 @@ class Handler(BaseHTTPRequestHandler):
                     _emit_text_delta(value)
                 else:  # "tool"
                     # L-22 rescue: 内联工具出现 → 前段文本属正常轮, 补发
+                    # L-62: ctx_recall 的内联工具同样让位微轮判定(口径与结构化
+                    # delta 一致; 内联路径的微轮门槛另受 content_tools_pending
+                    # 约束, 判不通过时流末统一补发)。
                     if _pending_text:
-                        _flush_pending_text()
+                        _nm = (value.get("name") or "").strip() if isinstance(value, dict) else ""
+                        if _hold_eligible() and _nm and "ctx_recall".startswith(_nm):
+                            _hold_text_for_micro_turn = True
+                        else:
+                            _flush_pending_text()
                     content_tools_pending.append(value)
 
         # Flush any unfinished state-machine state.
@@ -1704,7 +1743,9 @@ class Handler(BaseHTTPRequestHandler):
         # 在此整段拦截, 经微轮闭包追加纠错消息重派(客户端全透明, 预算共享
         # PROXY_PD_MICRO_TURN_MAX)。开关关闭/预算耗尽/无闭包 → 缓冲文本
         # 原样发射(fail-open, 会话不挂)。检测签名固定, 零误报源。
-        if _rescue_on and _pending_text and (tool_calls_buffer or content_tools_pending):
+        # L-62: 正在为 ctx_recall 持有旁白时不补发(留给下面的微轮门槛)。
+        if (_rescue_on and _pending_text and not _hold_text_for_micro_turn
+                and (tool_calls_buffer or content_tools_pending)):
             _flush_pending_text()  # 正常 agent 轮(有工具): 补发缓冲文本
         _rescue_kind = (
             _classify_rescue_response(total_text, bool(tool_calls_buffer or content_tools_pending))
@@ -1725,7 +1766,9 @@ class Handler(BaseHTTPRequestHandler):
             # 预算耗尽/无闭包: 缓冲文本照常发射(fail-open)
             _flush_pending_text()
         # 正常纯文本轮(任务总结等, 分类 None): 兜底发射缓冲
-        if _pending_text:
+        # L-62: 持有中的旁白不在此处发射——先给下面的微轮门槛判定机会,
+        # 判不通过时在发射前统一补发(见门槛后的 fail-open)。
+        if _pending_text and not _hold_text_for_micro_turn:
             _flush_pending_text()
 
         # IFC-3 方案B(2026-08-30): 微轮重派——本响应尚未向客户端发出任何内容
@@ -1734,6 +1777,10 @@ class Handler(BaseHTTPRequestHandler):
         # 全透明。开关关闭/预算耗尽/构造失败 → 正常发射回落路径 A(次请求改写)。
         # 注: thinking 模型的 reasoning_content 会作为文本增量先发 →
         # text_block_started=True → 自动回落路径 A(生产配置 thinking off 不受影响)。
+        # L-62(2026-09-30): 旁白经 _hold_text_for_micro_turn 持有后
+        # text_block_started 保持 False, 门槛对"文本+ctx_recall"响应同样可过;
+        # 持有的文本随 follow-up 的 assistant 消息交给模型(客户端不可见, 与
+        # 工具调用本身同口径), 判不通过时在下面统一补发。
         if (not text_block_started and not content_tools_pending
                 and tool_calls_buffer
                 and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
@@ -1756,14 +1803,36 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as _e:
                     _warn_diag("micro_turn_build", _e)
                 if _follow is not None:
+                    # L-62: 持有中的旁白随 follow-up 交给模型(模型可见性保留,
+                    # 客户端不可见); 重派失败/预算耗尽则不清缓冲, 走下面补发。
+                    _held_text = "".join(_pending_text)
+                    if _held_text:
+                        if isinstance(_follow[0], dict):
+                            _follow[0]["content"] = _held_text
+                        log("  -> [MICRO_TURN] narration held (%d chars) — "
+                            "self-answering text+call response" % len(_held_text))
                     # 标志先置 True 供递归入口消费; finally 兜底清除防重派异常
                     # 时泄漏到同连接的下一请求。
                     self._micro_continuation = True
                     try:
                         if _dispatch(_follow):
+                            _pending_text.clear()
                             return
                     finally:
                         self._micro_continuation = False
+
+        # L-62 fail-open: 未走成微轮(开关关闭/预算耗尽/构造失败/无重派钩子/
+        # 混有非 cr 工具) → 持有的旁白在发射前统一补发, 块序与旧行为一致
+        # (text index 0 → tools index 1+)。此前的降级完全静默, 判读只能翻
+        # payload; 现将"旁白已发射 ⇒ ctx_recall 回落路径 A"提为可见日志。
+        if _pending_text:
+            _flush_pending_text()
+        if (_hold_text_for_micro_turn and text_block_started
+                and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)
+                and any((tc["function"].get("name") or "") == "ctx_recall"
+                        for tc in tool_calls_buffer.values())):
+            log("  -> [MICRO_TURN] skipped: narration already streamed — "
+                "ctx_recall falls back to path A (client-side no-such-tool risk)")
 
         # Send content_block_stop for text (only if text was output)
         if text_block_started:

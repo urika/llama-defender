@@ -1235,7 +1235,8 @@ _RELOAD_SPEC = [
     ("PROXY_PD_MICRO_TURN_ENABLED", "PROXY_PD_MICRO_TURN_ENABLED", "bool", "false", "false"),
     ("PROXY_PD_MICRO_TURN_MAX", "PROXY_PD_MICRO_TURN_MAX", "int", "2", "2"),
     # L-62(2026-09-30): 旁白文本持有——微轮自答对"文本+ctx_recall"响应同样可用
-    ("PROXY_PD_MICRO_TURN_HOLD_TEXT", "PROXY_PD_MICRO_TURN_HOLD_TEXT", "bool", "true", "true"),
+    # （默认 false：代码落地行为中立；激活=conf true + reload）
+    ("PROXY_PD_MICRO_TURN_HOLD_TEXT", "PROXY_PD_MICRO_TURN_HOLD_TEXT", "bool", "false", "false"),
     # P0(ii) ctx_recall 复发-交错计数（2026-09-30）
     ("PROXY_CTX_RECALL_STREAK_ENABLED", "PROXY_CTX_RECALL_STREAK_ENABLED", "bool", "true", "true"),
     ("PROXY_CTX_RECALL_STREAK_THRESHOLD", "PROXY_CTX_RECALL_STREAK_THRESHOLD", "int", "3", "3"),

@@ -73,6 +73,7 @@ wait_for_port() {
 
 start_proxy() {
   local extra_env_name=$1  # "on" | "off"
+  local hold_flag="${2:-true}"  # L-62: 旁白持有(默认生产值)
   local mt_flag="false"
   [[ "$extra_env_name" == "on" ]] && mt_flag="true"
   PORT="$PROXY_PORT" \
@@ -88,6 +89,7 @@ start_proxy() {
   PROXY_ROUTE_ENABLED=false \
   PROXY_PD_ENABLED=true \
   PROXY_PD_MICRO_TURN_ENABLED="$mt_flag" \
+  PROXY_PD_MICRO_TURN_HOLD_TEXT="$hold_flag" \
     python3 "$REPO_ROOT/anthropic_proxy.py" >>"$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
   wait_for_port "$PROXY_PORT" "proxy(micro=$mt_flag)"
@@ -191,6 +193,78 @@ n_captured_off=$(wc -l < "$CAPTURE_PATH" | tr -d ' ')
 if [[ "$n_start_off" == "1" ]]; then pass "关闭时正常 1 个 message_start"; else fail "message_start=$n_start_off"; fi
 if [[ "$n_recall_off" -ge 1 ]]; then pass "关闭时 ctx_recall tool_use 正常发给客户端(路径 A)"; else fail "关闭时未见 tool_use"; fi
 if [[ "$n_captured_off" == "1" ]]; then pass "关闭时后端仅 1 次请求(无重派)"; else fail "后端请求数=$n_captured_off(期望 1)"; fi
+
+# ============================================================
+# 场景 3/4 (L-62, 2026-09-30): 旁白文本 + ctx_recall —— 修复前 38/38 漏给客户端
+#   3=持有开(修复态): 旁白与调用都不进客户端, 旁白随 follow-up 交给模型
+#   4=持有关(旧行为): 旁白与调用都发给客户端(变异基线)
+# ============================================================
+info "场景 3/4: 旁白文本 + ctx_recall(L-62 持有开/关)"
+NARRATION="I'm stuck in a loop. Let me break out and take a completely different approach."
+NARR_SEQ="$LOG_DIR/seq_narr.json"
+python3 -c "
+import json
+seq = [
+    {'text': '''$NARRATION''',
+     'tool_call': {'id': 'call_narr', 'name': 'ctx_recall',
+                   'arguments': json.dumps({'query': '架构 决策'})}},
+    {'text': '根据召回: 早期架构决策是 session 方案(放弃 JWT)。'},
+]
+json.dump(seq, open('$NARR_SEQ', 'w'), ensure_ascii=False)
+"
+SSE_NARR_ON="$LOG_DIR/client_sse_narr_on.txt"
+SSE_NARR_OFF="$LOG_DIR/client_sse_narr_off.txt"
+
+run_narration() {  # $1=hold(true/false)  $2=outfile  $3=capture_reset
+  kill "$MOCK_PID" 2>/dev/null; wait "$MOCK_PID" 2>/dev/null; MOCK_PID=""
+  sleep 0.3
+  MOCK_SEQ_FILE="$NARR_SEQ" \
+  MOCK_CAPTURE_PATH="$CAPTURE_PATH" \
+    python3 "$REPO_ROOT/test/integration/mock_backend.py" "$MOCK_PORT" >>"$MOCK_LOG" 2>&1 &
+  MOCK_PID=$!
+  wait_for_port "$MOCK_PORT" "mock backend(narration)"
+  : > "$CAPTURE_PATH"; : > "$PROXY_LOG"
+  kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""
+  sleep 0.3
+  start_proxy on "$1"
+  send_stream "$2"
+}
+
+# --- 场景 3: 持有开(修复态) ---
+run_narration true "$SSE_NARR_ON"
+n3_start=$(count_matches '^event: message_start' "$SSE_NARR_ON")
+n3_recall=$(count_matches 'ctx_recall' "$SSE_NARR_ON")
+n3_narr=$(count_matches 'stuck in a loop' "$SSE_NARR_ON")
+n3_answer=$(count_matches 'JWT' "$SSE_NARR_ON")
+n3_cap=$(wc -l < "$CAPTURE_PATH" | tr -d ' ')
+
+if [[ "$n3_start" == "1" ]]; then pass "L-62: 恰好 1 个 message_start(持有态仍透明)"; else fail "L-62: message_start=$n3_start"; fi
+if [[ "$n3_narr" == "0" ]]; then pass "L-62: 旁白未发给客户端(已随 follow-up 交模型)"; else fail "L-62: 旁白泄漏到客户端(n=$n3_narr)"; fi
+if [[ "$n3_recall" == "0" ]]; then pass "L-62: ctx_recall 调用仍被抑制(未漏给客户端)"; else fail "L-62: 客户端看到 ctx_recall(n=$n3_recall)"; fi
+if [[ "$n3_answer" == "1" ]]; then pass "L-62: 微轮重派后的最终答案已送达"; else fail "L-62: 未见最终答案"; fi
+if [[ "$n3_cap" == "2" ]]; then pass "L-62: 后端收到 2 次请求(自答重派)"; else fail "L-62: 后端请求数=$n3_cap(期望 2)"; fi
+if grep -q "MICRO_TURN] narration held" "$PROXY_LOG"; then pass "L-62: 日志留痕 [MICRO_TURN] narration held"; else fail "L-62: 日志未见持有留痕"; fi
+if python3 - "$CAPTURE_PATH" <<'PYEOF'
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").readlines()
+ok = False
+if len(lines) >= 2:
+    msgs = json.loads(lines[1])["body"].get("messages", [])
+    for m in msgs:
+        if m.get("role") == "assistant" and m.get("tool_calls") \
+                and "stuck in a loop" in (m.get("content") or ""):
+            ok = True
+sys.exit(0 if ok else 1)
+PYEOF
+then pass "L-62: follow-up 的 assistant 消息携带旁白(模型可见性保留)"; else fail "L-62: follow-up 未携带旁白"; fi
+
+# --- 场景 4: 持有关(旧行为/变异基线) ---
+run_narration false "$SSE_NARR_OFF"
+n4_recall=$(count_matches 'ctx_recall' "$SSE_NARR_OFF")
+n4_narr=$(count_matches 'stuck in a loop' "$SSE_NARR_OFF")
+n4_cap=$(wc -l < "$CAPTURE_PATH" | tr -d ' ')
+if [[ "$n4_recall" -ge 1 && "$n4_narr" -ge 1 ]]; then pass "L-62 关闭态=旧行为: 旁白+调用都发给客户端(变异基线)"; else fail "L-62 关闭态异常(recall=$n4_recall, narr=$n4_narr)"; fi
+if [[ "$n4_cap" == "1" ]]; then pass "L-62 关闭态: 后端仅 1 次请求(无重派)"; else fail "L-62 关闭态: 后端请求数=$n4_cap"; fi
 
 echo ""
 if (( FAIL == 0 )); then

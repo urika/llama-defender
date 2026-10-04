@@ -233,6 +233,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if spec is not None:
             chunks = [_chunk({"role": "assistant", "content": ""})]
+            # L-62(2026-09-30): text+tool_call 同响应——旁白先流、调用后流,
+            # 复现 EXP-12 081154 的响应形状(38/38 次调用都带旁白文本)。
+            if spec.get("text") and "tool_call" in spec:
+                _t = spec["text"]
+                _mid = max(1, len(_t) // 2)
+                chunks.append(_chunk({"content": _t[:_mid]}))
+                chunks.append(_chunk({"content": _t[_mid:]}))
             if "tool_call" in spec:
                 tcs = spec["tool_call"]
                 chunks.append(_chunk({"tool_calls": [{
