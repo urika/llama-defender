@@ -1208,9 +1208,15 @@ def format_recall_result(lines, query, session_key=None, offset=0,
                        window_hint.get("total") or 0,
                        window_hint.get("hits") or 0))
         if window_hint is not None:
+            # L-61(2026-10-05): 重试邀请有界化——旧文案"先换关键词重试一次"实测
+            # 被模型读成可反复邀请（激活验收探针两次即换词重发；与 P0(ii) 连败
+            # 干预文风矛盾）。改为显式"至多一次"＋告知连败计数存在（与
+            # loop_detection 的 ctx_recall fail_streak 联动；≥3 连败将注入
+            # 停止提示）。勿回退为无界邀请（test_l61_miss_bounded 钉死）。
             return ("ctx_recall: 无匹配的已折叠单元（query=%s）。已核验折叠后视图："
-                    "**不在你的当前上下文中**——折叠库亦未命中：先换关键词重试一次 "
-                    "recall；仍无再重读/repo 检索（或该信息确实不可得，勿编造）。%s"
+                    "**不在你的当前上下文中**——折叠库亦未命中：**至多再换一次关键词**"
+                    "（仅此一次；连续未命中会累积计数，连败后系统将提示停止重试）；"
+                    "仍无则转重读/repo 检索（或该信息确实不可得，勿编造）。%s"
                     % (query, hint))
         return ("ctx_recall: 无匹配的已折叠单元（query=%s）。ctx_recall 只检索"
                 "**已折叠**内容——未命中说明它从未被折叠：若你在对话中见过它，"
