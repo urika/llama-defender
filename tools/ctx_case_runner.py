@@ -439,6 +439,13 @@ def eval_expect(expect, resp_status, resp_headers, resp, captures,
             n = len(last.get("body", {}).get("messages") or [])
             add("backend_msg_count_min", expect["backend_msg_count_min"], n,
                 n >= expect["backend_msg_count_min"])
+        if "backend_first_message_role" in expect:
+            # L-38 唤醒（2026-10-05）：位置型断言——引擎 chat template 要求
+            # system 在首位（L-36 400 出典），此处钉代理出口报文形态。
+            msgs = last.get("body", {}).get("messages") or []
+            actual = msgs[0].get("role") if msgs else None
+            add("backend_first_message_role", expect["backend_first_message_role"],
+                actual, actual == expect["backend_first_message_role"])
 
     for s in expect.get("log_contains", []):
         add("log_contains", s, "(log %d chars)" % len(log_text),

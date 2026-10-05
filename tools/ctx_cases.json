@@ -1598,5 +1598,40 @@
     }
    ]
   }
+ },
+ {
+  "id": "TC32",
+  "suite": "prod",
+  "session": "t32",
+  "name": "system 位置归一：中部 system 前移至后端首位（L-36）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "start"
+    },
+    {
+     "role": "system",
+     "content": "SYS-MID-MARK"
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "backend_first_message_role": "system",
+   "last_dispatch_contains": [
+    "SYS-MID-MARK"
+   ]
+  },
+  "note": "L-38 唤醒·已知红(2026-10-05): 断言「后端首消息 role=system」不变量。当前 lifecycle._normalize_system_messages 按文档序原位保留中部 system ⇒ 断言失败（L-36）。套用 results/patches/l36-system-hoist-20261005/system-hoist.patch 后应转绿——红→绿即验收探针。"
  }
 ]
