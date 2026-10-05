@@ -445,7 +445,7 @@
   "id": "TC08",
   "suite": "micro",
   "session": "t08",
-  "name": "混合调用不自答",
+  "name": "混合调用拆分：ctx_recall 自答＋其他工具由模型重派（0923 split）",
   "mock_steps": [
    {
     "tool_calls": [
@@ -455,6 +455,14 @@
        "query": "SECRET"
       }
      },
+     {
+      "name": "DummyTool00",
+      "arguments": {}
+     }
+    ]
+   },
+   {
+    "tool_calls": [
      {
       "name": "DummyTool00",
       "arguments": {}
@@ -480,14 +488,14 @@
   },
   "expect": {
    "resp_status": 200,
-   "dispatch_count": 1,
+   "dispatch_count": 2,
    "resp_tool_use_names": {
-    "contains": [
-     "ctx_recall",
+    "exact": [
      "DummyTool00"
     ]
    }
-  }
+  },
+  "note": "L-38 唤醒适配(2026-10-05): 原断言（dispatch=1、客户端只见一次调用）编码 0923 前语义；现行为=混合批次抽 cr 子集自答、其余工具让模型重派轮重新发起（代码注释「0923 split」）。本例钉新不变量：客户端最终收到 DummyTool00、ctx_recall 不可见、dispatch=2。"
  },
  {
   "id": "TC09",
@@ -891,7 +899,8 @@
    "model": "$client",
    "max_tokens": 256,
    "tools": {
-    "$dummy": 1
+    "$dummy": 1,
+    "$ctx_recall": true
    },
    "$turns": 100,
    "$turn_tag": "mark20"
@@ -904,7 +913,9 @@
    "last_dispatch_contains": [
     "use ctx_recall to recover"
    ]
-  }
+  },
+  "_note_l59": null,
+  "note": "L-38 唤醒·已知红(2026-10-05): 本例子断言\"折叠面板含 RECALL_CUE\"，当前代码不满足。根因= L-59 门控(pipeline.py:733)按 **OpenAI 格式** 读请求 tools (`t.function.name==\"ctx_recall\"`)，而客户端协议为 Anthropic 格式(`t.name`) ⇒ 即使声明 $ctx_recall 门控也恒 False，A 路 cue 在生产形态下实际不可达。待 D3 裁决：①门控改双格式归一（→本例转绿）或 ②确认 cue 退役（→本例改写为断言 cue 缺席）。（面板主体/原文不在视图等其余断言均通过。）"
  },
  {
   "id": "TC22",
@@ -915,7 +926,8 @@
    "model": "$client",
    "max_tokens": 512,
    "tools": {
-    "$dummy": 1
+    "$dummy": 1,
+    "$ctx_recall": true
    },
    "$turns": 100,
    "$turn_tag": "mark",
@@ -941,7 +953,9 @@
      "min": 1
     }
    ]
-  }
+  },
+  "_note_l59": null,
+  "note": "L-38 唤醒·已知红(2026-10-05): 本例子断言\"折叠面板含 RECALL_CUE\"，当前代码不满足。根因= L-59 门控(pipeline.py:733)按 **OpenAI 格式** 读请求 tools (`t.function.name==\"ctx_recall\"`)，而客户端协议为 Anthropic 格式(`t.name`) ⇒ 即使声明 $ctx_recall 门控也恒 False，A 路 cue 在生产形态下实际不可达。待 D3 裁决：①门控改双格式归一（→本例转绿）或 ②确认 cue 退役（→本例改写为断言 cue 缺席）。（面板主体/原文不在视图等其余断言均通过。）"
  },
  {
   "id": "TC23",
