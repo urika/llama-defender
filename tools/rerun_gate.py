@@ -24,6 +24,19 @@
   4. `lru_evictions`（rapid_mlx_prefix_cache_evictions_total）增量
      ≤2× 窗 A 校准（432），即 ≤864（容量驱逐护栏，与命中率联动）
 
+族（profile）适配（2026-10-05，S-16 补门）：
+  引擎按 /metrics 暴露的族自动判别并记入快照 `profile` 字段——
+  - `rapid_mlx`：上方原四件套（Metal 有界/压力驱逐/cache 驱逐/折叠/墙钟）。
+  - `splash`：Splash 后端**无 `rapid_mlx_*` 计数器**，改用等价硬判据（v1）：
+    · `splash_memory_pressure{state="critical"}` 为 0（内存顶格在场）
+    · `splash_requests_failed_total` / `splash_capacity_failures_total` 增量为 0
+    · `splash_kv_pages_free` > 0（KV 页耗尽）
+    · ctx_config 漂移为空（S/K/engine）
+    · 墙钟比（R16 sessions.jsonl，中位）与折叠增量为两族**共用**判据
+    软项（待校准，进 `verdict.splash.notes`，不阻断）：decode tps 比、ITL p95、
+    cache_cold_misses 增量、cancelled 增量、admission_waiting_memory。
+    吞吐硬判据待校准后经 `--min-decode-tps-ratio` 启用（默认不 armed）。
+
 用法（由 swe-eval 批跑侧编排调用）：
   # 批前快照
   python3 tools/rerun_gate.py snapshot --out /tmp/gate-before.json
@@ -64,6 +77,30 @@ GAUGES = {
     "prefix_cache_current_bytes": "rapid_mlx_prefix_cache_current_bytes",
     "prefix_cache_cap_bytes": "rapid_mlx_prefix_cache_cap_bytes",
 }
+# Splash 族（2026-10-05，S-16 补门）：无 rapid_mlx_* 计数器，见 docstring 族适配
+SPLASH_COUNTERS = {
+    "requests_submitted": "splash_requests_submitted_total",
+    "requests_completed": "splash_requests_completed_total",
+    "requests_cancelled": "splash_requests_cancelled_total",
+    "requests_failed": "splash_requests_failed_total",
+    "capacity_failures": "splash_capacity_failures_total",
+    "cache_cold_misses": "splash_cache_cold_misses_total",
+    "cache_hits": "splash_cache_hits_total",
+    "cache_reused_tokens": "splash_cache_reused_tokens_total",
+}
+SPLASH_GAUGES = {
+    "mem_pressure_normal": 'splash_memory_pressure{state="normal"}',
+    "mem_pressure_warning": 'splash_memory_pressure{state="warning"}',
+    "mem_pressure_critical": 'splash_memory_pressure{state="critical"}',
+    "transport_pending": "splash_transport_pending",
+    "admission_waiting_memory": "splash_admission_waiting_memory",
+    "admission_suspended": "splash_admission_suspended",
+    "kv_pages_free": "splash_kv_pages_free",
+    "kv_pages_active": "splash_kv_pages_active",
+    "decode_tps": "splash_decode_tokens_per_second",
+    "itl_p50_ms": "splash_itl_p50_milliseconds",
+    "itl_p95_ms": "splash_itl_p95_milliseconds",
+}
 
 
 def _fetch(url, timeout=15):
@@ -76,14 +113,31 @@ def _metric_value(txt, name):
     return float(m.group(1)) if m else None
 
 
-def _backend_metrics():
-    txt = _fetch(BACKEND_METRICS)
+def _detect_profile(txt):
+    """按 /metrics 暴露的族判别：rapid_mlx > splash > unknown（未知按旧族处理）。"""
+    if "rapid_mlx_prefix_cache_" in txt:
+        return "rapid_mlx"
+    if "splash_" in txt:
+        return "splash"
+    return "unknown"
+
+
+def _backend_metrics(text=None):
+    txt = text if text is not None else _fetch(BACKEND_METRICS)
     out = {}
     for label, name in COUNTERS.items():
         v = _metric_value(txt, name)
         if v is not None:
             out[label] = int(v)
     for label, name in GAUGES.items():
+        v = _metric_value(txt, name)
+        if v is not None:
+            out[label] = int(v)
+    for label, name in SPLASH_COUNTERS.items():
+        v = _metric_value(txt, name)
+        if v is not None:
+            out[label] = int(v)
+    for label, name in SPLASH_GAUGES.items():
         v = _metric_value(txt, name)
         if v is not None:
             out[label] = int(v)
@@ -192,10 +246,12 @@ def _log_evict_attribution(since_bytes=0):
 
 
 def snapshot(out_path):
+    metrics_text = _fetch(BACKEND_METRICS)
     snap = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "epoch_utc": time.time(),
-        "metrics": _backend_metrics(),
+        "profile": _detect_profile(metrics_text),
+        "metrics": _backend_metrics(metrics_text),
         "ctx_config": _proxy_ctx(),
         "epoch_collapse_by_session": _epoch_collapse_by_session(),
         "wall_samples_ms": _wall_times_from_sessions(),
@@ -215,7 +271,8 @@ def snapshot(out_path):
 
 def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
           max_epoch_collapse, out_path, max_metal_evict=0,
-          max_metal_peak_gb=34.0, max_metal_events_30min=8):
+          max_metal_peak_gb=34.0, max_metal_events_30min=8,
+          min_decode_tps_ratio=None):
     with open(before_path, "r") as f:
         before = json.load(f)
     after = snapshot(None)
@@ -261,27 +318,68 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         if bc_cfg.get(k) != ac_cfg.get(k)
     }
 
+    profile = before.get("profile") or "rapid_mlx"   # 旧快照按旧族判
     reasons = []
-    if delta.get("pressure_evictions", 0) > max_pressure_evict:
-        reasons.append(f"pressure_evictions +{delta['pressure_evictions']} > {max_pressure_evict}")
-    # 判据 (1)："Metal 有界"（0922-3）——两段式：
-    #   1a 天花板：metal_peak < max_metal_peak_gb（绝对量纲）
-    #   1b thrash：窗内 Metal 日志事件 < max_metal_events_30min
-    # 关键：日志归因只扫 before 快照之后的增量（否则读全量历史数月事件）。
-    since_bytes = int(before.get("log_size_bytes") or 0)
-    metal_n, cache_n, both_n = _log_evict_attribution(since_bytes=since_bytes)
-    metal_events = metal_n + both_n
-    peak_bytes = am.get("metal_peak_bytes")
-    peak_gb = (peak_bytes / 1e9) if peak_bytes else None
-    if peak_gb is not None and peak_gb >= max_metal_peak_gb:
-        reasons.append(f"metal_peak {peak_gb:.1f}GB >= {max_metal_peak_gb}GB (1a ceiling)")
-    if metal_events >= max_metal_events_30min:
-        reasons.append(
-            f"Metal events {metal_events} >= {max_metal_events_30min} (1b thrash)")
-    if peak_gb is not None and peak_gb >= 33.0:
-        reasons.append(f"WARN: metal_peak {peak_gb:.1f}GB >= 33.0GB (early warning)")
-    if delta.get("lru_evictions", 0) > max_lru_evict:
-        reasons.append(f"lru_evictions +{delta['lru_evictions']} > {max_lru_evict}")
+    splash_block = None
+    if profile == "splash":
+        # Splash 族硬判据（v1；阈值口径见模块 docstring「族适配」）
+        sdelta = {k: am.get(k, 0) - bm.get(k, 0) for k in SPLASH_COUNTERS
+                  if k in bm and k in am}
+        if am.get("mem_pressure_critical"):
+            reasons.append("splash memory_pressure=critical 在场（内存顶格）")
+        if sdelta.get("requests_failed", 0) > 0:
+            reasons.append(f"requests_failed +{sdelta['requests_failed']} > 0")
+        if sdelta.get("capacity_failures", 0) > 0:
+            reasons.append(f"capacity_failures +{sdelta['capacity_failures']} > 0")
+        kv_free = am.get("kv_pages_free")
+        if kv_free is not None and kv_free <= 0:
+            reasons.append("kv_pages_free <= 0（KV 页耗尽）")
+        notes = [
+            f"decode_tps before/after={bm.get('decode_tps')}/{am.get('decode_tps')}",
+            f"itl_p95_ms={am.get('itl_p95_ms')}",
+            f"cache_cold_misses delta={sdelta.get('cache_cold_misses')}",
+            f"requests_cancelled delta={sdelta.get('requests_cancelled')}",
+            f"admission_waiting_memory={am.get('admission_waiting_memory')}",
+        ]
+        if min_decode_tps_ratio is not None:
+            b_tps, a_tps = bm.get("decode_tps"), am.get("decode_tps")
+            if b_tps and a_tps is not None and a_tps / b_tps < min_decode_tps_ratio:
+                reasons.append(
+                    f"decode_tps ratio {a_tps / b_tps:.2f} < {min_decode_tps_ratio}")
+        splash_block = {
+            "delta": sdelta,
+            "notes": notes,
+            "criteria_pending_calibration": [
+                "decode_tps_ratio（--min-decode-tps-ratio 校准后启用）",
+                "itl_p95", "cache_cold_misses_delta",
+                "cancelled_delta", "admission_waiting_memory",
+            ],
+        }
+        metal_n = cache_n = both_n = 0
+        metal_events = 0
+        peak_gb = None
+    else:
+        if delta.get("pressure_evictions", 0) > max_pressure_evict:
+            reasons.append(f"pressure_evictions +{delta['pressure_evictions']} > {max_pressure_evict}")
+        # 判据 (1)："Metal 有界"（0922-3）——两段式：
+        #   1a 天花板：metal_peak < max_metal_peak_gb（绝对量纲）
+        #   1b thrash：窗内 Metal 日志事件 < max_metal_events_30min
+        # 关键：日志归因只扫 before 快照之后的增量（否则读全量历史数月事件）。
+        since_bytes = int(before.get("log_size_bytes") or 0)
+        metal_n, cache_n, both_n = _log_evict_attribution(since_bytes=since_bytes)
+        metal_events = metal_n + both_n
+        peak_bytes = am.get("metal_peak_bytes")
+        peak_gb = (peak_bytes / 1e9) if peak_bytes else None
+        if peak_gb is not None and peak_gb >= max_metal_peak_gb:
+            reasons.append(f"metal_peak {peak_gb:.1f}GB >= {max_metal_peak_gb}GB (1a ceiling)")
+        if metal_events >= max_metal_events_30min:
+            reasons.append(
+                f"Metal events {metal_events} >= {max_metal_events_30min} (1b thrash)")
+        if peak_gb is not None and peak_gb >= 33.0:
+            reasons.append(f"WARN: metal_peak {peak_gb:.1f}GB >= 33.0GB (early warning)")
+        if delta.get("lru_evictions", 0) > max_lru_evict:
+            reasons.append(f"lru_evictions +{delta['lru_evictions']} > {max_lru_evict}")
+    # 共用判据（两族）：墙钟比 / epoch 折叠 / ctx 配置漂移
     if wall_ratio is not None and wall_ratio > wall_threshold_ratio:
         reasons.append(f"wall_ratio {wall_ratio:.2f} > {wall_threshold_ratio}")
     if epoch_total > max_epoch_collapse:
@@ -291,9 +389,11 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
 
     verdict = {
         "ts": after["ts"],
+        "profile": profile,
         "verdict": "PASS" if not reasons else "STOP",
         "reasons": reasons,
         "delta": delta,
+        "splash": splash_block,
         "log_evict_attribution": {"metal": metal_n, "cache_self": cache_n, "both": both_n},
         "metal_peak_gb": peak_gb,
         "epoch_collapse_delta": epoch_delta,
@@ -307,6 +407,7 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
             "max_metal_evict": max_metal_evict,
             "max_lru_evict": max_lru_evict,
             "max_epoch_collapse": max_epoch_collapse,
+            "min_decode_tps_ratio": min_decode_tps_ratio,
         },
     }
     if out_path:
@@ -314,9 +415,15 @@ def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
         with open(out_path, "w") as f:
             json.dump(verdict, f, ensure_ascii=False, indent=2)
 
-    print(f"[gate] 判定: {verdict['verdict']}")
-    print(f"        计数器增量: {delta}")
-    print(f"        日志归因: Metal事件={metal_events} cache-self={cache_n} metal_peak={peak_gb}GB")
+    print(f"[gate] 判定: {verdict['verdict']} (profile={profile})")
+    if profile == "splash":
+        print(f"        splash 计数增量: {splash_block['delta']}")
+        for note in splash_block["notes"]:
+            print(f"        note: {note}")
+        print(f"        待校准软项: {splash_block['criteria_pending_calibration']}")
+    else:
+        print(f"        计数器增量: {delta}")
+        print(f"        日志归因: Metal事件={metal_events} cache-self={cache_n} metal_peak={peak_gb}GB")
     print(f"        epoch_collapse 增量: {epoch_total}")
     print(f"        墙钟比: {wall_ratio}")
     if reasons:
@@ -344,6 +451,10 @@ def main():
     s2.add_argument("--max-lru-evict", type=int, default=864,
                     help="容量驱逐上限（默认 864 = 2× 窗 A 校准 432）")
     s2.add_argument("--max-epoch-collapse", type=int, default=0)
+    s2.add_argument("--min-decode-tps-ratio", type=float, default=None,
+                    dest="min_decode_tps_ratio",
+                    help="Splash 族吞吐硬判据（after/before decode tps 比下限；"
+                         "默认不 armed，校准后启用）")
     s2.add_argument("--out", default=None)
 
     args = ap.parse_args()
@@ -358,7 +469,8 @@ def main():
                  args.max_lru_evict, args.max_epoch_collapse, args.out,
                  max_metal_evict=0,
                  max_metal_peak_gb=args.max_metal_peak_gb,
-                 max_metal_events_30min=args.max_metal_events_30min)
+                 max_metal_events_30min=args.max_metal_events_30min,
+                 min_decode_tps_ratio=args.min_decode_tps_ratio)
 
 
 if __name__ == "__main__":
