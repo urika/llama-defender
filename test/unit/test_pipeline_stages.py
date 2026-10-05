@@ -920,6 +920,9 @@ class TestBackendDispatcher(unittest.TestCase):
 
     def setUp(self):
         self._patches = []
+        # L-63: 保存日成本累加器原值——本类 stream 用例的 mock usage 会流经
+        # _accumulate_route_daily_cost 把该模块级全局覆写成 MagicMock。
+        self._orig_route_daily_cost = getattr(_ps, "_route_daily_cost", None)
         self._mock_handler = MagicMock()
         self._mock_handler._handle_streaming_response = MagicMock()
         self._mock_handler._handle_non_streaming_response = MagicMock()
@@ -939,13 +942,16 @@ class TestBackendDispatcher(unittest.TestCase):
         #  every later test in this class into the local fallback path).
         _ps._PROVIDER_FAIL_COUNT.clear()
         _ps._PROVIDER_COOLDOWN_START.clear()
-
-    def tearDown(self):
         # Also clear on exit: leftover breaker state leaks into later test
         # MODULES in the same discover process (e.g. test_payload_limit).
         _ps._PROVIDER_FAIL_COUNT.clear()
         _ps._PROVIDER_COOLDOWN_START.clear()
         _ps._SESSION_ROUTE_MAP.clear()
+        # L-63: 复原累加器——否则 MagicMock 泄漏到同进程后续模块，任何对其
+        # 做数值格式化的消费方（admin /status）集体爆炸（"unsupported format
+        # string passed to MagicMock.__format__"）。注：本类原有两个
+        # tearDown、后者覆盖前者致 self._patches 从未 stop——合并即修复。
+        _ps._route_daily_cost = self._orig_route_daily_cost
 
     def _make_ctx(self, target="local", is_stream=False, total_chars=5000, session_id="s1"):
         ctx = PipelineContext(
@@ -1718,6 +1724,10 @@ class TestAnthropicProtocolDispatch(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.addCleanup(self._restore)
+        # L-63: 本类 stream 用例的 mock usage 会流经
+        # _accumulate_route_daily_cost 把模块级日成本覆写成 MagicMock
+        # （泄漏到同进程后续模块 → admin /status 格式化爆炸）。
+        self._orig_route_daily_cost = getattr(_ps, "_route_daily_cost", None)
         self._mock_handler = MagicMock()
         self._mock_handler._handle_streaming_response = MagicMock()
         self._mock_handler._handle_non_streaming_response = MagicMock()
@@ -1734,6 +1744,8 @@ class TestAnthropicProtocolDispatch(unittest.TestCase):
     def _restore(self):
         _ps._PROVIDER_FAIL_COUNT.clear()
         _ps._PROVIDER_COOLDOWN_START.clear()
+        # L-63: 复原日成本累加器（mock usage 污染，见 setUp 注）
+        _ps._route_daily_cost = self._orig_route_daily_cost
         self._tmp.cleanup()
         self._model_registry._reset()
         self._model_registry.load(

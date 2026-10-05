@@ -54,6 +54,26 @@ def _import_loop_detection():
     return loop_detection
 
 
+def _mirror_diag_ctx_stats(ctx):
+    """L-65（2026-10-05）: 把管线 ctx 上的 P0(ii) 统计镜像到诊断 ctx。
+
+    finalize_request 的 per-turn 记录读的是 `_ps._diag_ctx`（诊断专属对象），
+    而统计落在管线的 `PipelineContext` 上——两个对象不共事导致
+    sessions.jsonl 的 `ctx_recall`/`reread` 两段恒空（L-65 出典）。此处
+    在统计赋值点同址镜像；`_diag_ctx` 缺席（诊断关闭早期）时静默跳过。
+    候选②（finalize 内从进程级 store 取数）无法覆盖 reread——finalize
+    处没有消息视图，故取①。
+    """
+    _dc = getattr(_ps, "_diag_ctx", None)
+    if _dc is None:
+        return
+    try:
+        _dc.ctx_recall_stats = getattr(ctx, "ctx_recall_stats", None)
+        _dc.reread_stats = getattr(ctx, "reread_stats", None)
+    except Exception as _e:
+        _warn_diag("mirror_diag_ctx_stats", _e)
+
+
 def _assemble_ctx_recall_stats(ctx):
     """P0(ii) 配套指标（2026-09-30）: 合流 ctx_recall 的调用侧与结局侧事实。
 
@@ -1838,6 +1858,7 @@ class ToolLoopDetector(PipelineStage):
         except Exception as _e:
             _warn_diag("reread_stats", _e)
             ctx.reread_stats = None
+        _mirror_diag_ctx_stats(ctx)
         return ctx
 
     def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
@@ -3024,6 +3045,7 @@ class FormatConverter(PipelineStage):
                     ctx.ctx_recall_stats = _snap
             except Exception as _e:
                 _warn_diag("ctx_recall_stats_refresh", _e)
+            _mirror_diag_ctx_stats(ctx)
 
         # 1. Convert messages
         messages = msg_converter.convert_anthropic_messages_to_openai(ctx.messages)
