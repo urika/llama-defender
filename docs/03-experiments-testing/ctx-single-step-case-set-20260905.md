@@ -381,6 +381,10 @@
 | TC08 | ✅ | ✅（改写） | 原断言编码 0923 前语义（混合调用整单放弃→dispatch=1）。现行为=**0923 split**：抽 ctx_recall 子集自答、其余工具由模型重派轮重新发起。已按新不变量改写：dispatch=2、客户端最终收到 `DummyTool00`、ctx_recall 不可见。 |
 | TC20/TC22 | ✅ | ❌（已知红） | **L-59 门控格式错配**：`pipeline.py:733` 按 OpenAI 格式读请求 tools（`t.function.name`），客户端协议为 Anthropic 格式（`t.name`）⇒ 即使客户端声明 `ctx_recall` 门控也恒 False，**A 路 cue 在生产形态下实际不可达**。待 D3 裁决：①门控双格式归一（本例转绿）或 ②确认 cue 退役（改写为断言 cue 缺席）。其余断言（面板主体、原文不在视图、manifest）通过。 |
 | TC32（新） | — | ❌（就绪红锚） | system 位置归一（L-36）：中部 system 须前移至后端首位（`backend_first_message_role` 新断言）。当前 `lifecycle._normalize_system_messages` 原位保留 ⇒ 红；就绪补丁 `swe-eval/results/patches/l36-system-hoist-20261005/` 已验证**红→绿全链**（temp worktree 套用后本例 PASS）——套用后转绿。 |
+| TC33（新） | — | ✅ | 折叠窗口几何：单次折叠、最新轮仍在发送视图、视图收窄、无溢出回退错误（`log_regex_between` 钉 EPOCH 恰 1 次；出典=0922 几何死）。 |
+| TC34（新） | — | ✅ | est 估计器量级带：4000 字符载荷 → est≈1013 落 ±5% 带（`log_regex_between`；防 est 坍塌/低估口径回归）。 |
+| TC35（新） | — | ✅ | epoch 计数累计：二发超集（24→30 轮、长文本轮保折叠缩水）二次折叠 ⇒ 面板编号=2、`epochs=2`（`bodies` 多报文；防计数重置）。 |
+| TC36（新） | — | ✅ | 分页 dup 口径（L-15）：同文件不同窗口不计 dup（worst=1）、同窗重读计（size=2，有牙对照）（`ledger_dup` 新断言读台账）。 |
 | 其余 30 例 | — | ✅ | 含此前高风险的 TC12/TC23/TC28b/TC31；TC21b 保持文档化红（§4.6 契约自证）。 |
 
 复跑命令：`python3 tools/ctx_case_runner.py`（全量）／`--case TC20`（单例）；报告落 `logs/ctx_case/run-<ts>/`。

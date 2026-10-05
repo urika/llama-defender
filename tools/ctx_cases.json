@@ -1633,5 +1633,242 @@
    ]
   },
   "note": "L-38 唤醒·已知红(2026-10-05): 断言「后端首消息 role=system」不变量。当前 lifecycle._normalize_system_messages 按文档序原位保留中部 system ⇒ 断言失败（L-36）。套用 results/patches/l36-system-hoist-20261005/system-hoist.patch 后应转绿——红→绿即验收探针。"
+ },
+ {
+  "id": "TC33",
+  "suite": "epoch",
+  "session": "t33",
+  "name": "折叠窗口几何：单次折叠、尾部保全、无溢出（几何余量≥0）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$turns": 100,
+   "$turn_tag": "geo"
+  },
+  "expect": {
+   "resp_status": 200,
+   "last_dispatch_contains": [
+    "context-engine epoch 1",
+    "geo-099"
+   ],
+   "backend_msg_count_max": 95,
+   "backend_msg_count_min": 3,
+   "manifest_count_min": [
+    {
+     "session": "t33",
+     "min": 1
+    }
+   ],
+   "log_contains": [
+    "EPOCH #1"
+   ],
+   "log_not_contains": [
+    "exceeds epoch budget"
+   ],
+   "log_regex_between": [
+    {
+     "pattern": "EPOCH #(\\d+) triggered",
+     "min": 1,
+     "max": 1
+    }
+   ]
+  },
+  "note": "L-38 唤醒新增(2026-10-05)：几何余量——折叠恰一次（K=4 收紧不触发多轮）、最新轮仍在发送视图、视图被收窄（<100 msgs）、无溢出回退错误。出典=0922 窗口几何死（S+INIT 超上下文负余量，0924-7 修复）。"
+ },
+ {
+  "id": "TC34",
+  "suite": "prod",
+  "session": "t34",
+  "name": "est 估计器量级带（/4 口径；防 est 低估/坍塌）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "$big": 4000
+  },
+  "expect": {
+   "resp_status": 200,
+   "log_regex_between": [
+    {
+     "pattern": "est_tokens≈(\\d+)",
+     "min": 962,
+     "max": 1063
+    }
+   ]
+  },
+  "note": "L-38 唤醒新增(2026-10-05)：est=ceil(序列化chars/4)（TOKEN_CHAR_RATIO=4）。4000 字符正文 → 预期 ≈1013；带宽已按实测收紧至 ±5%。真实×1.6 校准属 usage 回填路径，本例只钉估计器口径不坍塌。"
+ },
+ {
+  "id": "TC35",
+  "suite": "epoch",
+  "session": "t35",
+  "name": "epoch 计数累计：二次折叠编号递增不重置（epoch 累计）",
+  "bodies": [
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "$turns": 24,
+    "$turn_text": "acc-%03d: FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+   },
+   {
+    "model": "$client",
+    "max_tokens": 256,
+    "tools": {
+     "$dummy": 1
+    },
+    "$turns": 30,
+    "$turn_text": "acc-%03d: FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+   }
+  ],
+  "expect": {
+   "resp_status": 200,
+   "log_contains": [
+    "EPOCH #1",
+    "EPOCH #2"
+   ],
+   "last_dispatch_contains": [
+    "context-engine epoch 2"
+   ]
+  },
+  "note": "L-38 唤醒新增(2026-10-05)：二发超集（18→20 轮；前 18 条同 hash 被 absorb 去重）。长文本轮（~430 字符）保证折叠缩水（台账行 head 截断 160）⇒ 第二次折叠不溢出；断言 EPOCH #1/#2 与面板编号 2 ⇒ epoch_count 累计不重置（出典=0924-6 计数重置盲区）。"
+ },
+ {
+  "id": "TC36",
+  "suite": "prod",
+  "session": "t36",
+  "name": "分页读 dup 口径：同文件不同窗口不计、同窗口重读计（L-15）",
+  "body": {
+   "model": "$client",
+   "max_tokens": 256,
+   "tools": {
+    "$dummy": 1
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "tool_use",
+       "id": "call_a1",
+       "name": "Read",
+       "input": {
+        "file_path": "/repo/page_a.py",
+        "offset": 0,
+        "limit": 100
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "tool_result",
+       "tool_use_id": "call_a1",
+       "content": "AAAA"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "tool_use",
+       "id": "call_a2",
+       "name": "Read",
+       "input": {
+        "file_path": "/repo/page_a.py",
+        "offset": 100,
+        "limit": 100
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "tool_result",
+       "tool_use_id": "call_a2",
+       "content": "BBBB"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "tool_use",
+       "id": "call_b1",
+       "name": "Read",
+       "input": {
+        "file_path": "/repo/same_b.py"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "tool_result",
+       "tool_use_id": "call_b1",
+       "content": "CCCC"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "tool_use",
+       "id": "call_b2",
+       "name": "Read",
+       "input": {
+        "file_path": "/repo/same_b.py"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "tool_result",
+       "tool_use_id": "call_b2",
+       "content": "DDDD"
+      }
+     ]
+    }
+   ]
+  },
+  "expect": {
+   "resp_status": 200,
+   "ledger_dup": [
+    {
+     "session": "t36",
+     "target_contains": "page_a.py",
+     "max": 1
+    },
+    {
+     "session": "t36",
+     "target_contains": "same_b.py",
+     "min": 2
+    }
+   ]
+  },
+  "note": "L-38 唤醒新增(2026-10-05)：L-15 分页感知——page_a 两次读窗口不同(0/100 vs 100/100) ⇒ 各自成组（worst=1 不计 dup）；same_b 同窗重读两次 ⇒ 同组 size=2（计数活着=有牙对照）。"
  }
 ]

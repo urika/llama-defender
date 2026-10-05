@@ -22,6 +22,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -453,6 +454,16 @@ def eval_expect(expect, resp_status, resp_headers, resp, captures,
     for s in expect.get("log_not_contains", []):
         add("log_not_contains", s, "(log %d chars)" % len(log_text),
             s not in log_text)
+    for spec in expect.get("log_regex_between", []) or []:
+        # L-38 唤醒（2026-10-05）：数值带断言（如 est_tokens≈N 的估计器量级）。
+        m = re.search(spec.get("pattern", ""), log_text)
+        value = int(m.group(1)) if (m and m.groups()) else None
+        lo, hi = spec.get("min"), spec.get("max")
+        ok = (value is not None
+              and (lo is None or value >= lo)
+              and (hi is None or value <= hi))
+        add("log_regex_between[%s]" % spec.get("pattern", "?")[:40],
+            {"min": lo, "max": hi}, value, ok)
 
     for spec in expect.get("manifest_count_min", []) or []:
         rows = _read_manifest(diag_dir, spec["session"])
@@ -478,11 +489,49 @@ def eval_expect(expect, resp_status, resp_headers, resp, captures,
         add("manifest_field_contains[%s.%s]" % (spec["session"],
                                                 spec.get("field")),
             spec.get("any_of"), "hit=%s over %d rows" % (hit, len(rows)), hit)
+    for spec in expect.get("ledger_dup", []) or []:
+        # L-38 唤醒（2026-10-05）：台账 dup 口径断言——(tool, target_hash)
+        # 分组计数，钉 L-15 分页感知（同文件不同 offset/limit 不计 dup；
+        # 同窗口重读仍计）。target_contains 过滤展示串选定目标文件。
+        actions = []
+        for rec in _read_jsonl(os.path.join(
+                diag_dir, "ledger", "%s.jsonl" % spec["session"])):
+            actions.extend(rec.get("actions") or [])
+        matched = [a for a in actions
+                   if spec.get("target_contains", "") in (a.get("target") or "")]
+        groups = {}
+        for a in matched:
+            k = (a.get("tool"), a.get("target_hash"))
+            groups[k] = groups.get(k, 0) + 1
+        worst = max(groups.values()) if groups else 0
+        ok = worst >= spec.get("min", 0) and (("max" not in spec)
+                                              or worst <= spec["max"])
+        add("ledger_dup[%s]" % spec.get("target_contains", "?"),
+            {"min": spec.get("min"), "max": spec.get("max")},
+            "worst=%d over %d actions (%d groups)"
+            % (worst, len(matched), len(groups)), ok)
     return out
 
 
 def _read_manifest(diag_dir, session):
     path = os.path.join(diag_dir, "manifest", "%s.jsonl" % session)
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return rows
+
+
+def _read_jsonl(path):
+    """通用 JSONL 读取（坏行跳过）——L-38 唤醒引入（台账 dup 断言）。"""
     if not os.path.exists(path):
         return []
     rows = []
