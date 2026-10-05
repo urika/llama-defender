@@ -839,9 +839,36 @@ def effective_window_k():
     return int(raw) if raw > 0 else DEFAULT_WINDOW_K
 
 
+def recall_cue_available(body_tools=None):
+    """折叠面板 RECALL_CUE 注入谓词（L-59 门控修复，2026-10-06）。
+
+    严格语义 = **offer ∧ interception**，返回 (bool, detail)：
+    - offer：ctx_recall 会被注入后端工具表——与 FormatConverter stage 20 的
+      tool_filter._inject_ctx_recall 条件逐字同源（请求带 tools ∧
+      PROXY_TOOL_FILTER_ENABLED ∧ PROXY_PD_ENABLED）。旧门控（cd107d4）查
+      **客户端** tools 声明，而生产客户端从不声明 ctx_recall（代理注入的
+      幽灵工具）⇒ 门控恒 False、折叠召回线索自 09-29 起实际不可达
+      （TC20/22 红锚 + 轮2 台账 16 次自发尝试 vs 5,821 次内容重读实证）。
+    - interception：PROXY_PD_MICRO_TURN_ENABLED——engine-on 时 stage 14 被
+      跳过（TC21b），微轮自答是唯一应答通道；关闭时邀请必漏给客户端
+      ＝死环入口（轮1 实测 47/47），此处 fail-closed。
+    ADR-016 退役窗（B 目标态：工具面退役＋视图注入）到位后，本谓词随 cue
+    一起自动常闭（契约 §4.7 过渡态口径）。
+    """
+    tools_ok = bool(body_tools)
+    tf = bool(getattr(_ps, "PROXY_TOOL_FILTER_ENABLED", False))
+    pd = bool(getattr(_ps, "PROXY_PD_ENABLED", True))
+    mt = bool(getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False))
+    offer = tools_ok and tf and pd
+    return (offer and mt,
+            "offer=%s(tools=%s,filter=%s,pd=%s) intercept=%s" % (
+                offer, tools_ok, tf, pd, mt))
+
+
 __all__ = [
     "ENGINE", "CanonicalSession", "EngineStore", "ContextOverflowError",
     "compress_observation", "estimate_tokens",
     "effective_trigger_tokens", "effective_window_k",
+    "recall_cue_available",
     "DEFAULT_EPOCH_TRIGGER_TOKENS", "DEFAULT_WINDOW_K", "TOKEN_CHAR_RATIO",
 ]

@@ -892,15 +892,14 @@
  },
  {
   "id": "TC20",
-  "suite": "epoch",
+  "suite": "epochmicro",
   "session": "t20",
   "name": "epoch 折叠面板的召回线索（B环·B路）",
   "body": {
    "model": "$client",
    "max_tokens": 256,
    "tools": {
-    "$dummy": 1,
-    "$ctx_recall": true
+    "$dummy": 1
    },
    "$turns": 100,
    "$turn_tag": "mark20"
@@ -915,19 +914,18 @@
    ]
   },
   "_note_l59": null,
-  "note": "L-38 唤醒·已知红(2026-10-05): 本例子断言\"折叠面板含 RECALL_CUE\"，当前代码不满足。根因= L-59 门控(pipeline.py:733)按 **OpenAI 格式** 读请求 tools (`t.function.name==\"ctx_recall\"`)，而客户端协议为 Anthropic 格式(`t.name`) ⇒ 即使声明 $ctx_recall 门控也恒 False，A 路 cue 在生产形态下实际不可达。待 D3 裁决：①门控改双格式归一（→本例转绿）或 ②确认 cue 退役（→本例改写为断言 cue 缺席）。（面板主体/原文不在视图等其余断言均通过。）"
+  "note": "L-59 谓词修复(2026-10-06)：改钉生产真实形态——客户端不声明 ctx_recall（代理注入），套件 epochmicro（offer∧interception 均真）⇒ 面板应含 RECALL_CUE。旧门控（查客户端声明）下本例恒红；谓词修复后转绿。"
  },
  {
   "id": "TC22",
-  "suite": "epoch",
+  "suite": "epochmicro",
   "session": "t22",
   "name": "engine-on 单请求折叠：事实入折叠区+cue暴露+原文不在发送视图",
   "body": {
    "model": "$client",
    "max_tokens": 512,
    "tools": {
-    "$dummy": 1,
-    "$ctx_recall": true
+    "$dummy": 1
    },
    "$turns": 100,
    "$turn_tag": "mark",
@@ -952,10 +950,15 @@
      "session": "t22",
      "min": 1
     }
-   ]
+   ],
+   "backend_tools_last": {
+    "contains": [
+     "ctx_recall"
+    ]
+   }
   },
   "_note_l59": null,
-  "note": "L-38 唤醒·已知红(2026-10-05): 本例子断言\"折叠面板含 RECALL_CUE\"，当前代码不满足。根因= L-59 门控(pipeline.py:733)按 **OpenAI 格式** 读请求 tools (`t.function.name==\"ctx_recall\"`)，而客户端协议为 Anthropic 格式(`t.name`) ⇒ 即使声明 $ctx_recall 门控也恒 False，A 路 cue 在生产形态下实际不可达。待 D3 裁决：①门控改双格式归一（→本例转绿）或 ②确认 cue 退役（→本例改写为断言 cue 缺席）。（面板主体/原文不在视图等其余断言均通过。）"
+  "note": "L-59 谓词修复(2026-10-06)：联合不变量锚——同一派发里 RECALL_CUE 在场 ⇔ backend tools 含 ctx_recall（由代理注入而非客户端声明）。防\"谓词与注入条件漂移\"类缺陷复发；原文不在发送视图断言保持。"
  },
  {
   "id": "TC23",
@@ -998,9 +1001,11 @@
    ],
    "dispatch_count": 2,
    "last_dispatch_contains": [
-    "DEPLOY-KEY-7742"
+    "DEPLOY-KEY-7742",
+    "use ctx_recall to recover"
    ]
-  }
+  },
+  "note": "L-59 谓词修复(2026-10-06)：补 cue 在场断言（epochmicro 全链）。"
  },
  {
   "id": "TC24",

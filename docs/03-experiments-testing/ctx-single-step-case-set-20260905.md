@@ -379,7 +379,7 @@
 | 案例 | 上轮 | 本轮 | 根因/处置 |
 |---|---|---|---|
 | TC08 | ✅ | ✅（改写） | 原断言编码 0923 前语义（混合调用整单放弃→dispatch=1）。现行为=**0923 split**：抽 ctx_recall 子集自答、其余工具由模型重派轮重新发起。已按新不变量改写：dispatch=2、客户端最终收到 `DummyTool00`、ctx_recall 不可见。 |
-| TC20/TC22 | ✅ | ❌（已知红） | **L-59 门控格式错配**：`pipeline.py:733` 按 OpenAI 格式读请求 tools（`t.function.name`），客户端协议为 Anthropic 格式（`t.name`）⇒ 即使客户端声明 `ctx_recall` 门控也恒 False，**A 路 cue 在生产形态下实际不可达**。待 D3 裁决：①门控双格式归一（本例转绿）或 ②确认 cue 退役（改写为断言 cue 缺席）。其余断言（面板主体、原文不在视图、manifest）通过。 |
+| TC20/TC22 | ✅ | ✅（谓词修复后） | 原 red 根因＝L-59 门控（pipeline.py:733）按客户端 tools 声明判断可用性——生产客户端从不声明 ctx_recall（代理注入）⇒ cue 恒不可达。**修复（2026-10-06）＝谓词改 offer∧interception（`context_engine.recall_cue_available`，与 stage 20 注入条件同源；micro-off fail-closed）**，两例移入 epochmicro、去除客户端 `$ctx_recall` 声明（生产真实形态）；TC22 增联合不变量（同派发 cue⇔backend tools 含 ctx_recall）。 |
 | TC32（新） | — | ❌（就绪红锚） | system 位置归一（L-36）：中部 system 须前移至后端首位（`backend_first_message_role` 新断言）。当前 `lifecycle._normalize_system_messages` 原位保留 ⇒ 红；就绪补丁 `swe-eval/results/patches/l36-system-hoist-20261005/` 已验证**红→绿全链**（temp worktree 套用后本例 PASS）——套用后转绿。 |
 | TC33（新） | — | ✅ | 折叠窗口几何：单次折叠、最新轮仍在发送视图、视图收窄、无溢出回退错误（`log_regex_between` 钉 EPOCH 恰 1 次；出典=0922 几何死）。 |
 | TC34（新） | — | ✅ | est 估计器量级带：4000 字符载荷 → est≈1013 落 ±5% 带（`log_regex_between`；防 est 坍塌/低估口径回归）。 |

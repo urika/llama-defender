@@ -726,16 +726,15 @@ class ContextEngineStage(ConditionalStage):
             # 断点轮换不再误报, 此 WARN 恢复为真正的客户端改写信号
             log("  -> [context_engine] client tail divergence (report-only, "
                 "canonical unchanged)", level="WARN")
-        # L-59: 请求 tools 是否含 ctx_recall（客户端白名单面）——折叠召回 cue
-        # 的门控旗标（context_engine 侧缺省 True=fail-open，取不到 tools 时
-        # 保持现行为）。
-        try:
-            sess.recall_tool_available = any(
-                isinstance(t, dict)
-                and ((t.get("function") or {}).get("name")) == "ctx_recall"
-                for t in ((getattr(ctx, "body", None) or {}).get("tools") or []))
-        except Exception:
-            pass
+        # L-59 谓词修复（2026-10-06）：cue 可用性 = offer ∧ interception
+        # （context_engine.recall_cue_available，与 stage 20 注入条件同源）。
+        # 旧实现查客户端 tools 声明——生产客户端从不声明 ctx_recall（代理
+        # 注入的幽灵工具），门控恒 False，折叠召回线索自 cd107d4 起实际
+        # 不可达（TC20/22 红锚＋轮2 台账实证）。
+        _cue_ok, _cue_detail = context_engine.recall_cue_available(
+            (getattr(ctx, "body", None) or {}).get("tools") or [])
+        sess.recall_tool_available = _cue_ok
+        sess._recall_cue_detail = _cue_detail
         triggered, final = sess.maybe_epoch(
             context_engine.effective_trigger_tokens(),
             context_engine.effective_window_k())
@@ -757,6 +756,8 @@ class ContextEngineStage(ConditionalStage):
             # 台账/diagnostics 的 turn = 客户端请求序号(mark_epoch_turn 对齐)。
             log(f"  -> [context_engine] EPOCH #{sess.epoch_count} triggered "
                 f"(user_msgs={sess.user_msgs}, K={context_engine.effective_window_k()})")
+            # L-59 验收读数: 折叠时的 cue 门控决策（量级=折叠次数, 非每请求）
+            log(f"  -> [recall-cue] available={_cue_ok} ({_cue_detail})")
         if final is None:
             # §4.9 回退保护硬上限: 代理无权把历史压到失真假装放得下
             raise context_engine.ContextOverflowError(
@@ -4179,7 +4180,19 @@ class BackendDispatcher(PipelineStage):
                 _stream_usage = self._handler._handle_anthropic_stream_passthrough(
                     resp, ctx.body)
                 if _stream_usage:
-                    if _stream_usage.get("input_tokens"):
+                    try:
+                        from anthropic_proxy import (
+                            _anthropic_input_total as _ant_total)
+                        _total_in = _ant_total(_stream_usage)
+                    except Exception:
+                        _total_in = ((_stream_usage.get("input_tokens") or 0)
+                                     + (_stream_usage.get(
+                                         "cache_read_input_tokens") or 0)
+                                     + (_stream_usage.get(
+                                         "cache_creation_input_tokens") or 0))
+                    if _total_in:
+                        self._input_tokens = _total_in
+                    elif _stream_usage.get("input_tokens"):
                         self._input_tokens = _stream_usage["input_tokens"]
                     if _stream_usage.get("output_tokens"):
                         self._output_tokens = _stream_usage["output_tokens"]
@@ -4192,14 +4205,27 @@ class BackendDispatcher(PipelineStage):
                 try:
                     anth_resp = json.loads(resp_bytes.decode("utf-8"))
                     usage = anth_resp.get("usage") or {}
-                    self._input_tokens = usage.get("input_tokens", self._input_tokens)
-                    self._output_tokens = usage.get("output_tokens", self._output_tokens)
+                    try:
+                        from anthropic_proxy import (
+                            _anthropic_input_total as _ant_total_ns)
+                        _total_ns = _ant_total_ns(usage)
+                    except Exception:
+                        _total_ns = 0
+                    if _total_ns:
+                        self._input_tokens = _total_ns
+                    else:
+                        self._input_tokens = usage.get(
+                            "input_tokens", self._input_tokens)
+                    self._output_tokens = usage.get(
+                        "output_tokens", self._output_tokens)
                     # R16: 云端 anthropic 路径 token 事实(无 timings——P3 降级为 null)
+                    # sent 用输入总量(含缓存命中)，否则热轮只记未命中部分。
                     if _ps.PROXY_DIAG_ENABLED:
                         try:
                             import diagnostics as _diag
                             _diag.set_prompt_tokens(
-                                sent_n=usage.get("input_tokens"),
+                                sent_n=(_total_ns or usage.get(
+                                    "input_tokens")),
                                 generation_n=usage.get("output_tokens"))
                         except Exception as _e:
                             _warn_diag("anthropic_usage", _e)

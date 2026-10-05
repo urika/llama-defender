@@ -74,5 +74,74 @@ class TestL59CueGating(unittest.TestCase):
         self.assertIn("earlier rounds collapsed", text)
 
 
+class TestRecallCuePredicate(unittest.TestCase):
+    """L-59 谓词修复（2026-10-06）：recall_cue_available = offer ∧ interception。
+
+    offer 与 FormatConverter stage 20 的注入条件同源（tools 非空 ∧
+    PROXY_TOOL_FILTER_ENABLED ∧ PROXY_PD_ENABLED）；interception =
+    PROXY_PD_MICRO_TURN_ENABLED（engine-on 下 stage 14 跳过，微轮是唯一
+    应答通道，关闭即死环入口 → fail-closed）。
+    """
+
+    def setUp(self):
+        self._orig = {k: getattr(_ps, k, None) for k in (
+            "PROXY_TOOL_FILTER_ENABLED", "PROXY_PD_ENABLED",
+            "PROXY_PD_MICRO_TURN_ENABLED")}
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            if v is None:
+                try:
+                    delattr(_ps, k)
+                except AttributeError:
+                    pass
+            else:
+                setattr(_ps, k, v)
+
+    def _set(self, tf=None, pd=None, mt=None):
+        if tf is not None:
+            _ps.PROXY_TOOL_FILTER_ENABLED = tf
+        if pd is not None:
+            _ps.PROXY_PD_ENABLED = pd
+        if mt is not None:
+            _ps.PROXY_PD_MICRO_TURN_ENABLED = mt
+
+    def test_all_on_allows(self):
+        self._set(tf=True, pd=True, mt=True)
+        ok, detail = ce.recall_cue_available([{"name": "Read"}])
+        self.assertTrue(ok)
+        self.assertIn("intercept=True", detail)
+
+    def test_no_tools_blocks(self):
+        self._set(tf=True, pd=True, mt=True)
+        ok, detail = ce.recall_cue_available([])
+        self.assertFalse(ok)
+        self.assertIn("tools=False", detail)
+
+    def test_filter_off_blocks(self):
+        self._set(tf=False, pd=True, mt=True)
+        ok, _ = ce.recall_cue_available([{"name": "Read"}])
+        self.assertFalse(ok)
+
+    def test_pd_off_blocks(self):
+        self._set(tf=True, pd=False, mt=True)
+        ok, _ = ce.recall_cue_available([{"name": "Read"}])
+        self.assertFalse(ok)
+
+    def test_micro_turn_off_blocks(self):
+        # fail-closed：无拦截的邀请＝死环入口（轮1 47/47 出典）
+        self._set(tf=True, pd=True, mt=False)
+        ok, detail = ce.recall_cue_available([{"name": "Read"}])
+        self.assertFalse(ok)
+        self.assertIn("intercept=False", detail)
+
+    def test_client_declaration_is_irrelevant(self):
+        # 生产形态锚：客户端声明与否不影响谓词（旧门控的误判面）
+        self._set(tf=True, pd=True, mt=True)
+        ok_declared, _ = ce.recall_cue_available([{"name": "ctx_recall"}])
+        ok_absent, _ = ce.recall_cue_available([{"name": "Read"}])
+        self.assertEqual(ok_declared, ok_absent)
+
+
 if __name__ == "__main__":
     unittest.main()
