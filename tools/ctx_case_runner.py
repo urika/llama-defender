@@ -703,6 +703,8 @@ def main():
     ap.add_argument("--real-backend", action="store_true",
                     help="LLAMA_BASE_URL 指向真实 :8081（行为探针模式；"
                          "仍走影子代理，隔离不变，captures 为空）")
+    ap.add_argument("--real-backend-model", default=None,
+                    help="覆盖真模型码（缺省自动探测 /v1/models）")
     args = ap.parse_args()
 
     with open(CASES_PATH, encoding="utf-8") as f:
@@ -731,9 +733,23 @@ def main():
     # 行为探针模式：LLAMA_BASE_URL 指向真实后端（MODEL_NAME 同步换成真模型码）
     real_env = {}
     if args.real_backend:
+        model_name = args.real_backend_model
+        if not model_name:
+            # 自动探测现役模型码（2026-10-06：原硬编码 Ornith-1.5-35B 已随
+            # L-54 换栈过期，Splash 世代不匹配会 404/模型码错位）
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:8081/v1/models", timeout=8) as r:
+                    _j = json.loads(r.read())
+                model_name = ((_j.get("data") or [{}])[0].get("id")
+                              or _j.get("model") or "")
+            except Exception:
+                model_name = ""
+            model_name = model_name or "pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp"
+            print("[real-backend] 自动探测模型码: %s" % model_name)
         real_env = {
             "LLAMA_BASE_URL": "http://127.0.0.1:8081/v1",
-            "MODEL_NAME": "pyros-vault/Ornith-1.5-35B-A3B-oQ4e-fixed-mtp",
+            "MODEL_NAME": model_name,
         }
         BASE_ENV.update(real_env)
 

@@ -389,6 +389,16 @@
 
 复跑命令：`python3 tools/ctx_case_runner.py`（全量）／`--case TC20`（单例）；报告落 `logs/ctx_case/run-<ts>/`。
 
+### 真模型冒烟与效果测试的调用方式（2026-10-06 补）
+
+| 层 | 命令 | 前提/边界 |
+|---|---|---|
+| 机制冒烟（mock） | `python3 tools/ctx_case_runner.py` | 随时可跑（影子环境，不碰生产） |
+| 真模型行为冒烟 | `python3 tools/ctx_case_runner.py --real-backend --case TC24 --case TC29` | 影子代理直打 :8081 引擎——**须安静引擎窗**（批期禁）；模型码现自动探测 `/v1/models`（`--real-backend-model` 可覆盖；2026-10-06 修复原硬编码 Ornith 过期问题） |
+| 生产代理冒烟 | `python3 tools/recall_smoke.py` | 打**生产 :4000**，端到端验证折叠→cue→调用→自答→答案命中；批期守卫默认拒绝（`--allow-during-batch` 覆盖）；L-59 激活前预期 FAIL（有牙） |
+| 召回质量（索引层） | `python3 tools/eval_ctx_recall.py` | 离线只读 diag 存量；E1 锚点直查应为 100%（契约），E2 关键词式偏弱为已知（triggers 质量） |
+| 效果对账（三档预注册） | `python3 scripts/recall_effect_readout.py --baseline` → 激活后 `python3 scripts/recall_effect_readout.py`（swe-eval 仓） | 8127abbc 跑步机实例；判据＝召回 ≥1／浪费池 −50%／cue 日志 >0 |
+
 ## 附录：2026-09-05 日志问题 → 环节 → 案例追溯
 
 | 问题 | 证据 | 归因环节 | 拦截案例 |
