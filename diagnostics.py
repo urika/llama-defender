@@ -120,6 +120,7 @@ def begin_request(request_id, session_key, key_source="unknown"):
     _ps._diag_ctx.canonical_mismatch = False
     _ps._diag_ctx.backend_timings_note = None
     _ps._diag_ctx.ifc_view = None  # R9.1: 本轮发送视图摘要(capture 时填充)
+    _ps._diag_ctx.view_dropped = None  # L-71: 本轮视图流失 {reason:{msgs,tokens}}
     try:
         import trace_context
         trace = trace_context.current()
@@ -233,11 +234,15 @@ def set_prompt_tokens(processed_n=None, sent_n=None, generation_n=None,
 
     注意: 同一请求会多次调用(先 timings 后 usage),None 参数不得覆盖
     已写入的值——否则 usage 回填会把 timings 阶段的 gen_ms 清掉。
+    L-72: processed_n 为**fill-if-missing**（timings.prompt_n 是 rapid-mlx
+    世代的首选源先到先写; Splash 世代无 timings ⇒ usage 的 cached_tokens
+    作为第二来源补位。后到者不覆盖先到者——两源语义不同, 覆盖即污染）。
     """
     if not _ps.PROXY_DIAG_ENABLED:
         return
     ctx = _ps._diag_ctx
-    if isinstance(processed_n, (int, float)) and processed_n >= 0:
+    if (getattr(ctx, "prompt_processed_tokens", None) is None
+            and isinstance(processed_n, (int, float)) and processed_n >= 0):
         ctx.prompt_processed_tokens = int(processed_n)
         if isinstance(prompt_eval_ms, (int, float)):
             ctx.prompt_eval_ms = prompt_eval_ms
@@ -384,6 +389,38 @@ def log_lifecycle_event(event, **detail):
         pass
 
 
+def record_view_drop(reason, msgs=0, tokens=0):
+    """L-71 视图流失计量（fail-open）：各 drop 点调用，按 reason 分型累计。
+
+    reason ∈ {epoch_collapse, keep_budget, fifo_window, oom_safety}（L-71
+    分型口径）。per-request 累积（_diag_ctx），finalize_request 逐轮落
+    view_dropped 段；/api/session/<key>/metrics 按轮求和=会话总量。
+    """
+    if not _ps.PROXY_DIAG_ENABLED:
+        return
+    try:
+        ctx = _ps._diag_ctx
+        vd = getattr(ctx, "view_dropped", None)
+        if vd is None:
+            vd = {}
+            ctx.view_dropped = vd
+        item = vd.setdefault(str(reason), {"msgs": 0, "tokens": 0})
+        item["msgs"] += int(msgs or 0)
+        item["tokens"] += int(tokens or 0)
+    except Exception:
+        pass
+
+
+def _view_dropped_record(ctx):
+    """L-71: 把 per-request 累计整理为 {msgs,tokens,by_reason}；无 drop → None。"""
+    vd = getattr(ctx, "view_dropped", None)
+    if not vd:
+        return None
+    msgs = sum(v.get("msgs", 0) for v in vd.values())
+    tokens = sum(v.get("tokens", 0) for v in vd.values())
+    return {"msgs": msgs, "tokens": tokens, "by_reason": dict(vd)}
+
+
 def finalize_request(mc):
     """请求成功完成时落盘 R16 记录(与 log_metrics 同点调用)。
 
@@ -446,6 +483,10 @@ def finalize_request(mc):
         # 逐键取 max：会话内单调，代理中途重启则退化为下界（口径诚实）。
         "ctx_recall": getattr(ctx, "ctx_recall_stats", None),
         "reread": getattr(ctx, "reread_stats", None),
+        # L-71 视图流失（2026-10-06）: {msgs,tokens,by_reason{...}}，本轮
+        # drop 点分型累计；无 drop 轮为 null。消费方（metrics 端点按轮求和
+        # ＝会话总量；trajcore view_governance 曲线）。
+        "view_dropped": _view_dropped_record(ctx),
         "trace": None,
         # ① 配置指纹: 数据自带产生条件(队列识别/实验归因)
         "config": None,
@@ -597,6 +638,7 @@ __all__ = [
     "mark_canonical_mismatch", "probe_timings", "timings_supported",
     "reset_timings_probe", "warn_suppressed",
     "set_prompt_tokens", "build_diag_payload", "capture_sent_view",
+    "record_view_drop",
     "log_session_diag", "log_lifecycle_event", "finalize_request",
     "read_session_metrics", "read_session_hbe", "build_session_signals",
 ]

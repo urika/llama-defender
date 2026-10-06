@@ -2928,6 +2928,25 @@ def _build_session_metrics_json(session_key, records):
     ctx_recall_stats = counts.get("ctx_recall") or None
     reread_stats = counts.get("reread") or None
 
+    # L-71(2026-10-06) 视图流失段: view_dropped 是**逐轮量**（per-request
+    # 累计, 非会话单调）⇒ 聚合口径 = 逐轮求和（会话总量），与 P0(ii) 的
+    # max 口径不同。by_reason 展平为 <reason>_msgs/<reason>_tokens。
+    _view_total = {"msgs": 0, "tokens": 0}
+    for r in records:
+        vd = r.get("view_dropped")
+        if not isinstance(vd, dict):
+            continue
+        _view_total["msgs"] += int(vd.get("msgs") or 0)
+        _view_total["tokens"] += int(vd.get("tokens") or 0)
+        for reason, item in (vd.get("by_reason") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            _rk = f"{reason}_msgs"
+            _view_total[_rk] = _view_total.get(_rk, 0) + int(item.get("msgs") or 0)
+            _tk = f"{reason}_tokens"
+            _view_total[_tk] = _view_total.get(_tk, 0) + int(item.get("tokens") or 0)
+    view_stats = _view_total if _view_total["msgs"] > 0 else None
+
     return {
         "session_key": session_key,
         "turns": len(records),
@@ -2951,6 +2970,8 @@ def _build_session_metrics_json(session_key, records):
         # P0(ii): 无记录（旧代理/无调用）→ None，消费方按 unavailable 处理
         "ctx_recall": ctx_recall_stats,
         "reread": reread_stats,
+        # L-71: 会话视图流失总量（逐轮求和; 无 drop 会话 → None 按 unavailable 处理）
+        "view": view_stats,
         "series": series,
     }
 

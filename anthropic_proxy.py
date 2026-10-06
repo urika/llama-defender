@@ -1060,6 +1060,15 @@ class Handler(BaseHTTPRequestHandler):
                             total_chars = len(json.dumps(msgs_truncated, ensure_ascii=False))
                             log(f"  -> Pre-truncated: dropped={pre_stats.get('dropped_msgs', 0)}, "
                                 f"kept={len(msgs_truncated)} msgs, now {total_chars:,} chars")
+                            # L-71 视图流失: 引擎关 OOM 预截断进 oom_safety 分型
+                            if PROXY_DIAG_ENABLED:
+                                try:
+                                    import diagnostics
+                                    diagnostics.record_view_drop(
+                                        "oom_safety",
+                                        msgs=pre_stats.get("dropped_msgs", 0))
+                                except Exception:
+                                    pass
                             if PROXY_METRICS_ENABLED:
                                 mc = getattr(_metrics_ctx, 'mc', None)
                                 if mc:
@@ -1316,6 +1325,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_non_streaming_response(self, resp, anthropic_body):
         openai_resp = json.loads(resp.read().decode("utf-8"))
+
+        # L-72(2026-10-06): 非流式路径此前零 token 回填——hit_ratio 断链
+        # 的另一半。usage 的 cached_tokens 作 processed 第二来源
+        # （fill-if-missing；本路径无 timings，通常即唯一来源）。
+        if PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                _u = openai_resp.get("usage") or {}
+                if _u:
+                    diagnostics.set_prompt_tokens(
+                        processed_n=(_u.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                        sent_n=_u.get("prompt_tokens"),
+                        generation_n=_u.get("completion_tokens"))
+            except Exception as _e:
+                _warn_diag("nonstream_usage", _e)
 
         if getattr(self, '_openai_mode', False):
             # Pipeline processed an OpenAI-format request; return the backend's
@@ -1626,7 +1650,11 @@ class Handler(BaseHTTPRequestHandler):
                 if PROXY_DIAG_ENABLED:
                     try:
                         import diagnostics
+                        # L-72: Splash 世代无 timings.prompt_n ⇒ processed 的
+                        # 第二来源 = cached_tokens（fill-if-missing，timings
+                        # 先到不覆盖）——hit_ratio 链路两族后端都通。
                         diagnostics.set_prompt_tokens(
+                            processed_n=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                             sent_n=usage.get("prompt_tokens"),
                             generation_n=usage.get("completion_tokens"))
                     except Exception as _e:

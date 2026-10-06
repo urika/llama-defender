@@ -2583,8 +2583,15 @@ class ContextTruncator(ConditionalStage):
                     import diagnostics
                     # 截断会注入结构化摘要占位(DEF-107)——按合成内容计量
                     diagnostics.record_injection("truncation_summary")
+                    # L-71 视图流失: 引擎关路径的 fifo/rounds/smart/char 截断
+                    # 统计进 fifo_window 分型（tokens 按 chars/4 估算, 缺失
+                    # 则 0——口径诚实, 不造数）。
+                    diagnostics.record_view_drop(
+                        "fifo_window",
+                        msgs=trunc_stats.get("dropped_messages", 0),
+                        tokens=int(trunc_stats.get("dropped_chars", 0) / 4))
                 except Exception as _e:
-                    _warn_diag("inject_truncation_summary", _e)
+                    _warn_diag("view_drop_truncator", _e)
             strategy = trunc_stats.get("strategy", "char")
             if strategy == "rounds":
                 chars_after = trunc_stats.get("chars", trunc_stats.get("estimated_tokens", "?"))
@@ -2803,6 +2810,14 @@ class OOMSafetyFIFO(ConditionalStage):
                     ctx.session_id,
                     _ps._SESSION_REQUEST_COUNT.get(ctx.session_id, 0) or 0,
                     "oom_drop", _oom_dropped_msgs)
+            except Exception:
+                pass
+            # L-71 视图流失: OOM 安全阀裁剪进 oom_safety 分型（TC11 出典
+            # 路径；tokens 无直接读数, 留 0——口径诚实）。
+            try:
+                import diagnostics
+                diagnostics.record_view_drop(
+                    "oom_safety", msgs=len(_oom_dropped_msgs))
             except Exception:
                 pass
             try:

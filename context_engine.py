@@ -510,11 +510,21 @@ class CanonicalSession(object):
             ladder = ((window_k, False), (4, False), (4, True))
         for k, halve in ladder:
             self.compression_region = list(base_region)
-            messages = self._collapse(k, halve,
-                                      keep_budget=(k if keep_budget > 0 else 0))
+            messages, dropped_msgs, dropped_tokens = self._collapse(
+                k, halve, keep_budget=(k if keep_budget > 0 else 0))
             if self._real_scale(messages) <= trigger_tokens:
                 self.canonical = messages
                 self._sync_order_after_collapse(messages)
+                # L-71 视图流失计量: 折叠收编的轮次按 reason 分型
+                # （keep_budget>0 走预算保留口径 → keep_budget；否则
+                # epoch_collapse）。fail-open，不影响折叠本体。
+                try:
+                    import diagnostics as _diag
+                    _diag.record_view_drop(
+                        "keep_budget" if keep_budget > 0 else "epoch_collapse",
+                        msgs=dropped_msgs, tokens=dropped_tokens)
+                except Exception:
+                    pass
                 return True, messages
         return True, None
 
@@ -537,10 +547,13 @@ class CanonicalSession(object):
         self.sent_order = list(tail)
 
     def _collapse(self, window_k, halve, keep_budget=0):
-        """K 窗口外轮次 → 压缩区动作行; 返回重切后的消息列表（不落 self.canonical）。
+        """K 窗口外轮次 → 压缩区动作行; 返回 (重切消息列表, 流失计量)。
 
         L-9/DEF-313: keep_budget>0 时保留窗口按 token 预算自最新轮回保
-        （至少最近 2 轮），window_k 仅作预算=0 时的旧口径。"""
+        （至少最近 2 轮），window_k 仅作预算=0 时的旧口径。
+        L-71(2026-10-06): 第二返回值 = (dropped_msgs, dropped_tokens_est)
+        ——被收编轮次的消息数与 est token（可能为 (0,0)，如全部轮次都
+        在保留窗内）；maybe_epoch 据此落 view_dropped 计量。"""
         rounds = _rounds(self.canonical)
         system_rounds = [r for r in rounds if _is_system_round(r)]
         body_rounds = [r for r in rounds if not _is_system_round(r)]
@@ -559,6 +572,8 @@ class CanonicalSession(object):
         else:
             keep = body_rounds[-window_k:] if window_k else []
             collect = body_rounds[:-window_k] if window_k else body_rounds
+        dropped_msgs = sum(len(r) for r in collect)
+        dropped_tokens = sum(self.est_tokens(list(r)) for r in collect)
         # R10.1 manifest: 收编轮次留索引行(页表;折叠面板行已含摘要,索引行
         # 提供可寻址性;fail-open)
         if getattr(_ps, "PROXY_PD_ENABLED", True) and collect and self.session_key:
@@ -768,7 +783,7 @@ class CanonicalSession(object):
             })
         for r in keep:
             out.extend(r)
-        return out
+        return out, dropped_msgs, dropped_tokens
 
 
 class EngineStore(object):

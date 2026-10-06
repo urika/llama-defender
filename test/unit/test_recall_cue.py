@@ -72,7 +72,7 @@ class TestPathBCue(unittest.TestCase):
     def test_epoch_panel_contains_shared_cue(self):
         sess = context_engine.CanonicalSession("cue_b_01")
         sess.absorb(_msgs())
-        out = sess._collapse(window_k=2, halve=False)
+        out, _dm, _dt = sess._collapse(window_k=2, halve=False)  # L-71: 返回 (msgs, 流失计量)
         panels = [m for m in out if m.get("_ctx_engine_epoch")]
         self.assertTrue(panels)
         text = panels[0]["content"][0]["text"]
@@ -83,7 +83,7 @@ class TestPathBCue(unittest.TestCase):
     def test_no_collect_no_panel_no_crash(self):
         sess = context_engine.CanonicalSession("cue_b_02")
         sess.absorb([{"role": "user", "content": "只有一轮"}])
-        out = sess._collapse(window_k=4, halve=False)
+        out, _dm, _dt = sess._collapse(window_k=4, halve=False)
         self.assertFalse([m for m in out if m.get("_ctx_engine_epoch")])
 
 
