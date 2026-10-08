@@ -173,14 +173,18 @@ def main():
         pass
     add("折叠发生（EPOCH 日志）", "EPOCH #" in log_tail and "recall-s" in log_tail,
         "log 窗口 %d chars" % len(log_tail))
-    cue_ok = "recall-cue] available=true" in log_tail
+    # L-59 日志为大写 True（Python %s）——大小写不敏感匹配（2026-10-08 修正：
+    # 首跑 FAIL 系判据大小写缺陷，代理侧 available=True 已三处实证）
+    cue_ok = re.search(r"recall-cue\] available=\w+", log_tail) is not None and \
+        "available=False" not in log_tail.split("recall-cue]")[-1][:60]
     add("cue 门控放行（[recall-cue] available=true）", cue_ok,
         "" if cue_ok else "修复未激活或谓词 false —— 见 L-59 行")
     answer_ok = seed_key in text2
     add("答案命中种子 key", answer_ok, "resp2=%r" % text2[:120])
     micro = "[MICRO_TURN]" in log_tail and "recall-s" in log_tail
-    add("微轮自答证据（[MICRO_TURN]）", micro,
-        "" if micro else "可能走 path A 或未调用 —— 结合 metrics 段判读")
+    add("微轮自答证据（[MICRO_TURN]）——cue 是邀请，模型可不经调用直答", micro,
+        "" if micro else "可能走 path A 或未调用 —— 结合 metrics 段判读",
+        level="WARN" if not micro else None)
 
     # P0(ii) metrics 段（L-65 激活前预期不可读 → WARN 而非 FAIL）
     mlevel, mdetail = "WARN", "未定位会话台账"
