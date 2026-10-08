@@ -69,3 +69,16 @@ export PROXY_HANDOFF_ENABLED=true
 - **现状**：R-CM-6 目标（消除写文件轮次被 `saturation` 档 8192 截断）**已由既有 L-73（2026-10-07）实现**——`lifecycle._compute_dynamic_max_tokens`：长载荷工具（`Write/Edit/MultiEdit/NotebookEdit/Bash`，`pipeline._LONG_PAYLOAD_TOOLS`）轮次**完全不降压**；其余带工具轮次下限 `PROXY_DYNAMIC_MAX_TOKENS_FLOOR`（默认 32768）；纯文本轮次保留原降压。测试 7 例（`test/unit/test_lifecycle.py::TestComputeDynamicMaxTokens`）。
 - **本次补齐**：`PROXY_DYNAMIC_MAX_TOKENS_FLOOR` / `_WRITE_NO_REDUCE` 此前**声明 reloadable 却未进 `_RELOAD_SPEC`**（reload 不生效）——现补入；文档/`requirements.yaml` R-CM-6 锚点对齐。
 - **未重复实现**：需求初稿拟用的 `..._WRITE_BYPASS`/`..._WRITE_FLOOR` 名称作废，统一用既有 `..._WRITE_NO_REDUCE`/`..._FLOOR`。
+
+## 10. 附：R-CM-7 召回采纳率度量（同日补，2026-10-08）
+
+- **实现**：
+  - `diagnostics._rcm_record(ctx)` → per-turn `sessions.jsonl` 增 `rcm` 段 `{memory,handoff,recall}`（0/1，取自 `injection_details`；决策 `finalize_request` 写入）。
+  - `admin_server._build_session_metrics_json` → `/api/session/<key>/metrics` 增 `rcm` 聚合段：
+    - `memory_injected_turns` / `handoff_injected_turns` / `recall_injected_turns`；
+    - `first_injection_turn` / `turns_after_first_injection`（会话在注入后延续的 lead-lag 代理）；
+    - `recall_adoption{adopted,total,rate}`：**台账口径**——`auto_recall` 注入目标在注入轮之后未再被读取（`dup_queries[target].last_turn <= 注入轮`）计采纳；
+    - `recall_hit_rate` = `ctx_recall.hits/(hits+misses)`。
+- **口径诚实**：台账不在此进程（重启后内存态缺失）→ `recall_adoption.total=0 / rate=null`，不编造。采纳定义与 `ctx-recall-auto-closed-loop` 设计"由 last_dup_turn 差分"一致，代理侧先行提供数。
+- **测试**：`test/unit/test_rcm_metrics.py`（3 例：计数/lead-lag/采纳率、台账缺失降级、无注入）全绿。
+- **配置**：无新增开关（沿用 `PROXY_DIAG_ENABLED`）。

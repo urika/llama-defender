@@ -358,5 +358,10 @@ requirements:
   - id: R-CM-7
     domain: R-CM
     title: 召回采纳率度量
-    desc: 注入→是否被采纳的闭环指标（recall_hit_rate / lead-lag），待排期
+    desc: per-turn rcm 段 + /api/session/<key>/metrics 聚合召回采纳率/命中率/lead-lag
     priority: P1
+    impl:
+      - diagnostics.py:_rcm_record
+      - admin_server.py:_build_session_metrics_json
+    tests:
+      - test/unit/test_rcm_metrics.py::TestRcmMetrics

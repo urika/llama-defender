@@ -2947,6 +2947,70 @@ def _build_session_metrics_json(session_key, records):
             _view_total[_tk] = _view_total.get(_tk, 0) + int(item.get("tokens") or 0)
     view_stats = _view_total if _view_total["msgs"] > 0 else None
 
+    # R-CM-7(2026-10-08) 召回/注入采纳率与 lead-lag。
+    # 计数来自 per-turn rcm 段（缺失时回落 injection_details 键存在性）。
+    # 采纳定义（台账口径）: auto_recall 注入目标在注入轮之后**未再被读取**
+    # （dup_queries[target].last_turn <= 注入轮）→ adopted。台账不在此进程
+    # （重启后内存态缺失）→ total=0, rate=null（口径诚实，不编造）。
+    _mem_turns = _ho_turns = _rec_turns = 0
+    _first_inj = None
+    _recall_injections = []  # (turn, target)
+    for r in records:
+        inj = r.get("injection_details") or {}
+        rr = r.get("rcm") or {}
+        t = r.get("turn")
+        _m = bool(rr.get("memory")) or ("memory" in inj)
+        _h = bool(rr.get("handoff")) or ("handoff" in inj)
+        _c = bool(rr.get("recall")) or ("auto_recall" in inj)
+        _mem_turns += 1 if _m else 0
+        _ho_turns += 1 if _h else 0
+        _rec_turns += 1 if _c else 0
+        if (_m or _h or _c) and isinstance(t, int):
+            if _first_inj is None or t < _first_inj:
+                _first_inj = t
+        ar = inj.get("auto_recall")
+        if isinstance(ar, dict) and ar.get("target"):
+            _recall_injections.append((t, ar.get("target")))
+    _adopted = _total = 0
+    try:
+        import session_ledger as _sl
+        _led = _sl.LEDGER.build_ledger_json(session_key)
+        _last_by_target = {}
+        for _d in (_led.get("dup_queries") or []):
+            if _d.get("target"):
+                _last_by_target[_d["target"]] = _d.get("last_turn")
+        for (_t, _tgt) in _recall_injections:
+            _lt = _last_by_target.get(_tgt)
+            if _lt is None:
+                continue
+            _total += 1
+            if not isinstance(_t, int) or _lt <= _t:
+                _adopted += 1
+    except Exception:
+        pass
+    _crs = ctx_recall_stats or {}
+    _hit_rate = None
+    try:
+        _denom = int(_crs.get("hits") or 0) + int(_crs.get("misses") or 0)
+        if _denom > 0:
+            _hit_rate = round(int(_crs.get("hits") or 0) / _denom, 4)
+    except (TypeError, ValueError):
+        _hit_rate = None
+    rcm_stats = {
+        "memory_injected_turns": _mem_turns,
+        "handoff_injected_turns": _ho_turns,
+        "recall_injected_turns": _rec_turns,
+        "first_injection_turn": _first_inj,
+        "turns_after_first_injection": (
+            (len(records) - _first_inj) if isinstance(_first_inj, int) else None),
+        "recall_adoption": {
+            "adopted": _adopted,
+            "total": _total,
+            "rate": round(_adopted / _total, 4) if _total else None,
+        },
+        "recall_hit_rate": _hit_rate,
+    }
+
     return {
         "session_key": session_key,
         "turns": len(records),
@@ -2972,6 +3036,8 @@ def _build_session_metrics_json(session_key, records):
         "reread": reread_stats,
         # L-71: 会话视图流失总量（逐轮求和; 无 drop 会话 → None 按 unavailable 处理）
         "view": view_stats,
+        # R-CM-7: 记忆/交接/召回注入计数 + 召回采纳率/命中率/lead-lag
+        "rcm": rcm_stats,
         "series": series,
     }
 

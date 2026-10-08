@@ -421,6 +421,23 @@ def _view_dropped_record(ctx):
     return {"msgs": msgs, "tokens": tokens, "by_reason": dict(vd)}
 
 
+def _rcm_record(ctx):
+    """R-CM-7(2026-10-08): 本轮 R-CM 注入事实（记忆/交接/召回各 0/1）。
+
+    取自 _diag_ctx.injection_details（record_injection 台账），归一化为稳定
+    键，供 /api/session/<key>/metrics 的 rcm 聚合与 swe-eval 消费。fail-open。
+    """
+    try:
+        inj = getattr(ctx, "injection_details", None) or {}
+        return {
+            "memory": 1 if "memory" in inj else 0,
+            "handoff": 1 if "handoff" in inj else 0,
+            "recall": 1 if "auto_recall" in inj else 0,
+        }
+    except Exception:
+        return {"memory": 0, "handoff": 0, "recall": 0}
+
+
 def finalize_request(mc):
     """请求成功完成时落盘 R16 记录(与 log_metrics 同点调用)。
 
@@ -469,6 +486,8 @@ def finalize_request(mc):
         # DEF-310: 注入属性(target/anchor/chars/source/session_count)——
         # 严格版机制核验(注入来源归因)数据面;无注入轮为 {}
         "injection_details": dict(getattr(ctx, "injection_details", None) or {}),
+        # R-CM-7(2026-10-08): 记忆/交接/召回注入归一化事实（0/1/段）
+        "rcm": _rcm_record(ctx),
         "prefix_ratio": ((mc or {}).get("pipeline", {})
                          .get("common_prefix_ratio", {}) or {}).get("ratio"),
         "canonical_mismatch": bool(getattr(ctx, "canonical_mismatch", False)),

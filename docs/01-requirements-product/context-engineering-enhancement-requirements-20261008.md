@@ -109,7 +109,7 @@
 
 **验收**：`test/unit/test_lifecycle.py::TestComputeDynamicMaxTokens` 7 例覆盖（no-reduce / 下限兜底 / Bash 入列 / 关闭豁免 / FLOOR=0 / 不超客户端请求）。
 
-### R-CM-7 召回采纳率度量（P1，支撑 R-CM-1/2/4/5）
+### R-CM-7 召回采纳率度量（P1，支撑 R-CM-1/2/4/5）——✅ 已交付（2026-10-08）
 
 **目标**：建立"注入 → 是否被采纳"的闭环指标，作为上述所有能力的疗效口径。
 
