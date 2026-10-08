@@ -79,6 +79,8 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 | [`ifc_metrics.py`](ifc_metrics.py) | IFC Tier-0 结构指标（信号层，`PROXY_IFC_ENABLED` 默认开，纯函数 + 有界会话基线）：**锚点差分法**——相邻两轮发送视图差分 + 台账动作序列派生 `retention`/`rationale_ratio`/`action_div`（工具序列归一化 bigram 熵，双端检测循环坍缩/游走）/`reread_pressure`。不触碰管线 stage（无 per-stage 钩子），见 `docs/02-architecture-design/information-fidelity-control-design-20260829.md` |
 | [`memory_stores.py`](memory_stores.py) | PDC 披露清单（manifest）存储：被丢弃上下文单元的可寻址索引行（会话页表，`R10.1`「索引永不丢」），`logs/diag/manifest/<sid>.jsonl` 增量落盘 + MB 上限 + 跨批隔离（`SESSION_GAP_SECONDS` 轮转 `.prev`）。写入方：truncation fifo/OOMSafetyFIFO 与 context_engine epoch 折叠 |
 | [`ctx_recall.py`](ctx_recall.py) | PDC 渐进披露检索核心（`R10.2`，已挂载）：L1 内存子串过滤 + L2 FTS5 trigram 全文（`logs/diag/index/<sid>.db`）+ archive 全文恢复（`recover_full_content`）+ **IFC-3 微轮自答**（`build_follow_up_messages` 同请求自答 ctx_recall 并重派，客户端透明）；`TOOL_SCHEMA` 工具定义；三级穿透检索（整句短语→token 聚合 r: 内容行→全量） |
+| [`memory_store.py`](memory_store.py) | **R-CM-1 跨会话持久记忆**（`PROXY_MEMORY_ENABLED` 默认关，2026-10-08）：项目级 stdlib `sqlite3`+FTS5（不可用则 LIKE 回退）记忆库（`MEMORY` 单例），`add/search/list/forget/stats/export_markdown`；`MemoryInjectStage`（0.61）会话首请求注入一次（append-only；engine-on 进 canonical）；端点 `GET /api/memory`/`POST /admin/memory`/`DELETE /admin/memory/<id>`；分域头 `X-Proxy-Project`。fail-open |
+| [`handoff.py`](handoff.py) | **R-CM-2 自动交接摘要**（`PROXY_HANDOFF_ENABLED` 默认关，2026-10-08）：从 `session_ledger` 规则化抽取结构化 handoff（goal/files_touched/tools_used/recent_actions/repeated_targets）；`store`（`logs/diag/handoff/<sid>.jsonl`+`.md`）/`latest`/`render_block`/`distill_memory`；`HandoffInjectStage`（0.62）下一会话首请求注入；端点 `GET /api/handoff`/`POST /admin/handoff`，CLI `./manage.sh handoff`。P0 为规则化生成，LLM 富化接口预留 |
 | [`queue_manager.py`](queue_manager.py) | 请求优先级队列：按 total_chars 分桶（interactive/standard/large/huge），heapq 最小堆，叠加在 `_llama_lock` 之上；`acquire(timeout)` 排队超时出队；`stats()` 供 `/api/queue`。默认关 `PROXY_QUEUE_ENABLED=false`（active 配置已开） |
 | [`signal_types.py`](signal_types.py) | Signal Layer 数据契约（叶子）：`ViewSummary`/`DiffResult`/`ReconcileResult`/`IFCSection` 4 个类型；字段全 Optional（fail-open：信号层故障时协议层以默认值运行） |
 | [`protocol_types.py`](protocol_types.py) | Protocol Layer 数据契约：五协议（P1-P5）+ 编排器 8 个核心类型（`Task`/`SubTask`/`VerificationRule`/`Citation`/`Patch`/`Verdict`/`EscalationDecision` 等），依赖 signal_types |
@@ -102,6 +104,8 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
        0. RequestParser
        0.5. ContextEngine (上下文工程引擎, 默认关; 开启时 6/7/14/17 跳过)
        0.6. AdminInjectStage (admin 注入原语, ADR-013 T1; /admin/inject 队列非空才运行)
+       0.61. MemoryInjectStage (R-CM-1 跨会话记忆注入, 默认关; 会话首请求注入一次)
+       0.62. HandoffInjectStage (R-CM-2 自动交接注入, 默认关; 会话首请求注入一次)
        1. LifecycleClassifier
        2. DynamicMaxTokens
        2.5. SmartRouter (local/cloud 路由决策)
@@ -602,6 +606,28 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_AUTOTUNE_SESSION_LIMIT` | `1` | 单会话晋级提案上限（gate 返回 `over_session_limit`） |
 
 > **2026-10-05 裁决（hub 0925-2①，域负责人拍板"分工"）**：autotune **降格为纯提案器**——`generate/list` 保留，`apply/rollback` 冻结（提案一律进 swe-eval E 期周闸门人审，采纳后经 goal.yaml 管控的 knob 路径生效）；参数白名单唯一权威＝`configs/goal.yaml`（version 递增），白名单外提案拒绝。**批期禁 autotune apply**（同批期红线 1 族）。生效链路（overrides.conf/reload 钩子）如需接通，先按契约 §六登记（roadmap #15）。
+
+### 11.9 跨会话记忆 + 自动交接（R-CM-1/R-CM-2，2026-10-08，reloadable）
+
+需求：[`docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md`](docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md)。**均默认关**。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_MEMORY_ENABLED` | `false` | R-CM-1 跨会话记忆总开关（`memory_store.py`，stdlib sqlite3+FTS5） |
+| `PROXY_MEMORY_DB_PATH` | `logs/memory/memory.db` | 记忆库路径（相对 `_SCRIPT_DIR`） |
+| `PROXY_MEMORY_DEFAULT_PROJECT` | `default` | 记忆分域键；请求头 `X-Proxy-Project` 可覆盖 |
+| `PROXY_MEMORY_INJECT_MAX_CHARS` | `2000` | 会话首请求注入记忆块上限 |
+| `PROXY_MEMORY_TOP_K` | `5` | 记忆检索条数上限 |
+| `PROXY_MEMORY_TTL_DAYS` | `90` | 保留期（P0 仅登记） |
+| `PROXY_HANDOFF_ENABLED` | `false` | R-CM-2 自动交接总开关（`handoff.py`，规则化抽取） |
+| `PROXY_HANDOFF_TRIGGER_CHARS` | `0` | 自动触发阈值（0=仅显式端点） |
+| `PROXY_HANDOFF_MAX_CHARS` | `3000` | 注入块上限 |
+| `PROXY_HANDOFF_DIR` | `logs/diag/handoff` | 落盘目录（JSONL + markdown） |
+
+- 注入 stage：`MemoryInjectStage`（0.61）/ `HandoffInjectStage`（0.62），**会话首请求注入一次**（进程内守卫，防每轮重复破坏前缀）；engine-on 持久进 canonical、engine-off view-only；append-only + fail-open。
+- 端点：`GET /api/memory`（`?project=&q=&mode=stats`）、`POST /admin/memory`、`DELETE /admin/memory/<id>`、`GET /api/handoff?session=KEY`、`POST /admin/handoff`。
+- CLI：`./manage.sh handoff <session_key> [--goal/--decision/--next/--question/--distill]`。
+- P0 交接为**规则化**生成（确定性、零后端依赖）；LLM 富化生成接口预留（`handoff.build(..., enrich=...)`）。
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 

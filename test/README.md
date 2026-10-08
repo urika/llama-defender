@@ -49,7 +49,7 @@ test/
 │   ├── test_proxy_logging.py       # sensitive header masking, JSONL/structured logging
 │   └── test_model_registry.py      # model catalog: synthesis equivalence, $env/$default refs,
 │                                   # fallback chains, validation, hot-swap rejection, catalog_hash
-├── integration/                    # boots a mock backend, no real LLM, ~60s (7 suites)
+├── integration/                    # boots a mock backend, no real LLM, ~60s (15 suites)
 │   ├── test_blocker_integration.sh
 │   ├── test_loop_integration.sh
 │   ├── test_cache_align_integration.sh
@@ -57,6 +57,7 @@ test/
 │   ├── test_memory_reject_integration.sh
 │   ├── test_status_integration.sh
 │   ├── test_long_context_integration.sh
+│   ├── test_rcm_memory_handoff.sh  # R-CM-1/R-CM-2 memory+handoff injection & guard
 │   └── mock_backend.py             # shared OpenAI-compatible mock fixture
 ├── e2e/                            # requires running proxy + backend, ~30-60s
 │   ├── test_proxy_integration.py

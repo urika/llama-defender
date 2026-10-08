@@ -44,6 +44,8 @@ from pipeline import (
     ToolPairingRepair,
     FormatConverter,
     BackendDispatcher,
+    MemoryInjectStage,
+    HandoffInjectStage,
 )
 
 
@@ -2027,3 +2029,77 @@ class TestFetchKimiUsageReset(unittest.TestCase):
 
     def test_empty_key_returns_zero(self):
         self.assertEqual(_fetch_kimi_usage_reset(""), 0)
+
+
+# ===========================================================================
+# R-CM-1/R-CM-2 记忆/交接注入 stage（2026-10-08）
+# ===========================================================================
+
+class TestMemoryHandoffInjectStages(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="rcm_stage_")
+        self._saved = {k: getattr(_ps, k, None) for k in (
+            "PROXY_MEMORY_ENABLED", "PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_TOP_K",
+            "PROXY_MEMORY_INJECT_MAX_CHARS", "PROXY_MEMORY_DEFAULT_PROJECT",
+            "PROXY_HANDOFF_ENABLED", "PROXY_HANDOFF_DIR",
+            "PROXY_HANDOFF_MAX_CHARS", "PROXY_CTX_ENGINE_ENABLED")}
+        _ps.PROXY_MEMORY_DB_PATH = os.path.join(self._tmp, "m.db")
+        _ps.PROXY_HANDOFF_DIR = os.path.join(self._tmp, "ho")
+        _ps.PROXY_CTX_ENGINE_ENABLED = False
+        import memory_store as _ms
+        _ms.MEMORY.reset()
+        with _ps._state_lock:
+            _ps._SESSION_MEMORY_SEEN.clear()
+            _ps._SESSION_HANDOFF_SEEN.clear()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is not None:
+                setattr(_ps, k, v)
+        import memory_store as _ms
+        _ms.MEMORY.reset()
+        with _ps._state_lock:
+            _ps._SESSION_MEMORY_SEEN.clear()
+            _ps._SESSION_HANDOFF_SEEN.clear()
+
+    def test_memory_disabled_should_not_run(self):
+        _ps.PROXY_MEMORY_ENABLED = False
+        self.assertFalse(MemoryInjectStage().should_run(
+            PipelineContext(session_id="s1")))
+
+    def test_memory_aux_skipped(self):
+        _ps.PROXY_MEMORY_ENABLED = True
+        self.assertFalse(MemoryInjectStage().should_run(
+            PipelineContext(session_id="s1::aux-haiku")))
+
+    def test_memory_inject_then_guard(self):
+        _ps.PROXY_MEMORY_ENABLED = True
+        import memory_store as _ms
+        _ms.MEMORY.add("关键决策: 采用 Drizzle ORM", kind="decision",
+                       project=_ps.PROXY_MEMORY_DEFAULT_PROJECT)
+        st = MemoryInjectStage()
+        ctx = PipelineContext(session_id="s1", messages=[
+            {"role": "user", "content": "Drizzle 怎么配置"}])
+        self.assertTrue(st.should_run(ctx))
+        ctx = st.process(ctx)
+        self.assertEqual(ctx.memory_inject_info["injected"], 1)
+        # 守卫：同会话第二次不再注入（防每轮重复破坏前缀）
+        self.assertFalse(st.should_run(PipelineContext(session_id="s1")))
+
+    def test_handoff_inject_then_guard(self):
+        _ps.PROXY_HANDOFF_ENABLED = True
+        import handoff as _ho
+        _ho.store(_ho.build("s1", goal="目标G"))
+        st = HandoffInjectStage()
+        ctx = PipelineContext(session_id="s1", messages=[
+            {"role": "user", "content": "继续"}])
+        self.assertTrue(st.should_run(ctx))
+        ctx = st.process(ctx)
+        self.assertEqual(ctx.handoff_inject_info["injected"], 1)
+        self.assertFalse(st.should_run(PipelineContext(session_id="s1")))
+
+    def test_handoff_disabled_should_not_run(self):
+        _ps.PROXY_HANDOFF_ENABLED = False
+        self.assertFalse(HandoffInjectStage().should_run(
+            PipelineContext(session_id="s1")))

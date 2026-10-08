@@ -219,7 +219,18 @@ def check_test_anchor(anchor: str) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Orphan detection: R<id> tags in code/tests not in the YAML
 # ---------------------------------------------------------------------------
-ID_PATTERN = re.compile(r"R[1-7]\.\d+")
+# R<domain>.<n> (PRD R1-R7) 与私域域 R-CM-<n>（上下文工程增强需求）均支持。
+ID_PATTERN = re.compile(r"R[1-7]\.\d+|R-CM-\d+")
+
+
+def _req_sort_key(rid: str):
+    """Sort key tolerant to both `R<d>.<n>` and `R-CM-<n>` id forms."""
+    if rid.startswith("R-CM-"):
+        tail = rid.rsplit("-", 1)[-1]
+        return ("R-CM", int(tail) if tail.isdigit() else 0)
+    parts = rid.split(".")
+    num = parts[1] if len(parts) > 1 and parts[1].isdigit() else "0"
+    return (parts[0], int(num))
 
 def scan_code_tags() -> Dict[str, List[str]]:
     """Grep anthropic_proxy.py for `# Implements: R<id>` patterns."""
@@ -228,7 +239,7 @@ def scan_code_tags() -> Dict[str, List[str]]:
         return found
     with open(PROXY_PATH) as f:
         for i, line in enumerate(f, 1):
-            m = re.search(r"#\s*Implements:\s*([R\d.,\s]+)", line)
+            m = re.search(r"#\s*Implements:\s*([R\d.,\s-]+)", line)
             if m:
                 for rid in ID_PATTERN.findall(m.group(1)):
                     found[rid].append(f"anthropic_proxy.py:{i}")
@@ -279,7 +290,7 @@ def main():
 
     errors: List[str] = []
     rows = []
-    for rid in sorted(by_id.keys(), key=lambda x: (x.split(".")[0], int(x.split(".")[1]))):
+    for rid in sorted(by_id.keys(), key=_req_sort_key):
         r = by_id[rid]
         impls = r.get("impl") or []
         tests = r.get("tests") or []

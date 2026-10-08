@@ -68,7 +68,7 @@ run_integration() {
   source "$SCRIPT_DIR/lib/state_sentinel.sh"
   state_sentinel_begin
   # Make sure no stale process holds the integration ports.
-  for port in 8089 8090 8091 8092 4001 4002 4003 4004; do
+  for port in 8089 8090 8091 8092 8093 4001 4002 4003 4004 4005; do
     if lsof -ti :"$port" >/dev/null 2>&1; then
       warn "port $port is busy; killing stale holder"
       lsof -ti :"$port" | xargs kill -9 2>/dev/null || true
@@ -223,6 +223,22 @@ run_integration() {
     record "integration" "fail" "test_recall_hint_integration.sh exited $rh_rc"
   else
     record "integration" "ok" "recall-hint: all cases passed"
+  fi
+
+  rcm_out=$(bash "$SCRIPT_DIR/integration/test_rcm_memory_handoff.sh" 2>&1)
+  rcm_rc=$?
+  echo "$rcm_out" | tail -15
+  if [[ $rcm_rc -ne 0 ]]; then
+    record "integration" "fail" "test_rcm_memory_handoff.sh exited $rcm_rc"
+  else
+    local rcm_p rcm_f
+    rcm_p=$(echo "$rcm_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -oE "R-CM integration: [0-9]+ passed" | grep -oE "[0-9]+")
+    rcm_f=$(echo "$rcm_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -oE "[0-9]+ failed" | tail -1 | grep -oE "[0-9]+")
+    if [[ "${rcm_f:-0}" == "0" ]]; then
+      record "integration" "ok" "rcm-memory-handoff: all ${rcm_p:-?} cases passed"
+    else
+      record "integration" "fail" "rcm-memory-handoff: $rcm_f cases failed"
+    fi
   fi
 
   lock_out=$(bash "$SCRIPT_DIR/integration/test_manage_lock.sh" 2>&1)

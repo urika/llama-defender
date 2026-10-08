@@ -137,5 +137,54 @@ class TestExtractContentToolCalls(unittest.TestCase):
         self.assertEqual(out["tools"], [])
 
 
+class TestToolArgsCutAtLimit(unittest.TestCase):
+    """L-73(2026-10-07): 区分「输出触顶被截」与「轻微语法不合法」。
+
+    事故样本: 饱和期 max_tokens=8192, Write 大文件的 content 在 23813 字符处
+    被切断, 代理补齐 JSON 后客户端把残缺文件当成功写入落盘。
+    """
+
+    # 事故真实形态: content 字符串未闭合, 停在 '<div'
+    CUT_RAW = ('{"file_path": "/tmp/实验4.html", "content": "<!DOCTYPE html>\\n'
+               '<html lang=\\"zh-CN\\">\\n<head>\\n<div')
+
+    def test_incident_payload_is_incomplete(self):
+        self.assertTrue(tp._is_truncated_json(self.CUT_RAW))
+
+    def test_finish_reason_length_blocks(self):
+        self.assertTrue(tp._tool_args_cut_at_limit(self.CUT_RAW, finish_reason="length"))
+
+    def test_force_stopped_blocks(self):
+        self.assertTrue(tp._tool_args_cut_at_limit(self.CUT_RAW, force_stopped=True))
+
+    def test_output_tokens_at_ceiling_blocks(self):
+        self.assertTrue(tp._tool_args_cut_at_limit(
+            self.CUT_RAW, effective_max_tokens=8192, output_tokens=8192))
+
+    def test_estimated_tokens_at_ceiling_blocks(self):
+        # 事故实测: 文本 1626 + 参数 25089 ≈ 26715 字符 → 估算 10686 tokens ≥ 8192
+        self.assertTrue(tp._tool_args_cut_at_limit(
+            self.CUT_RAW, effective_max_tokens=8192, output_chars=26715))
+
+    def test_incomplete_without_cut_evidence_is_not_blocked(self):
+        """载荷不完整但无触顶证据 → 维持旧的补齐行为(仅语法不合法)。"""
+        self.assertFalse(tp._tool_args_cut_at_limit(
+            self.CUT_RAW, effective_max_tokens=8192,
+            output_chars=1000, output_tokens=100))
+
+    def test_no_limit_info_is_not_blocked(self):
+        self.assertFalse(tp._tool_args_cut_at_limit(self.CUT_RAW))
+
+    def test_complete_args_never_blocked(self):
+        full = '{"file_path": "x.html", "content": "<div>hi</div>"}'
+        self.assertFalse(tp._tool_args_cut_at_limit(full, finish_reason="length"))
+
+    def test_sloppy_but_complete_args_not_blocked(self):
+        """多余逗号属语法问题、载荷完整, 不应被当截断拦下。"""
+        sloppy = '{"file_path": "x.html", "content": "abc",}'
+        self.assertFalse(tp._is_truncated_json(sloppy))
+        self.assertFalse(tp._tool_args_cut_at_limit(sloppy, finish_reason="length"))
+
+
 if __name__ == "__main__":
     unittest.main()

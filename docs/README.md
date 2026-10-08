@@ -31,6 +31,7 @@ docs/
 |------|------|
 | `PRD-anthropic-proxy.md` | 产品需求文档 (PRD v3.1，2026-08-29 修订)，需求体系 R1-R10（v3.1 新增 R9 信息保真控制 IFC / R10 渐进披露上下文服务 PDC，其中 R9.0 统一词汇表已落地）、8 层处理管线、关键配置参数和信息面分批次迭代路线图 |
 | `llama-defender-integration-requirements.md` | llama-defender 集成需求（agent_go → 服务方）：R1-R12 已交付，R13-R16 上下文工程诊断数据面，R17-R19 数据契约 |
+| `context-engineering-enhancement-requirements-20261008.md` | 上下文工程增强需求（R-CM-1~R-CM-7）：**P0 已交付** R-CM-1 跨会话持久记忆 + R-CM-2 自动交接；P1/P2 门控折叠/符号检索/预取/输出预算/召回度量待排期 |
 | `system-requirements-analysis.md` | 系统需求分析与验证，基于实测数据（Qwen3.6-35B-A3B + Claude Code + M5 Pro 48GB）提炼性能基线与优化目标 |
 | `business-cases-validation-20260830.md` | 业务案例与系统解决方案推演（**产品验证**）：五个业务案例（防死循环/wiki 综述更新/会话健康监控/多文件代码修复/压缩成本评估）逐一推演三层架构+五协议的端到端方案 |
 | `prd-cognitive-orchestrator-v4.md` | PRD v4.0：认知编排器（**开发输入**）——R11-R15 五大需求；核心指标；三期架构图+五协议调用流+数据流；五批次交付计划 |
@@ -169,6 +170,7 @@ docs/
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
 | `exp9-closeout-runbook-20260920.md` | EXP-9 收官日操作手册（D5 激活/取证/LCP ladder 序列） |
 | `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` | Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）：pin-system-prompt+gpu0.80 / HBE off+S=50K / 升 rapid-mlx 0.14.3 三步；含零影响隔离验证（T0-T3）与回退设计 |
+| `cross-session-memory-handoff-p0-20261008.md` | 跨会话记忆 + 自动交接（R-CM-1/R-CM-2）P0 落地：模块/端点/配置/启用/测试/回退 |
 | `dflash-mlx-integration-20260826.md` | dflash-mlx 新后端集成（35B ~117 tok/s） |
 | `ornith-15-integration-20260826.md` | Ornith-1.5-35B 集成变更 |
 | `model-catalog-multi-cloud-20260815.md` | 多云模型目录 Phase A-D 全量落地变更记录 |

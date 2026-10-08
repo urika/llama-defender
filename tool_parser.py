@@ -117,6 +117,41 @@ def _is_truncated_json(raw: str) -> bool:
     return False
 
 
+def _tool_args_cut_at_limit(raw_args, finish_reason=None, force_stopped=False,
+                            output_tokens=0, output_chars=0, effective_max_tokens=0):
+    """True 当且仅当：参数 JSON 不完整 **且** 有证据表明是输出触顶被切断。
+
+    L-73(2026-10-07) 截断事故修复的核心判据。区分两类不完整参数:
+      - 「轻微语法不合法」(载荷完整, 只差闭合符号/多逗号) → False, 可安全补齐;
+      - 「输出触顶被截」(载荷本身被 max_tokens 切断) → True, 补齐全等于伪造
+        完整参数, 会让客户端把残缺内容当成功结果落盘
+        (事故: 饱和期上限 8192, Write 大文件在 23813 字符处截断, 补齐后落盘报成功)。
+    触顶证据: 后端 finish_reason=length / 代理自身 force_stop / 已用输出 token 或
+    估算 token 达到生效上限。
+    """
+    if not raw_args or not _is_truncated_json(raw_args):
+        return False
+    if finish_reason == "length" or force_stopped:
+        return True
+    try:
+        eff = int(effective_max_tokens or 0)
+    except (TypeError, ValueError):
+        eff = 0
+    if eff <= 0:
+        return False
+    try:
+        if int(output_tokens or 0) >= eff:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if round(float(output_chars or 0) * 0.4) >= eff:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _coerce_booleans(obj):
     """Recursively coerce stringified booleans ('True'/'False'/'true'/'false') to bool."""
     if isinstance(obj, dict):
@@ -458,6 +493,7 @@ __all__ = [
     "_extract_xml_tool_name",
     "_repair_truncated_json",
     "_is_truncated_json",
+    "_tool_args_cut_at_limit",
     "_coerce_booleans",
     "_unescape_double_escaped_json",
     "_finalize_parsed_args",

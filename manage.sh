@@ -1520,6 +1520,53 @@ cmd_autotune() {
 }
 
 # ============================================================
+# R-CM-2 自动交接摘要（handoff）
+# ============================================================
+cmd_handoff() {
+    local sid="${1:-}"
+    if [[ -z "$sid" || "$sid" == "help" || "$sid" == "-h" ]]; then
+        info "自动交接摘要（R-CM-2）"
+        info "用法: ./manage.sh handoff <session_key> [--goal 文本] [--decision 文本]... [--next 文本]... [--question 文本]... [--distill]"
+        info "  从台账生成会话 handoff，落盘 logs/diag/handoff/（JSONL+md）。"
+        info "  下一会话首请求自动注入需 PROXY_HANDOFF_ENABLED=true（reload 生效）。"
+        info "  --distill  同时把决策沉淀进跨会话记忆（需 PROXY_MEMORY_ENABLED=true）"
+        info "设计: docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md (R-CM-2)"
+        return 0
+    fi
+    shift
+    local body
+    body=$(python3 - "$sid" "$@" <<'PY'
+import json, sys
+sid = sys.argv[1]
+args = sys.argv[2:]
+b = {"session_key": sid, "decisions": [], "next_steps": [], "open_questions": []}
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--goal" and i + 1 < len(args):
+        b["goal"] = args[i + 1]; i += 2
+    elif a == "--decision" and i + 1 < len(args):
+        b["decisions"].append(args[i + 1]); i += 2
+    elif a == "--next" and i + 1 < len(args):
+        b["next_steps"].append(args[i + 1]); i += 2
+    elif a == "--question" and i + 1 < len(args):
+        b["open_questions"].append(args[i + 1]); i += 2
+    elif a == "--distill":
+        b["distill"] = True; i += 1
+    else:
+        i += 1
+print(json.dumps(b, ensure_ascii=False))
+PY
+)
+    if ! curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
+            -d "$body" "http://$PROXY_HOST:$PROXY_PORT/admin/handoff"; then
+        error "handoff 生成失败（代理未运行？）"
+        return 1
+    fi
+    echo
+}
+
+# ============================================================
 # 切换配置
 # ============================================================
 cmd_switch() {
@@ -2506,6 +2553,9 @@ llama.cpp / Rapid-MLX 服务管理脚本
 自调优（BVR autotune）:
   autotune help        查看 autotune 用法（generate/list/apply/rollback/status）
 
+上下文工程（R-CM-1/R-CM-2，默认关）:
+  handoff <session>    生成会话交接摘要并落盘（可选 --goal/--decision/--next/--distill）
+
 快速启动:
   wizard               交互式向导，引导完成首次启动配置
 
@@ -2663,6 +2713,9 @@ main() {
             ;;
         autotune)
             cmd_autotune "$2" "${@:3}"
+            ;;
+        handoff)
+            cmd_handoff "$2" "${@:3}"
             ;;
         switch)
             _with_manage_lock cmd_switch "$2"

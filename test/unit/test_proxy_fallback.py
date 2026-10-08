@@ -3735,6 +3735,160 @@ class TestStreamingTailUsageChunk(unittest.TestCase):
         self.assertIn("message_stop", joined)
 
 
+class TestOpenAIStreamCtxRecall(unittest.TestCase):
+    class _FakeHandler:
+        def __init__(self, micro_dispatch=None):
+            self._openai_mode = True
+            self._openai_stream_headers_sent = False
+            self._request_id = "req_openai_stream_test"
+            self._route_response_headers = {"X-Proxy-Route-Target": "local"}
+            self._queue_response_headers = None
+            self._pin_response_headers = None
+            self._diag_response_headers = {}
+            self._last_jsonl_token = "openai_stream_test"
+            self._micro_recall_dispatch = micro_dispatch
+            self._micro_continuation = False
+            self.wfile = unittest.mock.Mock()
+            self.wfile.write.side_effect = lambda data: len(data)
+            self.header_calls = []
+
+        def send_response(self, code):
+            self.header_calls.append(("status", code))
+
+        def send_header(self, key, value):
+            self.header_calls.append((key, value))
+
+        def end_headers(self):
+            self.header_calls.append(("end", None))
+
+        def _send_diag_headers(self):
+            pass
+
+        def _heartbeat_lines(self, resp):
+            return proxy.Handler._heartbeat_lines(self, resp)
+
+        def _handle_openai_streaming_response(self, resp):
+            return proxy.Handler._handle_openai_streaming_response(self, resp)
+
+    @staticmethod
+    def _chunk(delta=None, finish_reason=None, choices=True):
+        obj = {"id": "chatcmpl-test", "object": "chat.completion.chunk"}
+        if choices:
+            choice = {"index": 0, "delta": delta or {}}
+            if finish_reason is not None:
+                choice["finish_reason"] = finish_reason
+            obj["choices"] = [choice]
+        return ("data: " + json.dumps(obj) + "\n\n").encode()
+
+    @staticmethod
+    def _resp(*lines):
+        import io
+        return io.BytesIO(b"".join(lines))
+
+    def _run(self, handler, resp):
+        body = {"model": "claude-sonnet-4-6", "max_tokens": 128}
+        with patch.object(proxy, "log"), \
+             patch.object(proxy, "PROXY_DIAG_ENABLED", False), \
+             patch.object(proxy._log_ctx, "session_id", "sid-openai-test", create=True):
+            proxy.Handler._handle_streaming_response(handler, resp, body)
+
+    def test_ctx_recall_tool_call_is_self_answered_without_leaking(self):
+        follow = [{"role": "assistant", "content": "", "tool_calls": []},
+                  {"role": "tool", "tool_call_id": "call-r", "content": "found"}]
+        dispatched = []
+        h = self._FakeHandler(lambda msgs: dispatched.append(msgs) or True)
+        resp = self._resp(
+            self._chunk({"tool_calls": [{"index": 0, "id": "call-r", "type": "function",
+                                         "function": {"name": "ctx_recall", "arguments": '{"query":'}}]}),
+            self._chunk({"tool_calls": [{"index": 0, "function": {"arguments": ' "宝丰能源"}'}}]}),
+            self._chunk({}, finish_reason="tool_calls"),
+            b"data: [DONE]\n\n",
+        )
+        with patch.object(proxy._ps, "PROXY_PD_ENABLED", True), \
+             patch.object(proxy._ps, "PROXY_PD_MICRO_TURN_ENABLED", True), \
+             patch("ctx_recall.split_follow_up_messages", return_value=(follow, True)) as split:
+            self._run(h, resp)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0], follow)
+        calls = split.call_args.args[1]
+        self.assertEqual(calls[0]["function"]["name"], "ctx_recall")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"query": "宝丰能源"})
+        written = b"".join(c[0][0] for c in h.wfile.write.call_args_list).decode()
+        self.assertNotIn("call-r", written)
+        self.assertEqual(sum(1 for entry in h.header_calls if entry[0] == "status"), 1)
+
+    def test_mixed_batch_self_answers_recall_and_dispatches(self):
+        follow = [{"role": "assistant", "content": "", "tool_calls": []},
+                  {"role": "tool", "tool_call_id": "call-r", "content": "found"}]
+        dispatched = []
+        h = self._FakeHandler(lambda msgs: dispatched.append(msgs) or True)
+        resp = self._resp(
+            self._chunk({"tool_calls": [{"index": 0, "id": "call-r", "type": "function",
+                                         "function": {"name": "ctx_recall", "arguments": '{"query":"x"}'}}]}),
+            self._chunk({"tool_calls": [{"index": 1, "id": "call-fetch", "type": "function",
+                                         "function": {"name": "fetch_url", "arguments": "{\\\"url\\\":\\\"https://example.test\\\"}"}}]}),
+            self._chunk({}, finish_reason="tool_calls"),
+            b"data: [DONE]\n\n",
+        )
+        with patch.object(proxy._ps, "PROXY_PD_ENABLED", True), \
+             patch.object(proxy._ps, "PROXY_PD_MICRO_TURN_ENABLED", True), \
+             patch("ctx_recall.split_follow_up_messages", return_value=(follow, True)) as split:
+            self._run(h, resp)
+        self.assertEqual(len(dispatched), 1)
+        calls = split.call_args.args[1]
+        self.assertEqual([tc["function"]["name"] for tc in calls], ["ctx_recall", "fetch_url"])
+        written = b"".join(c[0][0] for c in h.wfile.write.call_args_list).decode()
+        self.assertNotIn("call-fetch", written)
+
+    def test_ordinary_tool_stream_is_replayed_unchanged(self):
+        h = self._FakeHandler(lambda _msgs: self.fail("must not dispatch"))
+        lines = [
+            self._chunk({"tool_calls": [{"index": 0, "id": "call-fetch", "type": "function",
+                                         "function": {"name": "fetch_url", "arguments": "{}"}}]}),
+            self._chunk({}, finish_reason="tool_calls"),
+            b"data: [DONE]\n\n",
+        ]
+        with patch.object(proxy._ps, "PROXY_PD_ENABLED", True), \
+             patch.object(proxy._ps, "PROXY_PD_MICRO_TURN_ENABLED", True), \
+             patch("ctx_recall.split_follow_up_messages") as split:
+            self._run(h, self._resp(*lines))
+        written = b"".join(c[0][0] for c in h.wfile.write.call_args_list)
+        self.assertEqual(written, b"".join(lines))
+        split.assert_not_called()
+
+    def test_recursive_micro_turn_does_not_send_second_headers(self):
+        h = self._FakeHandler()
+        follow = [{"role": "assistant", "content": "", "tool_calls": []}]
+        tool_resp = self._resp(
+            self._chunk({"tool_calls": [{"index": 0, "id": "call-r", "type": "function",
+                                         "function": {"name": "ctx_recall", "arguments": '{"query":"x"}'}}]}),
+            self._chunk({}, finish_reason="tool_calls"), b"data: [DONE]\n\n")
+        final_resp = self._resp(self._chunk({"content": "done"}),
+                                 self._chunk({}, finish_reason="stop"), b"data: [DONE]\n\n")
+        dispatch_calls = []
+
+        def dispatch(msgs):
+            dispatch_calls.append(msgs)
+            h._micro_continuation = True
+            try:
+                proxy.Handler._handle_streaming_response(h, final_resp,
+                    {"model": "claude-sonnet-4-6", "max_tokens": 128})
+            finally:
+                h._micro_continuation = False
+            return True
+
+        h._micro_recall_dispatch = dispatch
+        with patch.object(proxy._ps, "PROXY_PD_ENABLED", True), \
+             patch.object(proxy._ps, "PROXY_PD_MICRO_TURN_ENABLED", True), \
+             patch("ctx_recall.split_follow_up_messages", return_value=(follow, True)):
+            self._run(h, tool_resp)
+        self.assertEqual(dispatch_calls, [follow])
+        self.assertEqual(sum(1 for entry in h.header_calls if entry[0] == "status"), 1)
+        written = b"".join(c[0][0] for c in h.wfile.write.call_args_list).decode()
+        self.assertIn('"content": "done"', written)
+        self.assertNotIn("call-r", written)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

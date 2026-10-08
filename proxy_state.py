@@ -288,6 +288,21 @@ PROXY_DYNAMIC_MAX_TOKENS_SATURATION = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKE
 PROXY_DYNAMIC_MAX_TOKENS_OOM = int(os.environ.get("PROXY_DYNAMIC_MAX_TOKENS_OOM", "4096"))
 PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO = float(os.environ.get(
     "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "0.8"))
+# L-73(2026-10-07) 截断事故修复(与上面两个开关配套):
+#   1) FLOOR: 饱和期上限被压到 8192 时, Write 大文件的参数载荷在 23813 字符处
+#      被切断, 代理再"修复"JSON 即让客户端把残缺文件当成功写入。下限兜底确保
+#      单次工具调用的输出预算够放完载荷。
+#   2) WRITE_NO_REDUCE: 含写文件工具的轮次干脆不降压(载荷长度不可预知)。
+PROXY_DYNAMIC_MAX_TOKENS_FLOOR = int(os.environ.get(
+    "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", get_default("PROXY_DYNAMIC_MAX_TOKENS_FLOOR")))
+PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE = os.environ.get(
+    "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE",
+    get_default("PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE")).lower() in ("1", "true", "yes")
+# 触顶截断的工具调用: 阻止执行(丢弃 + 可见错误 + stop_reason=max_tokens)而非
+# 静默补齐 JSON。等同于失败标记, 由客户端重试。
+PROXY_BLOCK_CUT_TOOL_CALLS = os.environ.get(
+    "PROXY_BLOCK_CUT_TOOL_CALLS",
+    get_default("PROXY_BLOCK_CUT_TOOL_CALLS")).lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Phase 3: request failure snapshots
@@ -603,6 +618,36 @@ PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
 PROXY_ADMIN_TOKEN = os.environ.get("PROXY_ADMIN_TOKEN", "")
 PROXY_INJECT_MAX_CHARS = int(os.environ.get(
     "PROXY_INJECT_MAX_CHARS", get_default("PROXY_INJECT_MAX_CHARS")))
+
+# R-CM-1 跨会话持久记忆（2026-10-08；默认关，memory_store.py）：
+# 项目级 SQLite(+FTS5) 记忆库，会话首请求按相关性注入。
+PROXY_MEMORY_ENABLED = os.environ.get(
+    "PROXY_MEMORY_ENABLED", get_default("PROXY_MEMORY_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_MEMORY_DB_PATH = os.environ.get(
+    "PROXY_MEMORY_DB_PATH", get_default("PROXY_MEMORY_DB_PATH"))
+PROXY_MEMORY_DEFAULT_PROJECT = os.environ.get(
+    "PROXY_MEMORY_DEFAULT_PROJECT", get_default("PROXY_MEMORY_DEFAULT_PROJECT"))
+PROXY_MEMORY_INJECT_MAX_CHARS = int(os.environ.get(
+    "PROXY_MEMORY_INJECT_MAX_CHARS", get_default("PROXY_MEMORY_INJECT_MAX_CHARS")))
+PROXY_MEMORY_TOP_K = int(os.environ.get(
+    "PROXY_MEMORY_TOP_K", get_default("PROXY_MEMORY_TOP_K")))
+PROXY_MEMORY_TTL_DAYS = int(os.environ.get(
+    "PROXY_MEMORY_TTL_DAYS", get_default("PROXY_MEMORY_TTL_DAYS")))
+
+# R-CM-2 自动交接摘要（2026-10-08；默认关，handoff.py）：
+# 规则化从台账生成结构化 handoff，落盘 + 新会话首请求注入。
+PROXY_HANDOFF_ENABLED = os.environ.get(
+    "PROXY_HANDOFF_ENABLED", get_default("PROXY_HANDOFF_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_HANDOFF_TRIGGER_CHARS = int(os.environ.get(
+    "PROXY_HANDOFF_TRIGGER_CHARS", get_default("PROXY_HANDOFF_TRIGGER_CHARS")))
+PROXY_HANDOFF_MAX_CHARS = int(os.environ.get(
+    "PROXY_HANDOFF_MAX_CHARS", get_default("PROXY_HANDOFF_MAX_CHARS")))
+PROXY_HANDOFF_DIR = os.environ.get(
+    "PROXY_HANDOFF_DIR", get_default("PROXY_HANDOFF_DIR"))
+# 会话级"首请求已注入"守卫（防每轮重复注入破坏前缀；进程内 FIFO 有界）
+_SESSION_MEMORY_SEEN: set = set()
+_SESSION_HANDOFF_SEEN: set = set()
+_SESSION_INJECT_SEEN_MAX = 4096
 
 # ---------------------------------------------------------------------------
 # 上下文工程引擎（R8.1-R8.3，context_engine.py；设计 llama-defender-context-
@@ -1207,6 +1252,9 @@ _RELOAD_SPEC = [
     ("PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", "int", "2048", "2048"),
     ("PROXY_DYNAMIC_MAX_TOKENS_OOM", "PROXY_DYNAMIC_MAX_TOKENS_OOM", "int", "4096", "4096"),
     ("PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO", "float", "0.8", "0.8"),
+    # L-73 / R-CM-6: 工具轮次输出下限兜底 + 长载荷工具不降压（reloadable）
+    ("PROXY_DYNAMIC_MAX_TOKENS_FLOOR", "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", "int", "32768", "32768"),
+    ("PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", "bool", "true", "true"),
     # 请求优先级队列（Phase 1，默认关闭）
     ("PROXY_QUEUE_ENABLED", "PROXY_QUEUE_ENABLED", "bool", "false", "false"),
     ("PROXY_QUEUE_TIMEOUT_SECONDS", "PROXY_QUEUE_TIMEOUT_SECONDS", "int", "300", "300"),
@@ -1262,6 +1310,18 @@ _RELOAD_SPEC = [
     # ADR-013 T1 admin 注入原语（reloadable；默认空 token=localhost-only）
     ("PROXY_ADMIN_TOKEN", "PROXY_ADMIN_TOKEN", "str", "", ""),
     ("PROXY_INJECT_MAX_CHARS", "PROXY_INJECT_MAX_CHARS", "int", "4000", "4000"),
+    # R-CM-1 跨会话持久记忆（默认关；SIGHUP 可热开）
+    ("PROXY_MEMORY_ENABLED", "PROXY_MEMORY_ENABLED", "bool", "false", "false"),
+    ("PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_DB_PATH", "str", "logs/memory/memory.db", "logs/memory/memory.db"),
+    ("PROXY_MEMORY_DEFAULT_PROJECT", "PROXY_MEMORY_DEFAULT_PROJECT", "str", "default", "default"),
+    ("PROXY_MEMORY_INJECT_MAX_CHARS", "PROXY_MEMORY_INJECT_MAX_CHARS", "int", "2000", "2000"),
+    ("PROXY_MEMORY_TOP_K", "PROXY_MEMORY_TOP_K", "int", "5", "5"),
+    ("PROXY_MEMORY_TTL_DAYS", "PROXY_MEMORY_TTL_DAYS", "int", "90", "90"),
+    # R-CM-2 自动交接摘要（默认关；SIGHUP 可热开）
+    ("PROXY_HANDOFF_ENABLED", "PROXY_HANDOFF_ENABLED", "bool", "false", "false"),
+    ("PROXY_HANDOFF_TRIGGER_CHARS", "PROXY_HANDOFF_TRIGGER_CHARS", "int", "0", "0"),
+    ("PROXY_HANDOFF_MAX_CHARS", "PROXY_HANDOFF_MAX_CHARS", "int", "3000", "3000"),
+    ("PROXY_HANDOFF_DIR", "PROXY_HANDOFF_DIR", "str", "logs/diag/handoff", "logs/diag/handoff"),
 ]
 
 
@@ -1355,6 +1415,12 @@ __all__ = [
     "PROXY_HBE_TOP_LOGPROBS", "PROXY_HBE_MAX_TOKENS", "PROXY_HBE_LOCK_WAIT_S",
     "PROXY_HBE_TIMEOUT_S",
     "PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_WINDOW_K",
+    # R-CM-1/R-CM-2 跨会话记忆 + 自动交接
+    "PROXY_MEMORY_ENABLED", "PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_DEFAULT_PROJECT",
+    "PROXY_MEMORY_INJECT_MAX_CHARS", "PROXY_MEMORY_TOP_K", "PROXY_MEMORY_TTL_DAYS",
+    "PROXY_HANDOFF_ENABLED", "PROXY_HANDOFF_TRIGGER_CHARS", "PROXY_HANDOFF_MAX_CHARS",
+    "PROXY_HANDOFF_DIR", "_SESSION_MEMORY_SEEN", "_SESSION_HANDOFF_SEEN",
+    "_SESSION_INJECT_SEEN_MAX",
     "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_DIAG_LEDGER_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",
@@ -1396,6 +1462,8 @@ __all__ = [
     "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", "PROXY_DYNAMIC_MAX_TOKENS_INIT",
     "PROXY_DYNAMIC_MAX_TOKENS_GROWTH", "PROXY_DYNAMIC_MAX_TOKENS_SATURATION",
     "PROXY_DYNAMIC_MAX_TOKENS_OOM", "PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO",
+    "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE",
+    "PROXY_BLOCK_CUT_TOOL_CALLS",
     # Snapshots
     "PROXY_SNAPSHOT_ENABLED", "PROXY_SNAPSHOT_MAX_FILES",
     # Dynamic concurrency

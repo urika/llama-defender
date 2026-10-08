@@ -412,5 +412,63 @@ class TestEnsureToolChainIntegrity(unittest.TestCase):
         self.assertIn("tc_3", out[3]["content"])
 
 
+class TestTruncatedArgsSurviveConversion(unittest.TestCase):
+    """L-73(2026-10-07): 非流式守卫的前提性质。
+
+    converter 会在解析时把截断参数补齐成合法非空 dict(容错特性, 不改)——但
+    **不得回写** openai_resp 里的原始参数串。守卫据此回到原始串判定截断:
+    转换后 input 非空(旧守卫的 input=={} 条件会放过) + 原始串仍不完整
+    + _tool_args_cut_at_limit 有触顶证据 → 应被拦。
+    事故形态: 饱和期 max_tokens=8192, Write 的 content 在 23813 字符处截断。
+    """
+
+    CUT_ARGS = ('{"file_path": "/tmp/实验4.html", "content": "<!DOCTYPE html>\\n'
+                '<html lang=\\"zh-CN\\">\\n<head>\\n<div')
+
+    def _make_resp(self, finish_reason="length"):
+        return {
+            "id": "resp_t", "object": "chat.completion", "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_t", "type": "function",
+                     "function": {"name": "Write", "arguments": self.CUT_ARGS}},
+                ]},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {"completion_tokens": 8192},
+        }
+
+    def test_repaired_input_nonempty_but_raw_survives(self):
+        import tool_parser as tp
+        resp = self._make_resp()
+        out = mc.convert_openai_response_to_anthropic(resp, "claude-test")
+
+        # 转换产物: tool_use 块的 input 被 converter 补齐为非空 dict
+        tool_blocks = [b for b in out.get("content", []) if b.get("type") == "tool_use"]
+        self.assertEqual(len(tool_blocks), 1)
+        self.assertNotEqual(tool_blocks[0].get("input"), {})   # 事故形态: 非空!
+
+        # 原始参数串在 openai_resp 中原样幸存(converter 只读不写)
+        raw = resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(raw, self.CUT_ARGS)
+
+        # 统一谓词在触顶证据下判定为截断 → 守卫会拦下这个"看起来合法"的调用
+        self.assertTrue(tp._tool_args_cut_at_limit(
+            raw, finish_reason="length", force_stopped=False,
+            output_tokens=8192, output_chars=0, effective_max_tokens=8192))
+
+    def test_no_cut_evidence_not_flagged(self):
+        import tool_parser as tp
+        resp = self._make_resp(finish_reason="stop")
+        mc.convert_openai_response_to_anthropic(resp, "claude-test")
+        raw = resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        # 无触顶证据(正常完成、token 未到上限) → 不拦, 保持旧补齐容错
+        self.assertFalse(tp._tool_args_cut_at_limit(
+            raw, finish_reason="stop", force_stopped=False,
+            output_tokens=100, output_chars=1000, effective_max_tokens=8192))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,8 @@ from pipeline import (
     RequestParser,
     ContextEngineStage,
     AdminInjectStage,
+    MemoryInjectStage,
+    HandoffInjectStage,
     _INJECT_TAG_RE,
     _ctx_engine_on,
     LifecycleClassifier,
@@ -443,6 +445,24 @@ def _huge_view_budget():
 
 
 
+def _anthropic_input_total(usage):
+    """Anthropic usage 输入总量 = input + cache_read + cache_creation。
+
+    云端缓存命中时 input_tokens 仅为未命中部分(如 43)，真发送量藏在
+    cache_read_input_tokens(如 16768)——台账/计费必须用总量，否则热轮
+    看似只发了 1 个 token。缺失字段按 0 计；全缺失返回 0。
+    """
+    if not isinstance(usage, dict):
+        return 0
+    def _num(key):
+        try:
+            return int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return _num("input_tokens") + _num("cache_read_input_tokens") + _num(
+        "cache_creation_input_tokens")
+
+
 def _parse_anthropic_sse_usage(raw, acc):
     """DEF-309/EXP-3: 从 anthropic SSE 数据行提取 usage 到 acc(就地更新)。
 
@@ -471,6 +491,15 @@ def _parse_anthropic_sse_usage(raw, acc):
         _in = 0
     if _in:
         acc["input_tokens"] = _in
+    # 缓存命中分量(message_start usage 原生字段)：只记非零值，保持 acc
+    # 无缓存时的旧形态不变(旧单测断言精确相等)。
+    for _ck in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        try:
+            _cv = int(usage.get(_ck) or 0)
+        except (TypeError, ValueError):
+            _cv = 0
+        if _cv:
+            acc[_ck] = _cv
     try:
         _out = int(usage.get("output_tokens") or 0)
     except (TypeError, ValueError):
@@ -532,6 +561,14 @@ def _estimate_prompt_tokens(anthropic_body):
     rapid-mlx timings 覆盖率低（L-5，3.5%）导致此前恒 0，CLI auto-compact
     失明，全量会话历史滚到 32MB 请求体爆窗（EXP-3 v2 seq12/31/86 实证）。
     json.dumps 含结构开销 → 估算偏高 = 安全方向（促使 CLI 提前 compact）。
+
+    **L-80 修订（2026-10-08）**：立论前提已不成立——DEF-309 会话键同源修复后
+    真实后端口径可达（[REQ_USAGE]/stage 行 last_real 有值），估算器把 CLI 侧
+    计量固定放大约 2.7×（实测 seq4：客户端 177,052 vs 后端 65,461）；而
+    DISABLE_AUTO_COMPACT=1 下 CLI 的 compact 排气阀已关，高估不再"促使其提前
+    压缩"，只把 CLI 硬阻断线 177,000 变成对 ≈65K 真实上下文生效。故新增
+    `_cli_usage_tokens()`：开启 PROXY_HONEST_METERING 时改用引擎记录的上一轮
+    真实后端口径；本估算器仅作首轮/缺值兜底。默认关闭＝保持本函数旧行为。
     """
     try:
         ratio = max(float(getattr(_ps, "PROXY_CTX_TOKEN_RATIO", 4) or 4), 0.1)
@@ -539,6 +576,52 @@ def _estimate_prompt_tokens(anthropic_body):
         return max(1, int(chars / ratio))
     except Exception:
         return 1
+
+
+# --- L-80(2026-10-08) 诚实计量开关 -------------------------------------------
+# PROXY_HONEST_METERING 未设/为 0 ⇒ 保持 L-23 估算回填(旧行为, 默认安全);
+# 为 1/true/yes/on ⇒ message_start.usage.input_tokens 改用**本会话上一轮后端
+# 口径真实值**(context_engine last_sent_tokens, 由 record_usage 写入), 使 CLI
+# 上下文计量表 ≈ 真实 token(k 由 ~2.7 回到 ~1.0, 见 docs/l80-context-budget-
+# landing-20261007.md §1.3b/§3)。不可得(首轮/无会话/异常)时回落估算器,
+# fail-open 不编造 0。非法值告警一次并按关闭处理(L-47 键名静默教训)。
+_HONEST_ON_VALUES = ("1", "true", "yes", "on", "y", "t")
+_HONEST_OFF_VALUES = ("", "0", "false", "no", "off", "n", "f")
+_honest_metering_warned = False
+
+
+def _honest_metering_on():
+    """L-80: PROXY_HONEST_METERING 开关(默认关)。"""
+    global _honest_metering_warned
+    raw = os.environ.get("PROXY_HONEST_METERING", "")
+    v = str(raw).strip().lower()
+    if v in _HONEST_ON_VALUES:
+        return True
+    if v in _HONEST_OFF_VALUES:
+        return False
+    if not _honest_metering_warned:
+        _honest_metering_warned = True
+        log(f"[L-80] PROXY_HONEST_METERING 非法值 {raw!r}(应为 1/0), 按关闭处理")
+    return False
+
+
+def _cli_usage_tokens(anthropic_body):
+    """L-80: message_start.usage.input_tokens 的回填值(诚实计量见上)。"""
+    if _honest_metering_on():
+        try:
+            _sid = (getattr(_log_ctx, "session_key", None)
+                    or getattr(_log_ctx, "session_id", None))
+            if _sid:
+                import context_engine
+                if context_engine.ENGINE.has_session(_sid):
+                    _real = int(getattr(
+                        context_engine.ENGINE.get_or_create(_sid),
+                        "last_sent_tokens", 0) or 0)
+                    if _real > 0:
+                        return _real
+        except Exception as _e:
+            log(f"[L-80] 诚实计量回填失败(回落估算): {_e}")
+    return _estimate_prompt_tokens(anthropic_body)
 
 
 def _inject_session_known(session_key):
@@ -603,9 +686,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
+
+    def do_DELETE(self):
+        """R-CM-1: DELETE /admin/memory/<id> — 硬删一条记忆。"""
+        try:
+            if self.path.startswith("/admin/memory/"):
+                rest = self.path[len("/admin/memory/"):].split("?", 1)[0]
+                self._handle_delete_memory(rest)
+            else:
+                self._respond_json({"detail": "Not found"}, 404)
+        except Exception as e:
+            log(f"  -> DELETE error: {e}", level="ERROR")
+            self._respond_json(
+                {"error": {"type": "internal_error", "message": str(e)[:200]}}, 500)
 
     def do_GET(self):
         # DEF-309: 引擎会话 key 不再截 8 字符——header sid 全量(cap 64, 与
@@ -762,6 +858,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._handle_backend_props_endpoint("props")
                 elif self.path == "/api/backend/slots":
                     self._handle_backend_props_endpoint("slots")
+                # R-CM-1: 读取记忆（GET /api/memory?project=&q=&limit=）
+                elif self.path == "/api/memory" or self.path.startswith("/api/memory?"):
+                    self._handle_get_memory()
+                # R-CM-2: 读取最近交接（GET /api/handoff?session=KEY）
+                elif self.path == "/api/handoff" or self.path.startswith("/api/handoff?"):
+                    self._handle_get_handoff()
                 else:
                     self._respond_json({"detail": "Not found"}, 404)
             except Exception as e:
@@ -859,6 +961,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/admin/route/force-cloud":
                 self._handle_admin_route_force(parsed, "cloud")
+                return
+
+            # R-CM-1: 写记忆（POST /admin/memory）
+            if self.path == "/admin/memory":
+                self._handle_admin_memory(parsed)
+                return
+            # R-CM-2: 生成交接（POST /admin/handoff）
+            if self.path == "/admin/handoff":
+                self._handle_admin_handoff(parsed)
                 return
 
             if self.path == "/v1/messages" or self.path.startswith("/v1/messages?") or \
@@ -1287,11 +1398,14 @@ class Handler(BaseHTTPRequestHandler):
             trace_id=(trace_context.current() or {}).get("trace_id", ""),
             root_span_id=(trace_context.current() or {}).get("root_span_id", ""),
             client_type=_detect_client_type(self.headers.get('User-Agent', '')),
+            project=(self.headers.get('X-Proxy-Project', '') or '')[:128],
         )
         InstrumentedPipeline([
             RequestParser(),              # 0
             ContextEngineStage(),         # 0.5 — 上下文工程引擎(默认关;开启时 7/14/17 跳过)
             AdminInjectStage(),           # 0.6 — admin 注入原语(ADR-013 T1)
+            MemoryInjectStage(),          # 0.61 — R-CM-1 跨会话记忆注入(默认关)
+            HandoffInjectStage(),         # 0.62 — R-CM-2 自动交接注入(默认关)
             LifecycleClassifier(),        # 1
             DynamicMaxTokens(),           # 2
             SmartRouter(),                # 2.5 — route decision (local vs cloud)
@@ -1396,6 +1510,12 @@ class Handler(BaseHTTPRequestHandler):
         output_chars = 0
         force_stopped = False
 
+        # L-73: 输出预算必须计入工具参数——只数文本时, "几乎全是 Write 载荷"的响应
+        # (事故形态)永远到不了限额, force_stopped 永不触发。与流式路径口径一致。
+        for block in anthropic_resp.get("content", []):
+            if block.get("type") == "tool_use":
+                output_chars += len(json.dumps(block.get("input", {}), ensure_ascii=False))
+
         for block in anthropic_resp.get("content", []):
             if block.get("type") == "text":
                 text = block.get("text", "")
@@ -1407,25 +1527,62 @@ class Handler(BaseHTTPRequestHandler):
                     output_chars = output_chars_limit
                     break
 
+        # L-73(2026-10-07): 非流式路径的同一类风险——converter(message_converter.
+        # convert_openai_response_to_anthropic → parse_tool_arguments)会在本守卫
+        # 上游把截断参数补齐成"合法非空 dict", 因此守卫不能看转换后的 input
+        # (旧的 input=={} 条件恰好放过事故形态), 必须回到 openai_resp 里的
+        # **原始参数串**判定(converter 只读不回写, 原始串幸存)。谓词与流式路径
+        # 统一为 _tool_args_cut_at_limit: 参数不完整 且 有触顶证据才拦。
+        _choices0 = openai_resp.get("choices") or []
+        _finish_reason = ""
+        if _choices0:
+            _finish_reason = _choices0[0].get("finish_reason") or ""
+        try:
+            _eff_max_ns = int(anthropic_body.get("max_tokens", 4096))
+        except (TypeError, ValueError):
+            _eff_max_ns = 0
+        _usage_completion = ((openai_resp.get("usage") or {}).get("completion_tokens")) or 0
+
         if force_stopped:
             anthropic_resp["stop_reason"] = "max_tokens"
             log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})", level="WARN")
-            for block in anthropic_resp.get("content", []):
-                if block.get("type") == "tool_use" and block.get("input") == {}:
-                    tool_name = block.get("name", "")
-                    _choices = openai_resp.get("choices") or []
-                    _msg0 = _choices[0].get("message", {}) if _choices else {}
-                    for tc in (_msg0.get("tool_calls") or []):
-                        if tc.get("function", {}).get("name") == tool_name:
-                            raw_args = tc["function"].get("arguments", "{}")
-                            try:
-                                json.loads(raw_args)
-                            except json.JSONDecodeError:
-                                repaired = _repair_truncated_json(raw_args)
-                                parsed = json.loads(repaired) if repaired else {}
-                                block["input"] = parsed
-                                log(f"  -> Repaired truncated JSON for tool {tool_name}")
-                            break
+
+        _msg0 = _choices0[0].get("message", {}) if _choices0 else {}
+        _raw_args_by_name = {}
+        for _tc in (_msg0.get("tool_calls") or []):
+            _fn = _tc.get("function") or {}
+            _raw_args_by_name.setdefault(_fn.get("name") or "", []).append(_fn.get("arguments") or "")
+
+        _cut_blocks = []
+        for block in anthropic_resp.get("content", []):
+            if block.get("type") != "tool_use":
+                continue
+            for _raw in _raw_args_by_name.get(block.get("name", "")) or []:
+                if not _raw.strip() or _raw.strip() == "{}":
+                    continue  # 无参工具的正常调用, 不动
+                if _tool_args_cut_at_limit(
+                        _raw, finish_reason=_finish_reason, force_stopped=force_stopped,
+                        output_tokens=_usage_completion, output_chars=output_chars,
+                        effective_max_tokens=_eff_max_ns):
+                    _cut_blocks.append(block)
+                    break
+
+        if _cut_blocks and getattr(_ps, "PROXY_BLOCK_CUT_TOOL_CALLS", True):
+            _cut_names = []
+            for block in _cut_blocks:
+                _cut_names.append(block.get("name", ""))
+                anthropic_resp["content"].remove(block)
+                log(f"  !! [TOOL_CALL_CUT_BLOCKED] tool={block.get('name', '')}: args cut at "
+                    f"output limit (finish={_finish_reason or 'proxy'}, out_tokens={_usage_completion}, "
+                    f"out_chars={output_chars}, eff_max={_eff_max_ns}) — block dropped, "
+                    f"retry expected", level="WARN")
+            anthropic_resp["content"].append({
+                "type": "text",
+                "text": (f"\n\n[proxy] 错误: 工具调用 {', '.join(_cut_names)} 的参数在输出上限处"
+                         f"被截断, 已阻止执行以免写入不完整内容。请重试; 写大文件请拆分为多次"
+                         f"较小的写入。\n"),
+            })
+            anthropic_resp["stop_reason"] = "max_tokens"
 
         content_summary = ""
         output_chars = 0
@@ -1443,6 +1600,11 @@ class Handler(BaseHTTPRequestHandler):
     # TODO(roadmap-U7): Stream reasoning progress — emit partial thinking events during long TTFT
     def _handle_streaming_response(self, resp, anthropic_body):
         if getattr(self, '_openai_mode', False):
+            _micro_continue = getattr(self, '_micro_continuation', False)
+            if _micro_continue:
+                self._micro_continuation = False
+            else:
+                self._openai_stream_headers_sent = False
             self._handle_openai_streaming_response(resp)
             return
 
@@ -1563,7 +1725,7 @@ class Handler(BaseHTTPRequestHandler):
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": _estimate_prompt_tokens(anthropic_body), "output_tokens": 0}
+                    "usage": {"input_tokens": _cli_usage_tokens(anthropic_body), "output_tokens": 0}
                 }
             }
             self.wfile.write(f"event: message_start\ndata: {json.dumps(event)}\n\n".encode("utf-8"))
@@ -1623,12 +1785,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 验收门禁 1: cached_tokens 回填引擎会话(流式路径; 需要
                 # FormatConverter 的 stream_options.include_usage 使后端发本块)
                 if _ctx_engine_on():
-                    # DEF-309 口径对齐(2026-09-28 批期实测 + 2026-09-29 探针复现):
-                    # 引擎 key 必须与 pipeline ctx.session_id 同源——pipeline.py:443
-                    # 明确"优先取全量 session_key"; 旧实现取 _log_ctx.session_id(8 字符
-                    # 日志显示 id), 致 usage 回填写进**另一个**引擎会话对象, 触发口径
-                    # 退化为只剩 est×1.6 (实测: 同会话 usage 行 hit 非空而
-                    # msgs=… last_real≈0, 有效触发 ≈83K 真实 token vs 名义 70K)。
+                    # DEF-309 口径对齐(2026-09-28 批期实测): 引擎 key 必须与
+                    # pipeline ctx.session_id 同源——pipeline.py:443 明确"优先取
+                    # 全量 session_key"; 旧实现取 _log_ctx.session_id(8 字符日志
+                    # 显示 id), 致 usage 回填写进**另一个**引擎会话对象, 触发口径
+                    # 退化为只剩 est×1.6 (EXP-12 轮1 实测: msgs= 行 last_real 恒 0,
+                    # 而同期 usage 行正常, 有效触发 ≈83K 真实 token vs 名义 70K)。
                     _sid = (getattr(_log_ctx, 'session_key', None)
                             or getattr(_log_ctx, 'session_id', None))
                     if _sid:
@@ -1748,23 +1910,56 @@ class Handler(BaseHTTPRequestHandler):
                                 log(f"  [CONTENT_TOOLS_FALLBACK] replaced empty args for {t['name']} from content text")
                                 break
 
-        # Repair truncated JSON in tool_call arguments unconditionally
-        for idx in tool_calls_buffer:
+        # Repair truncated JSON in tool_call arguments.
+        # L-73(2026-10-07) 事故修复: 必须区分「轻微语法补齐」与「输出触顶被截」。
+        # 前者载荷完整、只差闭合符号, 补齐安全; 后者载荷本身被 max_tokens 切断
+        # (事故: 饱和期上限 8192, Write 的 content 停在 23813 字符处), 静默补齐
+        # 会让客户端把残缺文件当成功写入落盘。触顶截断一律阻止执行:
+        # 丢弃该调用 + 补发可见错误文本 + 强制 stop_reason=max_tokens, 由客户端重试。
+        _eff_max = anthropic_body.get("max_tokens", 4096)
+        try:
+            _eff_max = int(_eff_max)
+        except (TypeError, ValueError):
+            _eff_max = 0
+        _blocked_cuts = []
+        for idx in list(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
             raw_args = tc["function"].get("arguments", "{}")
+            tool_name = tc["function"].get("name", "?")
             try:
                 json.loads(raw_args)
+                continue
             except json.JSONDecodeError:
-                if _is_truncated_json(raw_args):
-                    log(f"  [JSON_TRUNCATED] streamed tool={tc['function'].get('name', '?')}, raw={raw_args[:200]!r}")
-                repaired = _repair_truncated_json(raw_args)
-                tc["function"]["arguments"] = repaired
-                tool_name = tc["function"].get("name", "?")
-                try:
-                    json.loads(repaired)
-                    log(f"  [JSON_REPAIRED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
-                except json.JSONDecodeError:
-                    log(f"  [JSON_TRUNCATED_REPAIR_FAILED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+                pass
+            _looks_truncated = _is_truncated_json(raw_args)
+            _cut_at_limit = _tool_args_cut_at_limit(
+                raw_args, finish_reason=stream_finish_reason,
+                force_stopped=output_force_stopped, output_tokens=output_tokens,
+                output_chars=output_char_count, effective_max_tokens=_eff_max)
+            if (_cut_at_limit and getattr(_ps, "PROXY_BLOCK_CUT_TOOL_CALLS", True)):
+                log(f"  !! [TOOL_CALL_CUT_BLOCKED] streamed tool={tool_name}: args cut at "
+                    f"output limit (eff_max={_eff_max}, out_tokens={output_tokens}, "
+                    f"{len(raw_args)} chars) — call dropped, retry expected", level="WARN")
+                _blocked_cuts.append((tool_name, len(raw_args)))
+                del tool_calls_buffer[idx]
+                continue
+            if _looks_truncated:
+                log(f"  [JSON_TRUNCATED] streamed tool={tool_name}, raw={raw_args[:200]!r}")
+            repaired = _repair_truncated_json(raw_args)
+            tc["function"]["arguments"] = repaired
+            try:
+                json.loads(repaired)
+                log(f"  [JSON_REPAIRED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+            except json.JSONDecodeError:
+                log(f"  [JSON_TRUNCATED_REPAIR_FAILED] streamed tool={tool_name}: {len(raw_args)} -> {len(repaired)} chars")
+        if _blocked_cuts:
+            # 可见失败: 让模型/客户端看到"被截断未执行", 而不是拿着残缺参数继续。
+            _blocked_names = ", ".join(_n for _n, _ in _blocked_cuts)
+            _emit_text_delta(
+                f"\n\n[proxy] 错误: 工具调用 {_blocked_names} 的参数在输出上限处被截断"
+                f"(max_tokens={_eff_max}), 已阻止执行以免写入不完整内容。"
+                f"请重试; 写大文件请拆分为多次较小的写入。\n"
+            )
 
         # L-22(2026-09-12): 会话拯救——A1 工具协议漂移 / A3 首轮空转。
         # rescue 模式下文本从未向客户端发射(_pending_text 缓冲), 坏响应可
@@ -1916,6 +2111,11 @@ class Handler(BaseHTTPRequestHandler):
         if stream_finish_reason == "tool_calls" or tool_calls_buffer:
             stop_reason = "tool_use"
         elif stream_finish_reason == "length":
+            stop_reason = "max_tokens"
+        # L-73(2026-10-07): 有被截断阻止的调用时, 本轮必须显式报告 max_tokens——
+        # 被丢弃的调用不会出现在 tool_use 块里, 客户端据此把本轮当"输出被截断、
+        # 应重试"处理(而不是正常 tool_use 轮静默丢掉一次写操作)。
+        if _blocked_cuts:
             stop_reason = "max_tokens"
 
         # Send message_delta with usage (required by Anthropic SDK)
@@ -2077,84 +2277,169 @@ class Handler(BaseHTTPRequestHandler):
             yield line
 
     def _handle_openai_streaming_response(self, resp):
-        """Passthrough an OpenAI-format streaming response for /v1/chat/completions."""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        if not getattr(self, "_request_id", None):
-            self._request_id = f"req_{os.urandom(8).hex()}"
-        self.send_header("request-id", self._request_id)
-        route_headers = getattr(self, '_route_response_headers', None) or {}
-        for hk, hv in route_headers.items():
-            self.send_header(hk, str(hv))
-        self._route_response_headers = None
-        # 请求队列响应头（X-Queue-*），与 route headers 同机制
-        queue_headers = getattr(self, '_queue_response_headers', None) or {}
-        for hk, hv in queue_headers.items():
-            self.send_header(hk, str(hv))
-        self._queue_response_headers = None
-        # R19 pin 响应头（X-Proxy-Pin-*），与 queue headers 同机制
-        pin_headers = getattr(self, '_pin_response_headers', None) or {}
-        for hk, hv in pin_headers.items():
-            self.send_header(hk, str(hv))
-        self._pin_response_headers = None
-        # R13 诊断归因头
-        self._send_diag_headers()
-        self.end_headers()
+        """Relay OpenAI SSE and proxy-answer ctx_recall tool calls."""
+        if not getattr(self, "_openai_stream_headers_sent", False):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if not getattr(self, "_request_id", None):
+                self._request_id = f"req_{os.urandom(8).hex()}"
+            self.send_header("request-id", self._request_id)
+            route_headers = getattr(self, '_route_response_headers', None) or {}
+            for hk, hv in route_headers.items():
+                self.send_header(hk, str(hv))
+            self._route_response_headers = None
+            queue_headers = getattr(self, '_queue_response_headers', None) or {}
+            for hk, hv in queue_headers.items():
+                self.send_header(hk, str(hv))
+            self._queue_response_headers = None
+            pin_headers = getattr(self, '_pin_response_headers', None) or {}
+            for hk, hv in pin_headers.items():
+                self.send_header(hk, str(hv))
+            self._pin_response_headers = None
+            self._send_diag_headers()
+            self.end_headers()
+            self._openai_stream_headers_sent = True
 
         total_text = ""
+        pending_lines = []
+        tool_calls = {}
+        has_text = False
+        passthrough = False
+
+        def _emit_line(line):
+            nonlocal total_text
+            try:
+                decoded = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
+            except Exception:
+                decoded = ""
+            if decoded == "data: [DONE]" and PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
+                try:
+                    import diagnostics
+                    self.wfile.write(diagnostics.sse_tail_line(
+                        diagnostics.build_diag_payload()).encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                except Exception as _e:
+                    _warn_diag("sse_tail_done", _e)
+            self.wfile.write(line)
+            if decoded.startswith("data: "):
+                data_str = decoded[6:].strip()
+                if data_str and data_str != "[DONE]":
+                    try:
+                        chunk = json.loads(data_str)
+                        _choices = chunk.get("choices") or []
+                        delta = _choices[0].get("delta", {}) if _choices else {}
+                        total_text += delta.get("content", "") or ""
+                        if PROXY_DIAG_ENABLED:
+                            try:
+                                import diagnostics
+                                _t = chunk.get("timings")
+                                if diagnostics.probe_timings(_t):
+                                    diagnostics.set_prompt_tokens(
+                                        processed_n=_t.get("prompt_n"),
+                                        prompt_eval_ms=_t.get("prompt_ms"),
+                                        gen_ms=_t.get("predicted_ms"),
+                                        generation_n=_t.get("predicted_n"))
+                                _u = chunk.get("usage")
+                                if _u:
+                                    # L-72: processed 第二来源 cached_tokens
+                                    # （fill-if-missing，timings 先到不覆盖）
+                                    diagnostics.set_prompt_tokens(
+                                        processed_n=(_u.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                                        sent_n=_u.get("prompt_tokens"),
+                                        generation_n=_u.get("completion_tokens"))
+                            except Exception as _e:
+                                _warn_diag("passthrough_diag", _e)
+                    except Exception:
+                        pass
+
+        def _flush_pending():
+            while pending_lines:
+                _emit_line(pending_lines.pop(0))
+
         try:
             for line in self._heartbeat_lines(resp):
-                # R13 流式通道: [DONE] 前插入诊断尾注(设计 D1,注释行规范保证被忽略)
                 try:
-                    _dec = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
+                    decoded = line.decode("utf-8").strip() if isinstance(line, bytes) else str(line).strip()
+                    data_str = decoded[6:].strip() if decoded.startswith("data: ") else ""
+                    chunk = json.loads(data_str) if data_str and data_str != "[DONE]" else {}
                 except Exception:
-                    _dec = ""
-                if _dec == "data: [DONE]" and PROXY_DIAG_ENABLED and PROXY_DIAG_SSE_TAIL:
+                    decoded, data_str, chunk = "", "", {}
+                if decoded.startswith(":"):
+                    self.wfile.write(line)
+                    continue
+                choices = chunk.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                content = delta.get("content") or ""
+                chunk_has_tool_call = False
+                for part in delta.get("tool_calls") or []:
                     try:
-                        import diagnostics
-                        self.wfile.write(diagnostics.sse_tail_line(
-                            diagnostics.build_diag_payload()).encode("utf-8"))
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass  # client disconnected
+                        index = int(part.get("index", 0))
+                        tc = tool_calls.setdefault(index, {
+                            "id": "", "type": part.get("type") or "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                        if part.get("id"):
+                            tc["id"] = part["id"]
+                        if part.get("type"):
+                            tc["type"] = part["type"]
+                        fn = part.get("function") or {}
+                        if fn.get("name"):
+                            tc["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            tc["function"]["arguments"] += fn["arguments"]
+                        chunk_has_tool_call = True
+                    except (TypeError, ValueError):
+                        continue
+
+                if chunk_has_tool_call and not passthrough:
+                    pending_lines.append(line)
+                elif pending_lines and not passthrough:
+                    pending_lines.append(line)
+                else:
+                    _emit_line(line)
+
+                if content:
+                    has_text = True
+                if has_text and pending_lines:
+                    _flush_pending()
+                    passthrough = True
+                if has_text and chunk_has_tool_call:
+                    passthrough = True
+
+            if (pending_lines and not has_text and tool_calls
+                    and any((tc.get("function") or {}).get("name") == "ctx_recall"
+                            for tc in tool_calls.values())
+                    and getattr(_ps, "PROXY_PD_ENABLED", False)
+                    and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
+                _dispatch = getattr(self, "_micro_recall_dispatch", None)
+                if _dispatch is not None:
+                    try:
+                        import ctx_recall as _cr
+                        _tcs = [tool_calls[i] for i in sorted(tool_calls)]
+                        _follow, _split = _cr.split_follow_up_messages(
+                            getattr(_log_ctx, "session_id", None) or "", _tcs)
                     except Exception as _e:
-                        _warn_diag("sse_tail_done", _e)
-                self.wfile.write(line)
-                try:
-                    decoded = _dec
-                    if decoded.startswith("data: "):
-                        data_str = decoded[6:].strip()
-                        if data_str and data_str != "[DONE]":
-                            chunk = json.loads(data_str)
-                            _choices = chunk.get("choices") or []
-                            delta = _choices[0].get("delta", {}) if _choices else {}
-                            total_text += delta.get("content", "") or ""
-                            # R13/R16: 该透传路径此前完全不解析 usage/timings——
-                            # 补齐采集(OpenAI 协议流式的诊断数据来源)
-                            if PROXY_DIAG_ENABLED:
-                                try:
-                                    import diagnostics
-                                    _t = chunk.get("timings")
-                                    if diagnostics.probe_timings(_t):
-                                        diagnostics.set_prompt_tokens(
-                                            processed_n=_t.get("prompt_n"),
-                                            prompt_eval_ms=_t.get("prompt_ms"),
-                                            gen_ms=_t.get("predicted_ms"),
-                                            generation_n=_t.get("predicted_n"))
-                                    _u = chunk.get("usage")
-                                    if _u:
-                                        diagnostics.set_prompt_tokens(
-                                            sent_n=_u.get("prompt_tokens"),
-                                            generation_n=_u.get("completion_tokens"))
-                                except Exception as _e:
-                                    _warn_diag("passthrough_diag", _e)
-                except Exception:
-                    pass
+                        _warn_diag("openai_micro_turn_build", _e)
+                        _follow, _split = None, False
+                    if _follow is not None and _split:
+                        self.wfile.flush()
+                        self._micro_continuation = True
+                        try:
+                            if _dispatch(_follow):
+                                log("  -> [MICRO_TURN] OpenAI ctx_recall self-answered; "
+                                    "re-dispatched (mixed=%s)" % any(
+                                        (tc.get("function") or {}).get("name") != "ctx_recall"
+                                        for tc in _tcs))
+                                return
+                        finally:
+                            self._micro_continuation = False
+            _flush_pending()
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # 2026-08-27 修复: 原为 `pass`——断连后读循环继续消费后端流, 改为
-            # 上抛给 backend_dispatcher 取消在途生成(同 _emit_text_delta 注释)。
+            # 2026-08-27: propagate disconnect so the dispatcher cancels generation.
             raise
         _jsonl_output_map[self._last_jsonl_token] = len(total_text)
         log(f"  <- Streamed OpenAI mode text={len(total_text)} chars")
@@ -2284,6 +2569,141 @@ class Handler(BaseHTTPRequestHandler):
             % (tag, len(text), session_key, queued))
         self._respond_json({"ok": True, "queued": queued,
                             "session_key": session_key})
+
+    # ------------------------------------------------------------------
+    # R-CM-1: 跨会话记忆端点（/api/memory, /admin/memory）
+    # ------------------------------------------------------------------
+    def _admin_authorized(self):
+        """与 /admin/inject 同款鉴权（PROXY_ADMIN_TOKEN 空=localhost-only）。"""
+        token = getattr(_ps, "PROXY_ADMIN_TOKEN", "")
+        if not token:
+            return True
+        auth = self.headers.get("Authorization", "") or ""
+        x_tok = self.headers.get("X-Admin-Token", "") or ""
+        return auth == "Bearer " + token or x_tok == token
+
+    def _handle_get_memory(self):
+        from urllib.parse import parse_qs, urlparse
+        params = parse_qs(urlparse(self.path).query)
+        project = params.get("project", [""])[0] or _ps.PROXY_MEMORY_DEFAULT_PROJECT
+        q = params.get("q", [""])[0]
+        mode = (params.get("mode", ["list"])[0] or "list").lower()
+        try:
+            limit = int(params.get("limit", ["100"])[0])
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            import memory_store
+            if mode == "stats":
+                self._respond_json(memory_store.MEMORY.stats())
+            elif mode == "search" or q:
+                rows = memory_store.MEMORY.search(q, project=project, top_k=limit)
+                self._respond_json({"project": project, "query": q, "results": rows})
+            else:
+                rows = memory_store.MEMORY.list(project=project, limit=limit)
+                self._respond_json({"project": project, "results": rows,
+                                    "enabled": memory_store.enabled()})
+        except Exception as e:
+            self._respond_json({"error": {"type": "storage_fault",
+                                          "message": str(e)[:200]}}, 503)
+
+    def _handle_admin_memory(self, parsed):
+        if not self._admin_authorized():
+            self._respond_json({"error": {"type": "unauthorized",
+                                          "message": "admin token required"}}, 401)
+            return
+        try:
+            text = parsed.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("text must be a non-empty string")
+            kind = parsed.get("kind") or "note"
+            project = parsed.get("project") or _ps.PROXY_MEMORY_DEFAULT_PROJECT
+            source = parsed.get("source") or "admin"
+            session_key = parsed.get("session_key") or ""
+            try:
+                confidence = float(parsed.get("confidence", 0.7))
+            except (TypeError, ValueError):
+                confidence = 0.7
+            import memory_store
+            mid = memory_store.MEMORY.add(
+                text, kind=kind, project=project, source=source,
+                session_key=session_key, confidence=confidence)
+            if mid is None:
+                self._respond_json({"error": {"type": "storage_fault",
+                                              "message": "memory write failed"}}, 503)
+                return
+            self._respond_json({"ok": True, "id": mid, "project": project})
+        except (ValueError, json.JSONDecodeError) as e:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": str(e)[:200]}}, 400)
+
+    def _handle_delete_memory(self, mem_id):
+        if not self._admin_authorized():
+            self._respond_json({"error": {"type": "unauthorized",
+                                          "message": "admin token required"}}, 401)
+            return
+        try:
+            import memory_store
+            ok = memory_store.MEMORY.forget(mem_id)
+            self._respond_json({"ok": bool(ok), "id": mem_id})
+        except Exception as e:
+            self._respond_json({"error": {"type": "storage_fault",
+                                          "message": str(e)[:200]}}, 503)
+
+    # ------------------------------------------------------------------
+    # R-CM-2: 自动交接端点（/api/handoff, /admin/handoff）
+    # ------------------------------------------------------------------
+    def _handle_get_handoff(self):
+        from urllib.parse import parse_qs, urlparse
+        params = parse_qs(urlparse(self.path).query)
+        session_key = params.get("session", [""])[0]
+        if not session_key:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": "session query param required"}}, 400)
+            return
+        try:
+            import handoff
+            rec = handoff.latest(session_key)
+            if not rec:
+                self._respond_json({"error": {"type": "not_found",
+                                              "message": "no handoff for session"}}, 404)
+                return
+            if params.get("render", ["0"])[0] in ("1", "true"):
+                rec = dict(rec)
+                rec["_block"] = handoff.render_block(rec)
+            self._respond_json(rec)
+        except Exception as e:
+            self._respond_json({"error": {"type": "storage_fault",
+                                          "message": str(e)[:200]}}, 503)
+
+    def _handle_admin_handoff(self, parsed):
+        if not self._admin_authorized():
+            self._respond_json({"error": {"type": "unauthorized",
+                                          "message": "admin token required"}}, 401)
+            return
+        try:
+            session_key = parsed.get("session_key")
+            if not isinstance(session_key, str) or not session_key:
+                raise ValueError("session_key must be a non-empty string")
+            import handoff
+            h = handoff.build(session_key, goal=parsed.get("goal", ""))
+            handoff.apply_overrides(
+                h,
+                decisions=parsed.get("decisions"),
+                open_questions=parsed.get("open_questions"),
+                next_steps=parsed.get("next_steps"))
+            if parsed.get("project"):
+                h["project"] = str(parsed["project"])[:128]
+            stored = handoff.store(h)
+            distilled = 0
+            if parsed.get("distill"):
+                distilled = handoff.distill_memory(h)
+            self._respond_json({"ok": True, "stored": bool(stored),
+                                "distilled": distilled, "handoff": h})
+        except (ValueError, json.JSONDecodeError) as e:
+            self._respond_json({"error": {"type": "bad_request",
+                                          "message": str(e)[:200]}}, 400)
+
     def _handle_admin_reload(self):
         """R12: POST /admin/reload — HTTP equivalent of `manage.sh reload` (SIGHUP).
 
@@ -2410,7 +2830,10 @@ class Handler(BaseHTTPRequestHandler):
             if mc:
                 mc["ttft_ms"] = round((time.monotonic() - _first_token_time) * 1000, 1)
         # DEF-309/EXP-3: 解析到的真实 usage 返回给 dispatch 调用方(计费回填)
-        if usage_acc["input_tokens"] or usage_acc["output_tokens"]:
+        # 缓存命中时 input_tokens 可能为 0 但 cache_read 非零——一并判定。
+        if (usage_acc["input_tokens"] or usage_acc["output_tokens"]
+                or usage_acc.get("cache_read_input_tokens")
+                or usage_acc.get("cache_creation_input_tokens")):
             return usage_acc
         return None
 

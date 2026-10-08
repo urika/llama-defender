@@ -170,6 +170,93 @@ class TestComputeDynamicMaxTokens(unittest.TestCase):
             self.assertEqual(oom_adj, 2048)
             self.assertEqual(pre_adj, 2048)
 
+    # --- L-73(2026-10-07): 截断事故修复——工具轮次的下限兜底 ---
+
+    def test_tool_turn_gets_floor(self):
+        """带工具的轮次不得低于 FLOOR: 参数载荷被切断会静默落盘残缺内容。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 32768):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48}, has_tools=True
+            )
+            self.assertEqual(adjusted, 32000)   # min(FLOOR, orig)
+            self.assertIn("floor=32768", reason)
+
+    def test_text_turn_keeps_stage_cap(self):
+        """纯文本轮次保留降压语义(截断文本可见可重试), 兜底不介入。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 32768):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48}, has_tools=False
+            )
+            self.assertEqual(adjusted, 8192)
+            self.assertNotIn("floor", reason)
+
+    def test_long_payload_turn_no_reduction(self):
+        """含长载荷工具(Write/Edit/Bash...)的轮次完全不降压。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", True):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 5, "total_gb": 48},   # 低内存也不降
+                has_long_payload_tools=True, has_tools=True
+            )
+            self.assertEqual(adjusted, 32000)
+            self.assertIn("long_payload_no_reduce", reason)
+
+    def test_bash_counts_as_long_payload(self):
+        """Bash 入列: heredoc 写文件/长命令截断不可逆, 同样不降压。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48},
+                has_long_payload_tools=True, has_tools=True
+            )
+            self.assertEqual(adjusted, 32000)
+            self.assertIn("long_payload_no_reduce", reason)
+
+    def test_long_payload_no_reduce_can_be_disabled(self):
+        """关闭豁免后回到 FLOOR 兜底(仍不跌破下限)。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 32768), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", False):
+            adjusted, reason = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48},
+                has_long_payload_tools=True, has_tools=True
+            )
+            self.assertEqual(adjusted, 32000)
+            self.assertIn("floor=32768", reason)
+
+    def test_floor_zero_disables_guard(self):
+        """FLOOR=0 关闭兜底 → 恢复旧的激进降压行为。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 8192), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 0):
+            adjusted, _ = lifecycle._compute_dynamic_max_tokens(
+                32000, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48}, has_tools=True
+            )
+            self.assertEqual(adjusted, 8192)
+
+    def test_floor_never_exceeds_client_request(self):
+        """兜底不得把上限抬到客户端请求值之上。"""
+        with patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_ENABLED", True), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_SATURATION", 2048), \
+             patch.object(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 32768):
+            adjusted, _ = lifecycle._compute_dynamic_max_tokens(
+                4096, {"stage": "saturation"},
+                mem={"available_gb": 40, "total_gb": 48}, has_tools=True
+            )
+            self.assertEqual(adjusted, 4096)
+
 
 class TestNormalizeSystemMessages(unittest.TestCase):
 

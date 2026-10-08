@@ -161,12 +161,17 @@ def _classify_lifecycle_stage(messages, session_id=None):
             "is_continuation": is_continuation, "request_count": request_count,
         }
 # --- _compute_dynamic_max_tokens ---
-def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
+def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None,
+                                has_long_payload_tools=False, has_tools=False):
     """Compute a context-aware max_tokens ceiling.
 
     - Heavy lifecycle stages get a lower ceiling.
     - rapid-mlx backend gets an additional discount (known to ignore max_tokens).
     - Low available memory lowers the ceiling one more notch.
+    - L-73(2026-10-07): 含长载荷工具(Write/Edit/Bash heredoc...)的轮次不降压;
+      其余**可能产生工具调用**的轮次下限不低于 PROXY_DYNAMIC_MAX_TOKENS_FLOOR
+      (默认 32768)。纯文本轮次保留原来的降压语义(截断文本可见、可重试,
+      不造成静默落盘损坏)。
     Returns (adjusted_max_tokens, reason_string).
     """
     if not _ps.PROXY_DYNAMIC_MAX_TOKENS_ENABLED:
@@ -185,6 +190,14 @@ def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
     adjusted = min(max_tokens_orig, cap)
     reasons = [f"stage={stage}"]
 
+    # L-73: 长载荷工具轮次不降压。Write/Edit 的参数载荷、Bash 的 heredoc/长命令,
+    # 长度都不可预知, 压低上限会把载荷从中间切断(事故: 饱和期 8192 上限, 大 HTML
+    # 在 23813 字符处截断, 代理补齐 JSON 后客户端把残缺文件当成功写入; Bash 命令
+    # 截断则执行截断前缀, 不可逆)。载荷写不完的代价远大于多花的内存/KV 预算。
+    if has_long_payload_tools and getattr(_ps, "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", True):
+        reasons.append("long_payload_no_reduce")
+        return max(1, int(max_tokens_orig)), ",".join(reasons)
+
     if _strategy.oom_safety_enabled and "rapid-mlx" in (_ps.MODEL_NAME or ""):
         adjusted = int(adjusted * _ps.PROXY_DYNAMIC_MAX_TOKENS_RAPID_MLX_RATIO)
         reasons.append("rapid-mlx_discount")
@@ -199,6 +212,14 @@ def _compute_dynamic_max_tokens(max_tokens_orig, stage_config, mem=None):
             reasons.append("low_memory")
     except Exception:
         pass
+
+    # L-73: 工具轮次的下限兜底——工具调用参数被切断会静默落盘残缺内容, 故带工具的
+    # 轮次不得低于 FLOOR(且不超过客户端原始请求); 纯文本轮次保留原降压语义。
+    # FLOOR=0 关闭兜底。
+    floor = int(getattr(_ps, "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", 0) or 0)
+    if has_tools and floor > 0 and adjusted < floor:
+        adjusted = min(floor, int(max_tokens_orig))
+        reasons.append(f"floor={floor}")
 
     adjusted = max(1, adjusted)
     return adjusted, ",".join(reasons)

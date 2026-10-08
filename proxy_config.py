@@ -318,6 +318,16 @@ CONFIG_REGISTRY = {
         "type": "float", "scope": "reloadable",
         "doc": "Additional multiplier for rapid-mlx backend on dynamic max_tokens.",
     },
+    "PROXY_DYNAMIC_MAX_TOKENS_FLOOR": {
+        "defaults": {"all": "32768"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Hard floor for the dynamic max_tokens ceiling; keeps long tool-call payloads (e.g. Write of a large file) from being cut. 0 disables the floor.",
+    },
+    "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Skip the dynamic max_tokens reduction for turns whose tool list contains long-payload tools (Write/Edit/MultiEdit/NotebookEdit/Bash) — R-CM-6/L-73 (saturation-stage 8192 cap truncated a large file mid-write).",
+    },
 
     # ---- Dynamic concurrency ----
     "PROXY_DYNAMIC_CONCURRENT_ENABLED": {
@@ -579,6 +589,11 @@ CONFIG_REGISTRY = {
         "defaults": {"all": "3"},
         "type": "int", "scope": "reloadable",
         "doc": "Tools used ≥ this many times in a session auto-promote to keep set (DEF-104). 0 disables.",
+    },
+    "PROXY_BLOCK_CUT_TOOL_CALLS": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "Block tool calls whose arguments were cut at the output limit instead of silently repairing the JSON (prevents writing truncated files).",
     },
 
     # ---- History index ----
@@ -1093,6 +1108,61 @@ CONFIG_REGISTRY = {
                "ctx_recall hints (passive) and AutoRecallStage proxy-answers "
                "dangling calls from manifest deposits (active). Off = bare "
                "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
+    },
+    # ---- R-CM-1 跨会话持久记忆（2026-10-08 需求；默认关）----
+    "PROXY_MEMORY_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R-CM-1 跨会话持久记忆总开关。开启后代理在会话首请求按相关性"
+               "注入记忆库条目（fact/decision/regression/preference），并提供 "
+               "GET/POST/DELETE /api/memory。Off = 零行为变化。",
+    },
+    "PROXY_MEMORY_DB_PATH": {
+        "defaults": {"all": "logs/memory/memory.db"},
+        "type": "str", "scope": "reloadable",
+        "doc": "跨会话记忆 SQLite 路径（相对 _SCRIPT_DIR；stdlib sqlite3 + FTS5）。",
+    },
+    "PROXY_MEMORY_DEFAULT_PROJECT": {
+        "defaults": {"all": "default"},
+        "type": "str", "scope": "reloadable",
+        "doc": "记忆分域默认项目键；请求头 X-Proxy-Project 可覆盖。",
+    },
+    "PROXY_MEMORY_INJECT_MAX_CHARS": {
+        "defaults": {"all": "2000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "会话首请求注入记忆块的字符上限。",
+    },
+    "PROXY_MEMORY_TOP_K": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "记忆检索返回条数上限。",
+    },
+    "PROXY_MEMORY_TTL_DAYS": {
+        "defaults": {"all": "90"},
+        "type": "int", "scope": "reloadable",
+        "doc": "记忆条目建议保留期（天）；0=不过期（P0 仅登记，驱逐策略后续）。",
+    },
+    # ---- R-CM-2 自动交接摘要（2026-10-08 需求；默认关）----
+    "PROXY_HANDOFF_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R-CM-2 自动交接总开关。开启后新会话首请求注入最近 handoff 块；"
+               "生成由 POST /admin/handoff 显式触发（规则化抽取，零后端依赖）。",
+    },
+    "PROXY_HANDOFF_TRIGGER_CHARS": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "自动触发阈值（请求 chars，0=禁用自动触发，仅显式端点）。",
+    },
+    "PROXY_HANDOFF_MAX_CHARS": {
+        "defaults": {"all": "3000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "handoff 注入块字符上限。",
+    },
+    "PROXY_HANDOFF_DIR": {
+        "defaults": {"all": "logs/diag/handoff"},
+        "type": "str", "scope": "reloadable",
+        "doc": "handoff 落盘目录（JSONL 追加 + markdown 最新）。",
     },
     "PROXY_ADMIN_TOKEN": {
         "defaults": {"all": ""},

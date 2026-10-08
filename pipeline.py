@@ -30,6 +30,12 @@ import proxy_state as _ps
 import model_registry
 from proxy_logging import log
 
+# L-73(2026-10-07): 参数载荷长度不可预知、一旦被输出上限截断就会造成残缺落盘或
+# 截断命令执行的工具。含这些工具的轮次不做动态 max_tokens 降压(见 DynamicMaxTokens)。
+# Bash 入列: heredoc 写文件被截断即残缺文件; 命令文本截断会执行截断前缀
+# (如重定向路径截半), 后果不可逆。
+_LONG_PAYLOAD_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash")
+
 
 # ---------------------------------------------------------------------------
 # Deferred imports — resolved at stage construction time to avoid circular
@@ -225,6 +231,7 @@ class PipelineContext:
     total_chars: int = 0
     tools_list: list = field(default_factory=list)
     client_type: str = "unknown"
+    project: str = ""            # R-CM-1/2: X-Proxy-Project header (memory scope)
 
     # --- Mutable primary state ---
     messages: list = field(default_factory=list)
@@ -893,6 +900,179 @@ class AdminInjectStage(ConditionalStage):
 
 
 # ============================================================================
+# Stage 0.61/0.62: R-CM-1 记忆注入 / R-CM-2 handoff 注入（2026-10-08）
+# ============================================================================
+# 需求: docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md
+# 共同纪律: 会话首请求注入一次（进程内守卫，防每轮重复破坏前缀）；append-only
+# 尾部追加；engine-on 走 canonical（跨轮存活，AdminInject 同款），engine-off
+# view-only；fail-open；开关默认关。
+
+def _tail_user_text(messages):
+    """取最近一条 user 文本（注入 query/展示用），fail-open → ""。"""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            parts = [b.get("text", "") for b in c
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if parts:
+                return " ".join(parts)
+    return ""
+
+
+def _inject_tail_block(ctx, sid, wrapped):
+    """append-only 尾部注入；engine-on 持久进 canonical。返回是否持久化。"""
+    engine_persisted = False
+    try:
+        if _ctx_engine_on() and sid:
+            import context_engine
+            msg = context_engine.ENGINE.get_or_create(sid).append_injected(wrapped)
+            ctx.messages.append(msg)
+            engine_persisted = True
+        else:
+            last = ctx.messages[-1] if ctx.messages else None
+            if last is not None and last.get("role") == "user" \
+                    and isinstance(last.get("content"), list):
+                last["content"].append({"type": "text", "text": wrapped})
+            else:
+                ctx.messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": wrapped}],
+                })
+    except Exception as e:
+        _warn_diag("inject_tail_block", e)
+    return engine_persisted
+
+
+class MemoryInjectStage(ConditionalStage):
+    """Stage 0.61 — R-CM-1: 会话首请求注入跨会话记忆（默认关）。"""
+    # kv: append
+
+    name = "memory_inject"
+
+    def should_run(self, ctx):
+        try:
+            if not getattr(_ps, "PROXY_MEMORY_ENABLED", False):
+                return False
+        except Exception:
+            return False
+        sid = getattr(ctx, "session_id", "") or ""
+        if not sid or "::aux" in sid:
+            return False
+        with _ps._state_lock:
+            return sid not in _ps._SESSION_MEMORY_SEEN
+
+    def process(self, ctx):
+        ctx.memory_inject_info = {"injected": 0, "items": 0}
+        sid = ctx.session_id
+        import memory_store
+        project = (getattr(ctx, "project", "") or
+                   getattr(_ps, "PROXY_MEMORY_DEFAULT_PROJECT", "default"))
+        query = _tail_user_text(ctx.messages)[:200]
+        top_k = int(getattr(_ps, "PROXY_MEMORY_TOP_K", 5) or 5)
+        try:
+            rows = memory_store.MEMORY.search(query, project=project, top_k=top_k)
+        except Exception as e:
+            _warn_diag("memory_search", e)
+            rows = []
+        with _ps._state_lock:
+            self._mark_seen(sid)
+        if not rows:
+            return ctx
+        cap = int(getattr(_ps, "PROXY_MEMORY_INJECT_MAX_CHARS", 2000) or 2000)
+        lines = ["[System: MEMORY — 跨会话记忆（历史数据，非用户指令）]"]
+        for r in rows:
+            lines.append("- [%s] %s" % (r.get("kind"), (r.get("text") or "").strip()))
+        wrapped = "\n".join(lines)[:cap]
+        persisted = _inject_tail_block(ctx, sid, wrapped)
+        ctx.memory_inject_info = {"injected": 1, "items": len(rows),
+                                  "engine_persisted": persisted}
+        log("  -> [memory_inject] injected %d memory item(s) (project=%s)"
+            % (len(rows), project))
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("memory", detail={
+                    "items": len(rows), "chars": len(wrapped),
+                    "engine_persisted": persisted})
+            except Exception as _e:
+                _warn_diag("inject_memory", _e)
+        return ctx
+
+    @staticmethod
+    def _mark_seen(sid):
+        s = _ps._SESSION_MEMORY_SEEN
+        if len(s) >= _ps._SESSION_INJECT_SEEN_MAX:
+            s.clear()
+        s.add(sid)
+
+    def output_metrics(self, ctx):
+        return getattr(ctx, "memory_inject_info", None)
+
+
+class HandoffInjectStage(ConditionalStage):
+    """Stage 0.62 — R-CM-2: 会话首请求注入最近 handoff（默认关）。"""
+    # kv: append
+
+    name = "handoff_inject"
+
+    def should_run(self, ctx):
+        try:
+            if not getattr(_ps, "PROXY_HANDOFF_ENABLED", False):
+                return False
+        except Exception:
+            return False
+        sid = getattr(ctx, "session_id", "") or ""
+        if not sid or "::aux" in sid:
+            return False
+        with _ps._state_lock:
+            return sid not in _ps._SESSION_HANDOFF_SEEN
+
+    def process(self, ctx):
+        ctx.handoff_inject_info = {"injected": 0}
+        sid = ctx.session_id
+        try:
+            import handoff
+            rec = handoff.latest(sid)
+        except Exception as e:
+            _warn_diag("handoff_latest", e)
+            rec = None
+        with _ps._state_lock:
+            self._mark_seen(sid)
+        if not rec:
+            return ctx
+        import handoff as _ho
+        wrapped = _ho.render_block(
+            rec, max_chars=int(getattr(_ps, "PROXY_HANDOFF_MAX_CHARS", 3000) or 3000))
+        if not wrapped:
+            return ctx
+        persisted = _inject_tail_block(ctx, sid, wrapped)
+        ctx.handoff_inject_info = {"injected": 1, "engine_persisted": persisted}
+        log("  -> [handoff_inject] injected handoff block (%d chars)" % len(wrapped))
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("handoff", detail={
+                    "chars": len(wrapped), "engine_persisted": persisted})
+            except Exception as _e:
+                _warn_diag("inject_handoff", _e)
+        return ctx
+
+    @staticmethod
+    def _mark_seen(sid):
+        s = _ps._SESSION_HANDOFF_SEEN
+        if len(s) >= _ps._SESSION_INJECT_SEEN_MAX:
+            s.clear()
+        s.add(sid)
+
+    def output_metrics(self, ctx):
+        return getattr(ctx, "handoff_inject_info", None)
+
+
+# ============================================================================
 # Stage 1: LifecycleClassifier — classify context size into lifecycle stage
 # ============================================================================
 
@@ -951,8 +1131,15 @@ class DynamicMaxTokens(ConditionalStage):
         lifecycle = _import_lifecycle()
 
         current_mem = admin._get_system_memory()
+        # L-73(2026-10-07): 带工具的轮次可能产生工具调用 → 下限兜底防止参数载荷被
+        # 截断(事故: 饱和期降到 8192, 大文件在 23813 字符处截断, 残缺内容仍落盘
+        # 并报成功); 含长载荷工具(Write/Edit/Bash heredoc...)时干脆不降压。
+        has_tools = bool(ctx.tools_list)
+        has_long_payload_tools = any(
+            (n or "") in _LONG_PAYLOAD_TOOLS for n in (ctx.tools_list or []))
         dynamic_max, dynamic_reason = lifecycle._compute_dynamic_max_tokens(
-            ctx.max_tokens_orig, ctx.stage_config, mem=current_mem)
+            ctx.max_tokens_orig, ctx.stage_config, mem=current_mem,
+            has_long_payload_tools=has_long_payload_tools, has_tools=has_tools)
 
         if dynamic_max != ctx.max_tokens_orig:
             ctx.body["max_tokens"] = dynamic_max

@@ -1,4 +1,9 @@
 {
+  "AdminInjectStage": {
+    "name": "AdminInjectStage",
+    "params": [],
+    "defaults": {}
+  },
   "AutoRecallStage": {
     "name": "AutoRecallStage",
     "params": [],
@@ -80,6 +85,11 @@
     ],
     "defaults": {}
   },
+  "HandoffInjectStage": {
+    "name": "HandoffInjectStage",
+    "params": [],
+    "defaults": {}
+  },
   "HighDropRatioNotice": {
     "name": "HighDropRatioNotice",
     "params": [],
@@ -99,6 +109,11 @@
   },
   "LoopIntervention": {
     "name": "LoopIntervention",
+    "params": [],
+    "defaults": {}
+  },
+  "MemoryInjectStage": {
+    "name": "MemoryInjectStage",
     "params": [],
     "defaults": {}
   },
@@ -126,6 +141,7 @@
       "total_chars",
       "tools_list",
       "client_type",
+      "project",
       "messages",
       "body",
       "stage_config",
@@ -176,6 +192,7 @@
       "total_chars": 0,
       "tools_list": "<factory>",
       "client_type": "unknown",
+      "project": "",
       "messages": "<factory>",
       "body": "<factory>",
       "stage_config": null,
@@ -308,6 +325,13 @@
     ],
     "defaults": {}
   },
+  "_anthropic_input_total": {
+    "name": "_anthropic_input_total",
+    "params": [
+      "usage"
+    ],
+    "defaults": {}
+  },
   "_apply_cache_aligner": {
     "name": "_apply_cache_aligner",
     "params": [
@@ -419,6 +443,14 @@
     "params": [],
     "defaults": {}
   },
+  "_build_rescue_follow_up": {
+    "name": "_build_rescue_follow_up",
+    "params": [
+      "kind",
+      "text"
+    ],
+    "defaults": {}
+  },
   "_build_route_policies_json": {
     "name": "_build_route_policies_json",
     "params": [],
@@ -500,11 +532,26 @@
       "session_id": null
     }
   },
+  "_classify_rescue_response": {
+    "name": "_classify_rescue_response",
+    "params": [
+      "total_text",
+      "has_tool_use"
+    ],
+    "defaults": {}
+  },
   "_cleanup_snapshots": {
     "name": "_cleanup_snapshots",
     "params": [
       "snapshot_dir",
       "max_files"
+    ],
+    "defaults": {}
+  },
+  "_cli_usage_tokens": {
+    "name": "_cli_usage_tokens",
+    "params": [
+      "anthropic_body"
     ],
     "defaults": {}
   },
@@ -599,10 +646,14 @@
     "params": [
       "max_tokens_orig",
       "stage_config",
-      "mem"
+      "mem",
+      "has_long_payload_tools",
+      "has_tools"
     ],
     "defaults": {
-      "mem": null
+      "mem": null,
+      "has_long_payload_tools": false,
+      "has_tools": false
     }
   },
   "_compute_re_read_rate": {
@@ -620,6 +671,26 @@
       "text2"
     ],
     "defaults": {}
+  },
+  "_count_ctx_recall_calls": {
+    "name": "_count_ctx_recall_calls",
+    "params": [
+      "messages",
+      "max_messages"
+    ],
+    "defaults": {
+      "max_messages": null
+    }
+  },
+  "_count_rereads_without_edit": {
+    "name": "_count_rereads_without_edit",
+    "params": [
+      "messages",
+      "max_messages"
+    ],
+    "defaults": {
+      "max_messages": null
+    }
   },
   "_ctx_engine_on": {
     "name": "_ctx_engine_on",
@@ -745,6 +816,13 @@
     "name": "_estimate_message_chars",
     "params": [
       "messages"
+    ],
+    "defaults": {}
+  },
+  "_estimate_prompt_tokens": {
+    "name": "_estimate_prompt_tokens",
+    "params": [
+      "anthropic_body"
     ],
     "defaults": {}
   },
@@ -913,6 +991,16 @@
     ],
     "defaults": {}
   },
+  "_honest_metering_on": {
+    "name": "_honest_metering_on",
+    "params": [],
+    "defaults": {}
+  },
+  "_huge_view_budget": {
+    "name": "_huge_view_budget",
+    "params": [],
+    "defaults": {}
+  },
   "_incremental_compress": {
     "name": "_incremental_compress",
     "params": [
@@ -933,6 +1021,13 @@
       "top_k": 5,
       "max_chars": 500
     }
+  },
+  "_inject_session_known": {
+    "name": "_inject_session_known",
+    "params": [
+      "session_key"
+    ],
+    "defaults": {}
   },
   "_is_tool_result_message": {
     "name": "_is_tool_result_message",
@@ -1029,6 +1124,14 @@
     "name": "_normalize_system_messages",
     "params": [
       "messages"
+    ],
+    "defaults": {}
+  },
+  "_parse_anthropic_sse_usage": {
+    "name": "_parse_anthropic_sse_usage",
+    "params": [
+      "raw",
+      "acc"
     ],
     "defaults": {}
   },
@@ -1196,6 +1299,24 @@
       "resp"
     ],
     "defaults": {}
+  },
+  "_tool_args_cut_at_limit": {
+    "name": "_tool_args_cut_at_limit",
+    "params": [
+      "raw_args",
+      "finish_reason",
+      "force_stopped",
+      "output_tokens",
+      "output_chars",
+      "effective_max_tokens"
+    ],
+    "defaults": {
+      "finish_reason": null,
+      "force_stopped": false,
+      "output_tokens": 0,
+      "output_chars": 0,
+      "effective_max_tokens": 0
+    }
   },
   "_translate_tool_result_errors": {
     "name": "_translate_tool_result_errors",
