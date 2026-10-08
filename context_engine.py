@@ -237,6 +237,65 @@ def _is_system_round(rnd):
     return bool(rnd) and rnd[0].get("role") == "system"
 
 
+# ---------------------------------------------------------------------------
+# R-CM-3(2026-10-08): epoch 折叠结构判据（rubric gate）
+# ---------------------------------------------------------------------------
+def _last_round_closed(canonical):
+    """闭单元判据：最后一轮 body 是否"已完成"——末条不是悬空 tool_use。
+
+    客户端每轮以 tool_result（user 角色）收尾即闭单元；若末条是带 tool_use
+    的 assistant 消息（无后续 tool_result）则为悬空调用（推导中途）→ 不闭。
+    fail-open: 解析异常返回 True（不阻断折叠）。
+    """
+    try:
+        body = [r for r in _rounds(canonical) if not _is_system_round(r)]
+        if not body:
+            return True
+        last_msg = body[-1][-1] if body[-1] else None
+        if not isinstance(last_msg, dict):
+            return True
+        if last_msg.get("role") == "assistant":
+            content = last_msg.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        return False
+        return True
+    except Exception:
+        return True
+
+
+def build_epoch_rubric(sess, session_key=None):
+    """R-CM-3: 三判据 rubric —— 全 True 才允许折叠。
+
+    - closed     : 最后一轮为闭单元（非悬空 tool_use）。
+    - progress   : 自上次折叠以来有新增 user 轮（user_msgs 增长）。
+    - not_stuck  : 台账无高频重复读目标（dup_queries.count < 阈值）。
+    fail-open: 任一判据异常 → 视为 True（默认允许折叠，不引入新阻断）。
+    """
+    out = {"closed": True, "progress": True, "not_stuck": True}
+    try:
+        out["closed"] = _last_round_closed(sess.canonical)
+    except Exception:
+        pass
+    try:
+        out["progress"] = sess.user_msgs > (getattr(sess, "last_epoch_user_msgs", 0) or 0)
+    except Exception:
+        pass
+    try:
+        key = session_key or getattr(sess, "session_key", "") or ""
+        if key:
+            import session_ledger
+            led = session_ledger.LEDGER.build_ledger_json(key)
+            thr = int(getattr(_ps, "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX", 5) or 5)
+            if any((d.get("count") or 0) >= thr
+                   for d in (led.get("dup_queries") or [])):
+                out["not_stuck"] = False
+    except Exception:
+        pass
+    return out
+
+
 def _round_summary(rnd, turn):
     """折叠轮次 → 台账格式动作行（§4.9: 动作行 + 摘要 + 句柄，确定性无 LLM）。"""
     tools = []
@@ -476,7 +535,7 @@ class CanonicalSession(object):
         candidates.append(int(self.est_tokens() * EST_REAL_RATIO))
         return max(candidates)
 
-    def maybe_epoch(self, trigger_tokens, window_k):
+    def maybe_epoch(self, trigger_tokens, window_k, rubric=None):
         """发送前 epoch 检查 → (epoch_triggered, final_messages)。
 
         触发与容量判定均为**真实 prompt_tokens 口径**(2026-08-22 校准, 见
@@ -491,6 +550,15 @@ class CanonicalSession(object):
               （硬上限: 调用方返回 context 超限错误, §4.9 回退保护）。
         """
         if self._trigger_scale() <= trigger_tokens:
+            return False, list(self.canonical)
+        # R-CM-3(2026-10-08) 结构判据门: 超预算但非「闭单元 ∧ 有进展 ∧
+        # 非卡住」时**不折叠**（避免推导中途/重复折叠丢关键中间结果），保持
+        # canonical 原样返回未触发。rubric=None（默认关）→ 行为不变。
+        # 注: 卡住时不折叠可能使视图继续增长至硬上限（ContextOverflowError）
+        # ——这是有意取舍（宁可不压也不丢中间态）；换路线提示由 auto-recall
+        # 卡死升级路径另行注入。
+        if rubric is not None and not all(rubric.values()):
+            self.last_rubric = dict(rubric)
             return False, list(self.canonical)
         self.epoch_count += 1
         self.last_epoch_user_msgs = self.user_msgs
@@ -885,5 +953,6 @@ __all__ = [
     "compress_observation", "estimate_tokens",
     "effective_trigger_tokens", "effective_window_k",
     "recall_cue_available",
+    "build_epoch_rubric", "_last_round_closed",
     "DEFAULT_EPOCH_TRIGGER_TOKENS", "DEFAULT_WINDOW_K", "TOKEN_CHAR_RATIO",
 ]

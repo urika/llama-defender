@@ -742,9 +742,22 @@ class ContextEngineStage(ConditionalStage):
             (getattr(ctx, "body", None) or {}).get("tools") or [])
         sess.recall_tool_available = _cue_ok
         sess._recall_cue_detail = _cue_detail
+        # R-CM-3(2026-10-08): 门控式 epoch 折叠——开启时超预算也需结构判据
+        # （闭单元/有进展/非卡住）全满足才折叠；否则保持 canonical（跳过）。
+        _rubric = None
+        if getattr(_ps, "PROXY_CTX_EPOCH_RUBRIC_ENABLED", False):
+            try:
+                _rubric = context_engine.build_epoch_rubric(sess, ctx.session_id)
+            except Exception as _e:
+                _warn_diag("epoch_rubric", _e)
+        sess.last_rubric = None
         triggered, final = sess.maybe_epoch(
             context_engine.effective_trigger_tokens(),
-            context_engine.effective_window_k())
+            context_engine.effective_window_k(),
+            rubric=_rubric)
+        if _rubric is not None and not triggered and getattr(sess, "last_rubric", None):
+            log("  -> [context_engine] epoch gated by rubric %s"
+                % getattr(sess, "last_rubric", None))
         if triggered:
             # 诊断对齐口径: is_epoch_turn 按请求序号(_SESSION_REQUEST_COUNT+1,
             # 与 diagnostics.finalize_request 同源), 不能用引擎内部 turn

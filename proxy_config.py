@@ -1244,6 +1244,20 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Rounds kept verbatim at epoch re-cut (K); 0 = auto → 24.",
     },
+    # R-CM-3(2026-10-08): 门控式 epoch 折叠（rubric）——超预算也需结构判据全
+    # 满足（闭单元/有进展/非卡住）才折叠；默认关 = 纯 token 阈值旧行为。
+    "PROXY_CTX_EPOCH_RUBRIC_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R-CM-3 rubric-gated epoch folding: fold only when closed ∧ "
+               "progress ∧ not-stuck (else keep canonical). Off = token-threshold only.",
+    },
+    "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "R-CM-3: ledger dup_queries count≥this marks the session stuck "
+               "(blocks epoch fold). Read from session_ledger.",
+    },
 
     # ---- 后端启动参数（由 manage.sh 消费，代理运行时不读取，scope=module）----
     "LLAMA_BACKEND": {

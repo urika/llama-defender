@@ -329,8 +329,14 @@ requirements:
   - id: R-CM-3
     domain: R-CM
     title: 门控式 epoch 折叠
-    desc: epoch 触发由纯 token 阈值升级为 token×结构判据（闭单元/非卡住/有进展），待排期
+    desc: epoch 触发由纯 token 阈值升级为 token×结构判据（闭单元/非卡住/有进展）全满足才折叠
     priority: P1
+    impl:
+      - context_engine.py:build_epoch_rubric
+      - context_engine.py:_last_round_closed
+      - pipeline.py:ContextEngineStage
+    tests:
+      - test/unit/test_epoch_rubric.py::TestEpochRubric
 
   - id: R-CM-4
     domain: R-CM

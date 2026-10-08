@@ -661,6 +661,13 @@ PROXY_CTX_EPOCH_TRIGGER_TOKENS = int(os.environ.get(
 # K: epoch 重切保留最近轮数; 0 = auto → 24（§4.4）
 PROXY_CTX_WINDOW_K = int(os.environ.get(
     "PROXY_CTX_WINDOW_K", get_default("PROXY_CTX_WINDOW_K")))
+# R-CM-3(2026-10-08): 门控式 epoch 折叠（rubric）——默认关。
+PROXY_CTX_EPOCH_RUBRIC_ENABLED = os.environ.get(
+    "PROXY_CTX_EPOCH_RUBRIC_ENABLED",
+    get_default("PROXY_CTX_EPOCH_RUBRIC_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX = int(os.environ.get(
+    "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX",
+    get_default("PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX")))
 
 # L-9/DEF-313: 折叠后保留窗口的 token 预算; 0 = 旧口径(按 K 轮数保留)
 PROXY_CTX_KEEP_TOKEN_BUDGET = int(os.environ.get(
@@ -1306,6 +1313,9 @@ _RELOAD_SPEC = [
     ("PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_ENGINE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "int", "0", "0"),
     ("PROXY_CTX_WINDOW_K", "PROXY_CTX_WINDOW_K", "int", "0", "0"),
+    # R-CM-3 门控式 epoch 折叠（默认关；SIGHUP 可热开）
+    ("PROXY_CTX_EPOCH_RUBRIC_ENABLED", "PROXY_CTX_EPOCH_RUBRIC_ENABLED", "bool", "false", "false"),
+    ("PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX", "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX", "int", "5", "5"),
     ("PROXY_DIAG_TIMINGS_SOURCE", "PROXY_DIAG_TIMINGS_SOURCE", "str", "auto", "auto"),
     # ADR-013 T1 admin 注入原语（reloadable；默认空 token=localhost-only）
     ("PROXY_ADMIN_TOKEN", "PROXY_ADMIN_TOKEN", "str", "", ""),
@@ -1415,6 +1425,7 @@ __all__ = [
     "PROXY_HBE_TOP_LOGPROBS", "PROXY_HBE_MAX_TOKENS", "PROXY_HBE_LOCK_WAIT_S",
     "PROXY_HBE_TIMEOUT_S",
     "PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_WINDOW_K",
+    "PROXY_CTX_EPOCH_RUBRIC_ENABLED", "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX",
     # R-CM-1/R-CM-2 跨会话记忆 + 自动交接
     "PROXY_MEMORY_ENABLED", "PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_DEFAULT_PROJECT",
     "PROXY_MEMORY_INJECT_MAX_CHARS", "PROXY_MEMORY_TOP_K", "PROXY_MEMORY_TTL_DAYS",

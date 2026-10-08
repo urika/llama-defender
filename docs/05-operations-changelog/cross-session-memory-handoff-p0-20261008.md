@@ -82,3 +82,10 @@ export PROXY_HANDOFF_ENABLED=true
 - **口径诚实**：台账不在此进程（重启后内存态缺失）→ `recall_adoption.total=0 / rate=null`，不编造。采纳定义与 `ctx-recall-auto-closed-loop` 设计"由 last_dup_turn 差分"一致，代理侧先行提供数。
 - **测试**：`test/unit/test_rcm_metrics.py`（3 例：计数/lead-lag/采纳率、台账缺失降级、无注入）全绿。
 - **配置**：无新增开关（沿用 `PROXY_DIAG_ENABLED`）。
+
+## 11. 附：R-CM-3 门控式 epoch 折叠（同日补，2026-10-08）
+
+- **实现**：`context_engine.build_epoch_rubric(sess, session_key)` 三判据——`closed`（末轮非悬空 tool_use，`_last_round_closed`）/ `progress`（`user_msgs > last_epoch_user_msgs`）/ `not_stuck`（台账 `dup_queries.count < PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX`）。`CanonicalSession.maybe_epoch(..., rubric=None)` 新增 `rubric` 形参：非 None 且非全 True → **不折叠**（保持 canonical，返回未触发），日志 `epoch gated by rubric`。`pipeline.ContextEngineStage` 在开关开启时构造并传入 rubric。
+- **默认关**：`PROXY_CTX_EPOCH_RUBRIC_ENABLED=false` → `rubric=None` → 纯 token 阈值旧行为不变（零回归）。`PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX=5`。
+- **取舍**：卡住时不折叠可能使视图继续增长至 `ContextOverflowError`（宁可不压也不丢中间态）；换路线提示由 auto-recall 卡死升级路径另行注入（未在本项合并）。
+- **测试**：`test/unit/test_epoch_rubric.py`（5 例：闭单元/进展/卡住/门控跳过/rubric=None）全绿。
