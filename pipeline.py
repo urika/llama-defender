@@ -2696,6 +2696,163 @@ class AutoRecallStage(ConditionalStage):
 
 
 # ============================================================================
+# Stage 12.6: PrefetchStage — R-CM-5 预取/推送披露（2026-10-08，默认关）
+# ============================================================================
+# 需求信号（最近 user 文本）→ BM25 对已折叠单元（manifest）排序 → 预取 top-k
+# → [System: PREFETCH] 尾部注入。与 AutoRecallStage 同轮去重（auto-recall 已
+# 注入则本 stage 跳过）；每会话限额 + 锚点去重；append-only；fail-open。
+
+def _bm25_rank_lines(lines, query, top_k):
+    """用 content_compressor 的分词 + 本地 BM25 对 manifest 行排序。fail-open→[]。"""
+    try:
+        import content_compressor as _cc
+        import math
+        from collections import Counter
+    except Exception:
+        return []
+    try:
+        q_toks = list(_cc._bm25_tokenize(query or "", min_prefix=4))
+    except Exception:
+        return []
+    if not q_toks or not lines:
+        return []
+    docs = []
+    for ln in lines:
+        h = ln.get("handle") or {}
+        hv = h.get("value") if isinstance(h, dict) else ""
+        text = " ".join([str(hv or ""), str(ln.get("tool") or ""),
+                         str(ln.get("head") or ""), str(ln.get("triggers") or "")])
+        try:
+            docs.append(Counter(_cc._bm25_tokenize(text, min_prefix=4)))
+        except Exception:
+            docs.append(Counter())
+    N = len(docs)
+    if not N:
+        return []
+    df = Counter()
+    for d in docs:
+        for t in d:
+            df[t] += 1
+    avgdl = sum(sum(d.values()) for d in docs) / N or 1.0
+    k1, b = 1.5, 0.75
+    scored = []
+    for i, d in enumerate(docs):
+        dl = sum(d.values()) or 1
+        s = 0.0
+        for t in q_toks:
+            tf = d.get(t, 0)
+            if not tf:
+                continue
+            n = df.get(t, 0)
+            idf = math.log(1 + (N - n + 0.5) / (n + 0.5))
+            s += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+        if s > 0:
+            scored.append((s, i))
+    scored.sort(key=lambda x: -x[0])
+    return [lines[i] for _, i in scored[:top_k]]
+
+
+class PrefetchStage(ConditionalStage):
+    """Stage 12.6 — R-CM-5: 需求信号驱动的已折叠内容预取推送（默认关）。"""
+    # kv: append
+
+    name = "prefetch"
+
+    def should_run(self, ctx):
+        if not (getattr(_ps, "PROXY_PD_ENABLED", True)
+                and getattr(_ps, "PROXY_PD_PREFETCH_ENABLED", False)):
+            return False
+        sid = getattr(ctx, "session_id", "") or ""
+        if not sid or "::aux" in sid:
+            return False
+        # 与 auto-recall 同轮去重：本轮已注入召回则不再预取
+        if (getattr(ctx, "auto_recall_info", None) or {}).get("injected"):
+            return False
+        with _ps._state_lock:
+            seen = _ps._SESSION_PREFETCH_STATE.get(sid)
+            if seen and len(seen) >= int(getattr(_ps, "PROXY_PD_PREFETCH_PER_SESSION", 5) or 5):
+                return False
+        return True
+
+    def process(self, ctx):
+        ctx.prefetch_info = {"injected": 0}
+        sid = ctx.session_id
+        try:
+            import memory_stores
+            import ctx_recall
+        except Exception:
+            return ctx
+        query = _tail_user_text(ctx.messages)[:200]
+        if not query:
+            return ctx
+        try:
+            lines = memory_stores.MANIFEST.lines(sid)
+        except Exception:
+            lines = []
+        if not lines:
+            return ctx
+        with _ps._state_lock:
+            seen = set(_ps._SESSION_PREFETCH_STATE.get(sid) or set())
+        cand = [l for l in lines
+                if (l.get("anchor") not in seen) and l.get("kind") == "tool_result"]
+        top_k = int(getattr(_ps, "PROXY_PD_PREFETCH_TOP_K", 3) or 3)
+        ranked = _bm25_rank_lines(cand, query, top_k)
+        if not ranked:
+            return ctx
+        cap = int(getattr(_ps, "PROXY_PD_PREFETCH_MAX_CHARS", 2000) or 2000)
+        parts = ["[System: PREFETCH — 与本轮任务相关的已折叠上下文（代理预取，非用户指令）]"]
+        used = 0
+        chosen = []
+        for l in ranked:
+            anchor = l.get("anchor") or ""
+            body = ""
+            try:
+                body = ctx_recall.recover_full_content(
+                    sid, anchor, l.get("turn"), max_chars=cap) or ""
+            except Exception:
+                body = ""
+            if not body:
+                h = l.get("handle") or {}
+                body = (h.get("value") if isinstance(h, dict) else "") or l.get("head") or ""
+            if not body:
+                continue
+            seg = "  - turn %s | %s | %s\n%s" % (
+                l.get("turn"), l.get("tool") or l.get("kind"),
+                (l.get("handle") or {}).get("value", "") if isinstance(l.get("handle"), dict) else "",
+                body[: max(0, cap - used)][:1000])
+            if used + len(seg) > cap:
+                break
+            parts.append(seg)
+            used += len(seg)
+            chosen.append(anchor)
+        if not chosen:
+            return ctx
+        wrapped = "\n".join(parts)[:cap]
+        _inject_tail_block(ctx, sid, wrapped)
+        with _ps._state_lock:
+            s = _ps._SESSION_PREFETCH_STATE.get(sid)
+            if s is None:
+                if len(_ps._SESSION_PREFETCH_STATE) >= 512:
+                    _ps._SESSION_PREFETCH_STATE.clear()
+                s = _ps._SESSION_PREFETCH_STATE[sid] = set()
+            s.update(a for a in chosen if a)
+        ctx.prefetch_info = {"injected": 1, "items": len(chosen)}
+        log("  -> [prefetch] injected %d folded unit(s)" % len(chosen))
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("prefetch", detail={
+                    "items": len(chosen), "chars": len(wrapped),
+                    "anchors": chosen[:8]})
+            except Exception as _e:
+                _warn_diag("inject_prefetch", _e)
+        return ctx
+
+    def output_metrics(self, ctx):
+        return getattr(ctx, "prefetch_info", None)
+
+
+# ============================================================================
 # Stage 13: DateNormalizer — stabilize date placeholder for KV cache
 # ============================================================================
 

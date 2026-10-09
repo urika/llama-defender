@@ -610,6 +610,34 @@ PROXY_CTX_VIEW_STABLE_ENABLED = os.environ.get(
 PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
     "PROXY_TOMBSTONE_RECALL_ENABLED", get_default("PROXY_TOMBSTONE_RECALL_ENABLED")).lower() in ("1", "true", "yes")
 
+# R-CM-4 符号级检索增强（2026-10-08；默认关，ctx_recall.py 符号索引层）：
+# query 命中符号名 → 在召回结果追加定义/引用位置（外部 grep/ctags via subprocess）。
+PROXY_RECALL_SYMBOL_ENABLED = os.environ.get(
+    "PROXY_RECALL_SYMBOL_ENABLED", get_default("PROXY_RECALL_SYMBOL_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_RECALL_SYMBOL_TOOL = os.environ.get(
+    "PROXY_RECALL_SYMBOL_TOOL", get_default("PROXY_RECALL_SYMBOL_TOOL"))
+PROXY_RECALL_SYMBOL_CMD = os.environ.get(
+    "PROXY_RECALL_SYMBOL_CMD", get_default("PROXY_RECALL_SYMBOL_CMD"))
+PROXY_RECALL_SYMBOL_MAX_REFS = int(os.environ.get(
+    "PROXY_RECALL_SYMBOL_MAX_REFS", get_default("PROXY_RECALL_SYMBOL_MAX_REFS")))
+PROXY_RECALL_SYMBOL_TIMEOUT_S = int(os.environ.get(
+    "PROXY_RECALL_SYMBOL_TIMEOUT_S", get_default("PROXY_RECALL_SYMBOL_TIMEOUT_S")))
+PROXY_RECALL_SYMBOL_ROOT = os.environ.get(
+    "PROXY_RECALL_SYMBOL_ROOT", get_default("PROXY_RECALL_SYMBOL_ROOT"))
+
+# R-CM-5 预取/推送披露（2026-10-08；默认关，pipeline.PrefetchStage）：
+# 需求信号 → BM25 预取已折叠单元 → [System: PREFETCH] 尾部注入（每轮 ≤1）。
+PROXY_PD_PREFETCH_ENABLED = os.environ.get(
+    "PROXY_PD_PREFETCH_ENABLED", get_default("PROXY_PD_PREFETCH_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_PD_PREFETCH_TOP_K = int(os.environ.get(
+    "PROXY_PD_PREFETCH_TOP_K", get_default("PROXY_PD_PREFETCH_TOP_K")))
+PROXY_PD_PREFETCH_MAX_CHARS = int(os.environ.get(
+    "PROXY_PD_PREFETCH_MAX_CHARS", get_default("PROXY_PD_PREFETCH_MAX_CHARS")))
+PROXY_PD_PREFETCH_PER_SESSION = int(os.environ.get(
+    "PROXY_PD_PREFETCH_PER_SESSION", get_default("PROXY_PD_PREFETCH_PER_SESSION")))
+# 会话 → 已预取锚点集合（去重 + 计数；bounded FIFO）
+_SESSION_PREFETCH_STATE: dict = {}
+
 # ADR-013 T1 admin 注入原语（admin-inject-primitive-design-20260909 §4/§6）：
 # PROXY_ADMIN_TOKEN 默认空 = 与既有 admin 端点对齐（localhost-only，行为
 # 零变化）；配置后 /admin/inject 要求 Bearer/X-Admin-Token 匹配，否则 401。
@@ -1320,6 +1348,18 @@ _RELOAD_SPEC = [
     # ADR-013 T1 admin 注入原语（reloadable；默认空 token=localhost-only）
     ("PROXY_ADMIN_TOKEN", "PROXY_ADMIN_TOKEN", "str", "", ""),
     ("PROXY_INJECT_MAX_CHARS", "PROXY_INJECT_MAX_CHARS", "int", "4000", "4000"),
+    # R-CM-5 预取/推送披露（默认关；SIGHUP 可热开）
+    ("PROXY_PD_PREFETCH_ENABLED", "PROXY_PD_PREFETCH_ENABLED", "bool", "false", "false"),
+    ("PROXY_PD_PREFETCH_TOP_K", "PROXY_PD_PREFETCH_TOP_K", "int", "3", "3"),
+    ("PROXY_PD_PREFETCH_MAX_CHARS", "PROXY_PD_PREFETCH_MAX_CHARS", "int", "2000", "2000"),
+    ("PROXY_PD_PREFETCH_PER_SESSION", "PROXY_PD_PREFETCH_PER_SESSION", "int", "5", "5"),
+    # R-CM-4 符号级检索增强（默认关；SIGHUP 可热开）
+    ("PROXY_RECALL_SYMBOL_ENABLED", "PROXY_RECALL_SYMBOL_ENABLED", "bool", "false", "false"),
+    ("PROXY_RECALL_SYMBOL_TOOL", "PROXY_RECALL_SYMBOL_TOOL", "str", "grep", "grep"),
+    ("PROXY_RECALL_SYMBOL_CMD", "PROXY_RECALL_SYMBOL_CMD", "str", "", ""),
+    ("PROXY_RECALL_SYMBOL_MAX_REFS", "PROXY_RECALL_SYMBOL_MAX_REFS", "int", "8", "8"),
+    ("PROXY_RECALL_SYMBOL_TIMEOUT_S", "PROXY_RECALL_SYMBOL_TIMEOUT_S", "int", "3", "3"),
+    ("PROXY_RECALL_SYMBOL_ROOT", "PROXY_RECALL_SYMBOL_ROOT", "str", "", ""),
     # R-CM-1 跨会话持久记忆（默认关；SIGHUP 可热开）
     ("PROXY_MEMORY_ENABLED", "PROXY_MEMORY_ENABLED", "bool", "false", "false"),
     ("PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_DB_PATH", "str", "logs/memory/memory.db", "logs/memory/memory.db"),
@@ -1426,6 +1466,13 @@ __all__ = [
     "PROXY_HBE_TIMEOUT_S",
     "PROXY_CTX_ENGINE_ENABLED", "PROXY_CTX_EPOCH_TRIGGER_TOKENS", "PROXY_CTX_WINDOW_K",
     "PROXY_CTX_EPOCH_RUBRIC_ENABLED", "PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX",
+    # R-CM-5 预取/推送披露
+    "PROXY_PD_PREFETCH_ENABLED", "PROXY_PD_PREFETCH_TOP_K",
+    "PROXY_PD_PREFETCH_MAX_CHARS", "PROXY_PD_PREFETCH_PER_SESSION",
+    "_SESSION_PREFETCH_STATE",
+    # R-CM-4 符号级检索增强
+    "PROXY_RECALL_SYMBOL_ENABLED", "PROXY_RECALL_SYMBOL_TOOL", "PROXY_RECALL_SYMBOL_CMD",
+    "PROXY_RECALL_SYMBOL_MAX_REFS", "PROXY_RECALL_SYMBOL_TIMEOUT_S", "PROXY_RECALL_SYMBOL_ROOT",
     # R-CM-1/R-CM-2 跨会话记忆 + 自动交接
     "PROXY_MEMORY_ENABLED", "PROXY_MEMORY_DB_PATH", "PROXY_MEMORY_DEFAULT_PROJECT",
     "PROXY_MEMORY_INJECT_MAX_CHARS", "PROXY_MEMORY_TOP_K", "PROXY_MEMORY_TTL_DAYS",

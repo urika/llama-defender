@@ -1109,6 +1109,60 @@ CONFIG_REGISTRY = {
                "dangling calls from manifest deposits (active). Off = bare "
                "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
     },
+    # ---- R-CM-5 预取/推送披露（2026-10-08 需求；默认关）----
+    "PROXY_PD_PREFETCH_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R-CM-5 需求信号触发的预取推送：对已折叠单元按 BM25 相关度预取，"
+               "以 [System: PREFETCH] 尾部注入（每轮 ≤1、每会话限额，与 auto-recall 去重）。",
+    },
+    "PROXY_PD_PREFETCH_TOP_K": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "预取候选条数上限（BM25 排序取前 k）。",
+    },
+    "PROXY_PD_PREFETCH_MAX_CHARS": {
+        "defaults": {"all": "2000"},
+        "type": "int", "scope": "reloadable",
+        "doc": "单次预取注入字符上限。",
+    },
+    "PROXY_PD_PREFETCH_PER_SESSION": {
+        "defaults": {"all": "5"},
+        "type": "int", "scope": "reloadable",
+        "doc": "每会话预取注入次数上限（防注入循环）。",
+    },
+    # ---- R-CM-4 符号级检索增强（2026-10-08 需求；默认关）----
+    "PROXY_RECALL_SYMBOL_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "R-CM-4 ctx_recall 符号索引层：query 命中符号名时，在召回结果追加"
+               "定义/引用位置（跨本会话 manifest 涉及的文件）。Off = 纯文本召回。",
+    },
+    "PROXY_RECALL_SYMBOL_TOOL": {
+        "defaults": {"all": "grep"},
+        "type": "str", "scope": "reloadable",
+        "doc": "符号检索外部工具：grep（默认，零依赖）/ ctags（预留，当前回退 grep）。",
+    },
+    "PROXY_RECALL_SYMBOL_CMD": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "手动覆盖符号检索命令（如 tree-sitter sidecar 可执行）；空 = 用 TOOL。",
+    },
+    "PROXY_RECALL_SYMBOL_MAX_REFS": {
+        "defaults": {"all": "8"},
+        "type": "int", "scope": "reloadable",
+        "doc": "符号索引段返回的最大定义/引用条数。",
+    },
+    "PROXY_RECALL_SYMBOL_TIMEOUT_S": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "符号检索子进程超时（秒）；超时/异常 fail-open 返回空。",
+    },
+    "PROXY_RECALL_SYMBOL_ROOT": {
+        "defaults": {"all": ""},
+        "type": "str", "scope": "reloadable",
+        "doc": "符号检索文件范围约束根目录（安全边界）；空 = 不额外约束。",
+    },
     # ---- R-CM-1 跨会话持久记忆（2026-10-08 需求；默认关）----
     "PROXY_MEMORY_ENABLED": {
         "defaults": {"all": "false"},

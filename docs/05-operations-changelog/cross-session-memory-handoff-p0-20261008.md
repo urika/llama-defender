@@ -89,3 +89,17 @@ export PROXY_HANDOFF_ENABLED=true
 - **默认关**：`PROXY_CTX_EPOCH_RUBRIC_ENABLED=false` → `rubric=None` → 纯 token 阈值旧行为不变（零回归）。`PROXY_CTX_EPOCH_RUBRIC_STUCK_MAX=5`。
 - **取舍**：卡住时不折叠可能使视图继续增长至 `ContextOverflowError`（宁可不压也不丢中间态）；换路线提示由 auto-recall 卡死升级路径另行注入（未在本项合并）。
 - **测试**：`test/unit/test_epoch_rubric.py`（5 例：闭单元/进展/卡住/门控跳过/rubric=None）全绿。
+
+## 12. 附：R-CM-4 符号级检索增强 + R-CM-5 预取推送（同日补，2026-10-08）
+
+### R-CM-4 符号级检索增强（`ctx_recall.py`，默认关）
+- `format_recall_result` 改为薄包装：调用 `_format_recall_result`（原实现）+ 追加 `format_symbol_section(query, session_key)`。禁用/无命中/fail-open → 无追加。
+- 符号提取 `_symbol_ident(query)`：优先含 `_` 或大小写混合（PascalCase/camelCase）的标识符，否则首个 ≥4 字符标识符；`_candidate_files(session_key)` 取本会话 manifest 句柄中磁盘存在、且在 `PROXY_RECALL_SYMBOL_ROOT` 内的文件；`symbol_refs(...)` 经 subprocess 调 `grep -nw`（或 `PROXY_RECALL_SYMBOL_CMD` 覆盖），解析 `path:line:text`。
+- 配置（reloadable，默认关）：`PROXY_RECALL_SYMBOL_ENABLED=false`、`_TOOL=grep`、`_CMD=""`、`_MAX_REFS=8`、`_TIMEOUT_S=3`、`_ROOT=""`。
+- 核心 stdlib-only；外部工具经 subprocess，异常/超时 fail-open。
+
+### R-CM-5 预取/推送披露（`pipeline.PrefetchStage` 12.6，默认关）
+- 需求信号 = 最近 user 文本；`_bm25_rank_lines`（复用 `content_compressor._bm25_tokenize` + 本地 BM25）对 manifest 已折叠 `tool_result` 单元排序取 top-k → `recover_full_content` 取回 → `[System: PREFETCH]` 尾部注入（append-only）。
+- 去重/限额：与 `AutoRecallStage` **同轮去重**（本轮 auto-recall 已注入则跳过）；锚点级 `_SESSION_PREFETCH_STATE` 去重 + 每会话 `PROXY_PD_PREFETCH_PER_SESSION=5` 上限。
+- 配置（reloadable，默认关）：`PROXY_PD_PREFETCH_ENABLED=false`、`_TOP_K=3`、`_MAX_CHARS=2000`、`_PER_SESSION=5`。
+- 测试：`test/unit/test_recall_symbol.py`（12）、`test/unit/test_prefetch_stage.py`（8）全绿。

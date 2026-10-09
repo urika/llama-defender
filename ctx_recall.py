@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 
@@ -426,6 +427,129 @@ def lookup(session_key, query, kind=None, limit=DEFAULT_LIMIT):
     if not getattr(_ps, "PROXY_PD_ENABLED", True) or not session_key:
         return []
     return fts_search(session_key, query, kind, limit)
+
+
+# ============================================================================
+# R-CM-4 符号级检索增强（2026-10-08）: query 命中符号 → 定义 + 引用位置
+# ============================================================================
+# 外部工具（grep 默认 / ctags 可配）经 subprocess 调用；核心 stdlib-only；
+# fail-open。候选文件来自本会话 manifest 中出现的路径句柄（无需客户端 cwd），
+# 受 PROXY_RECALL_SYMBOL_ROOT 约束。命中内容作为 format_recall_result 的追加段。
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UPPER_RE = re.compile(r"[A-Z]")
+_LOWER_RE = re.compile(r"[a-z]")
+
+
+def _symbol_enabled():
+    try:
+        return bool(getattr(_ps, "PROXY_RECALL_SYMBOL_ENABLED", False))
+    except Exception:
+        return False
+
+
+def _symbol_ident(query):
+    """从查询提取最像符号名的标识符（优先含 _ 或 CamelCase），否则 None。
+
+    注意：不能复用 _query_tokens（其会 lowercased，CamelCase 丢失）。
+    """
+    try:
+        raw = re.split(r"[\s/\\,;:()\[\]{}\'\"\.\-]+", query or "")
+    except Exception:
+        raw = []
+    fallback = None
+    for t in raw:
+        t = t.strip()
+        if len(t) < 4 or not _IDENT_RE.match(t):
+            continue
+        # 符号味：含下划线，或大小写混合（PascalCase/camelCase）
+        camelish = bool(_UPPER_RE.search(t)) and bool(_LOWER_RE.search(t))
+        if "_" in t or camelish:
+            return t
+        if fallback is None:
+            fallback = t
+    return fallback
+
+
+def _candidate_files(session_key, max_files=200):
+    """本会话 manifest 句柄中出现的、磁盘存在且在 root 内的文件（去重）。"""
+    files = []
+    seen = set()
+    try:
+        root = (getattr(_ps, "PROXY_RECALL_SYMBOL_ROOT", "") or "").strip()
+        root_abs = os.path.abspath(root) if root else ""
+        for ln in memory_stores.MANIFEST.lines(session_key):
+            h = ln.get("handle") or {}
+            v = h.get("value") if isinstance(h, dict) else ""
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            if not os.path.isfile(v):
+                continue
+            if root_abs and not os.path.abspath(v).startswith(root_abs):
+                continue
+            files.append(v)
+            if len(files) >= max_files:
+                break
+    except Exception:
+        return []
+    return files
+
+
+def symbol_refs(identifier, files, max_refs=8, tool="grep", cmd=None, timeout=3.0):
+    """返回 [{path,line,text}]：符号出现的定义/引用行（去重、限额）。fail-open→[]。"""
+    ident = (identifier or "").strip()
+    if not ident or not files:
+        return []
+    try:
+        if cmd:
+            argv = [cmd, "-nw", "--", ident] + list(files)
+        elif tool == "ctags":
+            # ctags -x 输出列式不同，统一走 grep 以保证解析稳健
+            argv = ["grep", "-nw", "--", ident] + list(files)
+        else:
+            argv = ["grep", "-nw", "--", ident] + list(files)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        refs = []
+        seen = set()
+        for raw in (proc.stdout or "").splitlines():
+            parts = raw.split(":", 2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                continue
+            key = (parts[0], parts[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append({"path": parts[0], "line": int(parts[1]),
+                         "text": parts[2].strip()[:200]})
+            if len(refs) >= max_refs:
+                break
+        return refs
+    except Exception:
+        return []
+
+
+def format_symbol_section(query, session_key, max_refs=None):
+    """R-CM-4: 渲染符号索引段（定义/引用）。禁用/无命中/fail-open → ""."""
+    if not _symbol_enabled() or not session_key:
+        return ""
+    ident = _symbol_ident(query)
+    if not ident:
+        return ""
+    files = _candidate_files(session_key)
+    if not files:
+        return ""
+    tool = getattr(_ps, "PROXY_RECALL_SYMBOL_TOOL", "grep") or "grep"
+    cmd = getattr(_ps, "PROXY_RECALL_SYMBOL_CMD", "") or None
+    cap = int(max_refs or getattr(_ps, "PROXY_RECALL_SYMBOL_MAX_REFS", 8) or 8)
+    to = float(getattr(_ps, "PROXY_RECALL_SYMBOL_TIMEOUT_S", 3) or 3)
+    refs = symbol_refs(ident, files, max_refs=cap, tool=tool, cmd=cmd, timeout=to)
+    if not refs:
+        return ""
+    lines = ["[符号索引] %s：定义/引用 %d 处（跨本会话涉及文件）" % (ident, len(refs))]
+    for r in refs:
+        lines.append("  %s:%d: %s" % (r["path"], r["line"], r["text"]))
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -1171,6 +1295,19 @@ def window_lookup(messages, query):
 
 def format_recall_result(lines, query, session_key=None, offset=0,
                          window_hint=None):
+    """索引行 → 工具结果文本；R-CM-4 启用时追加符号索引段。"""
+    result = _format_recall_result(lines, query, session_key, offset, window_hint)
+    try:
+        sym = format_symbol_section(query, session_key) if session_key else ""
+        if sym:
+            result = result + "\n" + sym
+    except Exception:
+        pass  # fail-open：符号层故障不影响主召回结果
+    return result
+
+
+def _format_recall_result(lines, query, session_key=None, offset=0,
+                          window_hint=None):
     """索引行 → 工具结果文本（含配对 tool_result 行 + archive 全文恢复）。
 
     window_hint（L-53 P2，可选）= window_lookup() 结果：未命中折叠库时按
@@ -1542,4 +1679,5 @@ __all__ = [
     "MICRO_TURN_RESULT_MAX_CHARS",
     "auto_recall_for_target",
     "CTX_RECALL_STATS",
+    "format_symbol_section", "symbol_refs",
 ]

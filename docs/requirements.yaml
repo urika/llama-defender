@@ -341,14 +341,25 @@ requirements:
   - id: R-CM-4
     domain: R-CM
     title: 符号级检索增强
-    desc: ctx_recall 增加符号索引层（定义/引用），外部 ctags/tree-sitter sidecar，待排期
+    desc: ctx_recall 增加符号索引层（定义/引用），外部 grep/ctags via subprocess，默认关
     priority: P1
+    impl:
+      - ctx_recall.py:format_symbol_section
+      - ctx_recall.py:symbol_refs
+      - ctx_recall.py:format_recall_result
+    tests:
+      - test/unit/test_recall_symbol.py::TestRecallSymbol
 
   - id: R-CM-5
     domain: R-CM
     title: 预取/推送披露
-    desc: 需求信号触发 BM25 预取已折叠单元，主动推送尾部，待排期
+    desc: 需求信号触发 BM25 预取已折叠单元，[System: PREFETCH] 尾部推送，默认关
     priority: P2
+    impl:
+      - pipeline.py:PrefetchStage
+      - pipeline.py:_bm25_rank_lines
+    tests:
+      - test/unit/test_prefetch_stage.py::TestPrefetchStage
 
   - id: R-CM-6
     domain: R-CM

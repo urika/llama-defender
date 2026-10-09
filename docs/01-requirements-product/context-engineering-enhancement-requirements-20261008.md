@@ -77,7 +77,7 @@
 
 **借鉴**：SelfCompact（arXiv 2606.23525）+ `tianjianl/selfcompact`。
 
-### R-CM-4 符号级检索增强（P1）
+### R-CM-4 符号级检索增强（P1）——✅ 已交付（2026-10-08）
 
 **目标**：给 `ctx_recall` 增加**符号索引层（L1.5）**——命中符号名（函数/类/变量）时，返回定义点 + 引用点，替代纯文本子串。
 
@@ -88,7 +88,7 @@
 
 **借鉴**：`Aider-AI/aider`（tree-sitter + PageRank repo map）、`oraios/serena`（LSP `find_symbol`/`find_referencing_symbols`）、`DeusData/codebase-memory-mcp`、`cocoindex-io/cocoindex`。
 
-### R-CM-5 预取 / 推送披露（P2）
+### R-CM-5 预取 / 推送披露（P2）——✅ 已交付（2026-10-08）
 
 **目标**：实装 `PROXY_PD_PREFETCH_ENABLED`——当需求信号（重读目标、高熵游走、显式问题）出现时，用 BM25 从 manifest 预取相关折叠单元，**主动推送**到尾部，减少一轮往返。
 
