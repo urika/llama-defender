@@ -672,6 +672,11 @@ PROXY_HANDOFF_MAX_CHARS = int(os.environ.get(
     "PROXY_HANDOFF_MAX_CHARS", get_default("PROXY_HANDOFF_MAX_CHARS")))
 PROXY_HANDOFF_DIR = os.environ.get(
     "PROXY_HANDOFF_DIR", get_default("PROXY_HANDOFF_DIR"))
+# 会话键按 system 分叉（2026-10-09，默认关）：双 agent 共享静态会话头时按
+# system 内容哈希派生独立 key（sid::sys<hash8>），各身份独立 canonical/缓存线。
+PROXY_SESSION_KEY_SPLIT_BY_SYSTEM = os.environ.get(
+    "PROXY_SESSION_KEY_SPLIT_BY_SYSTEM",
+    get_default("PROXY_SESSION_KEY_SPLIT_BY_SYSTEM")).lower() in ("1", "true", "yes")
 # 会话级"首请求已注入"守卫（防每轮重复注入破坏前缀；进程内 FIFO 有界）
 _SESSION_MEMORY_SEEN: set = set()
 _SESSION_HANDOFF_SEEN: set = set()
@@ -1372,6 +1377,8 @@ _RELOAD_SPEC = [
     ("PROXY_HANDOFF_TRIGGER_CHARS", "PROXY_HANDOFF_TRIGGER_CHARS", "int", "0", "0"),
     ("PROXY_HANDOFF_MAX_CHARS", "PROXY_HANDOFF_MAX_CHARS", "int", "3000", "3000"),
     ("PROXY_HANDOFF_DIR", "PROXY_HANDOFF_DIR", "str", "logs/diag/handoff", "logs/diag/handoff"),
+    # 会话键按 system 分叉（默认关；锯齿缓存事故定案修复）
+    ("PROXY_SESSION_KEY_SPLIT_BY_SYSTEM", "PROXY_SESSION_KEY_SPLIT_BY_SYSTEM", "bool", "false", "false"),
 ]
 
 
@@ -1479,6 +1486,7 @@ __all__ = [
     "PROXY_HANDOFF_ENABLED", "PROXY_HANDOFF_TRIGGER_CHARS", "PROXY_HANDOFF_MAX_CHARS",
     "PROXY_HANDOFF_DIR", "_SESSION_MEMORY_SEEN", "_SESSION_HANDOFF_SEEN",
     "_SESSION_INJECT_SEEN_MAX",
+    "PROXY_SESSION_KEY_SPLIT_BY_SYSTEM",
     "_DIAG_DIR", "_DIAG_SESSIONS_PATH", "_DIAG_ARCHIVE_DIR", "_DIAG_LEDGER_DIR", "_diag_lock", "_diag_ctx",
     # Concurrency
     "PROXY_MAX_CONCURRENT", "_llama_lock", "MODEL_NAME",

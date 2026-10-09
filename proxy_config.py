@@ -1218,6 +1218,14 @@ CONFIG_REGISTRY = {
         "type": "str", "scope": "reloadable",
         "doc": "handoff 落盘目录（JSONL 追加 + markdown 最新）。",
     },
+    "PROXY_SESSION_KEY_SPLIT_BY_SYSTEM": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "会话键按 system 内容分叉（2026-10-09 锯齿缓存事故定案修复）：同一"
+               "进程内多身份（如 claude-cli 主代理与内建 file-search 子代理）共享"
+               "静态会话头时，每身份按 system sha256[:8] 派生独立 key "
+               "sid::sys<hash8>，各自独立 canonical/缓存线/台账。开启需 restart 载码。",
+    },
     "PROXY_ADMIN_TOKEN": {
         "defaults": {"all": ""},
         "type": "str", "scope": "reloadable",

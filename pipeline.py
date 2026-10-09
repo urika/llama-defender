@@ -14,6 +14,7 @@ Usage:
     pipeline.run(ctx)
 """
 import collections
+import hashlib
 import io
 import json
 import os
@@ -468,6 +469,42 @@ class InstrumentedPipeline(Pipeline):
         return ctx
 
 
+# ----------------------------------------------------------------------------
+# 会话键按 system 分叉（2026-10-09，锯齿缓存事故定案修复，默认关）
+# ----------------------------------------------------------------------------
+# 事故面: 同一 claude-cli 进程的主代理与内建 file-search 子代理共享静态
+# X-Claude-Code-Session-Id 头（swe-eval 侧 ANTHROPIC_CUSTOM_HEADERS 无法按
+# 调用区分），两身份的轮次在同一 canonical 上 1:1 交替——system 每轮不同
+# ⇒ 前缀从 token 0 断，主轮 39-93s TTFT（swe6c9a75ff 实证，占该实例时长大头）。
+# 修复: ctx.session_id 追加 "::sys<hash8>"（system 内容 sha256 前 8 位），
+# 每身份确定性独立 key → 独立 canonical/缓存线/台账/manifest/R-CM 守卫。
+# 单一咽喉点（RequestParser）分叉，下游全部自然一致。fail-open：无 system
+# 或已带后缀时不改写。
+_SPLIT_MARKER = "::sys"
+
+
+def _split_session_key_by_system(ctx):
+    """PROXY_SESSION_KEY_SPLIT_BY_SYSTEM 开启时按 system 内容分叉 ctx.session_id。"""
+    try:
+        if not getattr(_ps, "PROXY_SESSION_KEY_SPLIT_BY_SYSTEM", False):
+            return
+        sid = ctx.session_id
+        if not sid or _SPLIT_MARKER in sid:
+            return
+        syspr = (ctx.body or {}).get("system")
+        if not syspr:
+            return
+        if isinstance(syspr, str):
+            sys_str = syspr
+        else:
+            sys_str = json.dumps(syspr, ensure_ascii=False, sort_keys=True)
+        h = hashlib.sha256(sys_str.encode("utf-8")).hexdigest()[:8]
+        ctx.session_id = sid + _SPLIT_MARKER + h
+        log("  -> [session_split] %s -> %s" % (sid[:16] + "…", ctx.session_id[-16:]))
+    except Exception as e:  # fail-open: 分叉失败保持原 key
+        _warn_diag("session_split", e)
+
+
 # ============================================================================
 # Stage 0: RequestParser — parse raw body into PipelineContext
 # ============================================================================
@@ -499,6 +536,7 @@ class RequestParser(PipelineStage):
         # 日志显示,旧代理路径/测试未设 session_key 时回落。
         ctx.session_id = (getattr(_ps._log_ctx, 'session_key', None)
                           or getattr(_ps._log_ctx, 'session_id', None) or "")
+        _split_session_key_by_system(ctx)
 
         # Character count
         ctx.total_chars = sum(
