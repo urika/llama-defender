@@ -62,7 +62,7 @@ def _resp_text(resp):
                     if isinstance(b, dict) and b.get("type") == "text")
 
 
-def build_history(trigger_chars, seed_key):
+def build_history(trigger_chars, seed_payload):
     """合成会话：40 轮 × ~4.7KB；第 2 轮 tool_result 携带种子 key（折叠区内）。"""
     filler = "x" * 4600
     msgs = []
@@ -74,7 +74,7 @@ def build_history(trigger_chars, seed_key):
                 "name": "Read", "input": {"file_path": "/repo/ops/deploy.md"}}]})
             msgs.append({"role": "user", "content": [{
                 "type": "tool_result", "tool_use_id": "call_smoke_seed",
-                "content": "deploy.md: DEPLOY_KEY=%s (rotation: monthly)" % seed_key}]})
+                "content": "deploy.md note: %s" % seed_payload}]})
         else:
             msgs.append({"role": "assistant", "content": "ok-%03d" % i})
     total = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs)
@@ -89,6 +89,8 @@ def main():
     ap.add_argument("--trigger-chars", type=int, default=190000,
                     help="合成历史字符量（est×1.6 须 ≥ S=70000 ⇒ ≥175K）")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--seed-style", choices=["key", "content"], default="key",
+                    help="key=键型(面板keys行可直答,测送达); content=语义型(仅召回可答,测真实调用)")
     ap.add_argument("--allow-during-batch", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -112,7 +114,23 @@ def main():
         print("[WARN] 批跑进程在场 %s —— 已按 --allow-during-batch/--dry-run 继续" % batch[:3])
 
     seed_key = "SMK-%s" % os.urandom(4).hex()
-    history, total_chars = build_history(args.trigger_chars, seed_key)
+    # v1.1 双种子形态: key=键型（面板 keys 行可直答——测 cue 送达）
+    #                 content=语义型（无独特 token——只有 ctx_recall 全文检索可答，
+    #                          测真实召回调用, ADR-016 B 目标态核心场景）
+    days, owners = ["Thursday", "Friday", "Saturday"], ["Dana", "Lee", "Marco"]
+    seed_day = days[int(os.urandom(1).hex(), 16) % 3]
+    seed_owner = owners[int(os.urandom(1).hex(), 16) % 3]
+    if args.seed_style == "content":
+        seed_payload = ("the release window was moved to %s and the owner is %s; "
+                        "please keep this between us" % (seed_day, seed_owner))
+        ask2 = ("According to the earliest deployment note, on which day is the "
+                "release window and who owns it? Answer in the form 'day/owner'.")
+        answer_ok_fn = lambda t: (seed_day in t and seed_owner in t)
+    else:
+        seed_payload = "DEPLOY_KEY=%s (rotation: monthly)" % seed_key
+        ask2 = "What is the DEPLOY_KEY mentioned in the earliest deploy.md note?"
+        answer_ok_fn = lambda t: seed_key in t
+    history, total_chars = build_history(args.trigger_chars, seed_payload)
     sid = "recall-smoke-%s" % datetime.now().strftime("%Y%m%d%H%M%S")
     url = args.proxy + "/v1/messages"
 
@@ -150,9 +168,12 @@ def main():
         status1, resp1 = 0, {"_error": str(e)}
     add("请求1（触发折叠）", status1 == 200, "status=%s dt=%.0fs" % (status1, time.time() - t0))
 
+    q2 = ("What is the exact DEPLOY_KEY value from the earlier tool result? "
+          "Reply with only the key." if args.seed_style == "key" else
+          "According to the earliest deploy.md note, on which day is the release "
+          "window and who owns it? Reply in the form 'day/owner' only.")
     body2 = dict(body1, max_tokens=100,
-                 messages=history + [{"role": "user",
-                                      "content": "What is the exact DEPLOY_KEY value from the earlier tool result? Reply with only the key."}])
+                 messages=history + [{"role": "user", "content": q2}])
     t0 = time.time()
     try:
         status2, resp2 = _post(url, body2, sid, args.timeout)
@@ -179,7 +200,11 @@ def main():
         "available=False" not in log_tail.split("recall-cue]")[-1][:60]
     add("cue 门控放行（[recall-cue] available=true）", cue_ok,
         "" if cue_ok else "修复未激活或谓词 false —— 见 L-59 行")
-    answer_ok = seed_key in text2
+    question2 = ("What is the DEPLOY_KEY mentioned in the earliest deploy.md note?"
+             if args.seed_style == "key" else
+             "According to the earliest deployment note, on which day is the "
+             "release window and who owns it? Answer in the form 'day/owner'.")
+    answer_ok = answer_ok_fn(text2)
     add("答案命中种子 key", answer_ok, "resp2=%r" % text2[:120])
     micro = "[MICRO_TURN]" in log_tail and "recall-s" in log_tail
     add("微轮自答证据（[MICRO_TURN]）——cue 是邀请，模型可不经调用直答", micro,
@@ -210,7 +235,7 @@ def main():
     verdict = "FAIL" if fails else ("WARN" if warns else "PASS")
     print("\n== verdict: %s（%d PASS / %d WARN / %d FAIL）==" % (
         verdict, len(checks) - len(fails) - len(warns), len(warns), len(fails)))
-    print(json.dumps({"verdict": verdict, "sid": sid, "seed_key": seed_key,
+    print(json.dumps({"verdict": verdict, "sid": sid, "seed_style": args.seed_style, "seed_key": seed_key,
                       "checks": checks}, ensure_ascii=False, indent=2))
     return 0 if verdict == "PASS" else (3 if verdict == "WARN" else 1)
 
