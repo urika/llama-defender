@@ -254,9 +254,12 @@ def scan_test_tags() -> Dict[str, List[str]]:
             continue
         for root, _, files in os.walk(test_dir):
             for name in files:
+                # 只扫源码文件——__pycache__/*.pyc 等二进制会炸 UTF-8 解码
+                if not (name.endswith(".py") or name.endswith(".sh")):
+                    continue
                 path = os.path.join(root, name)
                 rel = os.path.relpath(path, REPO_ROOT)
-                with open(path) as f:
+                with open(path, encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f, 1):
                         if name.endswith(".py"):
                             for rid in ID_PATTERN.findall(line):
