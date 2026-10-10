@@ -1847,6 +1847,213 @@ def _svg_dual_chart(rows, width=800, height=120):
     )
 
 
+
+# --- 上下文动态质量（M2/M4/M5 + V 面尺寸）——swe-eval L-85/调研稿 §八/§九 ---
+_CTX_M2_WINDOW = 10
+
+
+def _load_ctx_actions(session_id):
+    """从 diag ledger（sid 前缀匹配）抽取逐动作序列:
+    [(turn, tool, target_hash, result_chars, target)]。纯读盘。"""
+    import glob as _glob
+    pat = os.path.join(_ps._SCRIPT_DIR, "logs", "diag", "ledger",
+                       session_id + "*.jsonl")
+    acts = []
+    for fp in sorted(_glob.glob(pat)):
+        with open(fp, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                turn = row.get("turn")
+                for a in row.get("actions") or []:
+                    acts.append((turn, a.get("tool") or "?",
+                                 a.get("target_hash") or "",
+                                 int(a.get("result_chars") or 0),
+                                 a.get("target") or ""))
+    return acts
+
+
+def _ctx_metrics_series(session_id):
+    """M2/M4/M5 序列 + V 面逐请求尺寸。每次页面访问现算（<50ms），无常驻。"""
+    import hashlib as _hashlib
+    acts = _load_ctx_actions(session_id)
+    seen, novel = set(), []
+    dup_bytes = total_bytes = 0
+    streak, cur, prev = [], 0, None
+    keycount, win, m2 = {}, [], []
+    for _, _tl, th, rc, _tg in acts:
+        sig = th + ":" + str(rc)
+        h = _hashlib.md5(sig.encode()).hexdigest()
+        total_bytes += rc
+        if h in seen:
+            novel.append(0)
+            dup_bytes += rc
+        else:
+            seen.add(h)
+            novel.append(rc)
+        cur = cur + 1 if th == prev else 1
+        prev = th
+        streak.append(cur)
+        keycount[th] = keycount.get(th, 0) + 1
+        win.append(h)
+        if len(win) > _CTX_M2_WINDOW:
+            win.pop(0)
+        m2.append(100.0 * (1 - len(set(win)) / len(win)))
+    cum, s = [], 0
+    for v in novel:
+        s += v
+        cum.append(s)
+    n = len(acts)
+    k = max(n // 3, 1)
+    thirds = [sum(novel[:k]), sum(novel[k:2 * k]), sum(novel[2 * k:])]
+    # T1=新息饱和点：累计唯一字节达总量 99% 的首个位置（对尾部杂讯鲁棒；
+    # 且要求落在前 2/3 内才判"塌陷型"，均匀分布=健康不标）
+    t1 = None
+    if n and cum[-1] > 0:
+        _sat = next((i for i, v in enumerate(cum) if v >= 0.99 * cum[-1]), None)
+        if _sat is not None and _sat <= 2 * n // 3:
+            t1 = _sat
+    top_th, top_n = (max(keycount.items(), key=lambda kv: kv[1])
+                     if keycount else ("", 0))
+    top_target = next((tg for _, _tl, th, _rc, tg in acts if th == top_th and tg),
+                      "")
+    view = [r.get("input_chars") or 0
+            for r in _load_session_metrics(session_id)]
+    return {
+        "n_actions": n, "novel": novel, "totals": [a[3] for a in acts],
+        "cum": cum, "thirds": thirds, "t1": t1, "m2_win": m2,
+        "m2_overall": (100.0 * dup_bytes / total_bytes) if total_bytes else 0.0,
+        "streak": streak, "streak_max": max(streak) if streak else 0,
+        "top_count": top_n, "top_target": top_target[:70],
+        "view_chars": view,
+    }
+
+
+def _ctx_svg_area(values, color, w=760, h=96, thresholds=None, marks=None):
+    """极简内联 SVG 面积图（无 JS 依赖；阈值线 marks=[(idx,color,label)]）。"""
+    if not values:
+        return "<div style='color:#888'>无数据</div>"
+    mx = max(max(values), 1)
+    n = len(values)
+    step = w / max(n - 1, 1)
+    pts = " ".join("%.1f,%.1f" % (i * step, h - 6 - (v / mx) * (h - 14))
+                   for i, v in enumerate(values))
+    out = ["<svg width='%d' height='%d' style='background:#12122a;"
+           "border-radius:6px;display:block'>" % (w, h)]
+    out.append("<polygon points='0,%d %s %.1f,%d' fill='%s' opacity='0.30'/>"
+               % (h - 6, pts, (n - 1) * step, h - 6, color))
+    out.append("<polyline points='%s' fill='none' stroke='%s' "
+               "stroke-width='1.3'/>" % (pts, color))
+    for tv, tc, tl in (thresholds or []):
+        if tv > mx:
+            continue
+        y = h - 6 - (tv / mx) * (h - 14)
+        out.append("<line x1='0' y1='%.1f' x2='%d' y2='%.1f' stroke='%s' "
+                   "stroke-dasharray='4,3'/>"
+                   "<text x='4' y='%.1f' fill='%s' font-size='9'>%s</text>"
+                   % (y, w, y, tc, y - 3, tc, tl))
+    for mv, mc, ml in (marks or []):
+        x = min(mv, n - 1) * step
+        out.append("<line x1='%.1f' y1='0' x2='%.1f' y2='%d' stroke='%s' "
+                   "stroke-width='1.2'/>"
+                   "<text x='%.1f' y='11' fill='%s' font-size='9'>%s</text>"
+                   % (x, x, h, mc, min(x + 4, w - 100), mc, ml))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _ctx_svg_dual(novel, totals, t1, w=760, h=96):
+    """M4 双面积：灰=总字节，绿=唯一新字节；红竖线=T1。"""
+    if not totals:
+        return "<div style='color:#888'>无数据</div>"
+    mx = max(max(totals), 1)
+    n = len(totals)
+    step = w / max(n - 1, 1)
+
+    def poly(vals, color, opacity):
+        pts = " ".join("%.1f,%.1f" % (i * step, h - 6 - (v / mx) * (h - 14))
+                       for i, v in enumerate(vals))
+        return ("<polygon points='0,%d %s %.1f,%d' fill='%s' opacity='%s'/>"
+                "<polyline points='%s' fill='none' stroke='%s' stroke-width='1'/>"
+                % (h - 6, pts, (n - 1) * step, h - 6, color, opacity, pts, color))
+    out = ["<svg width='%d' height='%d' style='background:#12122a;"
+           "border-radius:6px;display:block'>" % (w, h)]
+    out.append(poly(totals, "#8d99ae", 0.35))
+    out.append(poly(novel, "#2a9d8f", 0.85))
+    if t1 is not None:
+        x = min(t1, n - 1) * step
+        out.append("<line x1='%.1f' y1='0' x2='%.1f' y2='%d' stroke='#d62828' "
+                   "stroke-width='1.3'/>"
+                   "<text x='%.1f' y='11' fill='#d62828' font-size='9'>"
+                   "T1 信息枯竭点</text>" % (x, x, h, min(x + 4, w - 80)))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _build_ctx_metrics_section(session_id):
+    """Session Analysis 页新区块：上下文动态质量（M2/M4/M5 + V 面尺寸）。
+    纯读 diag ledger 与 proxy_metrics，按需现算；失败显式降级不静默。"""
+    try:
+        m = _ctx_metrics_series(session_id)
+    except Exception as e:
+        return ("<div class='card' style='margin-bottom:16px'><h2>🧭 上下文动态质量"
+                "</h2><div style='color:#e9c46a'>计算失败（fail-visible）: %s</div>"
+                "</div>" % e)
+    if not m["n_actions"] and not m["view_chars"]:
+        return ""
+    collapse = (m["thirds"][2] == 0
+                or (m["thirds"][0] > 0 and m["thirds"][2] < 0.05 * m["thirds"][0]))
+    chips = (
+        "<div style='display:flex;gap:14px;flex-wrap:wrap;font-size:0.85em;"
+        "margin:6px 0 10px'>"
+        "<span>动作数 <b>%d</b></span>"
+        "<span>M2 全程 <b style='color:%s'>%.1f%%</b>（字节加权）</span>"
+        "<span>M5 streak_max <b style='color:%s'>%d</b></span>"
+        "<span>Top1 同键 <b>×%d</b> <code>%s</code></span>"
+        "<span>T1 <b>%s</b></span>"
+        "<span>新息塌陷 <b style='color:%s'>%s</b>（三分段 %s）</span>"
+        "</div>" % (
+            m["n_actions"],
+            "#e9c46a" if m["m2_overall"] > 50 else "#2a9d8f", m["m2_overall"],
+            "#d62828" if m["streak_max"] >= 8 else "#2a9d8f", m["streak_max"],
+            m["top_count"], m["top_target"] or "—",
+            ("动作 %d" % m["t1"]) if m["t1"] is not None else "未达",
+            "#d62828" if collapse else "#2a9d8f",
+            "是" if collapse else "否", m["thirds"]))
+    marks = ([(m["t1"], "#d62828", "T1 信息枯竭点")] if m["t1"] is not None
+             else [])
+    parts = ["<div class='card' style='margin-bottom:16px'>"
+             "<h2>🧭 上下文动态质量（M2/M4/M5 · V 面治理 L-85 · 调研稿 §八/§九）</h2>",
+             chips]
+    if m["view_chars"]:
+        parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:6px 0 3px'>"
+                     "V 面·视图逐请求尺寸（metrics.input_chars）</div>")
+        parts.append(_ctx_svg_area(m["view_chars"], "#3498db"))
+    if m["n_actions"]:
+        parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
+                     "M4 新息（灰=结果总字节，绿=唯一新字节；红=T1）</div>")
+        parts.append(_ctx_svg_dual(m["novel"], m["totals"], m["t1"]))
+        parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
+                     "M2 输出冗余比（滑窗 %d 动作，字节口径）</div>"
+                     % _CTX_M2_WINDOW)
+        parts.append(_ctx_svg_area(m["m2_win"], "#e9c46a", thresholds=[
+            (50.0, "#d62828", "预警 50%")]))
+        parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
+                     "M5 streak 深度（连续同 target_hash；5=remind@5/8=kill@8 待裁）"
+                     "</div>")
+        parts.append(_ctx_svg_area(m["streak"], "#264653", thresholds=[
+            (5, "#e9c46a", "remind@5"), (8, "#d62828", "kill@8")],
+            marks=marks))
+    parts.append("<div style='color:#888;font-size:0.8em;margin-top:6px'>"
+                 "现算自 diag ledger + proxy_metrics（每次访问 &lt;50ms）；"
+                 "判读口径见 swe-eval docs/research/agent-context-governance-"
+                 "survey-20261011.md §八/§九；检测信号不自动定罪（L-76）</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _build_session_html(session_id: str) -> str:
     """Build an HTML page showing a single session timeline and performance."""
     data = _analyze_session(session_id)
@@ -1940,6 +2147,7 @@ def _build_session_html(session_id: str) -> str:
     dur_values = [r["duration_ms"] for r in timeline]
     chars_svg = _svg_dual_chart(timeline)
     dur_svg = _svg_line_chart(dur_values, rows=timeline, color="#9b59b6")
+    ctx_html = _build_ctx_metrics_section(session_id)
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -2004,6 +2212,8 @@ def _build_session_html(session_id: str) -> str:
   <h2>⏱️ 请求耗时变化</h2>
   {dur_svg}
 </div>
+
+{ctx_html}
 
 <div class="card">
   <h2>🕒 请求时间线</h2>
