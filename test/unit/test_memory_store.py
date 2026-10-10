@@ -35,6 +35,28 @@ class TestMemoryStore(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "decision")
         self.assertIn("Drizzle", rows[0]["text"])
 
+    def test_multitoken_query_or_semantics(self):
+        """R-CM-1 回归（2026-10-10 生产确诊）：FTS5 空格=隐式 AND，会话首条
+        user 消息几百 token 全量 AND 永不满足 → 注入恒 0。修复后多 token
+        query 必须 OR 召回。"""
+        ms.MEMORY.add("决定使用 Drizzle ORM 方案", kind="decision", project="p2")
+        ms.MEMORY.add("SWE 实例用 pytest 验证改动", kind="fact", project="p2")
+        # 真实形态：首条 user 消息长且混有无关 token（环境序言等）
+        big = ("Environment You are an agent pytest drizzle TODO list "
+               "workspace files read tools bash editor " * 3)
+        rows = ms.MEMORY.search(big, project="p2", top_k=5)
+        self.assertEqual(len(rows), 2)
+        kinds = {r["kind"] for r in rows}
+        self.assertEqual(kinds, {"decision", "fact"})
+
+    def test_multitoken_query_token_cap(self):
+        """token 上限 24 + 长度优先：超长 query 不炸，长信号词不被同长
+        filler 挤出 MATCH 串。"""
+        ms.MEMORY.add("目标条目 alpha", kind="fact", project="p3")
+        big = " ".join("tok%d" % i for i in range(30)) + " alpha"
+        rows = ms.MEMORY.search(big, project="p3", top_k=5)
+        self.assertTrue(any("alpha" in r["text"] for r in rows))
+
     def test_project_isolation(self):
         ms.MEMORY.add("alpha 项目事实", kind="fact", project="proj_a")
         ms.MEMORY.add("beta 项目事实", kind="fact", project="proj_b")

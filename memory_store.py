@@ -212,11 +212,21 @@ class MemoryStore(object):
             params.extend(klist)
         if q and self._fts:
             try:
-                # FTS5 查询：按 token 加 * 前缀匹配，规避特殊字符语法错误
-                safe = " ".join(
-                    re.sub(r"[^A-Za-z0-9_]", "", t) + "*"
-                    for t in q.split() if re.sub(r"[^A-Za-z0-9_]", "", t)
-                )
+                # FTS5 查询：token 加 * 前缀匹配，**OR 连接**（空格=隐式 AND，
+                # 会话首条 user 消息几百 token 时 AND 永不满足 → 恒 0 行，
+                # 2026-10-10 生产确诊）。去重 + 上限 12：控制查询串长度，
+                # BM25 对多命中行仍按词频-逆文档频率排序。
+                toks = []
+                for t in q.split():
+                    safe_t = re.sub(r"[^A-Za-z0-9_]", "", t) + "*"
+                    if safe_t != "*" and safe_t not in toks:
+                        toks.append(safe_t)
+                if len(toks) > 24:
+                    # 长度降序优先（长 token=更特异；稳定排序保留查询序），
+                    # 避免信号词排在 200 字符窗口尾部时被截断丢弃。
+                    # 24 覆盖实测真实首条消息的 18 token 且 MATCH 串有界。
+                    toks = sorted(toks, key=len, reverse=True)[:24]
+                safe = " OR ".join(toks)
                 if safe:
                     sql = (
                         "SELECT m.id, m.kind, m.text, m.source, m.created, "
