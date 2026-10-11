@@ -126,6 +126,9 @@ PROXY_CACHE_ALIGN_HEAD = int(os.environ.get("PROXY_CACHE_ALIGN_HEAD", "4"))
 # Per-session last messages for computing common_prefix_ratio.
 _SESSION_LAST_MESSAGES = {}
 _LOOP_SESSION_STATE = {}
+# L-85②: 会话级注入预算计数（跨 blocker/session_loop/loop 各注入口累计；
+# 旋钮 PROXY_LOOP_INJECT_BUDGET，0=不限=现行为）
+_INJECT_BUDGET_STATE = {}
 
 # Shared state for session tracking, dedup, and dynamic concurrency.
 # Read-modify-write sequences on these dicts must acquire _state_lock.
@@ -416,6 +419,9 @@ PROXY_REREAD_PREVIEW_CHARS = int(os.environ.get("PROXY_REREAD_PREVIEW_CHARS", "2
 # ---------------------------------------------------------------------------
 PROXY_BLOCKER_ENABLED = os.environ.get("PROXY_BLOCKER_ENABLED", "true" if not IS_CLOUD else "false").lower() in ("1", "true", "yes")
 PROXY_BLOCKER_THRESHOLD = int(os.environ.get("PROXY_BLOCKER_THRESHOLD", "2"))
+# L-85②: 会话级注入预算（每会话累计注入口上限；0=不限=现行为。耗尽后
+# blocker/session_loop/loop 各注入口对该会话停注，观测面（M2/塌陷）接手）
+PROXY_LOOP_INJECT_BUDGET = int(os.environ.get("PROXY_LOOP_INJECT_BUDGET", "0"))
 
 _BLOCKER_ERROR_MARKERS = (
     ("wasted",            ["该文件自上次读取后未发生变化", "wasted call"]),
@@ -1256,6 +1262,7 @@ _RELOAD_SPEC = [
     # Blocker
     ("PROXY_BLOCKER_ENABLED", "PROXY_BLOCKER_ENABLED", "bool", "false", "true"),
     ("PROXY_BLOCKER_THRESHOLD", "PROXY_BLOCKER_THRESHOLD", "int", "2", "2"),
+    ("PROXY_LOOP_INJECT_BUDGET", "PROXY_LOOP_INJECT_BUDGET", "int", "0", "0"),
     # Tool filter
     ("PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_ENABLED", "bool", "false", "true"),
     ("PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_MAX", "int", "20", "20"),

@@ -460,6 +460,11 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Consecutive same-error threshold before blocker injection.",
     },
+    "PROXY_LOOP_INJECT_BUDGET": {
+        "defaults": {"local": "0", "cloud": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "L-85②: per-session injection budget across blocker/session_loop/loop stages. 0=unlimited (legacy behavior). Exhausted -> stop injecting for that session, observation planes take over.",
+    },
 
     # ---- Semantic compression ----
     "PROXY_COMPRESS_ENABLED": {

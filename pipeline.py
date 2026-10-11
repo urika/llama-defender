@@ -1783,6 +1783,31 @@ class ErrorTranslator(PipelineStage):
 # Stage 4: BlockerDetector — detect consecutive same-error tool failures
 # ============================================================================
 
+def _inject_budget_allow(session_id, kind):
+    """L-85②: 会话级注入预算门（PROXY_LOOP_INJECT_BUDGET，0=不限=现行为）。
+
+    预算按会话跨注入口（blocker/session_loop/loop_l1-3）累计；耗尽后对该
+    会话停注、仅记 diagnostics（skip），由 M2/塌陷等观测面接手。
+    返回 True=允许注入（调用方随后必须真的注入）。"""
+    budget = int(getattr(_ps, "PROXY_LOOP_INJECT_BUDGET", 0) or 0)
+    if budget <= 0 or not session_id:
+        return True
+    used = _ps._INJECT_BUDGET_STATE.get(session_id, 0)
+    _ps._INJECT_BUDGET_STATE[session_id] = used + 1
+    if used >= budget:
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("inject_budget_skip")
+            except Exception as _e:
+                _warn_diag("inject_budget_skip", _e)
+            if used == budget:
+                log(f"  -> [L-85②] 注入预算耗尽({budget}) session={session_id[:16]} "
+                    f"at {kind}: 本会话停注（观测面接手）")
+        return False
+    return True
+
+
 class BlockerDetector(ConditionalStage):
     """Stage 4: Detect consecutive same-error tool_result rejections.
 
@@ -1802,6 +1827,9 @@ class BlockerDetector(ConditionalStage):
         ctx.blocker_info = blocker_info
 
         if blocker_info.get("triggered"):
+            if not _inject_budget_allow(ctx.session_id, "blocker"):
+                ctx.blocker_info = {**blocker_info, "budget_skipped": True}
+                return ctx
             log(f"  -> Blocker detected: {blocker_info['tool_name']} failed "
                 f"({blocker_info['error_type']}) {blocker_info['run_length']} times in a row, "
                 f"injecting [BLOCKER] message")
@@ -2165,6 +2193,8 @@ class SessionLoopState(PipelineStage):
         session_loop = _ps._LOOP_SESSION_STATE.get(session_id, {"level": 0, "triggers": 0})
 
         if session_loop["level"] >= 2 and ctx.max_run < _ps.PROXY_LOOP_THRESHOLD:
+            if not _inject_budget_allow(session_id, "session_loop"):
+                return ctx
             log(f"  -> Session had Level {session_loop['level']}, injecting persistent warning (max_run={ctx.max_run})")
             ctx.messages.append({
                 "role": "user",
@@ -2240,6 +2270,11 @@ class LoopIntervention(PipelineStage):
             ctx.loop_tool_name = None
             return ctx
 
+        if not _inject_budget_allow(ctx.session_id, "loop"):
+            # L-85②: 预算耗尽——保留检测结果但不注入（消息/工具面零改动）
+            ctx.loop_level = 0
+            ctx.loop_tool_name = "budget_skipped"
+            return ctx
         loop_detection = _import_loop_detection()
         raw_tools = ctx.body.get("tools")
 
