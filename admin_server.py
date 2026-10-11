@@ -1882,6 +1882,7 @@ def _ctx_metrics_series(session_id):
     seen, novel = set(), []
     dup_bytes = total_bytes = 0
     streak, cur, prev = [], 0, None
+    streak_sr, cur_sr, prev_sig = [], 0, None
     keycount, win, m2 = {}, [], []
     for _, _tl, th, rc, _tg in acts:
         sig = th + ":" + str(rc)
@@ -1896,6 +1897,10 @@ def _ctx_metrics_series(session_id):
         cur = cur + 1 if th == prev else 1
         prev = th
         streak.append(cur)
+        # 同结果签名 streak（kill@8∧同结果 的测度：连命令带结果都没变过）
+        cur_sr = cur_sr + 1 if sig == prev_sig else 1
+        prev_sig = sig
+        streak_sr.append(cur_sr)
         keycount[th] = keycount.get(th, 0) + 1
         win.append(h)
         if len(win) > _CTX_M2_WINDOW:
@@ -1926,6 +1931,7 @@ def _ctx_metrics_series(session_id):
         "cum": cum, "thirds": thirds, "t1": t1, "m2_win": m2,
         "m2_overall": (100.0 * dup_bytes / total_bytes) if total_bytes else 0.0,
         "streak": streak, "streak_max": max(streak) if streak else 0,
+        "streak_sr_max": max(streak_sr) if streak_sr else 0,
         "top_count": top_n, "top_target": top_target[:70],
         "view_chars": view,
     }
@@ -2005,23 +2011,41 @@ def _build_ctx_metrics_section(session_id):
         return ""
     collapse = (m["thirds"][2] == 0
                 or (m["thirds"][0] > 0 and m["thirds"][2] < 0.05 * m["thirds"][0]))
+    m2_hit = max(m["m2_win"]) >= 50 if m["m2_win"] else False
+    rem_hit = m["streak_max"] >= 5
+    kill_hit = m["streak_sr_max"] >= 8
+    chip = lambda label, val, bad, hit: (
+        "<span>%s <b style='color:%s'>%s</b></span>"
+        % (label, ("#d62828" if hit else "#2a9d8f") if bad else "#2a9d8f", val))
+    warn = []
+    if m2_hit: warn.append("M2 预警线")
+    if kill_hit: warn.append("kill@8∧同结果")
+    if collapse: warn.append("T1 塌陷")
     chips = (
         "<div style='display:flex;gap:14px;flex-wrap:wrap;font-size:0.85em;"
         "margin:6px 0 10px'>"
         "<span>动作数 <b>%d</b></span>"
-        "<span>M2 全程 <b style='color:%s'>%.1f%%</b>（字节加权）</span>"
-        "<span>M5 streak_max <b style='color:%s'>%d</b></span>"
+        "<span>M2 全程 <b style='color:%s'>%.1f%%</b>%s</span>"
+        "<span>M5 streak_max <b style='color:%s'>%d</b>%s</span>"
+        "<span>同结果 streak_max <b style='color:%s'>%d</b>%s</span>"
         "<span>Top1 同键 <b>×%d</b> <code>%s</code></span>"
         "<span>T1 <b>%s</b></span>"
         "<span>新息塌陷 <b style='color:%s'>%s</b>（三分段 %s）</span>"
+        "%s"
         "</div>" % (
             m["n_actions"],
             "#e9c46a" if m["m2_overall"] > 50 else "#2a9d8f", m["m2_overall"],
-            "#d62828" if m["streak_max"] >= 8 else "#2a9d8f", m["streak_max"],
+            " ⚠️超预警线" if m2_hit else "",
+            "#d62828" if rem_hit else "#2a9d8f", m["streak_max"],
+            " ⚠️触remind@5" if rem_hit and not kill_hit else "",
+            "#d62828" if kill_hit else "#2a9d8f", m["streak_sr_max"],
+            " 🔴触kill线" if kill_hit else "",
             m["top_count"], m["top_target"] or "—",
             ("动作 %d" % m["t1"]) if m["t1"] is not None else "未达",
             "#d62828" if collapse else "#2a9d8f",
-            "是" if collapse else "否", m["thirds"]))
+            "是" if collapse else "否", m["thirds"],
+            ("<div style='margin-top:4px;color:#d62828'><b>⚠️ 预警触发: %s</b>"
+             "</div>" % "、".join(warn)) if warn else ""))
     marks = ([(m["t1"], "#d62828", "T1 信息枯竭点")] if m["t1"] is not None
              else [])
     parts = ["<div class='card' style='margin-bottom:16px'>"
@@ -2039,17 +2063,19 @@ def _build_ctx_metrics_section(session_id):
                      "M2 输出冗余比（滑窗 %d 动作，字节口径）</div>"
                      % _CTX_M2_WINDOW)
         parts.append(_ctx_svg_area(m["m2_win"], "#e9c46a", thresholds=[
-            (50.0, "#d62828", "预警 50%")]))
+            (50.0, "#d62828", "预警 50%（0/79 误报）")]))
         parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
-                     "M5 streak 深度（连续同 target_hash；5=remind@5/8=kill@8 待裁）"
-                     "</div>")
+                     "M5 streak 深度（连续同 target_hash；remind@5 已裁，kill@8∧同"
+                     "结果待 EXP-8 重裁——本线画 streak，同结果值见 chips）</div>")
         parts.append(_ctx_svg_area(m["streak"], "#264653", thresholds=[
-            (5, "#e9c46a", "remind@5"), (8, "#d62828", "kill@8")],
+            (5, "#e9c46a", "remind@5（7.6% 提醒率）"),
+            (8, "#d62828", "kill@8∧同结果（0/79 误报）")],
             marks=marks))
     parts.append("<div style='color:#888;font-size:0.8em;margin-top:6px'>"
-                 "现算自 diag ledger + proxy_metrics（每次访问 &lt;50ms）；"
-                 "判读口径见 swe-eval docs/research/agent-context-governance-"
-                 "survey-20261011.md §八/§九；检测信号不自动定罪（L-76）</div>")
+                 "现算自 diag ledger + proxy_metrics（每次访问 &lt;80ms）；"
+                 "阈值裁定 2026-10-11：n=79 resolved 阴性集 0 误报（M2≥50%/"
+                 "streak≥8∧同结果/塌陷，见设计稿 §5.1）；检测信号不自动定罪"
+                 "（L-76）</div>")
     parts.append("</div>")
     return "".join(parts)
 
