@@ -2016,8 +2016,11 @@ def _build_ctx_metrics_section(session_id):
                 "</div>" % e)
     if not m["n_actions"] and not m["view_chars"]:
         return ""
+    # §5.2 合取精化：塌陷需附重复证据（伪塌陷形态=无重复小输出尾，failed 族假阳性）
+    rep_evidence = m["m2_overall"] >= 20.0 or m["streak_max"] >= 5
     collapse = (m["thirds"][2] == 0
-                or (m["thirds"][0] > 0 and m["thirds"][2] < 0.05 * m["thirds"][0]))
+                or (m["thirds"][0] > 0 and m["thirds"][2] < 0.05 * m["thirds"][0])) \
+        and rep_evidence
     m2_hit = max(m["m2_win"]) >= 50 if m["m2_win"] else False
     rem_hit = m["streak_max"] >= 5
     kill_hit = m["streak_sr_max"] >= 8
