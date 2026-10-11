@@ -1403,10 +1403,14 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
     when the file mtime changes.
     """
     metrics_path = os.path.join(_ps._SCRIPT_DIR, "logs", "proxy_metrics.jsonl")
+    # 轮转感知：.1 为上一轮转（会话跨度超过轮转点时其行落在 .1，
+    # 如 exp-20261010 seq12 螺旋会话——只读主文件会"未找到会话数据"）
+    metrics_paths = [metrics_path, metrics_path + ".1"]
     global _SESSION_METRICS_CACHE, _SESSION_METRICS_CACHE_MTIME
     try:
-        current_mtime = os.path.getmtime(metrics_path)
-    except OSError:
+        current_mtime = max(os.path.getmtime(p) for p in metrics_paths
+                            if os.path.exists(p))
+    except (OSError, ValueError):
         return []
     if current_mtime != _SESSION_METRICS_CACHE_MTIME:
         _SESSION_METRICS_CACHE.clear()
@@ -1416,21 +1420,24 @@ def _load_session_metrics(session_id: str, max_lines: int = 200000):
     if cached is not None:
         return cached
     rows = []
-    try:
-        with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
-            from collections import deque
-            for line in deque(f, maxlen=max_lines):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("session_id") == session_id:
-                    rows.append(rec)
-    except FileNotFoundError:
-        pass
+    from collections import deque
+    for path in metrics_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in deque(f, maxlen=max_lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("session_id") == session_id:
+                        rows.append(rec)
+        except FileNotFoundError:
+            pass
     rows.sort(key=lambda r: r.get("ts") or "")
     # Cache with LRU eviction (pop oldest when at maxsize)
     if len(_SESSION_METRICS_CACHE) >= _SESSION_METRICS_CACHE_MAXSIZE:
