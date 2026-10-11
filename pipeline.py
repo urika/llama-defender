@@ -2564,6 +2564,147 @@ class TestStateStage(ConditionalStage):
         return getattr(self, "_last_summary", None)
 
 
+
+# ============================================================================
+# Stage 12.55: ScaffoldRouteStage — 按路由目标注入脚手架包（S1，默认关）
+# ============================================================================
+# multi-agent-architecture §五建议1: 本地/云端模型需要不同的脚手架包——
+# 云端模型不需要本地 venv 导航图(PYTHONPATH 等本地专属), 但需要契约+环境卡;
+# 本地模型需要全套。消费 config/scaffold-routes.yaml 的路由映射。
+
+_SCAFFOLD_ROUTES_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "swe-eval", "config", "scaffold-routes.yaml")
+
+_SCAFFOLD_ROUTE_BEGIN = "[System: SCAFFOLD — 路由脚手架（按路由目标注入）]"
+
+
+def _load_scaffold_pack(route_target):
+    """路由目标 → 脚手架文本包。失败返回 None(fail-open)。"""
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(_SCAFFOLD_ROUTES_FILE, encoding="utf-8")) or {}
+        route_cfg = (cfg.get("routes") or {}).get(route_target) or {}
+        scaffold = route_cfg.get("scaffold") or {}
+        lines = []
+        if scaffold.get("tdd_mode"):
+            lines.append("验收模式：验收测试已预置在工作树中，可直接运行与迭代；评测以这些测试全部通过为准。")
+        if scaffold.get("env_card"):
+            card_path = os.path.join(os.path.dirname(_SCAFFOLD_ROUTES_FILE),
+                                     os.path.relpath(scaffold["env_card"], "config")
+                                     if scaffold["env_card"].startswith("config/") else scaffold["env_card"])
+            if os.path.exists(card_path):
+                lines.append("环境卡:\n" + open(card_path, encoding="utf-8").read()[:3000])
+        if scaffold.get("nav_map"):
+            nav_path = os.path.join(os.path.dirname(_SCAFFOLD_ROUTES_FILE),
+                                    os.path.relpath(scaffold["nav_map"], "config")
+                                    if scaffold["nav_map"].startswith("config/") else scaffold["nav_map"])
+            if os.path.exists(nav_path):
+                lines.append("导航图:\n" + open(nav_path, encoding="utf-8").read()[:3000])
+        if scaffold.get("state_pin"):
+            lines.append("状态管理：验收状态由代理自动追踪并注入（TEST-STATE 块），无需手动重跑确认。")
+        return "\n\n".join(lines) if lines else None
+    except Exception as e:
+        _warn_diag("scaffold_pack_load", e)
+        return None
+
+
+class ScaffoldRouteStage(ConditionalStage):
+    """S1: 按 route_target 注入路由脚手架包。默认关
+    (PROXY_SCAFFOLD_ROUTE_ENABLED)。在 SmartRouter 之后执行——依赖路由结果。"""
+
+    # kv: append
+    name = "scaffold_route_inject"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if not getattr(_ps, "PROXY_SCAFFOLD_ROUTE_ENABLED", False):
+            return False
+        sid = getattr(ctx, "session_id", "") or ""
+        return bool(sid) and "::aux" not in sid and             bool(getattr(ctx, "route_target", None))
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        route_target = getattr(ctx, "route_target", "") or "local"
+        # per-session 只注入一次（首请求）
+        with _ps._state_lock:
+            seen = _ps._SESSION_SCAFFOLD_SEEN
+            if sid_key := (ctx.session_id or ""):
+                if sid_key in seen:
+                    return ctx
+                if len(seen) >= getattr(_ps, "_SESSION_INJECT_SEEN_MAX", 512):
+                    seen.clear()
+                seen.add(sid_key)
+        pack = _load_scaffold_pack(route_target)
+        if not pack:
+            return ctx
+        wrapped = _SCAFFOLD_ROUTE_BEGIN + "\n" + pack
+        persisted = _inject_tail_block(ctx, ctx.session_id, wrapped)
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("scaffold_route", detail={
+                    "route": route_target, "chars": len(wrapped),
+                    "engine_persisted": persisted})
+            except Exception as _e:
+                _warn_diag("scaffold_route", _e)
+        return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return None
+
+
+# ============================================================================
+# Stage 12.56: ContentEgressStage — 出站内容过滤（S2，默认关）
+# ============================================================================
+# data-egress-tiering §4.2: 云通道出站请求体扫描 E-禁出模式（API key/连接串/
+# PII/私钥）——命中即 fail-closed 拦截并记录。
+
+_EGRESS_PATTERNS = [
+    (re.compile(r"sk-[a-zA-Z0-9]{20,}"), "API key (sk-)"),
+    (re.compile(r"ghp_[a-zA-Z0-9]{36,}"), "GitHub PAT"),
+    (re.compile(r"AKIA[A-Z0-9]{16}"), "AWS key"),
+    (re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"), "Private key"),
+]
+
+
+class ContentEgressStage(ConditionalStage):
+    """S2: 出站请求体 E-禁出模式扫描，命中即拦截。默认关
+    (PROXY_EGRESS_FILTER_ENABLED)。在 SmartRouter 之后——仅扫描将出域的请求。"""
+
+    # kv: safe
+    name = "content_egress"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if not getattr(_ps, "PROXY_EGRESS_FILTER_ENABLED", False):
+            return False
+        # 仅扫描将出域到云端的请求
+        return (getattr(ctx, "route_target", "") or "") == "cloud"
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        import json as _json
+        body_text = _json.dumps(ctx.messages, ensure_ascii=False)
+        for pat, desc in _EGRESS_PATTERNS:
+            m = pat.search(body_text)
+            if m:
+                log("  -> [EGRESS BLOCKED] %s detected at offset %d" % (desc, m.start()))
+                ctx.egress_blocked = desc
+                ctx.error_response = {"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "[Egress Filter] Request blocked: restricted content detected (%s). "
+                               "Remove sensitive data and retry." % desc}}
+                if _ps.PROXY_DIAG_ENABLED:
+                    try:
+                        import diagnostics
+                        diagnostics.record_injection("egress_blocked", detail={"type": desc})
+                    except Exception as _e:
+                        _warn_diag("egress_filter", _e)
+                return ctx
+        return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        blocked = getattr(ctx, "egress_blocked", None)
+        return {"blocked": blocked} if blocked else None
+
+
 # Stage 12.5: AutoRecallStage — ctx_recall 自闭环（auto-recall，默认关）
 # ============================================================================
 

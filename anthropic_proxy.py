@@ -85,6 +85,8 @@ from pipeline import (
     LoopIntervention,
     RereadDetector,
     AutoRecallStage,
+    ScaffoldRouteStage,
+    ContentEgressStage,
     PrefetchStage,
     DateNormalizer,
     ContextTruncator,
@@ -1422,6 +1424,8 @@ class Handler(BaseHTTPRequestHandler):
             LoopIntervention(),           # 11
             RereadDetector(),             # 12
             AutoRecallStage(),            # 12.5 — ctx_recall 自闭环(默认关;台账 dup 检测→manifest 确认→召回尾部注入)
+            ScaffoldRouteStage(),         # 12.55 — 按路由目标注入脚手架包(S1,默认关;读 scaffold-routes.yaml)
+            ContentEgressStage(),         # 12.56 — 出站内容 E-禁出过滤(S2,默认关;云端路由 fail-closed)
             PrefetchStage(),              # 12.6 — R-CM-5 预取推送(默认关;BM25 预取已折叠单元)
             DateNormalizer(),             # 13
             ContextTruncator(),           # 14

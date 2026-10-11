@@ -1081,6 +1081,22 @@ CONFIG_REGISTRY = {
                "the proxy itself recalls the folded content and appends it as a "
                "tail user message. Off = model-initiated ctx_recall only.",
     },
+    "PROXY_SCAFFOLD_ROUTE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "S1 scaffold-route (2026-10-10, multi-agent-arch §五): inject route-"
+               "specific scaffold packs (tdd/env-card/state-pin) based on route "
+               "target (local vs cloud). Reads config/scaffold-routes.yaml. "
+               "Off = uniform injection for all routes.",
+    },
+    "PROXY_EGRESS_FILTER_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "S2 egress filter (2026-10-10, data-egress-tiering §4.2): scan "
+               "outbound request bodies for restricted patterns (API keys, "
+               "connection strings, PII, private keys) and fail-closed on hit. "
+               "Off = no egress filtering (public-repo only).",
+    },
     "PROXY_TEST_STATE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
