@@ -575,6 +575,9 @@ PROXY_FOLD_DENSE_MAX_CHARS = int(os.environ.get(
 # 台账 dup 检测 + manifest 折叠确认 → ctx_recall 取回 → 尾部注入。
 PROXY_AUTO_RECALL_ENABLED = os.environ.get(
     "PROXY_AUTO_RECALL_ENABLED", get_default("PROXY_AUTO_RECALL_ENABLED")).lower() in ("1", "true", "yes")
+# K1 状态摘要 pin(2026-10-10, 分层契约 K1 首实现; SIGHUP 可热开)
+PROXY_TEST_STATE_ENABLED = os.environ.get(
+    "PROXY_TEST_STATE_ENABLED", get_default("PROXY_TEST_STATE_ENABLED")).lower() in ("1", "true", "yes")
 PROXY_AUTO_RECALL_DUP_THRESHOLD = int(os.environ.get(
     "PROXY_AUTO_RECALL_DUP_THRESHOLD", get_default("PROXY_AUTO_RECALL_DUP_THRESHOLD")))
 PROXY_AUTO_RECALL_MAX_CHARS = int(os.environ.get(
@@ -1340,6 +1343,8 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_MAX_CHARS", "int", "4000", "4000"),
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
+    # K1 状态摘要 pin(2026-10-10, 分层契约 context-layered-contract §3/§5; SIGHUP 可热开)
+    ("PROXY_TEST_STATE_ENABLED", "PROXY_TEST_STATE_ENABLED", "bool", "false", "false"),
     ("PROXY_CTX_VIEW_STABLE_ENABLED", "PROXY_CTX_VIEW_STABLE_ENABLED", "bool", "false", "false"),
     ("PROXY_AUX_ISOLATION_STRICT", "PROXY_AUX_ISOLATION_STRICT", "bool", "false", "false"),
     ("PROXY_CLOUD_CM_ENABLED", "PROXY_CLOUD_CM_ENABLED", "bool", "false", "false"),

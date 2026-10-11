@@ -1076,6 +1076,15 @@ CONFIG_REGISTRY = {
                "the proxy itself recalls the folded content and appends it as a "
                "tail user message. Off = model-initiated ctx_recall only.",
     },
+    "PROXY_TEST_STATE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "K1 state-summary pin (2026-10-10, layered-contract K1 first impl): "
+               "maintain a per-session test-state ledger (pytest pass/fail counts + "
+               "failed names) and refresh a pinned summary block every request "
+               "(post-folding, so folds cannot hide convergence state). "
+               "Off = legacy behavior (test results fold like any content).",
+    },
     "PROXY_AUTO_RECALL_DUP_THRESHOLD": {
         "defaults": {"all": "3"},
         "type": "int", "scope": "reloadable",

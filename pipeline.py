@@ -2412,6 +2412,123 @@ class RereadDetector(PipelineStage):
 
 
 # ============================================================================
+
+# ============================================================================
+# Stage 12.45: TestStateStage — K1 状态摘要 pin 常驻（默认关）
+# ============================================================================
+# K1 契约(状态域→认知域, context-layered-contract §3): 验收测试的通过/失败
+# 状态对认知域常驻可见——折叠清空验证状态后, 模型被迫重跑 pytest 重建
+# (EXP-15 d3型: 232/311轮的重复验证循环, 预算耗在状态重建)。
+# 机制: 扫描消息中的 pytest Bash 调用及配对 tool_result → 解析通过/失败计数
+# 与失败清单 → 尾部常驻摘要块**原位刷新**(每请求执行于 ContextEngineStage
+# 折叠之后, 折叠不影响本块)——收敛可被认知, 预算不再耗在状态重建。
+
+_TEST_STATE_BEGIN = "[System: TEST-STATE — 验收状态摘要（每请求刷新；折叠不影响本块）]"
+_PYTEST_COUNT_RE = re.compile(r"(\d+)\s+passed(?:,\s*(\d+)\s+failed)?")
+_PYTEST_FAILED_RE = re.compile(r"^FAILED\s+(\S+)", re.M)
+
+
+def _parse_pytest_summary(text):
+    """pytest 输出 → {passed, failed, failed_names[:12]} 或 None。取最后一组计数。"""
+    if not text:
+        return None
+    passed = failed = None
+    for m in re.finditer(r"(\d+)\s+passed", text):
+        passed = int(m.group(1))
+    for m in re.finditer(r"(\d+)\s+failed", text):
+        failed = int(m.group(1))
+    if passed is None and failed is None:
+        return None
+    failed_names = sorted(set(_PYTEST_FAILED_RE.findall(text)))[:12]
+    return {"passed": passed or 0, "failed": failed or 0, "failed_names": failed_names}
+
+
+class TestStateStage(ConditionalStage):
+    """K1(状态域→认知域): 验收状态常驻摘要。默认关
+    (PROXY_TEST_STATE_ENABLED); 触发=会话内出现过 pytest 调用且解析出计数。"""
+
+    # kv: append
+    name = "test_state_inject"
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if not getattr(_ps, "PROXY_TEST_STATE_ENABLED", False):
+            return False
+        sid = getattr(ctx, "session_id", "") or ""
+        return bool(sid) and "::aux" not in sid
+
+    def process(self, ctx: PipelineContext) -> PipelineContext:
+        pairs = []
+        pending = None
+        for msg in ctx.messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_use":
+                    inp = c.get("input") or {}
+                    cmd = inp.get("command") or ""
+                    pending = cmd if "pytest" in cmd else None
+                elif c.get("type") == "tool_result" and pending is not None:
+                    cc = c.get("content")
+                    text = " ".join(b.get("text", "") for b in cc
+                                    if isinstance(b, dict)) if isinstance(cc, list) else str(cc or "")
+                    if text:
+                        pairs.append(text)
+                    pending = None
+        summary = None
+        for text in reversed(pairs):
+            summary = _parse_pytest_summary(text)
+            if summary:
+                break
+        if not summary:
+            return ctx
+        lines = ["test 统计: %d passed, %d failed" % (summary["passed"], summary["failed"])]
+        if summary["failed_names"]:
+            lines.append("FAILED 清单: " + "; ".join(summary["failed_names"]))
+        block = (_TEST_STATE_BEGIN + "\n" + "\n".join(lines)
+                 + "\n[状态为最近一次 pytest 运行的实测；修改代码后请重跑对应测试刷新。]")
+        # 原位刷新: 从尾向前找已注入的 TEST-STATE 块 → 替换; 未找到 → 追加
+        replaced = False
+        for msg in reversed(ctx.messages):
+            content = msg.get("content")
+            if isinstance(content, str) and _TEST_STATE_BEGIN.split("—")[0] in content:
+                start = content.find(_TEST_STATE_BEGIN)
+                endm = content.find("[状态为最近一次", start)
+                if start >= 0 and endm > start:
+                    msg["content"] = content[:start] + block
+                    replaced = True
+                    break
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and isinstance(c.get("text"), str) \
+                            and _TEST_STATE_BEGIN.split("—")[0] in c["text"]:
+                        start = c["text"].find(_TEST_STATE_BEGIN)
+                        endm = c["text"].find("[状态为最近一次", start)
+                        if start >= 0 and endm > start:
+                            c["text"] = c["text"][:start] + block
+                            replaced = True
+                            break
+                if replaced:
+                    break
+        if not replaced:
+            ctx.messages.append({"role": "user", "content": [
+                {"type": "text", "text": block}]})
+        if _ps.PROXY_DIAG_ENABLED:
+            try:
+                import diagnostics
+                diagnostics.record_injection("test_state", detail={
+                    "passed": summary["passed"], "failed": summary["failed"],
+                    "failed_names": len(summary["failed_names"])})
+            except Exception as _e:
+                _warn_diag("test_state_inject", _e)
+        return ctx
+
+    def output_metrics(self, ctx: PipelineContext) -> Optional[dict]:
+        return getattr(self, "_last_summary", None)
+
+
 # Stage 12.5: AutoRecallStage — ctx_recall 自闭环（auto-recall，默认关）
 # ============================================================================
 
