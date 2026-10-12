@@ -4,7 +4,8 @@
 #
 # What runs:
 #   1. --unit  (<1s, no infrastructure)
-#   2. --promptfoo fast mode (only if proxy is already running; ~40s, core 5 tests)
+#   2. --ctx-case 快速档 (影子代理 :4100 + mock :8100, 不触生产栈; ~3s, **批期照跑**)
+#   3. --promptfoo fast mode (only if proxy is already running; ~40s, core 5 tests)
 #
 # Why conditional promptfoo:
 #   - pre-commit must stay fast when no model backend is running
@@ -109,6 +110,32 @@ fi
 
 echo ""
 echo "✅ pre-commit: refactoring regression checks passed."
+
+# ------------------------------------------------------------
+# ctx-case single-step gate (L-38② A1-A3, 2026-10-13)
+# ------------------------------------------------------------
+# 影子代理(:4100)+内嵌 mock(:8100) 从工作树启动，不 source conf、无
+# secret.local.conf ⇒ 云端物理不可达、不触生产栈，因此**批期照跑**
+# （与下方 Promptfoo 层不同：那一层要打真后端 8081，批期跳过）。
+# 门语义: exit 0=通过(含在册未到期 known-red) / 1=意外失败 / 2=门自身错误。
+# 快速档 11 例 ~3s；整套 38 例 ~31s（CTX_CASE_QUICK=0 + --ctx-case 手动跑）。
+echo ""
+echo "pre-commit: running ctx-case single-step gate (shadow env, quick set)..."
+echo ""
+ctx_rc=0
+CTX_CASE_QUICK=1 bash "$RUNNER" --ctx-case || ctx_rc=$?
+if [[ $ctx_rc -ne 0 ]]; then
+  echo ""
+  echo "❌ pre-commit: ctx-case 门未通过（exit $ctx_rc）。" >&2
+  echo "  • 细节: 上方 [失败]/[门错误] 行，或 logs/ctx_case_gate.log" >&2
+  echo "  • exit 1(意外失败): 修 case，或在 tools/ctx_cases.json 例上加 known_red" >&2
+  echo "    （须含 reason/ref/expires；到期未转绿会变成 exit 2，防长期挂账）" >&2
+  echo "  • exit 2(门自身错误): known-red 到期未转绿 / 已转绿未销账 / 登记册字段非法" >&2
+  echo "  • 手工整套: bash test/run_tests.sh --ctx-case" >&2
+  exit 1
+fi
+echo ""
+echo "✅ pre-commit: ctx-case gate passed."
 
 # ------------------------------------------------------------
 # Optional: Promptfoo regression tests (shadow env; needs real backend only)

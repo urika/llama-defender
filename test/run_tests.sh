@@ -61,6 +61,33 @@ run_unit() {
 }
 
 # ------------------------------------------------------------
+# Tier 1b: ctx-case single-step gate (shadow proxy + mock backend, no LLM)
+# 门语义见 tools/ctx_case_runner.py： exit 0=通过(含在册未到期 known-red)
+#   / exit 1=意外失败 / exit 2=门自身错误(到期未转绿/转绿未销账/登记册非法)
+# 影子代理(:4100)+内嵌 mock(:8100) 从工作树启动，不 source conf、无
+# secret.local.conf ⇒ 云端物理不可达、不触生产栈，故批期同样安全。
+# 默认整套(38 例，~31s)；CTX_CASE_QUICK=1 只跑 11 例快速档(~3s，pre-commit 用)。
+# ------------------------------------------------------------
+run_ctx_case() {
+  local mode="" label="整套"
+  if [[ "${CTX_CASE_QUICK:-0}" == "1" ]]; then mode="--quick"; label="快速档"; fi
+  print_banner "ctx-case single-step gate ($label, shadow env)"
+  local out rc
+  out=$(python3 "$REPO_ROOT/tools/ctx_case_runner.py" $mode 2>&1)
+  rc=$?
+  echo "$out" | tail -3
+  mkdir -p "$REPO_ROOT/logs"
+  echo "$out" > "$REPO_ROOT/logs/ctx_case_gate.log"
+  local verdict
+  verdict=$(echo "$out" | grep -E "^== 门判词:" | tail -1 | sed -E 's/.*门判词: *([A-Z_]+).*/\1/')
+  case $rc in
+    0) record "ctx-case" "ok" "${verdict:-PASS} ($label; 详见 logs/ctx_case_gate.log)" ;;
+    2) record "ctx-case" "fail" "GATE_ERROR ($label) — 见 [门错误] 行与 logs/ctx_case_gate.log" ;;
+    *) record "ctx-case" "fail" "意外失败 ($label) — 见 [失败] 行与 logs/ctx_case_gate.log" ;;
+  esac
+}
+
+# ------------------------------------------------------------
 # Tier 2: integration tests (mock backend, no LLM)
 # ------------------------------------------------------------
 run_integration() {
@@ -547,6 +574,8 @@ Usage: bash test/run_tests.sh [TIER]
 
 Tiers:
   --unit          Pure logic tests (default if no flag given)
+  --ctx-case      ctx-case single-step gate (shadow proxy + mock backend, no LLM;
+                  exits 0 pass / 1 unexpected failure / 2 gate-itself error)
   --integration   Boots a mock backend, no LLM needed
   --promptfoo     Promptfoo fixed-prompt regression tests (requires proxy)
   --e2e           Requires a running proxy + backend
@@ -563,6 +592,8 @@ Environment:
   BACKEND_URL     Override backend URL (default: http://127.0.0.1:8081)
   SKIP_E2E=1      Skip the e2e tier when using --all
   SKIP_PROMPTFOO=1  Skip the promptfoo tier when using --all
+  CTX_CASE_QUICK=1  Run only the 11-case quick set for --ctx-case (~3s vs ~31s)
+  SKIP_CTX_CASE=1   Skip the ctx-case tier when using --all
 USAGE
 }
 
@@ -572,6 +603,7 @@ main() {
   case "$mode" in
     -h|--help) usage; exit 0 ;;
     --unit)         run_unit ;;
+    --ctx-case)     run_ctx_case ;;
     --integration)  run_integration ;;
     --promptfoo)    run_promptfoo ;;
     --e2e)          run_e2e ;;
@@ -581,6 +613,13 @@ main() {
     --trace)        run_trace ;;
     --all)
       run_unit
+      echo ""
+      if [[ "${SKIP_CTX_CASE:-0}" == "1" ]]; then
+        warn "SKIP_CTX_CASE=1 — skipping ctx-case tier"
+        record "ctx-case" "skip" "SKIP_CTX_CASE=1"
+      else
+        run_ctx_case
+      fi
       echo ""
       run_integration
       echo ""
