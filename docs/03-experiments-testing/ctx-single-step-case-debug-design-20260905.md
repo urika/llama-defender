@@ -265,7 +265,7 @@ docs/03-experiments-testing/system-behavior-testing-methodology-20260905.md   # 
   IFC-11 cue 等后续批次待下次重启；
 - per-route 豁免已实现（TC25/26/27 全绿），§10.1 状态同步为已落地。
 
-**〔2026-10-13 咬合对（L-38 批前装配门 T-zero 第 1 步）〕**：43 案例／14 套件；
+**〔2026-10-12 咬合对（L-38 批前装配门 T-zero 第 1 步）〕**：43 案例／14 套件；
 新增 6 例旋钮咬合对——TC30/TC37 auto-recall、TC38/TC39 K1 状态摘要 pin、
 TC40/TC41 L-80 诚实计量。每对**套件 profile 只差一个旋钮**、案例同载荷
 （session 归一化后逐字节相同），OFF 侧结论相反才证明旋钮真咬合（防 L-79
@@ -281,7 +281,7 @@ stage 12.45，`anthropic_proxy.py:1406-1439` 的 `InstrumentedPipeline([...])` �
 顺带补上此前 0 覆盖的整条流式路径；新增断言键 `resp_usage_input_tokens`（exact/min/max）
 与案例字段 `mock_usage`（后端自报 usage，默认 100 保持既有案例口径）。
 结构不变式由 `test/unit/test_ctx_case_runner_gate.py::TestBiteSuites` 守卫。
-**〔2026-10-13 反向索引：案例 ↔ 装配规则〕** 本套案例已被 `archmeta` 的装配规则册
+**〔2026-10-12 反向索引：案例 ↔ 装配规则〕** 本套案例已被 `archmeta` 的装配规则册
 （`registry/assembly-rules.md`，AR-）逐例引用：43/43 例在册、无「无规则依据的案例」，
 覆盖视图＝`python3 scripts/rule_fitness.py --map`。**改案例前先看它守哪条 AR-**
 （`ctx-case:TCxx` 执行器），**删/改案例即改规则覆盖**——`rule_fitness` 的 RF-1 会因
