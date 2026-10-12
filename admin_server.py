@@ -1861,7 +1861,15 @@ _CTX_M2_WINDOW = 10
 
 def _load_ctx_actions(session_id):
     """从 diag ledger（sid 前缀匹配）抽取逐动作序列:
-    [(turn, tool, target_hash, result_chars, target)]。纯读盘。"""
+    [(turn, tool, target_hash, result_chars, target)]。纯读盘。
+
+    账本增量行重放口径（与 session_ledger._load_from_file / tools.
+    trace_common.replay_ledger_actions 一致）: mismatch 行是客户端历史失配
+    后的全量重建列表——重放须先清空再灌,否则历史动作被重复计数,M2/M4/M5
+    全线虚高（2026-10-12 实案: 健康会话 M2 0.26% 被裸拼接抬到 72.9% 触发
+    预警; 回归 test/unit/test_admin_ctx_metrics.py）。filled 行回填跨请求
+    到达的 result_chars。
+    """
     import glob as _glob
     pat = os.path.join(_ps._SCRIPT_DIR, "logs", "diag", "ledger",
                        session_id + "*.jsonl")
@@ -1873,13 +1881,26 @@ def _load_ctx_actions(session_id):
                     row = json.loads(line)
                 except Exception:
                     continue
-                turn = row.get("turn")
+                if row.get("mismatch"):
+                    acts = []  # 全量重建行: 清空再灌
                 for a in row.get("actions") or []:
-                    acts.append((turn, a.get("tool") or "?",
-                                 a.get("target_hash") or "",
-                                 int(a.get("result_chars") or 0),
-                                 a.get("target") or ""))
-    return acts
+                    if not (isinstance(a, dict) and a.get("tool")):
+                        continue
+                    act = dict(a)
+                    if act.get("turn") is None:
+                        act["turn"] = row.get("turn")
+                    acts.append(act)
+                for fl in row.get("filled") or []:
+                    tid = fl.get("_tid")
+                    for act in reversed(acts):
+                        if act.get("_tid") == tid \
+                                and act.get("result_chars") is None:
+                            act["result_chars"] = fl.get("result_chars")
+                            break
+    return [(a.get("turn"), a.get("tool") or "?",
+             a.get("target_hash") or "",
+             int(a.get("result_chars") or 0),
+             a.get("target") or "") for a in acts]
 
 
 def _ctx_metrics_series(session_id):
