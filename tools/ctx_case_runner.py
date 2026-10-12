@@ -130,6 +130,33 @@ SUITES = {
                    "PROXY_AUTO_RECALL_ENABLED": "true",
                    "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "40000",
                    "PROXY_CTX_WINDOW_K": "24"},
+    # ------------------------------------------------------------------
+    # 旋钮咬合（bite）套件对（L-38 批前装配门 T-zero，2026-10-13）
+    # 每对与同族套件**只差一个旋钮**，且各配一条同载荷案例；
+    # 一开一关结论相反 ⇒ 证明该旋钮真的咬合（否则批跑是构造性 null，
+    # 见 EXP-14 超时旋钮 0 次生效的 L-79 教训）。
+    # 不变式由 test/unit/test_ctx_case_runner_gate.py::TestBiteSuites 守卫。
+    # ------------------------------------------------------------------
+    # 对照 TC30（同族 autorecall，仅旋钮翻转）
+    "autorecalloff": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                      "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                      "PROXY_AUTO_RECALL_ENABLED": "false",
+                      "PROXY_CTX_EPOCH_TRIGGER_TOKENS": "40000",
+                      "PROXY_CTX_WINDOW_K": "24"},
+    # 对照 TC31（pin 家族）；K1 状态摘要 pin（阶段 E 常驻臂旋钮）
+    "teststate": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                  "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                  "PROXY_TEST_STATE_ENABLED": "true"},
+    "teststateoff": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                     "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                     "PROXY_TEST_STATE_ENABLED": "false"},
+    # 诚实计量（L-80）：影响每一批的上下文预算读数
+    "meteron": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                "PROXY_HONEST_METERING": "1"},
+    "meteroff": {"PROXY_CTX_ENGINE_ENABLED": "true",
+                 "PROXY_PD_MICRO_TURN_ENABLED": "false",
+                 "PROXY_HONEST_METERING": "0"},
 }
 
 # ---------------------------------------------------------------------------
@@ -149,6 +176,42 @@ class _MockHandler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _reply_stream(self, payload, msg, finish):
+        """OpenAI 风格 SSE —— 代理的流式转发路径。
+
+        流式是 `message_start.usage.input_tokens`（L-80 诚实计量唯一生效面）
+        与动态 max_tokens/心跳等所处的路径；此前 mock 只会发 JSON，整条流式
+        路径 0 案例覆盖。协议面取最小可用集：一条 delta + 一条带 usage 的
+        finish + [DONE]（HTTP/1.0 默认无 content-length，靠连接关闭收尾）。
+        """
+        base = {"id": payload["id"], "object": "chat.completion.chunk",
+                "created": payload["created"], "model": payload["model"]}
+        delta = {"role": "assistant", "content": msg.get("content")}
+        if msg.get("tool_calls"):
+            delta = {"role": "assistant", "content": msg.get("content"),
+                     "tool_calls": [{"index": i, "id": tc["id"],
+                                     "type": "function",
+                                     "function": tc["function"]}
+                                    for i, tc in enumerate(msg["tool_calls"])]}
+        chunks = [
+            dict(base, choices=[{"index": 0, "delta": delta,
+                                 "finish_reason": None}]),
+            dict(base, choices=[{"index": 0, "delta": {},
+                                 "finish_reason": finish}],
+                 usage=payload["usage"]),
+        ]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.end_headers()
+        for ch in chunks:
+            self.wfile.write(b"data: " +
+                             json.dumps(ch, ensure_ascii=False).encode("utf-8")
+                             + b"\n\n")
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def do_GET(self):
         if self.path.startswith("/v1/models"):
@@ -176,6 +239,7 @@ class _MockHandler(BaseHTTPRequestHandler):
             step = None
             if mock.steps:
                 step = mock.steps.pop(0)
+            usage = dict(mock.usage)
         if step is None:
             step = {"text": "ok"}
         msg = {"role": "assistant", "content": step.get("text")}
@@ -193,17 +257,25 @@ class _MockHandler(BaseHTTPRequestHandler):
             msg["tool_calls"] = tcs
             msg["content"] = step.get("text")
             finish = "tool_calls"
-        self._reply(200, {
+        payload = {
             "id": "chatcmpl-ctxcase", "object": "chat.completion",
             "created": int(time.time()), "model": req.get("model", MOCK_MODEL),
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
+            "usage": usage}
+        if req.get("stream"):
+            self._reply_stream(payload, msg, finish)
+        else:
+            self._reply(200, payload)
 
 
 class MockBackend(object):
     def __init__(self, capture_path):
         self.capture_path = capture_path
         self.steps = []
+        # 后端 usage 自报值（可被案例 `mock_usage` 覆盖）——诚实计量
+        # （L-80）案例要一个**区别于估算器**的后端真值才能证明旋钮咬合：
+        # 默认 100 保持既有案例（TC15 等）口径不变。
+        self.usage = {"prompt_tokens": 100, "completion_tokens": 20}
         self.lock = threading.Lock()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", MOCK_PORT), _MockHandler)
         self.httpd.ctxcase = self
@@ -214,6 +286,11 @@ class MockBackend(object):
     def set_steps(self, steps):
         with self.lock:
             self.steps = list(steps or [])
+
+    def set_usage(self, usage):
+        with self.lock:
+            self.usage = dict(usage or {"prompt_tokens": 100,
+                                        "completion_tokens": 20})
 
     def stop(self):
         self.httpd.shutdown()
@@ -407,6 +484,21 @@ def eval_expect(expect, resp_status, resp_headers, resp, captures,
         text = " ".join(b.get("text", "") for b in (resp or {}).get("content", [])
                         if isinstance(b, dict) and b.get("type") == "text")
         add("resp_text_contains", s, text[:80], s in text)
+    if "resp_usage_input_tokens" in expect:
+        spec = expect["resp_usage_input_tokens"]
+        actual = ((resp or {}).get("usage") or {}).get("input_tokens")
+        if isinstance(spec, dict):
+            if "exact" in spec:
+                add("resp_usage_input_tokens.exact", spec["exact"], actual,
+                    actual == spec["exact"])
+            if "min" in spec:
+                add("resp_usage_input_tokens.min", spec["min"], actual,
+                    isinstance(actual, int) and actual >= spec["min"])
+            if "max" in spec:
+                add("resp_usage_input_tokens.max", spec["max"], actual,
+                    isinstance(actual, int) and actual <= spec["max"])
+        else:
+            add("resp_usage_input_tokens", spec, actual, actual == spec)
 
     if "dispatch_count" in expect:
         add("dispatch_count", expect["dispatch_count"], len(captures),
@@ -563,6 +655,59 @@ def _read_jsonl(path):
 # 案例执行
 # ---------------------------------------------------------------------------
 
+def _assemble_sse(text):
+    """把 Anthropic SSE 文本装配成与 JSON 响应同形的 dict。
+
+    流式路径（`"stream": true`）是 `message_start.usage` 唯一出现处，装配后
+    `resp_text_contains`/`resp_stop_reason`/`resp_usage_input_tokens` 对 SSE
+    与 JSON 同语义，案例不必分两套断言词汇。
+    """
+    content, stop, usage, msg_id = [], None, {}, None
+    for chunk in text.split("\n\n"):
+        for line in chunk.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                ev = json.loads(line[6:])
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type")
+            if kind == "message_start":
+                m = ev.get("message") or {}
+                msg_id = m.get("id")
+                usage.update(m.get("usage") or {})
+            elif kind == "content_block_start":
+                b = ev.get("content_block") or {}
+                if b.get("type") == "tool_use":
+                    content.append(b)
+            elif kind == "content_block_delta":
+                d = ev.get("delta") or {}
+                if d.get("type") == "text_delta":
+                    content.append({"type": "text",
+                                    "text": d.get("text", "")})
+            elif kind == "message_delta":
+                if (ev.get("delta") or {}).get("stop_reason"):
+                    stop = ev["delta"]["stop_reason"]
+                usage.update(ev.get("usage") or {})
+    return {"id": msg_id, "type": "message", "role": "assistant",
+            "content": content, "stop_reason": stop, "usage": usage,
+            "__sse__": True}
+
+
+def parse_case_response(raw):
+    """客户端回程解析——JSON / SSE / 不可解析三形态（SSE 见 _assemble_sse）。"""
+    text = raw.decode("utf-8", "replace")
+    head = text.lstrip()
+    if head.startswith("event:") or head.startswith("data:"):
+        return _assemble_sse(text)
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {"__raw__": text}
+
+
 def send_case_request(case, body):
     headers = {
         "content-type": "application/json",
@@ -577,7 +722,7 @@ def send_case_request(case, body):
         headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=CASE_TIMEOUT_S) as r:
-            return r.status, dict(r.headers), json.loads(r.read())
+            return r.status, dict(r.headers), parse_case_response(r.read())
     except urllib.error.HTTPError as e:
         try:
             payload = json.loads(e.read())
@@ -646,6 +791,7 @@ def run_case(case, mock, shadow, log_path):
         log_off = f.seek(0, 2)
 
     mock.set_steps(case.get("mock_steps"))
+    mock.set_usage(case.get("mock_usage"))
     for spec in case.get("seed_manifest") or []:
         rows = spec.get("rows")
         if spec.get("$bulk"):

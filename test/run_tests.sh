@@ -66,7 +66,7 @@ run_unit() {
 #   / exit 1=意外失败 / exit 2=门自身错误(到期未转绿/转绿未销账/登记册非法)
 # 影子代理(:4100)+内嵌 mock(:8100) 从工作树启动，不 source conf、无
 # secret.local.conf ⇒ 云端物理不可达、不触生产栈，故批期同样安全。
-# 默认整套(38 例，~31s)；CTX_CASE_QUICK=1 只跑 11 例快速档(~3s，pre-commit 用)。
+# 默认整套(43 例，~35s)；CTX_CASE_QUICK=1 只跑 17 例快速档(~10s，pre-commit 用)。
 # ------------------------------------------------------------
 run_ctx_case() {
   local mode="" label="整套"
@@ -592,7 +592,7 @@ Environment:
   BACKEND_URL     Override backend URL (default: http://127.0.0.1:8081)
   SKIP_E2E=1      Skip the e2e tier when using --all
   SKIP_PROMPTFOO=1  Skip the promptfoo tier when using --all
-  CTX_CASE_QUICK=1  Run only the 11-case quick set for --ctx-case (~3s vs ~31s)
+  CTX_CASE_QUICK=1  Run only the 17-case quick set for --ctx-case (~10s vs ~35s)
   SKIP_CTX_CASE=1   Skip the ctx-case tier when using --all
 USAGE
 }

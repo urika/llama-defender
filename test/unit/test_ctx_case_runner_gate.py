@@ -24,8 +24,19 @@ import ctx_case_runner as ccr  # noqa: E402
 CASES = json.load(open(ccr.CASES_PATH, encoding="utf-8"))
 BY_ID = {c["id"]: c for c in CASES}
 TODAY = "2026-10-13"
-QUICK_IDS = ["TC01", "TC02", "TC03", "TC04", "TC05", "TC07", "TC14",
-             "TC15", "TC32", "TC34", "TC36"]
+# 快速档 = prod 11 例（无大报文）＋ 旋钮咬合对 5 例（L-38 T-zero C1）
+QUICK_PROD_IDS = ["TC01", "TC02", "TC03", "TC04", "TC05", "TC07", "TC14",
+                  "TC15", "TC32", "TC34", "TC36"]
+QUICK_BITE_IDS = ["TC30", "TC37", "TC38", "TC39", "TC40", "TC41"]
+QUICK_IDS = QUICK_PROD_IDS + QUICK_BITE_IDS
+# (ON 套件, OFF 套件, 旋钮键, (ON 值, OFF 值))——每对只许差这一个键
+BITE_PAIRS = [
+    ("autorecall", "autorecalloff", "PROXY_AUTO_RECALL_ENABLED",
+     ("true", "false")),
+    ("teststate", "teststateoff", "PROXY_TEST_STATE_ENABLED",
+     ("true", "false")),
+    ("meteron", "meteroff", "PROXY_HONEST_METERING", ("1", "0")),
+]
 
 
 def _kr(expires="2026-12-31", reason="r", ref="ref"):
@@ -47,10 +58,12 @@ class TestSelectCases(unittest.TestCase):
         self.assertEqual(len(sel), len(CASES))
         self.assertEqual(sk, [])
 
-    def test_quick_subset_is_single_prod_suite_without_big_payloads(self):
+    def test_quick_subset_has_no_big_payloads(self):
         sel, _ = ccr.select_cases(CASES, quick=True)
         self.assertEqual(sorted(c["id"] for c in sel), sorted(QUICK_IDS))
-        self.assertEqual({c["suite"] for c in sel}, {"prod"})
+        self.assertEqual({c["suite"] for c in sel},
+                         {"prod"} | {p[0] for p in BITE_PAIRS}
+                         | {p[1] for p in BITE_PAIRS})
         # 大报文例（TC13 500KB 413 / TC28a huge）不得进快速档
         self.assertNotIn("TC13", [c["id"] for c in sel])
 
@@ -66,7 +79,8 @@ class TestSelectCases(unittest.TestCase):
         sel, _ = ccr.select_cases(CASES, quick=True, want_suite=["epoch"])
         self.assertEqual(sel, [])
         sel2, _ = ccr.select_cases(CASES, quick=True, want_suite=["prod"])
-        self.assertEqual(sorted(c["id"] for c in sel2), sorted(QUICK_IDS))
+        self.assertEqual(sorted(c["id"] for c in sel2),
+                         sorted(QUICK_PROD_IDS))
 
 
 class TestGateExitCodes(unittest.TestCase):
@@ -175,6 +189,123 @@ class TestRealCaseSetRegistry(unittest.TestCase):
             self.assertGreaterEqual(ccr._parse_date(kr["expires"]),
                                     ccr._parse_date(ccr.today_str()),
                                     "%s known-red 已到期，需转绿或重估" % cid)
+
+
+class TestSseResponseParsing(unittest.TestCase):
+    """流式回程装配（L-80 诚实计量案例的唯一观察面，2026-10-13）。"""
+
+    SSE = (
+        'event: message_start\ndata: {"type": "message_start", "message": '
+        '{"id": "msg_1", "usage": {"input_tokens": 1000, "output_tokens": 0}}}'
+        '\n\n'
+        'event: content_block_start\ndata: {"type": "content_block_start", '
+        '"index": 0, "content_block": {"type": "text", "text": ""}}\n\n'
+        'event: content_block_delta\ndata: {"type": "content_block_delta", '
+        '"index": 0, "delta": {"type": "text_delta", "text": "ok"}}\n\n'
+        'event: message_delta\ndata: {"type": "message_delta", "delta": '
+        '{"stop_reason": "end_turn"}, "usage": {"output_tokens": 20}}\n\n'
+        'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
+    def test_sse_text_is_assembled_into_json_shaped_record(self):
+        r = ccr.parse_case_response(self.SSE.encode("utf-8"))
+        self.assertTrue(r["__sse__"])
+        self.assertEqual(r["usage"]["input_tokens"], 1000)
+        self.assertEqual(r["usage"]["output_tokens"], 20)
+        self.assertEqual(r["stop_reason"], "end_turn")
+        self.assertEqual([b["text"] for b in r["content"]], ["ok"])
+
+    def test_json_body_is_still_plain_json(self):
+        r = ccr.parse_case_response(b'{"usage": {"input_tokens": 5}}')
+        self.assertNotIn("__sse__", r)
+        self.assertEqual(r["usage"]["input_tokens"], 5)
+
+    def test_unparseable_body_is_kept_raw(self):
+        self.assertIn("__raw__", ccr.parse_case_response(b"<html>oops</html>"))
+
+    def test_usage_assertion_min_max_exact(self):
+        resp = {"usage": {"input_tokens": 1000}}
+        for spec, want in (({"min": 900}, True), ({"min": 1001}, False),
+                           ({"max": 800}, False), ({"max": 1000}, True),
+                           ({"exact": 1000}, True), ({"exact": 1000 - 1}, False)):
+            out = ccr.eval_expect({"resp_usage_input_tokens": spec}, 200, {},
+                                  resp, [], "", None)
+            self.assertEqual(out[0][3], want, spec)
+
+    def test_usage_assertion_missing_field_is_false_not_error(self):
+        out = ccr.eval_expect({"resp_usage_input_tokens": {"min": 1}}, 200, {},
+                              {"content": []}, [], "", None)
+        self.assertFalse(out[0][3])
+
+
+class TestBiteSuites(unittest.TestCase):
+    """旋钮咬合对不变式（L-38 T-zero C1；出典＝L-79 EXP-14 旋钮从未咬合）。
+
+    一「只差一个旋钮」的套件对 ＋ 同载荷案例：两例结论相反才证明该旋钮真的
+    咬合，否则批跑是构造性 null。本类机械守卫该结构，防止改坏（改动套件/
+    案例/断言时先看这里）。
+    """
+
+    @staticmethod
+    def _payload_normalized(case):
+        blob = json.dumps({k: case.get(k) for k in
+                           ("body", "bodies", "seed_archive", "seed_manifest")},
+                          ensure_ascii=False, sort_keys=True)
+        return blob.replace(case["session"], "<session>")
+
+    def test_pair_profiles_differ_in_exactly_the_knob(self):
+        for on, off, knob, (on_v, off_v) in BITE_PAIRS:
+            self.assertIn(on, ccr.SUITES)
+            self.assertIn(off, ccr.SUITES)
+            a, b = ccr.SUITES[on], ccr.SUITES[off]
+            diff = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+            self.assertEqual(diff, {knob},
+                             "%s/%s 只许差 %s" % (on, off, knob))
+            self.assertEqual(a[knob], on_v)
+            self.assertEqual(b[knob], off_v)
+            common = set(a) & set(b) - {knob}  # 旋钮本身由 diff 已覆盖
+            self.assertEqual({k: a[k] for k in common},
+                             {k: b[k] for k in common},
+                             "共有键取值也不得漂移")
+
+    def test_each_bite_suite_has_quick_case_with_discriminating_assertion(self):
+        for on, off, _knob, _vals in BITE_PAIRS:
+            for suite in (on, off):
+                cases = [c for c in CASES if c["suite"] == suite]
+                self.assertTrue(cases, "%s 无案例" % suite)
+                for c in cases:
+                    self.assertTrue(c.get("quick"),
+                                    "%s 须进快速档（T-zero 3s 路径）" % c["id"])
+                    self.assertTrue(set(c["expect"]) - {"resp_status"},
+                                    "%s 只断言 resp_status 即假绿" % c["id"])
+
+    def test_paired_cases_share_payload(self):
+        for on, off, _knob, _vals in BITE_PAIRS:
+            a = [c for c in CASES if c["suite"] == on]
+            b = [c for c in CASES if c["suite"] == off]
+            self.assertEqual(len(a), len(b), "%s/%s 案例数须一致" % (on, off))
+            for x, y in zip(a, b):
+                self.assertNotEqual(x["session"], y["session"])
+                self.assertEqual(self._payload_normalized(x),
+                                 self._payload_normalized(y),
+                                 "%s/%s 必须同载荷（只差旋钮）" % (x["id"], y["id"]))
+
+    def test_metering_pair_rides_streaming_path(self):
+        """L-80 只在流式 message_start 生效（非流式直接透传后端 usage）——
+        不置 stream 的计量案例必是假绿（2026-10-13 实测发现 2）。"""
+        for cid in ("TC40", "TC41"):
+            self.assertTrue(BY_ID[cid]["bodies"], "%s 需多轮 bodies" % cid)
+            for b in BY_ID[cid]["bodies"]:
+                self.assertTrue(b.get("stream"),
+                                "%s 的报文须 stream=true" % cid)
+            self.assertIn("resp_usage_input_tokens", BY_ID[cid]["expect"])
+            self.assertTrue(BY_ID[cid].get("mock_usage"),
+                            "%s 需区别于估算器的后端真值" % cid)
+
+    def test_k1_pin_red_anchor_records_stage_not_wired(self):
+        """TC38 红锚＝TestStateStage 未注册进生产管线（阶段 E 前置发现）。"""
+        kr = BY_ID["TC38"]["known_red"]
+        self.assertIn("TestStateStage", kr["reason"])
+        self.assertIn("pipeline.py", kr["reason"])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 #
 # What runs:
 #   1. --unit  (<1s, no infrastructure)
-#   2. --ctx-case 快速档 (影子代理 :4100 + mock :8100, 不触生产栈; ~3s, **批期照跑**)
+#   2. --ctx-case 快速档 (影子代理 :4100 + mock :8100, 不触生产栈; ~10s, **批期照跑**)
 #   3. --promptfoo fast mode (only if proxy is already running; ~40s, core 5 tests)
 #
 # Why conditional promptfoo:
@@ -118,7 +118,7 @@ echo "✅ pre-commit: refactoring regression checks passed."
 # secret.local.conf ⇒ 云端物理不可达、不触生产栈，因此**批期照跑**
 # （与下方 Promptfoo 层不同：那一层要打真后端 8081，批期跳过）。
 # 门语义: exit 0=通过(含在册未到期 known-red) / 1=意外失败 / 2=门自身错误。
-# 快速档 11 例 ~3s；整套 38 例 ~31s（CTX_CASE_QUICK=0 + --ctx-case 手动跑）。
+# 快速档 17 例 ~10s；整套 43 例 ~35s（CTX_CASE_QUICK=0 + --ctx-case 手动跑）。
 echo ""
 echo "pre-commit: running ctx-case single-step gate (shadow env, quick set)..."
 echo ""

@@ -265,6 +265,23 @@ docs/03-experiments-testing/system-behavior-testing-methodology-20260905.md   # 
   IFC-11 cue 等后续批次待下次重启；
 - per-route 豁免已实现（TC25/26/27 全绿），§10.1 状态同步为已落地。
 
+**〔2026-10-13 咬合对（L-38 批前装配门 T-zero 第 1 步）〕**：43 案例／14 套件；
+新增 6 例旋钮咬合对——TC30/TC37 auto-recall、TC38/TC39 K1 状态摘要 pin、
+TC40/TC41 L-80 诚实计量。每对**套件 profile 只差一个旋钮**、案例同载荷
+（session 归一化后逐字节相同），OFF 侧结论相反才证明旋钮真咬合（防 L-79
+「EXP-14 超时旋钮 0 次生效」式构造性 null）。快速档 17 例 ~10s、整套 43 例 ~35s；
+门判词 `PASS 15 / XFAIL 2`（快速档）与 `PASS 39 / XFAIL 2 / 跳过 2`（整套）。
+**反证（一次窗一次戳）**：只把 OFF 侧旋钮翻成 ON ⇒ TC37 两条鉴别断言同时 FAIL、
+TC41 `resp_usage_input_tokens.max` FAIL（1000 vs 估算 125）⇒ 差异确由旋钮而非载荷造成。
+两条实测发现：①**`TestStateStage` 未注册进生产管线**（`pipeline.py:2481` 定义
+stage 12.45，`anthropic_proxy.py:1406-1439` 的 `InstrumentedPipeline([...])` 无此实例）
+⇒ `PROXY_TEST_STATE_ENABLED` 不咬合、阶段 E（K1 常驻臂）按现状开批是构造性 null
+（TC38 已登记 known-red，swe-eval 立 L-95）；②**L-80 只在流式 `message_start` 生效**
+（非流式 JSON 路径直接透传后端 usage）⇒ mock 补 OpenAI 风格 SSE 后计量咬合才可观察，
+顺带补上此前 0 覆盖的整条流式路径；新增断言键 `resp_usage_input_tokens`（exact/min/max）
+与案例字段 `mock_usage`（后端自报 usage，默认 100 保持既有案例口径）。
+结构不变式由 `test/unit/test_ctx_case_runner_gate.py::TestBiteSuites` 守卫。
+
 ## 10. 后续扩展（非本期）
 
 - 检索端按锚点去重 + 登记端 triggers 增强后，将 §4.4 的关键词式查询场景补为案例（需先可注入确定性 seed）；
