@@ -281,6 +281,11 @@ stage 12.45，`anthropic_proxy.py:1406-1439` 的 `InstrumentedPipeline([...])` �
 顺带补上此前 0 覆盖的整条流式路径；新增断言键 `resp_usage_input_tokens`（exact/min/max）
 与案例字段 `mock_usage`（后端自报 usage，默认 100 保持既有案例口径）。
 结构不变式由 `test/unit/test_ctx_case_runner_gate.py::TestBiteSuites` 守卫。
+**〔2026-10-13 反向索引：案例 ↔ 装配规则〕** 本套案例已被 `archmeta` 的装配规则册
+（`registry/assembly-rules.md`，AR-）逐例引用：43/43 例在册、无「无规则依据的案例」，
+覆盖视图＝`python3 scripts/rule_fitness.py --map`。**改案例前先看它守哪条 AR-**
+（`ctx-case:TCxx` 执行器），**删/改案例即改规则覆盖**——`rule_fitness` 的 RF-1 会因
+悬空执行器而红；新增案例则应在规则册补一条 AR- 或挂到既有 AR- 的执行器上。
 
 ## 10. 后续扩展（非本期）
 
