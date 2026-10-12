@@ -17,6 +17,18 @@
   python3 tools/ctx_case_runner.py                # 全部套件
   python3 tools/ctx_case_runner.py --case TC01    # 单案例
   python3 tools/ctx_case_runner.py --suite micro  # 单套件
+  python3 tools/ctx_case_runner.py --quick        # 快速子集（门/pre-commit 档）
+  python3 tools/ctx_case_runner.py --report-only  # 调试：出报告但不拦停
+
+门语义（2026-10-13，L-38② A1-A3）:
+  exit 0 = 通过（含登记在册且未到期的 known-red 预期失败）
+  exit 1 = 意外失败（有 FAIL 且该例未登记 known-red）
+  exit 2 = 门自身错误（known-red 到期仍未转绿 / 已转绿未销账 /
+           登记册字段缺失或 expires 不是 YYYY-MM-DD）
+  known-red 登记在 tools/ctx_cases.json 的例级字段：
+    "known_red": {"reason": ..., "ref": ..., "expires": "YYYY-MM-DD"}
+  纪律：到期未转绿 ⇒ 门报错而非静默放行；转绿未销账同样报错——
+  避免出现「永远红的门被 SKIP 掉」（L-94 教训）。
 """
 
 import argparse
@@ -691,6 +703,117 @@ def run_case(case, mock, shadow, log_path):
 
 
 # ---------------------------------------------------------------------------
+# 选例与门判词（纯逻辑，可单测；2026-10-13 A1-A3）
+# ---------------------------------------------------------------------------
+
+KNOWN_RED_REQUIRED = ("reason", "ref", "expires")
+
+
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _parse_date(s):
+    try:
+        return datetime.strptime(str(s), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def select_cases(cases, want_case=None, want_suite=None, quick=False,
+                 real_backend=False):
+    """按 --case/--suite/--quick 选例，并分流「运行条件未满足」者。
+
+    返回 (selected, skipped)；skipped 为 [(case, 原因)]。
+    跳过不是假失败（设计 §5.4），但也不计入 PASS——它必须显式可见。
+    """
+    out = list(cases)
+    if want_case:
+        want = set(want_case)
+        out = [c for c in out if c.get("id") in want]
+    if want_suite:
+        want = set(want_suite)
+        out = [c for c in out if c.get("suite") in want]
+    if quick:
+        out = [c for c in out if c.get("quick")]
+    selected, skipped = [], []
+    for c in out:
+        if c.get("requires") == "real_backend" and not real_backend:
+            skipped.append((c, "需 --real-backend"))
+        else:
+            selected.append(c)
+    return selected, skipped
+
+
+def evaluate_gate(case_results, cases_by_id, today=None):
+    """把例级结果折算为门判词（纯函数，便于单测）。
+
+    case_results: [{"id","ok"}] 或 [{"id","skipped":True,"reason"}]。
+    返回 {"exit_code","verdict","counts","gate_errors","cases"}。
+    """
+    today = _parse_date(today) or _parse_date(today_str())
+    counts = {"pass": 0, "fail": 0, "xfail": 0, "xpass": 0, "expired": 0,
+              "invalid": 0, "skip": 0}
+    errors, failures, detail = [], [], []
+    for r in case_results:
+        cid = r.get("id")
+        case = cases_by_id.get(cid) or {}
+        kr = case.get("known_red")
+        if r.get("skipped"):
+            counts["skip"] += 1
+            detail.append({"id": cid, "status": "skip",
+                           "reason": r.get("reason", "")})
+            continue
+        ok = bool(r.get("ok"))
+        if kr is None:
+            if ok:
+                counts["pass"] += 1
+                status = "pass"
+            else:
+                counts["fail"] += 1
+                status = "fail"
+                failures.append("%s 未登记 known-red 却 FAIL（预期外失败）" % cid)
+        else:
+            missing = [f for f in KNOWN_RED_REQUIRED
+                       if not str(kr.get(f) or "").strip()]
+            exp = _parse_date(kr.get("expires"))
+            ref = str(kr.get("ref") or "")
+            if missing:
+                counts["invalid"] += 1
+                status = "known_red_invalid"
+                errors.append("%s known-red 登记册缺字段：%s"
+                              % (cid, "、".join(missing)))
+            elif exp is None:
+                counts["invalid"] += 1
+                status = "known_red_invalid"
+                errors.append("%s known-red 的 expires 不是 YYYY-MM-DD：%r"
+                              % (cid, kr.get("expires")))
+            elif exp < today:
+                counts["expired"] += 1
+                status = "known_red_expired"
+                errors.append("%s known-red 已于 %s 到期仍未转绿（%s）"
+                              % (cid, kr.get("expires"), ref))
+            elif not ok:
+                counts["xfail"] += 1
+                status = "xfail"
+            else:
+                counts["xpass"] += 1
+                status = "xpass"
+                errors.append("%s known-red 已转绿（%s）——请销账（移出登记册）"
+                              % (cid, ref))
+        detail.append({"id": cid, "status": status, "known_red": kr or None})
+    if errors:
+        exit_code = 2
+    elif counts["fail"]:
+        exit_code = 1
+    else:
+        exit_code = 0
+    verdict = {0: "PASS", 1: "FAIL", 2: "GATE_ERROR"}[exit_code]
+    return {"exit_code": exit_code, "verdict": verdict, "counts": counts,
+            "failures": failures, "gate_errors": errors, "cases": detail}
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -705,23 +828,26 @@ def main():
                          "仍走影子代理，隔离不变，captures 为空）")
     ap.add_argument("--real-backend-model", default=None,
                     help="覆盖真模型码（缺省自动探测 /v1/models）")
+    ap.add_argument("--quick", action="store_true",
+                    help="快速子集：只跑 ctx_cases.json 中 quick=true 的例"
+                         "（门/pre-commit 档；单套件、无大报文）")
+    ap.add_argument("--report-only", action="store_true",
+                    help="只出报告：恒 exit 0，不做门判词拦停（调试用）")
     args = ap.parse_args()
 
     with open(CASES_PATH, encoding="utf-8") as f:
-        cases = json.load(f)
-    if args.case:
-        want = set(args.case)
-        cases = [c for c in cases if c["id"] in want]
-    if args.suite:
-        want = set(args.suite)
-        cases = [c for c in cases if c["suite"] in want]
+        all_cases = json.load(f)
     # requires 门：未满足运行条件的案例跳过而非假失败（如 real_backend）
-    _skipped = [c for c in cases
-                if c.get("requires") == "real_backend" and not args.real_backend]
+    cases, _skipped = select_cases(all_cases, want_case=args.case,
+                                   want_suite=args.suite, quick=args.quick,
+                                   real_backend=args.real_backend)
     if _skipped:
-        cases = [c for c in cases if c not in _skipped]
-        print("跳过（需 --real-backend）:",
-              ", ".join(c["id"] for c in _skipped))
+        print("跳过（%s）: %s" % (
+            "／".join(sorted({why for _, why in _skipped})),
+            ", ".join(c["id"] for c, _ in _skipped)))
+    if not cases:
+        print("!! 选例为空（--case/--suite/--quick 组合无匹配）")
+        return 2
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     root = os.path.join(RUN_ROOT, "run-%s" % ts)
@@ -775,7 +901,8 @@ def main():
             r = run_case(case, mock, shadow,
                          os.path.join(root, "proxy-%s.log" % case["suite"]))
             report["cases"].append(r)
-            mark = "PASS" if r["ok"] else "FAIL"
+            mark = "PASS" if r["ok"] else (
+                "XFAIL" if case.get("known_red") else "FAIL")
             report["pass" if r["ok"] else "fail"] += 1
             print("[%s] %s %s — %s" % (mark, r["id"], r["name"],
                   "; ".join("%s %s" % (a[0], "ok" if a[3] else "MISMATCH")
@@ -789,12 +916,27 @@ def main():
             proxy.stop()
         mock.stop()
 
+    gate = evaluate_gate(
+        [{"id": r["id"], "ok": r["ok"]} for r in report["cases"]]
+        + [{"id": c["id"], "skipped": True, "reason": why}
+           for c, why in _skipped],
+        {c["id"]: c for c in all_cases})
+    report["gate"] = gate
     with open(os.path.join(root, "report.json"), "w",
               encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
-    print("\n== 汇总: PASS %d / FAIL %d → %s ==" % (report["pass"],
-                                                    report["fail"], root))
-    return 0
+    c = gate["counts"]
+    print("\n== 汇总: PASS %d / FAIL %d / XFAIL %d / XPASS %d / 到期 %d / "
+          "跳过 %d → %s ==" % (c["pass"], c["fail"], c["xfail"], c["xpass"],
+                               c["expired"], c["skip"], root))
+    for e in gate["failures"]:
+        print("[失败] %s" % e)
+    for e in gate["gate_errors"]:
+        print("[门错误] %s" % e)
+    print("== 门判词: %s (exit %d)%s ==" % (
+        gate["verdict"], gate["exit_code"],
+        "（--report-only 覆盖为 0）" if args.report_only else ""))
+    return 0 if args.report_only else gate["exit_code"]
 
 
 if __name__ == "__main__":

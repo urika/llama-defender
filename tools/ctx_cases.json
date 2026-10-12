@@ -1,6 +1,7 @@
 [
  {
   "id": "TC01",
+  "quick": true,
   "suite": "prod",
   "session": "t01",
   "name": "工具过滤+ctx_recall注入（异常A判定）",
@@ -31,6 +32,7 @@
  },
  {
   "id": "TC02",
+  "quick": true,
   "suite": "prod",
   "session": "t02",
   "name": "below_max 注入（D1裁决：≤MAX 也注入）",
@@ -60,6 +62,7 @@
  },
  {
   "id": "TC03",
+  "quick": true,
   "suite": "prod",
   "session": "t03",
   "name": "幂等注入：已含 ctx_recall 不重复",
@@ -88,6 +91,7 @@
  },
  {
   "id": "TC04",
+  "quick": true,
   "suite": "prod",
   "session": "t04",
   "name": "派发模型码+归因一致性（异常B回归）",
@@ -117,6 +121,7 @@
  },
  {
   "id": "TC05",
+  "quick": true,
   "suite": "prod",
   "session": "t05",
   "name": "aux 分域烟囱：haiku+无工具",
@@ -137,6 +142,7 @@
  },
  {
   "id": "TC07",
+  "quick": true,
   "suite": "prod",
   "session": "t07",
   "name": "MICRO off：ctx_recall 调用透传（路径A前半）",
@@ -221,6 +227,7 @@
  },
  {
   "id": "TC14",
+  "quick": true,
   "suite": "prod",
   "session": "t14",
   "name": "engine-on stage 跳过联动",
@@ -249,6 +256,7 @@
  },
  {
   "id": "TC15",
+  "quick": true,
   "suite": "prod",
   "session": "t15",
   "name": "usage 计量透传",
@@ -1606,6 +1614,12 @@
  },
  {
   "id": "TC32",
+  "quick": true,
+  "known_red": {
+   "reason": "中部 system 未前移至后端首位（L-36 代理侧归一化未修；红锚行为符合设计）",
+   "ref": "L-36 / L-38①「A6→TC32 就绪红锚」",
+   "expires": "2026-11-15"
+  },
   "suite": "prod",
   "session": "t32",
   "name": "system 位置归一：中部 system 前移至后端首位（L-36）",
@@ -1685,6 +1699,7 @@
  },
  {
   "id": "TC34",
+  "quick": true,
   "suite": "prod",
   "session": "t34",
   "name": "est 估计器量级带（/4 口径；防 est 低估/坍塌）",
@@ -1747,6 +1762,7 @@
  },
  {
   "id": "TC36",
+  "quick": true,
   "suite": "prod",
   "session": "t36",
   "name": "分页读 dup 口径：同文件不同窗口不计、同窗口重读计（L-15）",
