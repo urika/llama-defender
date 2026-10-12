@@ -3,7 +3,9 @@
 L-71: record_view_drop 分型累计 → finalize_request 逐轮 view_dropped 段
       （{msgs,tokens,by_reason}）；无 drop 轮 → null。
 L-72: set_prompt_tokens processed_n fill-if-missing——timings.prompt_n
-      （rapid-mlx 首选源）先到不覆盖；cached_tokens（Splash 世代）补位。
+      （rapid-mlx 首选源）先到不覆盖；Splash 世代 usage 作第二来源，但
+      cached_tokens 是命中量，须经 set_prompt_tokens_from_usage 换算为
+      prompt−cached（口径修正 2026-10-06，见该类 docstring 的回归用例）。
 设计依据: roadmap L-71/L-72 行 ＋ docs/trajectory-view-requirements-20261006.md ②c。
 """
 import json
@@ -85,7 +87,11 @@ class ViewDropTest(unittest.TestCase):
 
 
 class HitRatioFallbackTest(unittest.TestCase):
-    """L-72: processed 第二来源（fill-if-missing 语义）。"""
+    """L-72: processed 第二来源（fill-if-missing）＋ usage 口径换算。
+
+    口径契约: processed = 实算 prefill 数 = prompt_tokens − cached_tokens，
+    hit_ratio = 1 − processed/prompt = **缓存命中率**（不是未命中率）。
+    """
 
     def setUp(self):
         self._enabled = _ps.PROXY_DIAG_ENABLED
@@ -96,28 +102,81 @@ class HitRatioFallbackTest(unittest.TestCase):
         _ps.PROXY_DIAG_ENABLED = self._enabled
 
     def test_timings_first_not_overwritten(self):
-        """rapid-mlx 两族: timings.prompt_n 先写，usage.cached_tokens 后到不得覆盖。"""
+        """rapid-mlx 两族: timings.prompt_n 先写，usage 后到不得覆盖。"""
         diag.set_prompt_tokens(processed_n=90000)
-        diag.set_prompt_tokens(processed_n=12000, sent_n=98347,
-                               generation_n=500)
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 98347, "completion_tokens": 500,
+             "prompt_tokens_details": {"cached_tokens": 81234}})
         self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 90000)
         self.assertEqual(_ps._diag_ctx.prompt_sent_tokens, 98347)
+        self.assertEqual(_ps._diag_ctx.generation_tokens, 500)
         self.assertEqual(diag.compute_hit_ratio(
             _ps._diag_ctx.prompt_processed_tokens,
             _ps._diag_ctx.prompt_sent_tokens), 0.0849)
 
-    def test_splash_fallback_fills(self):
-        """Splash 世代: 无 timings → usage.cached_tokens 补位 processed。"""
-        diag.set_prompt_tokens(sent_n=98347)
-        diag.set_prompt_tokens(processed_n=81234, sent_n=98347,
-                               generation_n=420)
-        self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 81234)
-        self.assertIsNotNone(diag.compute_hit_ratio(81234, 98347))
+    def test_splash_fallback_subtracts_cached(self):
+        """Splash 世代: 无 timings → processed = prompt − cached。"""
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 98347, "completion_tokens": 420,
+             "prompt_tokens_details": {"cached_tokens": 81234}})
+        self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 17113)  # 98347-81234
+        self.assertEqual(_ps._diag_ctx.prompt_sent_tokens, 98347)
+        self.assertEqual(diag.compute_hit_ratio(17113, 98347), 0.826)
+
+    def test_splash_real_world_matches_engine_hit(self):
+        """回归实测(2026-10-06 排查): diag hit_ratio 必须等于引擎命中率。
+
+        engine 日志 `prompt=61910 cached=61728 hit=99.7%`；修正前 series 记
+        prompt_processed_tokens=61728 → hit_ratio=0.0029（实为未命中率，
+        与引擎 0.9971 互补——本条即锁死该反转不得回归）。
+        """
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 61910, "completion_tokens": 300,
+             "prompt_tokens_details": {"cached_tokens": 61728}})
+        self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 182)   # 61910-61728
+        ratio = diag.build_diag_payload()["hit_ratio"]
+        self.assertEqual(ratio, 0.9971)                    # = cached/prompt, 命中率
+        self.assertAlmostEqual(ratio, 61728 / 61910, places=3)
+        self.assertNotAlmostEqual(ratio, 1 - 61728 / 61910, places=2)  # 非未命中率
+
+    def test_cold_cache_full_prefill(self):
+        """cached=0(冷缓存) → processed=全部提示, hit_ratio=0(诚实)。"""
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 0}})
+        self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 1000)
+        self.assertEqual(diag.compute_hit_ratio(1000, 1000), 0.0)
+
+    def test_cached_gt_sent_clamped(self):
+        """异常 usage(cached > prompt) 不得产出负 processed。"""
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 180}})
+        self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 0)
+
+    def test_missing_cached_does_not_fabricate(self):
+        """无 prompt_tokens_details → 不伪造 processed(hit_ratio 断链)。"""
+        diag.set_prompt_tokens_from_usage({"prompt_tokens": 1000})
+        self.assertIsNone(_ps._diag_ctx.prompt_processed_tokens)
+        self.assertEqual(_ps._diag_ctx.prompt_sent_tokens, 1000)
+        self.assertIsNone(diag.build_diag_payload().get("hit_ratio"))
+
+    def test_malformed_usage_is_noop(self):
+        diag.set_prompt_tokens_from_usage(None)
+        diag.set_prompt_tokens_from_usage({})
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": "bad", "prompt_tokens_details": {"cached_tokens": "x"}})
+        self.assertIsNone(_ps._diag_ctx.prompt_processed_tokens)
 
     def test_none_never_overwrites(self):
         diag.set_prompt_tokens(processed_n=777)
-        diag.set_prompt_tokens(processed_n=None, sent_n=1000)
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 1}})
         self.assertEqual(_ps._diag_ctx.prompt_processed_tokens, 777)
+
+    def test_disabled_is_noop(self):
+        _ps.PROXY_DIAG_ENABLED = False
+        diag.set_prompt_tokens_from_usage(
+            {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 900}})
+        self.assertIsNone(_ps._diag_ctx.prompt_processed_tokens)
 
 
 class MetricsViewSectionTest(unittest.TestCase):

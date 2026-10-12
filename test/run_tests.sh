@@ -68,7 +68,7 @@ run_integration() {
   source "$SCRIPT_DIR/lib/state_sentinel.sh"
   state_sentinel_begin
   # Make sure no stale process holds the integration ports.
-  for port in 8089 8090 8091 8092 8093 4001 4002 4003 4004 4005; do
+  for port in 8089 8090 8091 8092 8093 8095 4001 4002 4003 4004 4005 4007; do
     if lsof -ti :"$port" >/dev/null 2>&1; then
       warn "port $port is busy; killing stale holder"
       lsof -ti :"$port" | xargs kill -9 2>/dev/null || true
@@ -124,6 +124,24 @@ run_integration() {
       record "integration" "ok" "cache-align: all ${cp:-?} cases passed"
     else
       record "integration" "fail" "cache-align: $cf cases failed"
+    fi
+  fi
+
+  local diaghit_rc=0
+  local diaghit_out
+  diaghit_out=$(bash "$SCRIPT_DIR/integration/test_diag_hit_ratio_integration.sh" 2>&1)
+  diaghit_rc=$?
+  echo "$diaghit_out" | tail -25
+  if [[ $diaghit_rc -ne 0 ]]; then
+    record "integration" "fail" "test_diag_hit_ratio_integration.sh exited $diaghit_rc"
+  else
+    local dhp dhf
+    dhp=$(echo "$diaghit_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "passed\." | tail -1 | grep -oE "[0-9]+" | head -1)
+    dhf=$(echo "$diaghit_out" | sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | grep -E "failed," | tail -1 | grep -oE "[0-9]+" | head -1)
+    if [[ "${dhf:-0}" == "0" ]]; then
+      record "integration" "ok" "diag-hit-ratio: all ${dhp:-?} cases passed"
+    else
+      record "integration" "fail" "diag-hit-ratio: $dhf cases failed"
     fi
   fi
 

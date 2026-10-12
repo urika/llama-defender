@@ -1447,17 +1447,15 @@ class Handler(BaseHTTPRequestHandler):
         openai_resp = json.loads(resp.read().decode("utf-8"))
 
         # L-72(2026-10-06): 非流式路径此前零 token 回填——hit_ratio 断链
-        # 的另一半。usage 的 cached_tokens 作 processed 第二来源
-        # （fill-if-missing；本路径无 timings，通常即唯一来源）。
+        # 的另一半。口径修正(同日排查): usage 的 cached_tokens 是**命中量**,
+        # 须换算 processed = prompt_tokens − cached_tokens 后回填(直传即把
+        # hit_ratio 写成未命中率), 换算集中在 set_prompt_tokens_from_usage。
         if PROXY_DIAG_ENABLED:
             try:
                 import diagnostics
                 _u = openai_resp.get("usage") or {}
                 if _u:
-                    diagnostics.set_prompt_tokens(
-                        processed_n=(_u.get("prompt_tokens_details") or {}).get("cached_tokens"),
-                        sent_n=_u.get("prompt_tokens"),
-                        generation_n=_u.get("completion_tokens"))
+                    diagnostics.set_prompt_tokens_from_usage(_u)
             except Exception as _e:
                 _warn_diag("nonstream_usage", _e)
 
@@ -1818,13 +1816,11 @@ class Handler(BaseHTTPRequestHandler):
                 if PROXY_DIAG_ENABLED:
                     try:
                         import diagnostics
-                        # L-72: Splash 世代无 timings.prompt_n ⇒ processed 的
-                        # 第二来源 = cached_tokens（fill-if-missing，timings
-                        # 先到不覆盖）——hit_ratio 链路两族后端都通。
-                        diagnostics.set_prompt_tokens(
-                            processed_n=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
-                            sent_n=usage.get("prompt_tokens"),
-                            generation_n=usage.get("completion_tokens"))
+                        # L-72 口径修正(2026-10-06 排查): Splash 世代无
+                        # timings.prompt_n, 第二来源是 usage; 但 cached_tokens
+                        # 是命中量, processed 必须取 prompt−cached(实算 prefill),
+                        # fill-if-missing 不覆盖先到的 timings.prompt_n。
+                        diagnostics.set_prompt_tokens_from_usage(usage)
                     except Exception as _e:
                         _warn_diag("stream_usage", _e)
 
@@ -2350,12 +2346,10 @@ class Handler(BaseHTTPRequestHandler):
                                         generation_n=_t.get("predicted_n"))
                                 _u = chunk.get("usage")
                                 if _u:
-                                    # L-72: processed 第二来源 cached_tokens
-                                    # （fill-if-missing，timings 先到不覆盖）
-                                    diagnostics.set_prompt_tokens(
-                                        processed_n=(_u.get("prompt_tokens_details") or {}).get("cached_tokens"),
-                                        sent_n=_u.get("prompt_tokens"),
-                                        generation_n=_u.get("completion_tokens"))
+                                    # L-72 口径修正: cached_tokens(命中量)
+                                    # → processed = prompt−cached(fill-if-missing,
+                                    # timings 先到不覆盖)
+                                    diagnostics.set_prompt_tokens_from_usage(_u)
                             except Exception as _e:
                                 _warn_diag("passthrough_diag", _e)
                     except Exception:

@@ -235,8 +235,12 @@ def set_prompt_tokens(processed_n=None, sent_n=None, generation_n=None,
     注意: 同一请求会多次调用(先 timings 后 usage),None 参数不得覆盖
     已写入的值——否则 usage 回填会把 timings 阶段的 gen_ms 清掉。
     L-72: processed_n 为**fill-if-missing**（timings.prompt_n 是 rapid-mlx
-    世代的首选源先到先写; Splash 世代无 timings ⇒ usage 的 cached_tokens
-    作为第二来源补位。后到者不覆盖先到者——两源语义不同, 覆盖即污染）。
+    世代的首选源先到先写; Splash 世代无 timings ⇒ usage 作第二来源补位。
+    后到者不覆盖先到者——两源语义不同, 覆盖即污染）。
+
+    ⚠ processed_n 的语义恒为"实算 prefill 数"。usage 来源**不可直传**
+    cached_tokens（那是命中量）——必须先换算, 走
+    set_prompt_tokens_from_usage()。
     """
     if not _ps.PROXY_DIAG_ENABLED:
         return
@@ -252,6 +256,49 @@ def set_prompt_tokens(processed_n=None, sent_n=None, generation_n=None,
         ctx.generation_tokens = int(generation_n)
         if isinstance(gen_ms, (int, float)):
             ctx.gen_ms = gen_ms
+
+
+def _usage_cached_n(usage):
+    """取 OpenAI usage 的 cached_tokens(读缓存命中数, **非**实算 prefill)。"""
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    if not isinstance(details, dict):
+        return None
+    cached = details.get("cached_tokens")
+    if isinstance(cached, bool) or not isinstance(cached, (int, float)):
+        return None
+    return int(cached) if cached >= 0 else None
+
+
+def set_prompt_tokens_from_usage(usage):
+    """OpenAI 口径 usage → 诊断 token 事实(L-72 口径修正 2026-10-06)。
+
+    processed(实算 prefill 数) = prompt_tokens − cached_tokens:
+    prompt_tokens 是本轮发出的完整提示量(hit_ratio 分母), cached_tokens 是其
+    中**读缓存命中、未实算**的部分, 二者相减才是真正 prefill 的部分——与
+    timings.prompt_n 同义(pipeline.py:4696 注释: timings.prompt_n = 实算
+    prefill 数(缓存未命中部分))。
+
+    修正前的缺陷: 三处回退直接把 cached_tokens 当 processed_n 传入, 于是
+    hit_ratio = 1 − cached/prompt = **未命中率**, 与真实命中率恰好互补。
+    实测同一轮 engine 日志 `prompt=61910 cached=61728 hit=99.7%`, 而诊断
+    series 记 prompt_processed_tokens=61728 → hit_ratio=0.0029(应为 0.9971)。
+    另一佐证: message_converter.py:891 把同一字段映射为 Anthropic
+    cache_read_input_tokens(读缓存=未实算), 两处语义必须一致。
+
+    fill-if-missing 语义不变: timings.prompt_n 先到则不覆盖。
+    cached_tokens 缺失时不伪造 processed——宁可 hit_ratio 断链, 不可填错口径。
+    """
+    if not _ps.PROXY_DIAG_ENABLED or not isinstance(usage, dict):
+        return
+    sent = usage.get("prompt_tokens")
+    cached = _usage_cached_n(usage)
+    processed = None
+    if (cached is not None and isinstance(sent, (int, float))
+            and not isinstance(sent, bool) and sent >= 0):
+        processed = max(int(sent) - cached, 0)
+    set_prompt_tokens(processed_n=processed,
+                      sent_n=sent,
+                      generation_n=usage.get("completion_tokens"))
 
 
 def build_diag_payload():

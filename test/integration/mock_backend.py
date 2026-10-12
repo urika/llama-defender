@@ -14,6 +14,9 @@ Configurable via env vars:
   MOCK_FINISH      (default: "tool_calls") finish_reason in response
   MOCK_USAGE_PROMPT      (default: 100)
   MOCK_USAGE_COMPLETION  (default: 20)
+  MOCK_USAGE_CACHED      (default: empty) when set, add OpenAI-style
+                               `usage.prompt_tokens_details.cached_tokens`
+                               — Splash 世代前缀缓存命中量的唯一来源(L-72 口径)
   MOCK_TIMINGS_PROMPT_N        (default: empty) when set, add llama-server style
                                `timings` object (prompt_n/prompt_ms/predicted_*)
                                — R13/R16 diagnostics integration tests
@@ -42,8 +45,22 @@ PLAIN_TEXT = os.environ.get("MOCK_PLAIN_TEXT", "")
 FINISH = os.environ.get("MOCK_FINISH", "tool_calls")
 USAGE_PROMPT = int(os.environ.get("MOCK_USAGE_PROMPT", "100"))
 USAGE_COMPLETION = int(os.environ.get("MOCK_USAGE_COMPLETION", "20"))
+_CACHED_RAW = os.environ.get("MOCK_USAGE_CACHED", "")
+USAGE_CACHED = int(_CACHED_RAW) if _CACHED_RAW != "" else None
 TIMINGS_PROMPT_N = os.environ.get("MOCK_TIMINGS_PROMPT_N", "")
 TIMINGS_PREDICTED_N = int(os.environ.get("MOCK_TIMINGS_PREDICTED_N", "10"))
+
+
+def _usage():
+    """OpenAI usage 块。
+
+    MOCK_USAGE_CACHED 设置时附 `prompt_tokens_details.cached_tokens`——Splash
+    世代唯一的前缀缓存命中来源(不返回 timings)。L-72 口径回归测试依赖此字段。
+    """
+    u = {"prompt_tokens": USAGE_PROMPT, "completion_tokens": USAGE_COMPLETION}
+    if USAGE_CACHED is not None:
+        u["prompt_tokens_details"] = {"cached_tokens": USAGE_CACHED}
+    return u
 
 # 序列模式(IFC-3 微轮测试): MOCK_SEQ_FILE 指向 JSON 数组, 每个 POST 依序消费
 # 一个 spec(最后一个重复)。spec: {"tool_call": {"id","name","arguments"}} 或
@@ -101,8 +118,7 @@ def _build_response():
                         }],
                     },
                 }],
-                "usage": {"prompt_tokens": USAGE_PROMPT,
-                          "completion_tokens": USAGE_COMPLETION},
+                "usage": _usage(),
             }
         return {
             "id": "chatcmpl-mock",
@@ -112,8 +128,7 @@ def _build_response():
                 "message": {"role": "assistant",
                             "content": spec.get("text", "")},
             }],
-            "usage": {"prompt_tokens": USAGE_PROMPT,
-                      "completion_tokens": USAGE_COMPLETION},
+            "usage": _usage(),
         }
     timings = _timings()
     if PLAIN_TEXT:
@@ -124,10 +139,7 @@ def _build_response():
                 "finish_reason": "stop",
                 "message": {"role": "assistant", "content": PLAIN_TEXT},
             }],
-            "usage": {
-                "prompt_tokens": USAGE_PROMPT,
-                "completion_tokens": USAGE_COMPLETION,
-            },
+            "usage": _usage(),
         }
         if timings:
             resp["timings"] = timings
@@ -147,10 +159,7 @@ def _build_response():
                 }],
             },
         }],
-        "usage": {
-            "prompt_tokens": USAGE_PROMPT,
-            "completion_tokens": USAGE_COMPLETION,
-        },
+        "usage": _usage(),
     }
     if timings:
         resp["timings"] = timings
@@ -225,8 +234,7 @@ class Handler(BaseHTTPRequestHandler):
                 obj.update(extra)
             return f"data: {json.dumps(obj)}\n\n".encode("utf-8")
 
-        final_extra = {"usage": {"prompt_tokens": USAGE_PROMPT,
-                                 "completion_tokens": USAGE_COMPLETION}}
+        final_extra = {"usage": _usage()}
         timings = _timings()
         if timings:
             final_extra["timings"] = timings
