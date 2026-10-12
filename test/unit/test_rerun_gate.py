@@ -240,5 +240,68 @@ class TestEpochCollapseScan(unittest.TestCase):
         self.assertEqual(got, {"sB": 4})
 
 
+class TestOutOverwriteGuard(unittest.TestCase):
+    """L-38-β（2026-10-12）：`check` 默认拒绝覆盖既有 verdict 文件。
+
+    出典：`results/quality/rerun-gate/gate-phaseD-v2-verdict.json` 的 STOP 覆盖了
+    世代台账 `7bfca00e214f` 所引用的同路径 PASS ⇒ 判词来源不可复核。护栏必须在
+    快照之前生效（拒绝时不产生后端流量、不写盘）。
+    """
+
+    def _before_file(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump({"ts": "2026-10-12T00:00:00", "metrics": {},
+                   "ctx_config": {"epoch_S": 70000}}, f)
+        f.close()
+        return f.name
+
+    def test_refuses_overwrite_without_force(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "gate-verdict.json")
+        with open(out, "w") as fh:
+            json.dump({"verdict": "PASS", "ts": "2026-10-11T14:16:41",
+                       "reasons": []}, fh)
+        before = self._before_file()
+        with mock.patch.object(rg, "snapshot",
+                               side_effect=AssertionError("护栏须先于后端快照")):
+            rc = rg.check(before, 1.5, 864, 864, 0, out)
+        os.unlink(before)
+        self.assertEqual(rc, 2)                        # 拒绝档，非 PASS/STOP
+        with open(out) as fh:                          # 既有判词原样保留
+            kept = json.load(fh)
+        self.assertEqual(kept["verdict"], "PASS")
+        self.assertEqual(kept["ts"], "2026-10-11T14:16:41")
+
+    def test_force_allows_overwrite(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "gate-verdict.json")
+        with open(out, "w") as fh:
+            json.dump({"verdict": "PASS", "ts": "2026-10-11T14:16:41"}, fh)
+        before = self._before_file()
+        after = {"ts": "2026-10-12T01:00:00", "metrics": {}, "ctx_config": {}}
+        with mock.patch.object(rg, "snapshot", return_value=after), \
+             mock.patch.object(rg, "_wall_times_from_sessions",
+                               return_value=[30000]), \
+             mock.patch.object(rg, "_log_evict_attribution",
+                               return_value=(0, 0, 0)):
+            rc = rg.check(before, 1.5, 864, 864, 0, out, force=True)
+        os.unlink(before)
+        self.assertIn(rc, (0, 1))                      # 正常判读路径
+        with open(out) as fh:
+            self.assertEqual(json.load(fh).get("ts"), "2026-10-12T01:00:00")
+
+    def test_no_out_writes_nothing_and_is_unaffected(self):
+        before = self._before_file()
+        after = {"ts": "2026-10-12T01:00:00", "metrics": {}, "ctx_config": {}}
+        with mock.patch.object(rg, "snapshot", return_value=after), \
+             mock.patch.object(rg, "_wall_times_from_sessions",
+                               return_value=[30000]), \
+             mock.patch.object(rg, "_log_evict_attribution",
+                               return_value=(0, 0, 0)):
+            rc = rg.check(before, 1.5, 864, 864, 0, None)
+        os.unlink(before)
+        self.assertIn(rc, (0, 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

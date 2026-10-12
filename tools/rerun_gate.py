@@ -44,7 +44,13 @@
   # 判读（与批前快照对比）
   python3 tools/rerun_gate.py check --before /tmp/gate-before.json \\
       --wall-threshold-ratio 1.5 --out /tmp/gate-verdict.json
-  # exit 0 = 放行；exit 1 = STOP（停批）
+  # exit 0 = 放行；exit 1 = STOP（停批）；exit 2 = 拒绝落盘（见下）
+
+**--out 覆盖护栏（2026-10-12，L-38-β）**：`check` 默认**拒绝**覆盖已存在的
+verdict 文件并返回 exit 2——同一路径被不同阈值档/不同世代的两次 check 复用会
+静默覆盖，判词来源即不可复核（出典：`gate-phaseD-v2-verdict.json` 的 STOP 覆盖了
+世代台账 `7bfca00e214f` 所引用的同路径 PASS，只能靠 note 反推校准档）。要重跑请
+换带世代+阈值档的文件名（如 `gate-<gen>-calib.json`），确需原地覆盖加 `--force`。
 
 依赖：Python 3 stdlib only。
 """
@@ -272,7 +278,25 @@ def snapshot(out_path):
 def check(before_path, wall_threshold_ratio, max_pressure_evict, max_lru_evict,
           max_epoch_collapse, out_path, max_metal_evict=0,
           max_metal_peak_gb=34.0, max_metal_events_30min=8,
-          min_decode_tps_ratio=None):
+          min_decode_tps_ratio=None, force=False):
+    # L-38-β 护栏（2026-10-12）：默认拒绝覆盖既有 verdict——同一 --out 被不同
+    # 阈值档/世代复用会静默覆盖，台账引用的判词即不可复核（出典见模块 docstring）。
+    # 放在快照之前 ⇒ 拒绝时不产生任何后端流量、不写盘。
+    if out_path and os.path.exists(out_path) and not force:
+        prev = {}
+        try:
+            with open(out_path, "r") as _pf:
+                prev = json.load(_pf) or {}
+        except Exception:
+            prev = {}
+        print("[gate] 拒绝覆盖既有 verdict: %s" % out_path, file=sys.stderr)
+        print("        既有判词: verdict=%s ts=%s reasons=%s"
+              % (prev.get("verdict"), prev.get("ts"), prev.get("reasons")),
+              file=sys.stderr)
+        print("        既有阈值档: %s" % (prev.get("thresholds"),), file=sys.stderr)
+        print("        => 请改用带世代+阈值档的文件名(如 gate-<gen>-calib.json)；"
+              "确需原地覆盖加 --force", file=sys.stderr)
+        return 2
     with open(before_path, "r") as f:
         before = json.load(f)
     after = snapshot(None)
@@ -456,6 +480,9 @@ def main():
                     help="Splash 族吞吐硬判据（after/before decode tps 比下限；"
                          "默认不 armed，校准后启用）")
     s2.add_argument("--out", default=None)
+    s2.add_argument("--force", action="store_true",
+                    help="允许覆盖已存在的 --out verdict（默认拒绝：防判词来源"
+                         "被静默覆盖，见 docstring 覆盖护栏）")
 
     args = ap.parse_args()
     if args.cmd == "snapshot":
@@ -470,7 +497,8 @@ def main():
                  max_metal_evict=0,
                  max_metal_peak_gb=args.max_metal_peak_gb,
                  max_metal_events_30min=args.max_metal_events_30min,
-                 min_decode_tps_ratio=args.min_decode_tps_ratio)
+                 min_decode_tps_ratio=args.min_decode_tps_ratio,
+                 force=args.force)
 
 
 if __name__ == "__main__":
