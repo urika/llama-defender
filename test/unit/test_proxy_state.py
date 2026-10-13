@@ -551,6 +551,74 @@ class TestProviderQuotaCooldown(unittest.TestCase):
         self.assertNotIn("zhipu", proxy_state._PROVIDER_QUOTA_RESET)
 
 
+class TestProviderCooldownState(unittest.TestCase):
+    """L-96(b): provider 熔断冷却态只读快照（/api/status route_config.provider_cooldown 数据源）."""
+
+    def setUp(self):
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_QUOTA_RESET.clear()
+            proxy_state._PROVIDER_COOLDOWN_START.clear()
+            proxy_state._PROVIDER_FAIL_COUNT.clear()
+
+    def test_inactive_when_no_state(self):
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertFalse(st["active"])
+        self.assertEqual(st["remaining_s"], 0)
+        self.assertIsNone(st["source"])
+
+    def test_active_circuit_breaker(self):
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_COOLDOWN_START["zhipu"] = _t.monotonic()
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertTrue(st["active"])
+        self.assertGreater(st["remaining_s"], 0)
+        self.assertLessEqual(st["remaining_s"],
+                             proxy_state.PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS)
+        self.assertEqual(st["source"], "circuit_breaker")
+
+    def test_readonly_no_eviction_side_effect(self):
+        """只读视图不清除过期条目——清除语义归 _provider_cooldown_active（惰性过期）。"""
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_COOLDOWN_START["zhipu"] = _t.monotonic() - 10**9
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertFalse(st["active"])
+        self.assertEqual(st["remaining_s"], 0)
+        with proxy_state._state_lock:
+            self.assertIn("zhipu", proxy_state._PROVIDER_COOLDOWN_START)
+
+    def test_quota_reset_window_precedence(self):
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_QUOTA_RESET["zhipu"] = _t.time() + 600
+            proxy_state._PROVIDER_COOLDOWN_START["zhipu"] = _t.monotonic()
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertTrue(st["active"])
+        self.assertEqual(st["source"], "quota_reset")
+        self.assertGreater(st["remaining_s"], 500)
+
+    def test_later_window_wins(self):
+        import time as _t
+        with proxy_state._state_lock:
+            proxy_state._PROVIDER_QUOTA_RESET["zhipu"] = _t.time() + 5
+            proxy_state._PROVIDER_COOLDOWN_START["zhipu"] = _t.monotonic()
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertEqual(st["source"], "circuit_breaker")
+        self.assertGreater(st["remaining_s"], 100)
+
+    def test_trip_via_record_failure(self):
+        with patch.object(proxy_state, "PROXY_ROUTE_MAX_CLOUD_FAILS", 1):
+            proxy_state._record_provider_failure("zhipu", retryable=True)
+        st = proxy_state._provider_cooldown_state("zhipu")
+        self.assertTrue(st["active"])
+        self.assertEqual(st["source"], "circuit_breaker")
+
+    def test_non_retryable_failure_does_not_trip(self):
+        proxy_state._record_provider_failure("zhipu", retryable=False)
+        self.assertFalse(proxy_state._provider_cooldown_state("zhipu")["active"])
+
 
 
 

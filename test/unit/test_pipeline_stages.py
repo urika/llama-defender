@@ -1021,6 +1021,23 @@ class TestBackendDispatcher(unittest.TestCase):
         self.assertEqual(ctx.openai_body["model"], _ps.MODEL_NAME)
 
     @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
+    def test_cloud_provider_cooldown_falls_back_to_local(self):
+        """L-96(a): cooldown 态回落必须与 key 缺失分流（此前误标 cloud_no_api_key）。"""
+        stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
+        ctx = self._make_ctx(target="cloud", total_chars=200000)
+        with patch.object(_ps, "_provider_cooldown_active", return_value=True), \
+             patch.object(_ps, "_provider_cooldown_state",
+                          return_value={"active": True, "remaining_s": 287,
+                                        "source": "circuit_breaker",
+                                        "cooldown_seconds": 300}), \
+             patch("pipeline.urllib.request.urlopen", return_value=self._mock_urlopen(200)) as mock_open:
+            stage.process(ctx)
+            self.assertIn(_ps.LLAMA_BASE, mock_open.call_args[0][0].full_url)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "cloud_provider_cooldown")
+        self.assertEqual(ctx.openai_body["model"], _ps.MODEL_NAME)
+
+    @patch.object(_ps, "PROXY_CLOUD_API_KEY", "sk-real-key")
     def test_cloud_dispatch_success(self):
         stage = BackendDispatcher(llama_lock=self._mock_lock, cloud_lock=self._mock_lock, handler=self._mock_handler)
         ctx = self._make_ctx(target="cloud")
@@ -1594,6 +1611,23 @@ class TestMultiProviderDispatch(unittest.TestCase):
             stage.process(ctx)
         self.assertEqual(ctx._route_target, "local")
         self.assertEqual(ctx._route_reason, "cloud_no_api_key")
+
+    def test_all_providers_in_cooldown_falls_to_local(self):
+        """L-96(a): keyed providers all in cooldown → cloud_provider_cooldown,
+        not the legacy keyless reason; no cloud dispatch attempted."""
+        import time as _t
+        with _ps._state_lock:
+            _ps._PROVIDER_COOLDOWN_START["p1"] = _t.monotonic()
+            _ps._PROVIDER_COOLDOWN_START["p2"] = _t.monotonic()
+        stage = self._stage()
+        ctx = self._make_ctx(model="m1", fallbacks=["m2"])
+        with patch("pipeline.urllib.request.urlopen",
+                   return_value=self._mock_urlopen(200)) as mo:
+            stage.process(ctx)
+        self.assertEqual(ctx._route_target, "local")
+        self.assertEqual(ctx._route_reason, "cloud_provider_cooldown")
+        urls = [str(c[0][0].full_url) for c in mo.call_args_list]
+        self.assertFalse([u for u in urls if "p1.example" in u or "p2.example" in u])
 
     def test_cloud_urlerror_falls_back_to_local(self):
         """Connection-level cloud failure (URLError) triggers local fallback."""

@@ -446,6 +446,14 @@ def _build_status_json():
                 for pname in model_registry.list_providers()
                 if pname != "local"
             },
+            # L-96(b): provider 熔断冷却态只读快照(进/出走代理日志, 此处供
+            # 开批门/判读取证轮询——冷却回落曾被误标 "key not configured",
+            # 联合文档 1013-1 (b))
+            "provider_cooldown": {
+                pname: _ps._provider_cooldown_state(pname)
+                for pname in model_registry.list_providers()
+                if pname != "local"
+            },
         },
         # R16: context-engineering config digest（仿 R11 route_config 先例）—
         # bench manifest 口径标注的机读数据源（上游设计 §9 P0-1）。
@@ -1328,7 +1336,9 @@ def _build_route_reason_legend() -> str:
         ("session_already_cloud", "会话已锁定云端"),
         ("session_force_local", "会话强制本地"),
         ("cloud_cooldown_active", "云端冷却中，走本地"),
+        ("cloud_provider_cooldown", "云端供应商熔断冷却中，回退本地"),
         ("cloud_no_api_key", "未配置云端 API Key，回退本地"),
+        ("cloud_protocol_mismatch", "OpenAI 客户端无可匹配协议的云端候选，回退本地"),
         ("cloud_fallback", "云端请求失败，回退本地"),
     ]
     items = "".join(

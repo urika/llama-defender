@@ -4198,26 +4198,83 @@ class BackendDispatcher(PipelineStage):
         # Validate cloud API key availability across candidates — force mode:
         # error; force_fallback/prefer: fall back to local. Cooldown-active
         # providers don't count as usable here.
+        #
+        # L-96(a): triage WHY no candidate is usable — provider cooldown vs
+        # missing key vs protocol mismatch used to share one "key not
+        # configured" log/reason, which misled both the batch launch gate and
+        # post-batch混流取证 (joint doc 1013-1 (a)). Cooldown wins the summary
+        # reason: it is transient and the operationally actionable cause.
+        def _unusable_cause(c):
+            if not c["api_key"]:
+                return "no_key"
+            if _ps._provider_cooldown_active(c["provider"]):
+                return "cooldown"
+            return "protocol"  # only reachable for _oai_client × anthropic-protocol
+
         if target == 'cloud' and not any(_usable(c) for c in candidates):
+            causes = [_unusable_cause(c) for c in candidates]
+            if "cooldown" in causes:
+                fall_reason, fall_level = 'cloud_provider_cooldown', "WARN"
+            elif "no_key" in causes:
+                fall_reason, fall_level = 'cloud_no_api_key', "ERROR"
+            else:
+                fall_reason, fall_level = 'cloud_protocol_mismatch', "WARN"
+            if len(candidates) > 1:
+                for c, cause in zip(candidates, causes):
+                    if cause == "cooldown":
+                        st = _ps._provider_cooldown_state(c["provider"])
+                        log(f"  -> [WARN] Cloud provider '{c['provider']}' in cooldown "
+                            f"({st['remaining_s']}s left, {st['source']}) — unusable")
+                    elif cause == "no_key":
+                        log(f"  -> [ERROR] Cloud provider '{c['provider']}' has no API key "
+                            f"({c['key_env']}) — unusable")
+                    else:
+                        log(f"  -> [WARN] Cloud model {c['model']} is anthropic-protocol — "
+                            f"cannot serve an OpenAI-protocol client")
             route_reason = getattr(ctx, '_route_reason', '')
             if route_reason and route_reason.startswith("model_forced_") \
                     and not route_reason.startswith("model_forced_fallback_"):
-                key_env = candidates[0]["key_env"] if candidates else "PROXY_CLOUD_API_KEY"
-                log("  -> [ERROR] Force mode but no cloud API key configured — returning 503")
-                self._handler._respond_json({
-                    "error": {
-                        "type": "cloud_unavailable",
-                        "message": (
-                            f"Cloud API key not configured for force-routed model. "
-                            f"Set {key_env} in configs/secret.local.conf, or switch to a "
-                            f"prefer-routed model via `/model claude-sonnet-4-6`."
-                        ),
-                    }
-                }, 503)
+                if fall_reason == 'cloud_provider_cooldown':
+                    c0 = candidates[causes.index("cooldown")]
+                    st = _ps._provider_cooldown_state(c0["provider"])
+                    log(f"  -> [ERROR] Force mode but cloud provider "
+                        f"'{c0['provider']}' in cooldown ({st['remaining_s']}s left) — returning 503")
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "cloud_unavailable",
+                            "message": (
+                                f"Cloud provider '{c0['provider']}' is in cooldown "
+                                f"({st['remaining_s']}s left) after repeated failures. "
+                                f"Retry later, or switch to a prefer-routed model via "
+                                f"`/model claude-sonnet-4-6`."
+                            ),
+                        }
+                    }, 503)
+                else:
+                    key_env = candidates[0]["key_env"] if candidates else "PROXY_CLOUD_API_KEY"
+                    log("  -> [ERROR] Force mode but no cloud API key configured — returning 503")
+                    self._handler._respond_json({
+                        "error": {
+                            "type": "cloud_unavailable",
+                            "message": (
+                                f"Cloud API key not configured for force-routed model. "
+                                f"Set {key_env} in configs/secret.local.conf, or switch to a "
+                                f"prefer-routed model via `/model claude-sonnet-4-6`."
+                            ),
+                        }
+                    }, 503)
                 return ctx
-            log("  -> [ERROR] Cloud API key not configured — falling back to local")
+            if fall_reason == 'cloud_provider_cooldown':
+                c0 = candidates[causes.index("cooldown")]
+                st = _ps._provider_cooldown_state(c0["provider"])
+                log(f"  -> [WARN] Cloud provider '{c0['provider']}' in cooldown "
+                    f"({st['remaining_s']}s left) — falling back to local")
+            elif fall_reason == 'cloud_no_api_key':
+                log("  -> [ERROR] Cloud API key not configured — falling back to local")
+            else:
+                log("  -> [WARN] No usable cloud candidate (protocol mismatch) — falling back to local")
             ctx._route_target = 'local'
-            ctx._route_reason = 'cloud_no_api_key'
+            ctx._route_reason = fall_reason
             target = 'local'
             # FormatConverter already built openai_body with the cloud model;
             # switch to local MODEL_NAME so the local backend recognises it.

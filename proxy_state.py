@@ -903,6 +903,15 @@ _PROVIDER_QUOTA_RESET = {}      # provider → epoch (wall-clock) when subscript
 _route_provider_cost = {}       # provider → daily cost (¥, same date key as _route_daily_date)
 
 
+def _cooldown_event(level, msg):
+    """L-96(b) 熔断生命周期日志（进入/退出）。fail-open：日志设施不可用不影响状态机。"""
+    try:
+        from proxy_logging import log  # deferred: proxy_logging 顶层 import proxy_state
+        log(msg, level=level)
+    except Exception:
+        pass
+
+
 def _provider_cooldown_active(pname):
     """True while provider cooldown window is open; clears it once expired.
 
@@ -922,6 +931,8 @@ def _provider_cooldown_active(pname):
             return True
         with _state_lock:
             _PROVIDER_QUOTA_RESET.pop(pname, None)
+        _cooldown_event("INFO",
+                        f"provider '{pname}' quota reset deadline passed — back in service")
     with _state_lock:
         ts = _PROVIDER_COOLDOWN_START.get(pname)
     if not ts:
@@ -930,6 +941,8 @@ def _provider_cooldown_active(pname):
         return True
     with _state_lock:
         _PROVIDER_COOLDOWN_START.pop(pname, None)
+    _cooldown_event("INFO",
+                    f"provider '{pname}' cooldown expired — back in service")
     return False
 
 
@@ -949,6 +962,31 @@ def _record_quota_exhausted(pname, reset_epoch):
             _PROVIDER_QUOTA_RESET[pname] = reset_epoch
             _PROVIDER_COOLDOWN_START[pname] = time.monotonic()
             _PROVIDER_FAIL_COUNT[pname] = 0
+
+
+def _provider_cooldown_state(pname):
+    """L-96(b) 熔断可观测：provider 冷却态只读快照（无清除副作用，可安全轮询）。
+
+    与 _provider_cooldown_active 同口径：配额重置窗与熔断冷却窗取更晚到期者。
+    返回 {active, remaining_s, source, cooldown_seconds}；source ∈
+    quota_reset | circuit_breaker | None（inactive 时 remaining_s=0/source=None）。
+    """
+    cooldown_s = PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS
+    if not pname:
+        return {"active": False, "remaining_s": 0, "source": None,
+                "cooldown_seconds": cooldown_s}
+    with _state_lock:
+        qr = _PROVIDER_QUOTA_RESET.get(pname)
+        ts = _PROVIDER_COOLDOWN_START.get(pname)
+    quota_left = max(0.0, qr - time.time()) if qr else 0.0
+    cb_left = max(0.0, ts + cooldown_s - time.monotonic()) if ts else 0.0
+    remaining = max(quota_left, cb_left)
+    if remaining <= 0:
+        return {"active": False, "remaining_s": 0, "source": None,
+                "cooldown_seconds": cooldown_s}
+    source = "quota_reset" if quota_left >= cb_left else "circuit_breaker"
+    return {"active": True, "remaining_s": int(remaining + 0.5), "source": source,
+            "cooldown_seconds": cooldown_s}
 
 
 def _provider_quota_state(pname):
@@ -972,6 +1010,12 @@ def _record_provider_failure(pname, retryable=True):
         if n >= PROXY_ROUTE_MAX_CLOUD_FAILS:
             _PROVIDER_COOLDOWN_START[pname] = time.monotonic()
             _PROVIDER_FAIL_COUNT[pname] = 0
+            # L-96(b): 熔断进入必须有独立打点——此前只有 key 缺失文案，
+            # cooldown 态被误读成 key 未配置（联合文档 1013-1 (a)）。
+            _cooldown_event(
+                "WARN",
+                f"provider '{pname}' entering cooldown "
+                f"{PROXY_ROUTE_CLOUD_COOLDOWN_SECONDS}s after {n} consecutive failures")
 
 
 def _record_provider_success(pname):
