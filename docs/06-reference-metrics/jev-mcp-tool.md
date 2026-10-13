@@ -48,6 +48,32 @@ cmd mcp add jev -- python3 /Users/<用户名>/APP/llama.cpp/tools/jev_mcp_server
 
 该决策调用需 GOAT 或以上计划；输入按 Provider API 费率计费，输出 token 免费。模型结论是概率信号，调用方应自行设定阈值并保留业务校验。
 
+## 使用策略与校准核验（2026-10-13 调研沉淀）
+
+> 背景：Jev 泛化能力与开源替代调研。核心事实——TypeSafe 的 RLCD 校准声明只在其自有
+> 分布上成立，**不覆盖本仓的判定数据**；开源替代（Laya / Kev / Ollaya / WaterSheep 等）
+> 的真实差距在训练集多样性与校准证据，而非接口兼容性。
+>
+> **级联流程设计**（规则 → Jev → 分层升级 + 抽审计）见
+> [`docs/02-architecture-design/decision-cascade-rules-jev-escalation-20261013.md`](../02-architecture-design/decision-cascade-rules-jev-escalation-20261013.md)
+> ——含业界实践综述（scanners-before-classifiers、cascade 双阈值、延迟预算）与
+> swe-eval / agent_go 跨仓落地提案。
+
+- **现有姿势已对一半**：`jev_decide` 返回原始概率、调用方自定阈值，是泛化策略的正确
+  一半；另一半是**在本仓自己的判定数据上定期核验校准**（方法参考 Vals AI / Convex
+  决策榜：固定判定集 + 重复多次 + 洗牌选项 + 准确率/校准误差分开报），因为 TypeSafe
+  的校准声明不覆盖我们的分布。
+- **准确率不足时的处置顺序**：优先 **L0——改 criteria / 拆问题 / 过滤无关 state**
+  （distractor 是官方承认的失败源，多步推理链应拆成多次单步判定）；其次
+  **L1——用少量标注做阈值重校准**（temperature scaling、按覆盖-准确率曲线定阈值、
+  不确定样本升级人工/大模型）；**不必也不宜自训模型**——L2/L3（LoRA/头训练、
+  重预训练/RL）是模型厂商的事，场景内判据工程与校准才是使用方的杠杆。
+- **降外部 API 依赖时的选型标准**：选开源替代（`/v1/systemone` 兼容层，Ollaya 换
+  `TYPESAFE_BASE_URL` 即切、Kev/WaterSheep/jev-style SDK 直连）看的不是"接口兼容"
+  ——接口层可零成本切换；要看**它的训练集多样性与项目自己公布的校准证据**
+  （多项目 README 自认泛化/校准落后于托管 Jev，如 Decima 0.616、jev-style
+  “hosted Jev 更准”、jevos 0.815 vs 0.927）。
+
 ## 额度与限流（2026-09-27 落地）
 
 jev 与运营 CLI 会话**共享同一账户的两个滚动窗口**（5 小时／周，按 credit 计）：窗口被吃满时
