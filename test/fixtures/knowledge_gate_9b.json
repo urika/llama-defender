@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "gate": "knowledge-quality-9b",
+  "engine": "ornith-9b",
+  "note": "9B 知识服务质量门金标集（2026-10-15）。确定性评分：extraction 字段全对算过、tagging 标签精确匹配、summary 关键点覆盖+长度上限、grounding 必含答案词/拒答、refine 第二轮约束检查。unanswerable 子集任一失手=整门 FAIL（防幻觉红线）。",
+  "thresholds": {
+    "extraction": 0.75,
+    "tagging": 0.875,
+    "summary": 0.667,
+    "grounding": 0.667,
+    "unanswerable": 1.0,
+    "refine": 0.5,
+    "overall": 0.75
+  },
+  "cases": [
+    {
+      "id": "A01_product_announce",
+      "cat": "extraction",
+      "prompt": "从下列文本抽取信息，只输出一个 JSON 对象（不要 markdown 围栏、不要解释），键名必须为 org, product, date, price：\n\n星尘科技今日在新品发布会上宣布推出智能音箱「星尘 Echo Mini」，建议零售价 399 元，将于 2026 年 11 月 11 日在全渠道开售。",
+      "fields": {"org": "星尘科技", "product": "星尘 Echo Mini", "date": "2026 年 11 月 11 日", "price": "399"}
+    },
+    {
+      "id": "A02_bug_report",
+      "cat": "extraction",
+      "prompt": "从下列工单抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 component, severity, version：\n\n工单 #4821：导出模块在批量导出超过 500 行时崩溃，页面直接白屏。影响版本 v3.7.2，紧急程度评为 High，组件为 export-service。",
+      "fields": {"component": "export-service", "severity": "High", "version": "v3.7.2"}
+    },
+    {
+      "id": "A03_meeting_notes",
+      "cat": "extraction",
+      "prompt": "从下列会议纪要抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 project, owner, deadline, milestone：\n\n项目「灵舟」周会纪要：本次确认由陈岚负责支付网关联调，里程碑定为灰度上线，截止日期 2026-10-30，其余事项顺延下周。",
+      "fields": {"project": "灵舟", "owner": "陈岚", "deadline": "2026-10-30", "milestone": "灰度上线"}
+    },
+    {
+      "id": "A04_api_doc",
+      "cat": "extraction",
+      "prompt": "从下列 API 文档抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 endpoint, method, rate_limit：\n\nGET /v2/usage：查询账户用量。未认证返回 401。该接口限流为每分钟 120 次请求，超出返回 429。",
+      "fields": {"endpoint": "/v2/usage", "method": "GET", "rate_limit": "120"}
+    },
+    {
+      "id": "A05_bio",
+      "cat": "extraction",
+      "prompt": "从下列人物简介抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 name, university, award, year：\n\n林觉，博士，现任教于岭东大学计算机学院，因在分布式一致性算法方面的贡献获得 2023 年度卓创青年学者奖。",
+      "fields": {"name": "林觉", "university": "岭东大学", "award": "卓创青年学者奖", "year": "2023"}
+    },
+    {
+      "id": "A06_financial",
+      "cat": "extraction",
+      "prompt": "从下列财报摘录抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 company, revenue, yoy：\n\n蓝湾百货发布 2026 年二季度财报：季度营收 18.4 亿元，同比增长 6.2%，净利润受门店改造投入影响略有下滑。",
+      "fields": {"company": "蓝湾百货", "revenue": "18.4", "yoy": "6.2"}
+    },
+    {
+      "id": "A07_log_line",
+      "cat": "extraction",
+      "prompt": "从下列日志及说明抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 service, error_code, timeout_s：\n\n[2026-10-14T02:11:07Z] ERROR payment-gateway: upstream call failed code=UPSTREAM_TIMEOUT after 30s (retry=2)",
+      "fields": {"service": "payment-gateway", "error_code": "UPSTREAM_TIMEOUT", "timeout_s": "30"}
+    },
+    {
+      "id": "A08_listing_cn",
+      "cat": "extraction",
+      "prompt": "从下列房源信息抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 community, area, floor, price：\n\n房源：望山府 3 号楼，建筑面积 128 平米，位于 18/32 层，挂牌价 685 万，满五唯一。",
+      "fields": {"community": "望山府", "area": "128", "floor": "18/32", "price": "685"}
+    },
+    {
+      "id": "B01_email_classify",
+      "cat": "tagging",
+      "prompt": "给下面的客户邮件选一个最合适的类别，只能从这些标签里选：support, invoice, bug, feature。只输出标签本身，不要任何其他内容。\n\n邮件内容：\"你们上个月给我开了两张发票，金额还不一样，麻烦核对一下并退回多收的部分。\"",
+      "labels": ["support", "invoice", "bug", "feature"],
+      "answer": "invoice"
+    },
+    {
+      "id": "B02_news_classify",
+      "cat": "tagging",
+      "prompt": "给下面这则新闻标题选一个最合适的主题标签，只能从这些标签里选：politics, tech, sports, finance。只输出标签本身。\n\n\"央行宣布下调存款准备金率 0.25 个百分点，下周一生效\"",
+      "labels": ["politics", "tech", "sports", "finance"],
+      "answer": "finance"
+    },
+    {
+      "id": "B03_intent",
+      "cat": "tagging",
+      "prompt": "判断下面用户消息的意图，只能从这些标签里选：question, complaint, praise, bug。只输出标签本身。\n\n\"用了三天了，搜索结果比之前快多了，点赞！\"",
+      "labels": ["question", "complaint", "praise", "bug"],
+      "answer": "praise"
+    },
+    {
+      "id": "B04_genre_cn",
+      "cat": "tagging",
+      "prompt": "判断下面这段文字的文体，只能从这些标签里选：议论文, 说明文, 记叙文, 应用文。只输出标签本身。\n\n\"会议纪要：一、时间 10 月 14 日 14:00；二、参会人：王力、周敏；三、决议：预算方案按 A 版执行。\"",
+      "labels": ["议论文", "说明文", "记叙文", "应用文"],
+      "answer": "应用文"
+    },
+    {
+      "id": "B05_ticket_type",
+      "cat": "tagging",
+      "prompt": "给下面的工单选类型，只能从这些标签里选：question, incident, change。只输出标签本身。\n\n\"生产环境从凌晨 2 点开始所有登录请求都返回 502，已影响全部用户。\"",
+      "labels": ["question", "incident", "change"],
+      "answer": "incident"
+    },
+    {
+      "id": "B06_sentiment",
+      "cat": "tagging",
+      "prompt": "判断下面评论的情感极性，只能从这些标签里选：positive, neutral, negative。只输出标签本身。\n\n\"东西还行吧，就是物流太慢了，等了整整一周。\"",
+      "labels": ["positive", "neutral", "negative"],
+      "answer": "negative"
+    },
+    {
+      "id": "B07_topic_cn",
+      "cat": "tagging",
+      "prompt": "判断下面句子的主要话题，只能从这些标签里选：天气, 交通, 医疗, 教育。只输出标签本身。\n\n\"早高峰地铁 2 号线再次延误，数千名乘客滞留站台。\"",
+      "labels": ["天气", "交通", "医疗", "教育"],
+      "answer": "交通"
+    },
+    {
+      "id": "B08_urgency",
+      "cat": "tagging",
+      "prompt": "评估下面事件的处理紧急度，只能从这些标签里选：high, medium, low。只输出标签本身。\n\n\"文档首页有个错别字，把'登录'写成了'登陆'。\"",
+      "labels": ["high", "medium", "low"],
+      "answer": "low"
+    },
+    {
+      "id": "C01_news_summary",
+      "cat": "summary",
+      "prompt": "用不超过 80 字总结下面新闻，必须覆盖所有关键事实，不要添加原文没有的信息。\n\n2026 年 10 月 13 日，临江市防汛指挥部发布通告：受台风外围环流影响，预计 14 日夜间至 15 日清晨全市累计降雨量将达 150 至 200 毫米，东部山区局地可超 250 毫米。指挥部决定自 14 日 18 时起将防汛应急响应由Ⅲ级提升至Ⅱ级，并要求沿江 7 个在建工地全部停工撤离。",
+      "points": [["150", "200"], ["Ⅱ级", "二级"], ["停工", "撤离"]],
+      "max_chars": 100
+    },
+    {
+      "id": "C02_tech_summary",
+      "cat": "summary",
+      "prompt": "Summarize the passage in at most 50 words. Cover all key facts, add nothing.\n\nThe caching layer released version 4.2 yesterday. It cuts median lookup latency from 18 ms to 6 ms by switching to a two-level key layout, and adds optional compression that reduces memory usage by roughly 35 percent. The upgrade path from 4.1 is automatic.",
+      "points": [["6 ms", "6ms"], ["35", "4.2"]],
+      "max_chars": 400
+    },
+    {
+      "id": "C03_decisions_summary",
+      "cat": "summary",
+      "prompt": "把下面会议纪要压缩为不超过 60 字的决议摘要，只保留已拍板的决定。\n\n讨论部分：有人建议把发布推迟一周，也有人认为测试覆盖率不够。最终决议如下：一、版本 2.0 按原计划 10 月 20 日发布；二、由测试组在发布前补齐支付链路用例；三、市场部同步准备发布公告。",
+      "points": [["10 月 20", "10月20", "20 日发布"], ["支付"], ["公告"]],
+      "max_chars": 80
+    },
+    {
+      "id": "C04_spec_summary",
+      "cat": "summary",
+      "prompt": "用不超过 70 字总结下面产品规格的三个核心特性，不要添加原文没有的信息。\n\n新款路由器 AX9000 的三项核心规格：其一，双频并发速率合计 9000 Mbps，其中 5GHz 频段 5764 Mbps；其二，搭载 2.2 GHz 四核处理器与 1 GB 内存；其三，提供 2.5G 网口一个、千兆网口三个，支持 Wi-Fi 7 与 Mesh 组网。",
+      "points": [["9000"], ["2.2", "四核"], ["2.5G"]],
+      "max_chars": 90
+    },
+    {
+      "id": "C05_postmortem_summary",
+      "cat": "summary",
+      "prompt": "用不超过 90 字总结事故复盘的原因与修复措施，不要添加原文没有的信息。\n\n事故：10 月 9 日订单页大面积超时 26 分钟。原因：配置中心推送的连接池上限被误设为 1，所有请求排队争抢单连接。修复：已回滚配置并把上限恢复为 64；后续改进包括为该配置增加下限校验（不得低于 16），以及推送前灰度验证。",
+      "points": [["连接池", "上限", "1"], ["64"], ["校验", "灰度"]],
+      "max_chars": 110
+    },
+    {
+      "id": "C06_research_summary",
+      "cat": "summary",
+      "prompt": "用不超过 60 字概括下面论文摘要的方法与结果，不要添加原文没有的信息。\n\n我们提出了一种面向小样本文本分类的原型对齐方法，在冻结的句子向量空间中对每个类别仅用 5 个样本构建原型，并通过对比损失对齐类内分布。在六个公开数据集上，该方法比提示微调基线平均提升 4.8 个百分点，在极端长尾设定下提升 7.1 个百分点。",
+      "points": [["5"], ["对比", "原型"], ["4.8"]],
+      "max_chars": 80
+    },
+    {
+      "id": "D01_lookup_answer",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：配置项 READ_TIMEOUT_S 默认为 15，最大可设为 60；WRITE_TIMEOUT_S 固定为 30，不支持修改。\n\n问题：READ_TIMEOUT_S 的默认值是多少？",
+      "must": [["15"]]
+    },
+    {
+      "id": "D02_lookup_person",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：2026 年城东区小学运动会于 4 月 12 日在育才中学操场举行，开幕式上实验小学代表队获得入场式一等奖，裁判长由区体育局的郑立担任。\n\n问题：运动会的裁判长是谁？",
+      "must": [["郑立"]]
+    },
+    {
+      "id": "D03_order_answer",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：紧急处理步骤依次为：第一步切断主电源，第二步打开泄压阀，第三步用干粉灭火器扑灭火源，第四步通风 30 分钟后方可进入。\n\n问题：扑灭火源是第几步？",
+      "must": [["第三步", "第 3 步", "3"]]
+    },
+    {
+      "id": "D04_unanswerable_person",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就明确回答\"资料中没有提到\"，绝不猜测。\n\n资料：《青川计划实施方案》共 7 章，涵盖总体目标、重点任务与保障措施，重点任务包括算力调度平台建设与数据治理体系建设两大部分。\n\n问题：该计划的专家组组长是谁？",
+      "refuse": true
+    },
+    {
+      "id": "D05_unanswerable_number",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就明确回答\"资料中没有提到\"，绝不猜测任何数字。\n\n资料：本次调研覆盖北京、上海、广州三地共 42 家企业，其中制造业 25 家、服务业 17 家。\n\n问题：受访企业中制造业企业的平均营收是多少？",
+      "refuse": true
+    },
+    {
+      "id": "D06_compare_answer",
+      "cat": "grounding",
+      "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：四个分店上季度营收分别为：东店 320 万、南店 450 万、西店 280 万、北店 390 万。\n\n问题：哪个分店营收最高？",
+      "must": [["南店"]]
+    },
+    {
+      "id": "E01_refine_table",
+      "cat": "refine",
+      "multiturn": true,
+      "turn1": "简单介绍一下常见的三种文件格式：PDF、Word、TXT，每种一句话。",
+      "prompt": "把上面三种格式改成一个 Markdown 表格输出，表头包含「格式」和「特点」两列，三种格式各一行。只输出表格。",
+      "check": {"type": "markdown_table", "min_rows": 3}
+    },
+    {
+      "id": "E02_refine_shorten",
+      "cat": "refine",
+      "multiturn": true,
+      "turn1": "用一段话介绍为什么数据库需要索引，以及索引的代价。",
+      "prompt": "把上面那段话压缩到 50 个汉字以内（不含标点可忽略，总长度不超过 60 个字符），只输出压缩后的句子。",
+      "check": {"type": "max_chars", "max": 60}
+    },
+    {
+      "id": "E03_refine_numbered",
+      "cat": "refine",
+      "multiturn": true,
+    "turn1": "写一段包含至少 4 个要点的段落，介绍如何准备一次线上发布。",
+      "prompt": "把上面段落里的要点提取成编号列表（1. 2. 3. 格式），至少 4 条，只输出列表。",
+      "check": {"type": "numbered_list", "min_items": 4}
+    },
+    {
+      "id": "E04_refine_extract_emails",
+      "cat": "refine",
+      "multiturn": true,
+      "turn1": "帮我起草一封给三个同事的会议通知邮件，收件人地址分别是 li.ming@example.com、han.xue@example.org、zhou.wei@example.cn，说明周一上午十点开项目评审会。",
+      "prompt": "只从上面的邮件里提取出全部邮箱地址，逐行输出，不要任何其他文字。",
+      "check": {"type": "contains_all", "items": ["li.ming@example.com", "han.xue@example.org", "zhou.wei@example.cn"]}
+    }
+  ]
+}
