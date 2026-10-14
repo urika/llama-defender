@@ -140,7 +140,61 @@ L2 子任务累计 / L3 任务熔断）；`eval gate` 以 Accepted Delivery 为�
   校准过不得用于生产拦截；③ 抽审计 ρ 不得为省钱关闭；④ 任何 swe-eval/
   agent_go 落地先 shadow 后生效，且经各自治理评审（批期禁扰动红线同样适用）。
 
-## 6. 参考
+## 6. Shadow 实测（2026-10-15）：双臂对照与阈值裁决
+
+首个规则判断点（loop_l1）已按 §4.3/§5 红线接入 shadow，工具 `tools/jev_shadow.py`
+（纯旁路：只读 sessions/archive 日志，不碰运行路径），数据落
+`logs/diag/jev_shadow.jsonl`（云臂）与 `jev_shadow_local_compare.jsonl`（对照臂）。
+
+### 6.1 云臂：规则 vs TypeSafe Jev（n=48 去重）
+
+- 近两天 **154 个 loop_l1 触发轮**（触发密度 32%——规则在该负载下高度活跃），
+  已复核 48；**Jev 确认规则正当 0.0%（0）**，确信假阳性 72.9%（35），真灰区 27.1%（13）。
+- 判读：批任务负载（Bash 连续调用做多步排障，同工具但命令不同）下 loop_l1
+  **疑似系统性假阳性**——与 DEF-002/109 假阳性缺陷史一致；这是级联 §3.1
+  「规则不够用的语义灰区」的第一个量化案例。生产接入形态（规则触发+Jev
+  确认后注入）待批后评审。
+
+### 6.2 双臂对照：本地 RSI-Jev（:8022）作为降依赖臂
+
+本地臂 = `~/APP/rsi-jev`（RSI-Jev v6.1-VL-4B MLX 8-bit，Apache-2.0，零外发），
+接口与官方同构（`POST /v1/systemone`），同一批 state 重放（37 可比，
+11 个因 archive TTL 轮转缺席；state 重建 37/37 与云侧一致）：
+
+| 维度 | 结果 | 结论 |
+|------|------|------|
+| choice 语义一致 | **94.6%**（35/37） | 语义判断等价，可作降级臂 |
+| 双臂 accept | **均为 0** | 「规则从未被确认」的结论双方独立复现 |
+| band 一致 @同一 φ=0.80 | 35.1% | 概率刻度不等价（见 6.3） |
+| band 一致 @本地 φ=0.50 | 84%（31/37） | 测量对齐值，非行动阈值 |
+| 本地概率形态 | p_prog 中位 **0.49**/max **0.62**（云 0.9+ 顶格） | **分布平坦是模型固有特性** |
+| 延迟 | 本地 p50 3.5s ≈ 云 2.4–4.3s | 降依赖价值=额度兜底+零外发，**不在速度** |
+
+**effort 档位不能救尖锐度**（12 子样本 × low/medium/high/auto 四档：
+max p_prog 仅 0.56–0.65，全部摸不到 0.80）——平坦非配置问题。
+
+### 6.3 阈值裁决：行动阈值宁严勿松（φ=0.80 双臂同严）
+
+**裁决（2026-10-15）**：`ARM_PHI = {cloud: 0.80, local: 0.80}`。
+
+- **效用账**：0.53 边际上的「确信」是刻度假象非校准证据；错判成本
+ （放走真循环/错推翻干预）≫ 灰区升级成本（9B 本地免费）——省的少、错的贵。
+- **0.50 的去向**：降级为离线**测量对齐**参考（band 一致 84% 扫描峰值），
+  留档不进行动路径。**下调资格 = holdout 上证明该阈值 band precision 达标**
+ （n≥100 + 参考标签：弱标签自动扫 transcript 连续同 (tool,args,output)≥3
+  + 分歧样本人工抽审）。
+- **本地臂现姿态 = 安全阀非过滤器**：φ=0.80 下本地 37/37 全灰区 → 全部升级
+  Tier 2，零错判风险；有降级价值（云额度耗尽时行为可预期），暂无过滤价值。
+- **分臂常量纪律**：切臂必须核对阈值绑定（`ARM_PHI`/`ARM_XI`/记录 `arm`
+  字段/`--summary` 分臂统计均已落地 `tools/jev_shadow.py`）。
+
+### 6.4 待办
+
+① 样本扩到 n≥100（archive 轮转前）→ φ 扫描定稿；② 参考标签三态
+（弱标签/抽审/云参考不作真值）；③ blocker/route 判断点复用同一 harness 扩展；
+④ 生产接入（loop_l1 触发+Jev 确认后注入，异步旁路不加 inline 延迟）——批后评审。
+
+## 7. 参考
 
 - 本仓：`docs/06-reference-metrics/jev-mcp-tool.md`（使用策略与校准核验）、
   `docs/06-reference-metrics/jev-quota.md`（额度）
@@ -149,3 +203,8 @@ L2 子任务累计 / L3 任务熔断）；`eval gate` 以 Accepted Delivery 为�
 - 业界：Flowable 2026.1 Guardrails；FutureAGI《Ultimate Guide to LLM Guardrails 2026》；
   arXiv:2502.09054（cascade 双阈值与 early abstention）；Openlayer/Maxim/
   DigitalApplied（OWASP LLM Top 10 对齐）；toolgate / jev-engineering / JevLoop（Jev 生态实证）
+- 交叉分析补充（RSI-Jev 方法论、8 条训练原则、官方四模式、证据等级标注）：
+  `docs/06-reference-metrics/jev-research-supplement-20261013.md`
+- 本地降依赖臂：`~/APP/rsi-jev`（RSI-Jev v6.1-VL-4B MLX-8bit，Apache-2.0，
+  `127.0.0.1:8022`，客户端 `tools/jev_local.py` 同构 `/v1/systemone`）；
+  对照数据 `logs/diag/jev_shadow_local_compare.jsonl`

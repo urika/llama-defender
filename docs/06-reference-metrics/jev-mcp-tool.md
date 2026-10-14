@@ -58,6 +58,10 @@ cmd mcp add jev -- python3 /Users/<用户名>/APP/llama.cpp/tools/jev_mcp_server
 > [`docs/02-architecture-design/decision-cascade-rules-jev-escalation-20261013.md`](../02-architecture-design/decision-cascade-rules-jev-escalation-20261013.md)
 > ——含业界实践综述（scanners-before-classifiers、cascade 双阈值、延迟预算）与
 > swe-eval / agent_go 跨仓落地提案。
+>
+> **外部调研交叉分析**（RSI-Jev 递归自我改进范式、8 条训练原则、官方四大
+> 架构模式、免训练路线 LLM2Jev、证据等级标注）见
+> [`docs/06-reference-metrics/jev-research-supplement-20261013.md`](jev-research-supplement-20261013.md)。
 
 - **现有姿势已对一半**：`jev_decide` 返回原始概率、调用方自定阈值，是泛化策略的正确
   一半；另一半是**在本仓自己的判定数据上定期核验校准**（方法参考 Vals AI / Convex
