@@ -355,6 +355,19 @@ def capture_sent_view(ctx):
     在 BackendDispatcher 发请求前调用;payload 必须是完整 openai_body 拷贝
     (dispatch 路径可能改写 model 字段——调用点在改写之后即可)。
     """
+    # S-17/BR-4 录制面挂点 2(旁路 fail-open; 默认关): R' 视图=改写定稿后的
+    # Anthropic 形状 ctx.body——区别于本函数落库的 openai_body(mirror_replay
+    # 重放目标是 anthropic messages 端点, 载荷须 Anthropic 形状)。
+    if getattr(_ps, "PROXY_REQUEST_ARCHIVE_ENABLED", False):
+        try:
+            import request_archive
+            request_archive.record_turn(
+                getattr(_ps._diag_ctx, "request_id", "") or "",
+                getattr(ctx, "session_id", "") or getattr(_ps._diag_ctx, "session_key", ""),
+                getattr(ctx, "body", None),
+            )
+        except Exception as _e:
+            warn_suppressed("request_archive_turn", _e)
     if not _ps.PROXY_DIAG_ENABLED:
         return
     # R9.1 IFC Tier-0: 视图摘要先于 archive 开关计算(差分基线不依赖档案)。

@@ -893,6 +893,37 @@ CONFIG_REGISTRY = {
                "protection; overflow beyond cap is accepted rather than deleting "
                "protected files).",
     },
+    # S-17/BR-4 录制面（request_archive.py; schema 契约 =
+    # swe-eval s17-recording-surface-design-v0-20261005.md §六）
+    "PROXY_REQUEST_ARCHIVE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "S-17 R-phase per-request archive writer (s17-archive/v1, "
+               "logs/diag/archive-req/<sid>.R|.Rp.jsonl). Default off = "
+               "restart-neutral; activation = conf true + reload (batch-safe).",
+    },
+    "PROXY_REQUEST_ARCHIVE_DIR": {
+        "defaults": {"all": "logs/diag/archive-req"},
+        "type": "str", "scope": "reloadable",
+        "doc": "Directory for per-session request archive shards "
+               "(<sid>.R.jsonl = pre-rewrite view, <sid>.Rp.jsonl = "
+               "post-rewrite view; consumed by swe-eval mirror_replay.py).",
+    },
+    "PROXY_REQUEST_ARCHIVE_MAX_MB": {
+        "defaults": {"all": "2048"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Total request-archive size cap in MB; eviction is per session "
+               "(both shards together) and skips PROXY_DIAG_ACTIVE_PROTECT_MIN-"
+               "recent files (L-18 lesson); overflow accepted over deleting "
+               "protected evidence.",
+    },
+    "PROXY_REQUEST_ARCHIVE_RESPONSE_MAX_CHARS": {
+        "defaults": {"all": "65536"},
+        "type": "int", "scope": "reloadable",
+        "doc": "Serialized response body cap per archived response row; "
+               "oversize responses are shape-preserving truncated with "
+               "truncated:true (mirror_replay treats them as degraded baselines).",
+    },
     "PROXY_CTX_KEEP_TOKEN_BUDGET": {
         "defaults": {"all": "0"},
         "type": "int", "scope": "reloadable",
@@ -1366,6 +1397,14 @@ CONFIG_REGISTRY = {
         "defaults": {"all": ""},
         "type": "str", "scope": "module",
         "doc": "Explicit path to the backend binary (e.g. .venv-rapidmlx/bin/rapid-mlx). Empty = PATH lookup.",
+    },
+    "LLAMA_EMBEDDING_PROBE": {
+        "defaults": {"all": "false"},
+        "type": "str", "scope": "module",
+        "doc": "true = readiness probe uses /v1/embeddings instead of /v1/chat/completions. "
+               "Required for llama-server embedding engines: with --embeddings the chat endpoint "
+               "always returns 500 'the current context does not support logits computation'. "
+               "Consumed by manage.sh (_wait_for_ready).",
     },
     "LLAMA_THREADS": {
         "defaults": {"all": "8"},

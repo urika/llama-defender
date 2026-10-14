@@ -4901,6 +4901,20 @@ class BackendDispatcher(PipelineStage):
             except Exception as _e:
                 _warn_diag("sent_view_anthropic", _e)
 
+        # S-17/BR-4 录制面挂点 3(旁路 fail-open; 默认关): zhipu anthropic 协议
+        # 路径不走 diagnostics.capture_sent_view, 须独立旁路——R' 视图取
+        # ctx.body(Anthropic 形状, ctx.messages 的别名宿主, 改写定稿口径)。
+        if getattr(_ps, "PROXY_REQUEST_ARCHIVE_ENABLED", False):
+            try:
+                import request_archive
+                _sk17 = getattr(ctx, "session_id", "")
+                if _sk17:
+                    request_archive.record_turn(
+                        getattr(_ps._diag_ctx, "request_id", "") or "",
+                        _sk17, getattr(ctx, "body", None))
+            except Exception as _e:
+                _warn_diag("request_archive_anthropic", _e)
+
         if len(body_bytes) > _ps.PROXY_CLOUD_MAX_REQUEST_BYTES:
             log(f"  -> Request body too large for anthropic backend: "
                 f"{len(body_bytes)} > {_ps.PROXY_CLOUD_MAX_REQUEST_BYTES}")

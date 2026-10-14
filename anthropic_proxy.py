@@ -1272,6 +1272,13 @@ class Handler(BaseHTTPRequestHandler):
                     # TS-4: 客户端中途断连 (BrokenPipe 已在 backend_dispatcher 捕获)
                     # 按 499 (client closed request) 记账,不计入 5xx 错误率。
                     _status = 499 if getattr(self, "_client_disconnected", False) else 200
+                    # S-17/BR-4 录制面挂点 5a: 流式轮骨架 response 行 + 暂存清理
+                    if PROXY_REQUEST_ARCHIVE_ENABLED:
+                        try:
+                            import request_archive
+                            request_archive.finalize_request(_req_id, _status)
+                        except Exception:
+                            pass
                     log_request(
                         model=parsed.get("model", "unknown"),
                         input_chars=total_chars,
@@ -1306,6 +1313,13 @@ class Handler(BaseHTTPRequestHandler):
                     _dur = (_time.monotonic() - _t0) * 1000
                     log(f"  -> Error: {e}", level="ERROR")
                     _jsonl_output_map.pop(self._last_jsonl_token, None)
+                    # S-17/BR-4 录制面挂点 5b: 异常请求清理暂存(不落 response 行)
+                    if PROXY_REQUEST_ARCHIVE_ENABLED:
+                        try:
+                            import request_archive
+                            request_archive.finalize_request(_req_id, 500)
+                        except Exception:
+                            pass
                     status_code, _, _ = _classify_exception(e)
                     log_request(
                         model=parsed.get("model", "unknown"),
@@ -1393,6 +1407,17 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_messages(self, body):
         """Pipeline-based message processing — 22 stages."""
         import trace_context
+        # S-17/BR-4 录制面挂点 1: R 视图(改写前原 body)暂存——旁路 fail-open,
+        # 默认关。_handle_messages 全仓唯一调用点在 do_POST, 微轮续流/H_BE
+        # 探针等内部重派不经此处, 天然只计客户端请求。
+        if PROXY_REQUEST_ARCHIVE_ENABLED:
+            try:
+                import request_archive
+                request_archive.begin_request(
+                    getattr(self, '_request_id', ''), body,
+                    is_stream=bool(body.get("stream")))
+            except Exception:
+                pass
         # Emergency rollback: set PROXY_PIPELINE_DISABLED=1 to use the old path
         # (requires reverting to a prior commit that still has the legacy code).
         ctx = PipelineContext(
@@ -1599,6 +1624,15 @@ class Handler(BaseHTTPRequestHandler):
                 output_chars += len(json.dumps(block.get("input", {}), ensure_ascii=False))
         _jsonl_output_map[self._last_jsonl_token] = output_chars
         log(f"  <- Responding: {content_summary[:200]} (output_chars={output_chars})")
+        # S-17/BR-4 录制面挂点 4: 非流式响应完形(Anthropic 形状=mirror 并排基线;
+        # OpenAI-mode 响应形状不同, 已在上方 return, 不到此处)
+        if PROXY_REQUEST_ARCHIVE_ENABLED:
+            try:
+                import request_archive
+                request_archive.record_response(
+                    getattr(self, '_request_id', ''), anthropic_resp)
+            except Exception:
+                pass
         self._respond_json(anthropic_resp)
 
     # TODO(roadmap-U7): Stream reasoning progress — emit partial thinking events during long TTFT
