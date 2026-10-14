@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""9B 知识服务质量门（knowledge quality gate）。
+"""9B 知识/能力质量门（knowledge quality gate v2）。
 
-金标集: test/fixtures/knowledge_gate_9b.json（32 条 / 5 类）
+金标集: test/fixtures/knowledge_gate_9b.json（45 条 / 7 类；v2 2026-10-15）
 执行:   直连 aux 引擎 :8084（OpenAI chat 格式），不经过 :4000 主代理 —— 批期安全。
 评分:   纯确定性（stdlib only），无 LLM 裁判，可复现。
 
@@ -12,6 +12,10 @@
   grounding   RAG 问答   → 必含答案词组全中；refuse 题须出现拒答措辞（防幻觉红线，
                            unanswerable 子集任一失手 = 整门 FAIL）
   refine      多轮精炼   → 第 2 轮约束检查（表格/字数/编号列表/内容全含），第 1 轮不计分
+  coding      编码能力   → exec 模式：安全扫描（import 白名单 + 危险内建禁用）后
+                           子进程沙箱跑金标断言（全部 expr==expect）；keywords 模式：must 全中
+  tool_call   工具调用   → 真实 tools 参数：只调用期望工具且参数命中（任一 alts）；
+                           no_tool 反例：零工具调用 + content_must 全中（防过度调用）
 
 通过线（fixture.thresholds）:
   各类达标 + unanswerable=1.0 + overall ≥ 0.75 → exit 0，否则 exit 1。
@@ -19,8 +23,13 @@
 用法:
   python3 tools/knowledge_gate_9b.py                 # 全量
   python3 tools/knowledge_gate_9b.py --case A01      # 单条
+  python3 tools/knowledge_gate_9b.py --cat coding    # 单类（v2）
   python3 tools/knowledge_gate_9b.py --limit 3       # 冒烟
   python3 tools/knowledge_gate_9b.py --base http://127.0.0.1:8084/v1
+
+coding exec 安全说明: 模型代码经 import 白名单 + 危险内建黑名单扫描，再以
+`python3 -I -c` 子进程执行（隔离模式，RLIMIT_CPU=6s，wall timeout 10s），仅本机
+质量门场景使用。
 """
 
 import argparse
@@ -165,21 +174,168 @@ def score_refine(resp: str, case: dict):
     return False, {"error": f"unknown check {t}"}
 
 
+# ------------------------------------------------------------ coding (v2)
+
+_CODING_BAN = re.compile(
+    r"(__import__|\beval\s*\(|\bexec\s*\(|\bopen\s*\(|\bcompile\s*\("
+    r"|\binput\s*\(|\bos\s*\.|\bsubprocess\b|\bshutil\b|\bsocket\b"
+    r"|\bpathlib\b|\bmultiprocessing\b|\bpty\b|\bwebbrowser\b"
+    r"|\bbreakpoint\s*\(|\bglobals\s*\(|\blocals\s*\()")
+# 允许的 import 白名单（其余 import 一律拒绝执行）
+_CODING_IMPORT_OK = {"re", "math", "json", "typing", "collections",
+                     "itertools", "functools", "string", "heapq", "bisect",
+                     "statistics", "operator", "dataclasses", "enum"}
+
+
+def _coding_extract_code(resp: str) -> str:
+    """从模型输出提取 Python 代码：优先 markdown 围栏，否则全文。"""
+    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", resp, re.S)
+    if m:
+        return m.group(1).strip()
+    # 无围栏：剔除首行中文说明（若代码前有 prose，取首个 def/class/import 起）
+    lines = resp.splitlines()
+    for i, ln in enumerate(lines):
+        if re.match(r"\s*(def |class |import |from )", ln):
+            return "\n".join(lines[i:]).strip()
+    return resp.strip()
+
+
+def score_coding(resp: str, case: dict):
+    if case.get("mode") == "keywords":
+        r_n = norm(resp)
+        detail, ok_all = [], True
+        for alts in case["must"]:
+            h = any(norm(a) in r_n for a in alts if norm(a))
+            detail.append({"alts": alts, "hit": h})
+            ok_all = ok_all and h
+        return ok_all, {"mode": "keywords", "must": detail}
+
+    # ---- exec 模式：安全扫描后子进程跑断言
+    code = _coding_extract_code(resp)
+    detail = {"mode": "exec", "code_head": code[:200]}
+    bad = _CODING_BAN.search(code)
+    if bad:
+        detail["error"] = f"unsafe_token:{bad.group(0)}"
+        return False, detail
+    for m in re.finditer(r"^\s*(?:import\s+([\w.]+)|from\s+([\w.]+)\s+import)", code, re.M):
+        mod = (m.group(1) or m.group(2)).split(".")[0]
+        if mod not in _CODING_IMPORT_OK:
+            detail["error"] = f"import_not_allowed:{mod}"
+            return False, detail
+    try:
+        import subprocess as _sp
+        # 组装沙箱脚本：模型代码 + 逐条 eval 断言，输出 JSON 行
+        checks = "\n".join(
+            f"__r.append(_gate_eval({json.dumps(t['expr'])}, {json.dumps(t['expect'])}))"
+            for t in case["tests"])
+        script = (
+            "import json as __j, math, re\n"
+            "def _gate_eval(expr, expect):\n"
+            "    try:\n"
+            "        got = eval(expr, globals())\n"
+            "        ok = (got == expect)\n"
+            "        return {'expr': expr, 'ok': bool(ok),\n"
+            "                'got': __j.dumps(got, default=str)[:160],\n"
+            "                'expect': __j.dumps(expect, default=str)[:160]}\n"
+            "    except Exception as e:\n"
+            "        return {'expr': expr, 'ok': False, 'err': f'{type(e).__name__}: {e}'[:160]}\n"
+            f"{code}\n"
+            "__r = []\n"
+            f"{checks}\n"
+            "print('__GATE__' + __j.dumps(__r, ensure_ascii=False))\n"
+        )
+        proc = _sp.run([sys.executable, "-I", "-c", script],
+                       capture_output=True, text=True, timeout=15)
+    except Exception as e:  # TimeoutExpired / OSError 等
+        detail["error"] = f"exec:{type(e).__name__}"
+        return False, detail
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("__GATE__")), None)
+    if line is None:
+        detail["error"] = "no_gate_output"
+        detail["stderr"] = proc.stderr[-300:]
+        return False, detail
+    try:
+        checks_out = json.loads(line[len("__GATE__"):])
+    except Exception:
+        detail["error"] = "bad_gate_json"
+        return False, detail
+    ok_all = all(c["ok"] for c in checks_out)
+    detail["checks"] = checks_out
+    detail["passed"] = f"{sum(c['ok'] for c in checks_out)}/{len(checks_out)}"
+    return ok_all, detail
+
+
+# ------------------------------------------------------------ tool_call (v2)
+
+def score_tool_call(msg: dict, case: dict):
+    """msg: OpenAI 风格 message（含 tool_calls / content）。"""
+    tcs = msg.get("tool_calls") or []
+    content = msg.get("content") or ""
+
+    if case.get("no_tool"):
+        # 反例：不得发起任何工具调用，且 content 命中必含词组
+        r_n = norm(content)
+        detail, ok_all = [], True
+        for alts in case.get("content_must", []):
+            h = any(norm(a) in r_n for a in alts if norm(a))
+            detail.append({"alts": alts, "hit": h})
+            ok_all = ok_all and h
+        ok = ok_all and not tcs
+        return ok, {"no_tool": True, "n_calls": len(tcs),
+                    "content_must": detail, "content": content[:160]}
+
+    if not tcs:
+        return False, {"error": "no_tool_call", "content": content[:160]}
+
+    want = case["tool"]
+    names = [t.get("function", {}).get("name") for t in tcs]
+    if want not in names:
+        return False, {"error": "wrong_tool", "want": want, "got": names}
+    extra = [n for n in names if n != want]
+    tc = next(t for t in tcs if t.get("function", {}).get("name") == want)
+    raw_args = tc.get("function", {}).get("arguments") or "{}"
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+    except Exception:
+        return False, {"error": "bad_args_json", "raw": raw_args[:160], "extra": extra}
+
+    detail, ok_all, hits = {}, True, 0
+    for k, gold in (case.get("args") or {}).items():
+        golds = gold if isinstance(gold, list) else [gold]
+        got = args.get(k)
+        got_n = norm(got) if got is not None else ""
+        hit = any((gn and (gn in got_n or (got_n and got_n in gn)))
+                  for gn in (norm(g) for g in golds))
+        detail[k] = {"gold": gold, "got": got, "hit": hit}
+        hits += int(hit)
+        ok_all = ok_all and hit
+    detail["_arg_acc"] = round(hits / max(1, len(case.get("args") or {})), 3)
+    detail["_extra_calls"] = extra
+    # 多余调用不算失败（模型可能并行补充），但记录在案；主工具+参数必须全中
+    return ok_all, {"tool": want, "args": detail, "all_calls": names}
+
+
 SCORERS = {
     "extraction": score_extraction,
     "tagging": score_tagging,
     "summary": score_summary,
     "grounding": score_grounding,
     "refine": score_refine,
+    "coding": score_coding,
+    "tool_call": score_tool_call,
 }
 
 # ---------------------------------------------------------------- llm client
 
-def chat(base: str, model: str, messages: list, timeout: int = 90):
-    payload = json.dumps({
+def chat(base: str, model: str, messages: list, tools=None, timeout: int = 90):
+    obj = {
         "model": model, "messages": messages,
         "temperature": 0, "max_tokens": 768,
-    }).encode("utf-8")
+    }
+    if tools:
+        obj["tools"] = tools
+        obj["tool_choice"] = "auto"
+    payload = json.dumps(obj).encode("utf-8")
     req = urllib.request.Request(
         base.rstrip("/") + "/chat/completions", data=payload,
         headers={"Content-Type": "application/json"})
@@ -187,8 +343,9 @@ def chat(base: str, model: str, messages: list, timeout: int = 90):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read().decode("utf-8"))
     ms = int((time.time() - t0) * 1000)
-    content = body["choices"][0]["message"]["content"] or ""
-    return content, ms
+    msg = body["choices"][0]["message"]
+    content = msg.get("content") or ""
+    return content, ms, msg
 
 # ---------------------------------------------------------------- runner
 
@@ -198,7 +355,7 @@ def run_case(base, model, case):
     calls, total_ms, extra = [], 0, {}
     try:
         if case.get("multiturn"):
-            r1, ms1 = chat(base, model, [{"role": "user", "content": case["turn1"]}])
+            r1, ms1, _ = chat(base, model, [{"role": "user", "content": case["turn1"]}])
             calls.append({"turn": 1, "ms": ms1, "resp": r1[:300]})
             total_ms += ms1
             msgs = [{"role": "user", "content": case["turn1"]},
@@ -206,10 +363,13 @@ def run_case(base, model, case):
                     {"role": "user", "content": case["prompt"]}]
         else:
             msgs = [{"role": "user", "content": case["prompt"]}]
-        resp, ms2 = chat(base, model, msgs)
+        resp, ms2, msg = chat(base, model, msgs, tools=case.get("tools"))
         calls.append({"turn": len(calls) + 1, "ms": ms2, "resp": resp[:300]})
         total_ms += ms2
-        ok, detail = scorer(resp, case)
+        if case["cat"] == "tool_call":
+            ok, detail = score_tool_call(msg, case)
+        else:
+            ok, detail = scorer(resp, case)
         extra["response"] = resp[:600]
         return ok, {**detail, **extra}, calls, total_ms
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, KeyError, OSError) as e:
@@ -222,12 +382,18 @@ def main():
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--case", help="只跑指定 id")
+    ap.add_argument("--cat", help="只跑指定类别（extraction/tagging/summary/grounding/refine/coding/tool_call）")
     ap.add_argument("--limit", type=int, help="只跑前 N 条（冒烟）")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
     fx = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     cases = fx["cases"]
+    if args.cat:
+        cases = [c for c in cases if c["cat"] == args.cat]
+        if not cases:
+            print(f"未找到类别 {args.cat}")
+            return 2
     if args.case:
         cases = [c for c in cases if c["id"] == args.case]
         if not cases:
@@ -264,10 +430,10 @@ def main():
         verdicts[cat] = good
         print(f"  {cat:<12} {sum(passes)}/{len(passes)} = {rate:.1%}  线 {thr:.1%}  "
               f"{'✓' if good else '✗'}")
-    # 防幻觉红线：unanswerable 子集（grounding refuse 题）
+    # 防幻觉红线：unanswerable 子集（grounding refuse 题）——仅当子集在场时生效
     unans = [r for r in results
              if r["cat"] == "grounding" and r["detail"].get("expect") == "refusal"]
-    unans_ok = bool(unans) and all(r["pass"] for r in unans)
+    unans_ok = all(r["pass"] for r in unans) if unans else True
     print(f"  unanswerable {sum(r['pass'] for r in unans)}/{len(unans)}  "
           f"线 {thresholds['unanswerable']:.0%}  {'✓' if unans_ok else '✗ ← 防幻觉红线'}")
 

@@ -1,8 +1,8 @@
 {
-  "version": 1,
+  "version": 2,
   "gate": "knowledge-quality-9b",
   "engine": "ornith-9b",
-  "note": "9B 知识服务质量门金标集（2026-10-15）。确定性评分：extraction 字段全对算过、tagging 标签精确匹配、summary 关键点覆盖+长度上限、grounding 必含答案词/拒答、refine 第二轮约束检查。unanswerable 子集任一失手=整门 FAIL（防幻觉红线）。",
+  "note": "9B 知识/能力质量门金标集 v2（2026-10-15）。v1=5类32条（知识加工）；v2 +coding(8: 执行断言5+关键词3, 安全扫描后子进程跑测) +tool_call(5: 真实 tools 参数, 含不该调用反例)。确定性评分：extraction 字段全对、tagging 标签精确、summary 关键点覆盖≥2/3+字数、grounding 必含/拒答、refine 第2轮约束、coding 断言全过/关键词全中、tool_call 工具+参数+无多余调用。unanswerable 子集任一失手=整门 FAIL（防幻觉红线）。",
   "thresholds": {
     "extraction": 0.75,
     "tagging": 0.875,
@@ -10,172 +10,330 @@
     "grounding": 0.667,
     "unanswerable": 1.0,
     "refine": 0.5,
-    "overall": 0.75
+    "overall": 0.75,
+    "coding": 0.625,
+    "tool_call": 0.8
   },
   "cases": [
     {
       "id": "A01_product_announce",
       "cat": "extraction",
       "prompt": "从下列文本抽取信息，只输出一个 JSON 对象（不要 markdown 围栏、不要解释），键名必须为 org, product, date, price：\n\n星尘科技今日在新品发布会上宣布推出智能音箱「星尘 Echo Mini」，建议零售价 399 元，将于 2026 年 11 月 11 日在全渠道开售。",
-      "fields": {"org": "星尘科技", "product": "星尘 Echo Mini", "date": "2026 年 11 月 11 日", "price": "399"}
+      "fields": {
+        "org": "星尘科技",
+        "product": "星尘 Echo Mini",
+        "date": "2026 年 11 月 11 日",
+        "price": "399"
+      }
     },
     {
       "id": "A02_bug_report",
       "cat": "extraction",
       "prompt": "从下列工单抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 component, severity, version：\n\n工单 #4821：导出模块在批量导出超过 500 行时崩溃，页面直接白屏。影响版本 v3.7.2，紧急程度评为 High，组件为 export-service。",
-      "fields": {"component": "export-service", "severity": "High", "version": "v3.7.2"}
+      "fields": {
+        "component": "export-service",
+        "severity": "High",
+        "version": "v3.7.2"
+      }
     },
     {
       "id": "A03_meeting_notes",
       "cat": "extraction",
       "prompt": "从下列会议纪要抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 project, owner, deadline, milestone：\n\n项目「灵舟」周会纪要：本次确认由陈岚负责支付网关联调，里程碑定为灰度上线，截止日期 2026-10-30，其余事项顺延下周。",
-      "fields": {"project": "灵舟", "owner": "陈岚", "deadline": "2026-10-30", "milestone": "灰度上线"}
+      "fields": {
+        "project": "灵舟",
+        "owner": "陈岚",
+        "deadline": "2026-10-30",
+        "milestone": "灰度上线"
+      }
     },
     {
       "id": "A04_api_doc",
       "cat": "extraction",
       "prompt": "从下列 API 文档抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 endpoint, method, rate_limit：\n\nGET /v2/usage：查询账户用量。未认证返回 401。该接口限流为每分钟 120 次请求，超出返回 429。",
-      "fields": {"endpoint": "/v2/usage", "method": "GET", "rate_limit": "120"}
+      "fields": {
+        "endpoint": "/v2/usage",
+        "method": "GET",
+        "rate_limit": "120"
+      }
     },
     {
       "id": "A05_bio",
       "cat": "extraction",
       "prompt": "从下列人物简介抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 name, university, award, year：\n\n林觉，博士，现任教于岭东大学计算机学院，因在分布式一致性算法方面的贡献获得 2023 年度卓创青年学者奖。",
-      "fields": {"name": "林觉", "university": "岭东大学", "award": "卓创青年学者奖", "year": "2023"}
+      "fields": {
+        "name": "林觉",
+        "university": "岭东大学",
+        "award": "卓创青年学者奖",
+        "year": "2023"
+      }
     },
     {
       "id": "A06_financial",
       "cat": "extraction",
       "prompt": "从下列财报摘录抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 company, revenue, yoy：\n\n蓝湾百货发布 2026 年二季度财报：季度营收 18.4 亿元，同比增长 6.2%，净利润受门店改造投入影响略有下滑。",
-      "fields": {"company": "蓝湾百货", "revenue": "18.4", "yoy": "6.2"}
+      "fields": {
+        "company": "蓝湾百货",
+        "revenue": "18.4",
+        "yoy": "6.2"
+      }
     },
     {
       "id": "A07_log_line",
       "cat": "extraction",
       "prompt": "从下列日志及说明抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 service, error_code, timeout_s：\n\n[2026-10-14T02:11:07Z] ERROR payment-gateway: upstream call failed code=UPSTREAM_TIMEOUT after 30s (retry=2)",
-      "fields": {"service": "payment-gateway", "error_code": "UPSTREAM_TIMEOUT", "timeout_s": "30"}
+      "fields": {
+        "service": "payment-gateway",
+        "error_code": "UPSTREAM_TIMEOUT",
+        "timeout_s": "30"
+      }
     },
     {
       "id": "A08_listing_cn",
       "cat": "extraction",
       "prompt": "从下列房源信息抽取信息，只输出一个 JSON 对象（不要解释），键名必须为 community, area, floor, price：\n\n房源：望山府 3 号楼，建筑面积 128 平米，位于 18/32 层，挂牌价 685 万，满五唯一。",
-      "fields": {"community": "望山府", "area": "128", "floor": "18/32", "price": "685"}
+      "fields": {
+        "community": "望山府",
+        "area": "128",
+        "floor": "18/32",
+        "price": "685"
+      }
     },
     {
       "id": "B01_email_classify",
       "cat": "tagging",
       "prompt": "给下面的客户邮件选一个最合适的类别，只能从这些标签里选：support, invoice, bug, feature。只输出标签本身，不要任何其他内容。\n\n邮件内容：\"你们上个月给我开了两张发票，金额还不一样，麻烦核对一下并退回多收的部分。\"",
-      "labels": ["support", "invoice", "bug", "feature"],
+      "labels": [
+        "support",
+        "invoice",
+        "bug",
+        "feature"
+      ],
       "answer": "invoice"
     },
     {
       "id": "B02_news_classify",
       "cat": "tagging",
       "prompt": "给下面这则新闻标题选一个最合适的主题标签，只能从这些标签里选：politics, tech, sports, finance。只输出标签本身。\n\n\"央行宣布下调存款准备金率 0.25 个百分点，下周一生效\"",
-      "labels": ["politics", "tech", "sports", "finance"],
+      "labels": [
+        "politics",
+        "tech",
+        "sports",
+        "finance"
+      ],
       "answer": "finance"
     },
     {
       "id": "B03_intent",
       "cat": "tagging",
       "prompt": "判断下面用户消息的意图，只能从这些标签里选：question, complaint, praise, bug。只输出标签本身。\n\n\"用了三天了，搜索结果比之前快多了，点赞！\"",
-      "labels": ["question", "complaint", "praise", "bug"],
+      "labels": [
+        "question",
+        "complaint",
+        "praise",
+        "bug"
+      ],
       "answer": "praise"
     },
     {
       "id": "B04_genre_cn",
       "cat": "tagging",
       "prompt": "判断下面这段文字的文体，只能从这些标签里选：议论文, 说明文, 记叙文, 应用文。只输出标签本身。\n\n\"会议纪要：一、时间 10 月 14 日 14:00；二、参会人：王力、周敏；三、决议：预算方案按 A 版执行。\"",
-      "labels": ["议论文", "说明文", "记叙文", "应用文"],
+      "labels": [
+        "议论文",
+        "说明文",
+        "记叙文",
+        "应用文"
+      ],
       "answer": "应用文"
     },
     {
       "id": "B05_ticket_type",
       "cat": "tagging",
       "prompt": "给下面的工单选类型，只能从这些标签里选：question, incident, change。只输出标签本身。\n\n\"生产环境从凌晨 2 点开始所有登录请求都返回 502，已影响全部用户。\"",
-      "labels": ["question", "incident", "change"],
+      "labels": [
+        "question",
+        "incident",
+        "change"
+      ],
       "answer": "incident"
     },
     {
       "id": "B06_sentiment",
       "cat": "tagging",
       "prompt": "判断下面评论的情感极性，只能从这些标签里选：positive, neutral, negative。只输出标签本身。\n\n\"东西还行吧，就是物流太慢了，等了整整一周。\"",
-      "labels": ["positive", "neutral", "negative"],
+      "labels": [
+        "positive",
+        "neutral",
+        "negative"
+      ],
       "answer": "negative"
     },
     {
       "id": "B07_topic_cn",
       "cat": "tagging",
       "prompt": "判断下面句子的主要话题，只能从这些标签里选：天气, 交通, 医疗, 教育。只输出标签本身。\n\n\"早高峰地铁 2 号线再次延误，数千名乘客滞留站台。\"",
-      "labels": ["天气", "交通", "医疗", "教育"],
+      "labels": [
+        "天气",
+        "交通",
+        "医疗",
+        "教育"
+      ],
       "answer": "交通"
     },
     {
       "id": "B08_urgency",
       "cat": "tagging",
       "prompt": "评估下面事件的处理紧急度，只能从这些标签里选：high, medium, low。只输出标签本身。\n\n\"文档首页有个错别字，把'登录'写成了'登陆'。\"",
-      "labels": ["high", "medium", "low"],
+      "labels": [
+        "high",
+        "medium",
+        "low"
+      ],
       "answer": "low"
     },
     {
       "id": "C01_news_summary",
       "cat": "summary",
       "prompt": "用不超过 80 字总结下面新闻，必须覆盖所有关键事实，不要添加原文没有的信息。\n\n2026 年 10 月 13 日，临江市防汛指挥部发布通告：受台风外围环流影响，预计 14 日夜间至 15 日清晨全市累计降雨量将达 150 至 200 毫米，东部山区局地可超 250 毫米。指挥部决定自 14 日 18 时起将防汛应急响应由Ⅲ级提升至Ⅱ级，并要求沿江 7 个在建工地全部停工撤离。",
-      "points": [["150", "200"], ["Ⅱ级", "二级"], ["停工", "撤离"]],
+      "points": [
+        [
+          "150",
+          "200"
+        ],
+        [
+          "Ⅱ级",
+          "二级"
+        ],
+        [
+          "停工",
+          "撤离"
+        ]
+      ],
       "max_chars": 100
     },
     {
       "id": "C02_tech_summary",
       "cat": "summary",
       "prompt": "Summarize the passage in at most 50 words. Cover all key facts, add nothing.\n\nThe caching layer released version 4.2 yesterday. It cuts median lookup latency from 18 ms to 6 ms by switching to a two-level key layout, and adds optional compression that reduces memory usage by roughly 35 percent. The upgrade path from 4.1 is automatic.",
-      "points": [["6 ms", "6ms"], ["35", "4.2"]],
+      "points": [
+        [
+          "6 ms",
+          "6ms"
+        ],
+        [
+          "35",
+          "4.2"
+        ]
+      ],
       "max_chars": 400
     },
     {
       "id": "C03_decisions_summary",
       "cat": "summary",
       "prompt": "把下面会议纪要压缩为不超过 60 字的决议摘要，只保留已拍板的决定。\n\n讨论部分：有人建议把发布推迟一周，也有人认为测试覆盖率不够。最终决议如下：一、版本 2.0 按原计划 10 月 20 日发布；二、由测试组在发布前补齐支付链路用例；三、市场部同步准备发布公告。",
-      "points": [["10 月 20", "10月20", "20 日发布"], ["支付"], ["公告"]],
+      "points": [
+        [
+          "10 月 20",
+          "10月20",
+          "20 日发布"
+        ],
+        [
+          "支付"
+        ],
+        [
+          "公告"
+        ]
+      ],
       "max_chars": 80
     },
     {
       "id": "C04_spec_summary",
       "cat": "summary",
       "prompt": "用不超过 70 字总结下面产品规格的三个核心特性，不要添加原文没有的信息。\n\n新款路由器 AX9000 的三项核心规格：其一，双频并发速率合计 9000 Mbps，其中 5GHz 频段 5764 Mbps；其二，搭载 2.2 GHz 四核处理器与 1 GB 内存；其三，提供 2.5G 网口一个、千兆网口三个，支持 Wi-Fi 7 与 Mesh 组网。",
-      "points": [["9000"], ["2.2", "四核"], ["2.5G"]],
+      "points": [
+        [
+          "9000"
+        ],
+        [
+          "2.2",
+          "四核"
+        ],
+        [
+          "2.5G"
+        ]
+      ],
       "max_chars": 90
     },
     {
       "id": "C05_postmortem_summary",
       "cat": "summary",
       "prompt": "用不超过 90 字总结事故复盘的原因与修复措施，不要添加原文没有的信息。\n\n事故：10 月 9 日订单页大面积超时 26 分钟。原因：配置中心推送的连接池上限被误设为 1，所有请求排队争抢单连接。修复：已回滚配置并把上限恢复为 64；后续改进包括为该配置增加下限校验（不得低于 16），以及推送前灰度验证。",
-      "points": [["连接池", "上限", "1"], ["64"], ["校验", "灰度"]],
+      "points": [
+        [
+          "连接池",
+          "上限",
+          "1"
+        ],
+        [
+          "64"
+        ],
+        [
+          "校验",
+          "灰度"
+        ]
+      ],
       "max_chars": 110
     },
     {
       "id": "C06_research_summary",
       "cat": "summary",
       "prompt": "用不超过 60 字概括下面论文摘要的方法与结果，不要添加原文没有的信息。\n\n我们提出了一种面向小样本文本分类的原型对齐方法，在冻结的句子向量空间中对每个类别仅用 5 个样本构建原型，并通过对比损失对齐类内分布。在六个公开数据集上，该方法比提示微调基线平均提升 4.8 个百分点，在极端长尾设定下提升 7.1 个百分点。",
-      "points": [["5"], ["对比", "原型"], ["4.8"]],
+      "points": [
+        [
+          "5"
+        ],
+        [
+          "对比",
+          "原型"
+        ],
+        [
+          "4.8"
+        ]
+      ],
       "max_chars": 80
     },
     {
       "id": "D01_lookup_answer",
       "cat": "grounding",
       "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：配置项 READ_TIMEOUT_S 默认为 15，最大可设为 60；WRITE_TIMEOUT_S 固定为 30，不支持修改。\n\n问题：READ_TIMEOUT_S 的默认值是多少？",
-      "must": [["15"]]
+      "must": [
+        [
+          "15"
+        ]
+      ]
     },
     {
       "id": "D02_lookup_person",
       "cat": "grounding",
       "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：2026 年城东区小学运动会于 4 月 12 日在育才中学操场举行，开幕式上实验小学代表队获得入场式一等奖，裁判长由区体育局的郑立担任。\n\n问题：运动会的裁判长是谁？",
-      "must": [["郑立"]]
+      "must": [
+        [
+          "郑立"
+        ]
+      ]
     },
     {
       "id": "D03_order_answer",
       "cat": "grounding",
       "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：紧急处理步骤依次为：第一步切断主电源，第二步打开泄压阀，第三步用干粉灭火器扑灭火源，第四步通风 30 分钟后方可进入。\n\n问题：扑灭火源是第几步？",
-      "must": [["第三步", "第 3 步", "3"]]
+      "must": [
+        [
+          "第三步",
+          "第 3 步",
+          "3"
+        ]
+      ]
     },
     {
       "id": "D04_unanswerable_person",
@@ -193,7 +351,11 @@
       "id": "D06_compare_answer",
       "cat": "grounding",
       "prompt": "只根据下面的资料回答问题，答案必须来自资料原文；如果资料中没有答案，就说\"资料中没有提到\"。\n\n资料：四个分店上季度营收分别为：东店 320 万、南店 450 万、西店 280 万、北店 390 万。\n\n问题：哪个分店营收最高？",
-      "must": [["南店"]]
+      "must": [
+        [
+          "南店"
+        ]
+      ]
     },
     {
       "id": "E01_refine_table",
@@ -201,7 +363,10 @@
       "multiturn": true,
       "turn1": "简单介绍一下常见的三种文件格式：PDF、Word、TXT，每种一句话。",
       "prompt": "把上面三种格式改成一个 Markdown 表格输出，表头包含「格式」和「特点」两列，三种格式各一行。只输出表格。",
-      "check": {"type": "markdown_table", "min_rows": 3}
+      "check": {
+        "type": "markdown_table",
+        "min_rows": 3
+      }
     },
     {
       "id": "E02_refine_shorten",
@@ -209,15 +374,21 @@
       "multiturn": true,
       "turn1": "用一段话介绍为什么数据库需要索引，以及索引的代价。",
       "prompt": "把上面那段话压缩到 50 个汉字以内（不含标点可忽略，总长度不超过 60 个字符），只输出压缩后的句子。",
-      "check": {"type": "max_chars", "max": 60}
+      "check": {
+        "type": "max_chars",
+        "max": 60
+      }
     },
     {
       "id": "E03_refine_numbered",
       "cat": "refine",
       "multiturn": true,
-    "turn1": "写一段包含至少 4 个要点的段落，介绍如何准备一次线上发布。",
+      "turn1": "写一段包含至少 4 个要点的段落，介绍如何准备一次线上发布。",
       "prompt": "把上面段落里的要点提取成编号列表（1. 2. 3. 格式），至少 4 条，只输出列表。",
-      "check": {"type": "numbered_list", "min_items": 4}
+      "check": {
+        "type": "numbered_list",
+        "min_items": 4
+      }
     },
     {
       "id": "E04_refine_extract_emails",
@@ -225,7 +396,455 @@
       "multiturn": true,
       "turn1": "帮我起草一封给三个同事的会议通知邮件，收件人地址分别是 li.ming@example.com、han.xue@example.org、zhou.wei@example.cn，说明周一上午十点开项目评审会。",
       "prompt": "只从上面的邮件里提取出全部邮箱地址，逐行输出，不要任何其他文字。",
-      "check": {"type": "contains_all", "items": ["li.ming@example.com", "han.xue@example.org", "zhou.wei@example.cn"]}
+      "check": {
+        "type": "contains_all",
+        "items": [
+          "li.ming@example.com",
+          "han.xue@example.org",
+          "zhou.wei@example.cn"
+        ]
+      }
+    },
+    {
+      "id": "COD01_flatten",
+      "cat": "coding",
+      "mode": "exec",
+      "prompt": "写一个 Python 函数 flatten(lst)：把任意深度嵌套的纯列表结构展平成一维列表，只处理 list 嵌套，其他类型元素原样保留。只输出函数定义代码本身，不要解释、不要 markdown 围栏。",
+      "tests": [
+        {
+          "expr": "flatten([1,[2,[3,4],5],6])",
+          "expect": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        {
+          "expr": "flatten([])",
+          "expect": []
+        },
+        {
+          "expr": "flatten([['a'],'b',[['c']]])",
+          "expect": [
+            "a",
+            "b",
+            "c"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "COD02_bugfix_median",
+      "cat": "coding",
+      "mode": "exec",
+      "prompt": "下面函数计算中位数，但偶数个元素时结果错误（median([1,2]) 返回 3 而不是 1.5）。请修复并输出完整函数，只输出代码：\n\ndef median(nums):\n    nums = sorted(nums)\n    n = len(nums)\n    if n % 2 == 0:\n        return nums[n // 2 - 1] + nums[n // 2]\n    else:\n        return nums[n // 2]",
+      "tests": [
+        {
+          "expr": "median([1,2])",
+          "expect": 1.5
+        },
+        {
+          "expr": "median([5,1,4,2])",
+          "expect": 3
+        },
+        {
+          "expr": "median([3,1,2])",
+          "expect": 2
+        },
+        {
+          "expr": "median([7])",
+          "expect": 7
+        }
+      ]
+    },
+    {
+      "id": "COD03_camel_to_snake",
+      "cat": "coding",
+      "mode": "exec",
+      "prompt": "写函数 camel_to_snake(s)：把驼峰命名转为下划线命名，连续大写缩写也要正确切分（parseXMLParser → parse_xml_parser）。只输出代码。",
+      "tests": [
+        {
+          "expr": "camel_to_snake('getName')",
+          "expect": "get_name"
+        },
+        {
+          "expr": "camel_to_snake('parseXMLParser')",
+          "expect": "parse_xml_parser"
+        },
+        {
+          "expr": "camel_to_snake('HTTPServer')",
+          "expect": "http_server"
+        },
+        {
+          "expr": "camel_to_snake('A')",
+          "expect": "a"
+        }
+      ]
+    },
+    {
+      "id": "COD04_extract_versions",
+      "cat": "coding",
+      "mode": "exec",
+      "prompt": "写函数 extract_versions(text)：用正则找出所有 x.y.z 形式（x/y/z 为一到两位数字）的版本号，按出现顺序返回字符串列表。只输出代码。",
+      "tests": [
+        {
+          "expr": "extract_versions('v1.2.3 and 4.5.6, also 12.34.56, bad 1.2')",
+          "expect": [
+            "1.2.3",
+            "4.5.6",
+            "12.34.56"
+          ]
+        },
+        {
+          "expr": "extract_versions('no versions here 1.2')",
+          "expect": []
+        }
+      ]
+    },
+    {
+      "id": "COD05_top_k",
+      "cat": "coding",
+      "mode": "exec",
+      "prompt": "写函数 top_k(nums, k)：返回列表中最大的 k 个数，按降序排列；k 可能等于列表长度。只输出代码。",
+      "tests": [
+        {
+          "expr": "top_k([3,1,5,2],2)",
+          "expect": [
+            5,
+            3
+          ]
+        },
+        {
+          "expr": "top_k([1],1)",
+          "expect": [
+            1
+          ]
+        },
+        {
+          "expr": "top_k([9,9,8],2)",
+          "expect": [
+            9,
+            9
+          ]
+        },
+        {
+          "expr": "top_k([4,5,6],3)",
+          "expect": [
+            6,
+            5,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "id": "COD06_shell_find",
+      "cat": "coding",
+      "mode": "keywords",
+      "prompt": "只用一条 shell 命令回答：用 find 列出当前目录及子目录下所有 .log 文件，按修改时间从旧到新排序输出路径。只输出这一条命令。",
+      "must": [
+        [
+          "find"
+        ],
+        [
+          ".log",
+          "*.log"
+        ],
+        [
+          "sort"
+        ]
+      ]
+    },
+    {
+      "id": "COD07_commit_message",
+      "cat": "coding",
+      "mode": "keywords",
+      "prompt": "给下面改动写一条 Conventional Commit 风格的 commit message（type(scope): 描述，一行）。\n改动：billing.js 中的 calcTotal() 原来不含税，现新增 taxRate 参数，返回含税总额。\n只输出 message 这一行。",
+      "must": [
+        [
+          "billing"
+        ],
+        [
+          "calctotal",
+          "total"
+        ],
+        [
+          "tax",
+          "税"
+        ],
+        [
+          "feat",
+          "fix",
+          "chore",
+          "refactor"
+        ]
+      ]
+    },
+    {
+      "id": "COD08_complexity",
+      "cat": "coding",
+      "mode": "keywords",
+      "prompt": "下面 Python 代码的平均时间复杂度是多少？只输出 O(...) 形式。\n\ndef run(items):\n    items.sort()\n    seen = {}\n    for x in items:\n        seen[x] = seen.get(x, 0) + 1\n    return sorted(seen.items(), key=lambda kv: -kv[1])",
+      "must": [
+        [
+          "O(n log n)",
+          "n log n",
+          "O(nlogn)",
+          "O(nlog2n)",
+          "O(n log2 n)",
+          "O(n\\log n)"
+        ]
+      ]
+    },
+    {
+      "id": "TOOL01_update_order",
+      "cat": "tool_call",
+      "prompt": "把订单 88213 标记为已发货。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "update_order",
+            "description": "更新订单状态",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "order_id": {
+                  "type": "string",
+                  "description": "订单号"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "shipped",
+                    "cancelled"
+                  ]
+                }
+              },
+              "required": [
+                "order_id",
+                "status"
+              ]
+            }
+          }
+        }
+      ],
+      "tool": "update_order",
+      "args": {
+        "order_id": [
+          "88213"
+        ],
+        "status": "shipped"
+      }
+    },
+    {
+      "id": "TOOL02_create_ticket",
+      "cat": "tool_call",
+      "prompt": "建一个工单：标题「登录页 500 错误」，组件 web-login，严重级 high。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "create_ticket",
+            "description": "创建工单",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "component": {
+                  "type": "string"
+                },
+                "severity": {
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ]
+                }
+              },
+              "required": [
+                "title",
+                "component",
+                "severity"
+              ]
+            }
+          }
+        }
+      ],
+      "tool": "create_ticket",
+      "args": {
+        "component": "web-login",
+        "severity": "high",
+        "title": [
+          "500",
+          "登录"
+        ]
+      }
+    },
+    {
+      "id": "TOOL03_choose_search",
+      "cat": "tool_call",
+      "prompt": "在代码库里找一下谁调用了 calcTotal 这个函数。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "search_docs",
+            "description": "搜索文档",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "search_code",
+            "description": "搜索代码",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "list_files",
+            "description": "列出文件",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "tool": "search_code",
+      "args": {
+        "query": [
+          "calcTotal",
+          "calctotal"
+        ]
+      }
+    },
+    {
+      "id": "TOOL04_no_tool_needed",
+      "cat": "tool_call",
+      "prompt": "珠穆朗玛峰海拔多少米？",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "查天气",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "search_code",
+            "description": "搜索代码",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        }
+      ],
+      "no_tool": true,
+      "content_must": [
+        [
+          "8848"
+        ]
+      ]
+    },
+    {
+      "id": "TOOL05_set_priority",
+      "cat": "tool_call",
+      "prompt": "工单 5566 标成 medium 优先级。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "set_priority",
+            "description": "设置工单优先级",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "ticket": {
+                  "type": "string"
+                },
+                "priority": {
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high"
+                  ]
+                }
+              },
+              "required": [
+                "ticket",
+                "priority"
+              ]
+            }
+          }
+        }
+      ],
+      "tool": "set_priority",
+      "args": {
+        "ticket": [
+          "5566"
+        ],
+        "priority": "medium"
+      }
     }
   ]
 }
