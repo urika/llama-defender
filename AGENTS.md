@@ -140,6 +140,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 - **IFC 信号层**（`ifc_metrics.py` + `diagnostics.py` + `memory_stores.py`）：相邻轮发送视图差分 + 台账动作序列派生 `retention`/`rationale_ratio`/`action_div`/`reread_pressure`；无 per-stage 钩子。
 - **PDC 披露召回**（`ctx_recall.py` + `memory_stores.py`）：被 fifo/epoch 丢弃的单元写入 manifest（可寻址索引行），模型经 `ctx_recall` 工具查询（L1 内存子串 + L2 FTS5 trigram + archive 全文恢复），微轮自答同请求重派。**自闭环 auto-recall**（stage 12.5，`PROXY_AUTO_RECALL_ENABLED` 默认关，2026-09-05 设计）：台账 `dup_queries` 检测同 Read 目标 ≥3 次 + manifest 确认已折叠 → 代理代答取回并以 `[System: AUTO-RECALL]` user 尾消息注入（每轮至多 1 条、每会话限 5 次、同目标去重；阈值/上限/注入长度均 reloadable）——实测模型主动召回 0 调用后的主动兜底，详见 `docs/01-requirements-product/ctx-recall-auto-closed-loop-20260905.md`。**墓碑召回**（`PROXY_TOMBSTONE_RECALL_ENABLED` 默认关，2026-09-06）：客户端历史改写把旧 tool_result 丢成悬空调用（工具结果单轮生命周期，EXP-2 实锤 transcript 级证据），stage 20 配对补洞注入的墓碑附 ctx_recall 取回提示（被动）+ AutoRecallStage 按悬空 call_id 直查 manifest 寄存并代答回填（主动，末条 assistant 未决调用豁免）——写入期压缩实测已寄存 ~40% 墓碑化内容。2026-09-07 增强（DEF-310/seq5 落地）：①auto-recall 注入升级为**结构感知摘录**（AST 骨架+focus 命中块，修复 Read 行号前缀致 ast 失效的上游 bug）+ **卡死型升级转径**（已注入目标仍重读达 阈值+STUCK_EXTRA 时改注入换路线提示）；②**关键事实钉住**（IFC-12）：折叠收编时提取 token/key=值 行常驻台账头；③**断言值核对**（IFC-13）：模型断言值与登记事实矛盾时下轮注入 VALUE-CHECK 更正；④**反编造禁令**（IFC-11）进 RECALL_CUE。EXP recall-r2 机制实证 6 次注入；治理曲线见 DEF-312。
 - **队列**（`queue_manager.py`）：`PROXY_QUEUE_ENABLED` 时叠加在 `_llama_lock` 之上按 interactive/standard/large/huge 分桶排队。
+- **录制面**（`request_archive.py`，S-17/BR-4，2026-10-15）：逐请求档案 append-only（`s17-archive/v1`，schema 契约=swe-eval `s17-recording-surface-design` §六）——R（改写前公平口径）/R′（改写后敏感性口径）双视图 snapshot/delta（msg_hash 前缀比对，客户端改写/epoch 折叠自动 snapshot 兜底）＋response 行（非流式全量、流式由中继尾部聚合变量成形——v1.1）；五挂点全旁路（入口暂存/capture_sent_view/anthropic 块/响应完形/do_POST 收尾），不改 log_request 本体与管线主链。消费方=swe-eval `mirror_replay.py`（反事实镜像重放，批活守卫）；分片命名与 mirror 用法的实作级补充见联合文档 1015-1/1015-2。`PROXY_REQUEST_ARCHIVE_ENABLED` 默认关，激活=批界窗 conf + reload。
 
 > **认知编排器 / Protocol Layer（P1-P5，`post_governance.py`/`escalate.py`/`decompose.py`/`verification_chain.py`/`idempotency.py`/`protocol_orchestrator.py`/`protocol_types.py`/`signal_types.py`/`contract_registry.py`）**：按三层架构规范（`docs/02-architecture-design/three-layer-architecture-spec-20260830.md`）与认知编排器设计（`cognitive-orchestrator-design-doc-20260830.md`）实现，**当前为 agent_go 集成契约 §3.3 R17/R18/R19 的参考实现冻结版**。Signal 层（ifc_metrics/diagnostics/hbe_probe/memory_stores/ctx_recall）已生产挂载；Protocol 层（decompose/verify/escalate/recall）为编排闭环的待接线部分，其任务工程 / 工具形态 / 是否接入运行时 pipeline 的决策归 agent_go。本仓库不再主动扩展编排器本体，仅吸收可拆解到已有组件的增强（如 PDC-L1/L2、ifc_metrics 信号口径）。
 
@@ -158,6 +159,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | `configs/splash-qwen36-35b.conf` | **Inco Splash 1.0.2**（DFlash 2 内置 decode 路径）+ Qwen3.6-35B-A3B-Splash 包（20.9GB，含专用 draft）：**散文 117 / 代码 264 tok/s，热 TTFT 32K 0.10s，32K 冷 prefill 3139 tok/s**；`LLAMA_BACKEND=splash`，与 ornith-oq4e **互斥单引擎**（switch+restart）；同机对照见 runbook §28/§28.9 |
 | `configs/splash-qwen38-27b.conf` | **Inco Splash 1.0.2** + Qwen3.8-27B-Splash 包（17.4GB）：代码任务 78–86 tok/s（散文 38.8=带宽极限+接受率），热 TTFT 32K 0.36s；与 ornith-oq4e 互斥 |
 | `configs/ornith-oq4e-256k.conf` | llama-server + Ornith-oQ4e GGUF（**256K 非交互档**）：禁头截断+大 KV（12.8–16GB）+原文寄存；冷 prefill 8–10min 可容忍、暖轮 10–30s；**批处理/长文档专用** |
+| `configs/embedgemma2.conf` | llama-server + **EmbeddingGemma 2 嵌入引擎**（`ggml-org/embeddinggemma-2-GGUF:Q8_0` 310MB + 可选 `mmproj` 多模态塔）：**辅助引擎**，独立端口 8083，`start-aux/stop-aux` 独立启停、与主后端共存。LLM 无关的纯向量服务（OpenAI `/v1/embeddings`，768d，MRL 支持 512/256/128，纯文本 + 可选 图/音/视频 共用同一向量空间）；`--embeddings --pooling mean -ngl 0`（CPU，实测索引 12.4 块/s、单条 p50 14.6ms）；**必须 `LLAMA_EMBEDDING_PROBE=true`**——`--embeddings` 下 `/v1/chat/completions` 恒 500，就绪探针须改打 `/v1/embeddings`；模型与投影器已落在 `tools/bin/`（`EMBEDGEMMA2_SERVER_BIN` / `EMBEDGEMMA2_MMPROJ=1` 可覆盖，`_EG2_ROOT` 亦可） |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
 | `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点（`deepseek-v4-flash`） |
@@ -170,6 +172,7 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 ### 3.4 工具与文档
 
 - `tools/`：benchmark（`bench_*.py`）、分析（`analyze_*.py`）、监控（`monitor.py`、`sysmon.sh`、`exp9_watch.py`——EXP-9 批期值守：驱动存活/turn 新鲜度/信号量审计/sessions.jsonl 轮转防护归档，2026-09-20）、需求追踪（`trace_requirements.py`）、模块提取（`extract_module.py`）、轨迹查询/投影（`trace_query.py` / `trace_replay.py` / `trace_common.py`，Phase B 2026-08-21：requests/metrics/diag/ledger/archive 五流跨查与 sent_view 离线投影、A/B diff，见 `docs/02-architecture-design/logging-trajectory-improvement-design-20260820.md`）、LCP 遥测分析（`lcp_trace_analyzer.py`，2026-09-20：后端日志切命中率/复用分布/失配分型，`--archive` 防轮转，Gate B 判读工具）、**长会话试点**（`pilot_long_session.py`，2026-09-21：append-only/多工具分叉两形态，读引擎 `/metrics` 计数器）、**重跑前置门**（`rerun_gate.py`，2026-09-21：批前 2–3 真实 run 校验驱逐/墙钟/epoch_collapse 四件套，exit 1=STOP 停批）、DFlash drafter 蒸馏（`dflash_distill_mlx.py`，dflash-mlx 0.1.8 API 适配版，2026-08-26 Ornith 实验：acceptance 2.34→2.66 但线上无增益，见 changelog）等。
+- **语义检索**（`tools/semantic_search.py`，2026-10-14）：纯标准库 + EmbeddingGemma 2（`./manage.sh start-aux embedgemma2`，端口 8083）的本地向量检索。子命令 `index`（增量：按 mtime+size 跳过未变文件）/ `query` / `oneshot`（小目录不落索引）/ `info`；索引落 `.semantic/<name>/`（`meta.json` + `chunks.jsonl` + `vectors.f32`，git-ignored）。已建：`wiki`（OpenClaw wiki 1788 段 / 272 文件）、`finwiki`（199 段 / 28 文件）、`docs`（本仓库 `docs/` 4385 段 / 162 文件）。定位是给这些知识库做**换说法也能命中**的语义召回，与 MCP `wiki_search`（BM25，精确关键词/路径更快更准）互补而非替代：低词汇重合或跨语言（中↔英）query 用语义，术语/路径检索用 BM25。
 - **Jev shadow**（`tools/jev_shadow.py`，2026-10-15）：规则判断点（当前 loop_l1）→ 决策模型的**双臂离线回放**（云 TypeSafe Jev / 本地 RSI-Jev `~/APP/rsi-jev` :8022），级联设计 §6 实测数据源。只读 sessions/archive 日志、fail-open、批期安全；分臂阈值 `ARM_PHI={cloud:0.80, local:0.80}`（2026-10-15 效用裁决：行动阈值宁严勿松，本地 0.50 仅为测量对齐参考）+ 记录 `arm` 字段 + `--summary` 分臂统计；落盘 `logs/diag/jev_shadow{,_local_compare}.jsonl`。实测（n=48/37）：Jev 确认规则正当 0%、choice 双臂一致 94.6%、本地概率平坦（effort 四档救不了）→ 本地臂当前=安全阀非过滤器；详见级联文档 §6。
 - `docs/`：按 7 类组织（需求产品、架构设计、实验测试、分析诊断、运维变更、参考指标、项目看板 `07-project-board/`）。入口 [`docs/README.md`](docs/README.md)；根级关键文档含 `llama-defender-integration-requirements.md`（agent_go 集成契约）、`DEFECT-LIST.md`、`requirement-matrix.md`。
 - `test/`：自动化测试，见下节。
@@ -574,7 +577,7 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_QUEUE_HUGE_THRESHOLD_CHARS` | `200000` | huge bucket 阈值：不入本地队列，按 `HUGE_ACTION` 处理。**engine-on 会话豁免（2026-09-07 TC28）**：先按引擎视图 est_tokens 复检，视图≤折叠预算 S 则 waive 放行（原始 chars 不再代表后端负载） |
 | `PROXY_QUEUE_HUGE_ACTION` | `cloud` | huge 处理：`cloud`（强制路由云端，需 `PROXY_ROUTE_ENABLED=true`）/ `reject`（413） |
 
-### 11.6 诊断数据面参数（R13-R16，全部 reloadable）
+### 11.6 诊断数据面参数（R13-R16＋S-17 录制面，全部 reloadable）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -586,6 +589,10 @@ git commit --no-verify               # 绕过所有钩子
 | `PROXY_DIAG_ARCHIVE_MAX_MB` | `200` | archive 磁盘总量上限（超限删最老会话文件） |
 | `PROXY_DIAG_LEDGER_ENABLED` | `true` | 台账增量落盘 `logs/diag/ledger/`（R14 端点档案兜底；关 = 仅内存） |
 | `PROXY_DIAG_LEDGER_MAX_MB` | `100` | ledger 磁盘总量上限（超限删最老会话文件） |
+| `PROXY_REQUEST_ARCHIVE_ENABLED` | `false` | **S-17/BR-4 录制面**（`request_archive.py`）：逐请求档案 append-only（`s17-archive/v1`，`logs/diag/archive-req/` 按 view 分片 `.R` 改写前/.`Rp` 改写后）；默认关=重启行为中立，激活=conf 置 true + reload（批界窗执行） |
+| `PROXY_REQUEST_ARCHIVE_DIR` | `logs/diag/archive-req` | 档案分片目录（相对路径锚定 `_SCRIPT_DIR`） |
+| `PROXY_REQUEST_ARCHIVE_MAX_MB` | `2048` | 档案总量上限；驱逐以会话为单位成对删（拆散=mirror 拒收档案）＋L-18 活跃保护窗内不驱逐、全保护接受溢出 |
+| `PROXY_REQUEST_ARCHIVE_RESPONSE_MAX_CHARS` | `65536` | response 行序列化上限（保形截断，`truncated:true`；流式已由尾部聚合变量 materialization——v1.1） |
 | `PROXY_CTX_ENGINE_ENABLED` | `false` | R8 上下文工程引擎（append-only + 写入期压缩 + epoch；开启时 6/7/14/17 跳过） |
 | `PROXY_CTX_EPOCH_TRIGGER_TOKENS` | `0` | epoch 预算 S（tokens）；0=auto → min(65%×ctx/4, 70K) |
 | `PROXY_CTX_WINDOW_K` | `0` | epoch 重切保留最近 K 轮；0=auto → 24 |
