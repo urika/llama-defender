@@ -336,6 +336,38 @@ def _write_view_row(session_key, view, turn, request_id, body, st):
     vst["hashes"] = hashes
 
 
+def build_stream_body(model, total_text, tool_calls_buffer, stop_reason,
+                      input_tokens=0, output_tokens=0):
+    """v1.1: 由流式尾部既有聚合变量成形 Anthropic body（挂点 4 的流式形态）。
+
+    中继本身就有全程聚合（total_text/tool_calls_buffer/stop_reason/usage，
+    anthropic_proxy._handle_streaming_response 尾部）——直接取用即可，无需
+    tee 字节流或解析自己发的 SSE。块序=发射序（text 单块在前，tool_use 按
+    索引序）；thinking 的 reasoning_content 在中继里本就并入文本增量，无
+    独立块可漏。参数串解析失败保 raw（mirror 只消费 name 序列，兼容）。
+    """
+    content = []
+    if total_text:
+        content.append({"type": "text", "text": total_text})
+    for idx in sorted(tool_calls_buffer or {}):
+        entry = tool_calls_buffer.get(idx) or {}
+        fn = entry.get("function") or {}
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except ValueError:
+                args = {"_unparsed": True, "_raw": raw_args[:2000]}
+        else:
+            args = raw_args if raw_args is not None else {}
+        content.append({"type": "tool_use", "id": entry.get("id") or "",
+                        "name": fn.get("name") or "", "input": args})
+    return {"model": model, "stop_reason": stop_reason, "stop_sequence": None,
+            "usage": {"input_tokens": int(input_tokens or 0),
+                      "output_tokens": int(output_tokens or 0)},
+            "content": content}
+
+
 def record_response(request_id, resp_body):
     """挂点 4: 非流式响应完形处——完整 Anthropic body 落 response 行（双分片）。
 

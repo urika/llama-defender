@@ -2181,6 +2181,22 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # Client disconnected before stream end
+        # S-17/BR-4 v1.1: 流式响应 materialization——由尾部既有聚合变量直接
+        # 成形 Anthropic 基线(旁路 fail-open, 默认关; 不改任何已发事件序列)。
+        # rescue 拦截早退不经此处 → 重派轮的尾部才记录(=客户端实际所见);
+        # 微轮续流由 record_response 的 request_id 去重兜底。
+        if PROXY_REQUEST_ARCHIVE_ENABLED:
+            try:
+                import request_archive
+                request_archive.record_response(
+                    getattr(self, '_request_id', ''),
+                    request_archive.build_stream_body(
+                        model=model_name, total_text=total_text,
+                        tool_calls_buffer=tool_calls_buffer,
+                        stop_reason=stop_reason, input_tokens=input_tokens,
+                        output_tokens=output_tokens))
+            except Exception:
+                pass
         if _first_token_time is not None:
             mc = getattr(_metrics_ctx, 'mc', None)
             if mc:

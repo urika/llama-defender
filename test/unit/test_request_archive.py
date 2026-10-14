@@ -184,6 +184,59 @@ class TestResponseRecords(RequestArchiveTestBase):
         self.assertFalse([r for r in rows if r["kind"] == "response"])
 
 
+class TestBuildStreamBody(RequestArchiveTestBase):
+    """v1.1: 流式尾部聚合变量 → Anthropic body（挂点 4 的流式形态）."""
+
+    def test_text_only(self):
+        body = ra.build_stream_body("m1", "hello 世界", {}, "end_turn", 10, 5)
+        self.assertEqual(body["stop_reason"], "end_turn")
+        self.assertEqual(body["content"], [{"type": "text", "text": "hello 世界"}])
+        self.assertEqual(body["usage"], {"input_tokens": 10, "output_tokens": 5})
+        # mirror response_shape 消费口径: text_chars/stop_reason 可提取
+        chars = sum(len(b.get("text", "")) for b in body["content"]
+                    if b.get("type") == "text")
+        self.assertEqual(chars, len("hello 世界"))
+
+    def test_tool_calls_sorted_by_index(self):
+        buf = {
+            1: {"id": "b", "type": "function",
+                "function": {"name": "Write", "arguments": '{"path":"a"}'}},
+            0: {"id": "a", "type": "function",
+                "function": {"name": "Read", "arguments": '{"f":"x"}'}},
+        }
+        body = ra.build_stream_body("m1", "plan", buf, "tool_use")
+        self.assertEqual([b["name"] for b in body["content"] if b["type"] == "tool_use"],
+                         ["Read", "Write"])
+        self.assertEqual(body["content"][0]["text"], "plan")
+        self.assertEqual(body["content"][1]["input"], {"f": "x"})
+
+    def test_unparsable_args_kept_raw(self):
+        buf = {0: {"id": "a", "type": "function",
+                   "function": {"name": "Edit", "arguments": '{"cut'}}}  # 截断参数串
+        body = ra.build_stream_body("m1", "", buf, "max_tokens")
+        blk = body["content"][0]
+        self.assertTrue(blk["input"].get("_unparsed"))
+        self.assertEqual(blk["input"].get("_raw"), '{"cut')
+
+    def test_empty_stream(self):
+        body = ra.build_stream_body("m1", "", None, "end_turn")
+        self.assertEqual(body["content"], [])
+        self.assertEqual(body["usage"], {"input_tokens": 0, "output_tokens": 0})
+
+    def test_materialized_response_row_replaces_skeleton(self):
+        # 流式挂点与 finalize 的接续: 尾部 record_response 落了实体行后,
+        # finalize 不再补骨架
+        self._turn("r1", "sessA", _body("hi"))
+        ra.record_response("r1", ra.build_stream_body(
+            "m1", "done", {}, "end_turn", 3, 4))
+        ra.finalize_request("r1", 200)
+        rows = _read_rows(self._shard("sessA", "R"))
+        resp = [r for r in rows if r["kind"] == "response"]
+        self.assertEqual(len(resp), 1)
+        self.assertNotIn("note", resp[0]["response"])
+        self.assertEqual(resp[0]["response"]["content"][0]["text"], "done")
+
+
 class TestTurnBookkeeping(RequestArchiveTestBase):
     def test_duplicate_record_turn_skipped(self):
         ra.begin_request("r1", _body("hi"))
