@@ -898,7 +898,8 @@ CONFIG_REGISTRY = {
     "PROXY_REQUEST_ARCHIVE_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
-        "doc": "S-17 R-phase per-request archive writer (s17-archive/v1, "
+        "doc": "S-17 R-phase per-request archive writer (s17-archive/v1.2 "
+               "— v1.2 adds tools/tool_choice on snapshot rows; "
                "logs/diag/archive-req/<sid>.R|.Rp.jsonl). Default off = "
                "restart-neutral; activation = conf true + reload (batch-safe).",
     },

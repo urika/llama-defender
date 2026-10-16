@@ -1,4 +1,4 @@
-"""Unit tests for request_archive — S-17/BR-4 R 期录制面 (s17-archive/v1).
+"""Unit tests for request_archive — S-17/BR-4 R 期录制面 (s17-archive/v1.2).
 
 校验分两层:
   1. writer 行为（snapshot/delta 判定、双 view 分片、response/骨架、
@@ -6,6 +6,10 @@
   2. mirror_replay 校验器不变量复刻（首 snapshot turn=1 / delta turn
      严格 max+1 / response ≤ max_turn）——writer 产物必须能被
      swe-eval scripts/mirror_replay.py 的 fail-loud 校验拒收率 = 0。
+
+v1.2（BR-4 tools 缺口闭合）: snapshot 行可带 tools/tool_choice；工具面
+变化强制 snapshot（delta 不携带工具面）；legacy v1 行（无 tools）对消费
+端合法——复刻校验接受双 schema 字符串。
 """
 import json
 import os
@@ -23,10 +27,23 @@ import proxy_state as _ps
 import request_archive as ra
 
 
-def _body(user, n_extra=0):
+def _body(user, n_extra=0, tools=None, tool_choice=None):
     msgs = [{"role": "user", "content": user}]
     msgs += [{"role": "user", "content": f"extra-{i}"} for i in range(n_extra)]
-    return {"model": "test-model", "system": "sys", "messages": msgs}
+    body = {"model": "test-model", "system": "sys", "messages": msgs}
+    if tools is not None:
+        body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    return body
+
+
+_TOOLS_A = [{"name": "bash", "description": "run shell",
+             "input_schema": {"type": "object", "properties": {}}}]
+_TOOLS_B = [{"name": "bash", "description": "run shell",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "edit", "description": "edit file",
+             "input_schema": {"type": "object", "properties": {}}}]
 
 
 def _read_rows(path):
@@ -35,11 +52,14 @@ def _read_rows(path):
 
 
 def _assert_mirror_valid(rows):
-    """复刻 mirror_replay.validate_session 的 fail-loud 不变量。"""
+    """复刻 mirror_replay.validate_session 的 fail-loud 不变量。
+
+    v1.2 起消费端接受双 schema 字符串（legacy v1 行无 tools=合法）。"""
+    ok_schemas = ("s17-archive/v1", "s17-archive/v1.2")
     seen_snapshot = False
     max_turn = 0
     for i, rec in enumerate(rows):
-        assert rec.get("schema") == "s17-archive/v1", f"row{i} schema"
+        assert rec.get("schema") in ok_schemas, f"row{i} schema"
         assert rec.get("kind") in ("snapshot", "delta", "response", "meta"), f"row{i} kind"
         assert rec.get("view") in ("R", "R'"), f"row{i} view"
         kind, turn = rec["kind"], rec.get("turn")
@@ -268,6 +288,97 @@ class TestTurnBookkeeping(RequestArchiveTestBase):
         _assert_mirror_valid(rows)
         self.assertEqual([r["turn"] for r in rows], [1, 2, 3])
         self.assertEqual(rows[2]["kind"], "snapshot")  # 续写首行必为 snapshot
+
+
+class TestToolsRecording(RequestArchiveTestBase):
+    """v1.2（BR-4）: tools/tool_choice 入档——tools 缺失致重放 tool_use=0 的闭合。
+
+    mirror 重建口径复刻: payload=基线 snapshot（含工具面）＋依序 delta；
+    writer 保证工具面变化必落 snapshot ⇒ delta 轮静默沿用基线工具面=安全。"""
+
+    def test_first_turn_snapshot_carries_tools(self):
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A,
+                                        tool_choice={"type": "auto"}))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertEqual(rows[0]["schema"], "s17-archive/v1.2")
+        self.assertEqual(rows[0]["tools"], _TOOLS_A)
+        self.assertEqual(rows[0]["tool_choice"], {"type": "auto"})
+
+    def test_no_tools_no_key_no_crash(self):
+        # 客户端未带工具面 → snapshot 行无 tools 键（与 legacy 区分靠 schema 串）
+        self._turn("r1", "sessA", _body("hi"))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertNotIn("tools", rows[0])
+        self.assertNotIn("tool_choice", rows[0])
+
+    def test_suffix_append_unchanged_tools_is_delta(self):
+        # 工具面不变 → 消息后缀扩展仍落 delta（不重复携带 tools）
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A))
+        self._turn("r2", "sessA", _body("hi", n_extra=2, tools=_TOOLS_A))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertEqual([r["kind"] for r in rows], ["snapshot", "delta"])
+        self.assertNotIn("tools", rows[1])
+        self.assertEqual(rows[0]["tools"], _TOOLS_A)
+
+    def test_tools_change_forces_snapshot(self):
+        # 消息是严格后缀扩展但工具集已变 → 必须 snapshot（delta 会静默沿用旧工具面）
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A))
+        self._turn("r2", "sessA", _body("hi", n_extra=1, tools=_TOOLS_B))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertEqual(rows[1]["kind"], "snapshot")
+        self.assertEqual(rows[1]["tools"], _TOOLS_B)
+
+    def test_tools_appear_from_none_forces_snapshot(self):
+        # 从无到有同样是工具面变化
+        self._turn("r1", "sessA", _body("hi"))
+        self._turn("r2", "sessA", _body("hi", n_extra=1, tools=_TOOLS_A))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertEqual(rows[1]["kind"], "snapshot")
+        self.assertEqual(rows[1]["tools"], _TOOLS_A)
+
+    def test_tool_choice_change_forces_snapshot(self):
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A,
+                                        tool_choice={"type": "auto"}))
+        self._turn("r2", "sessA", _body("hi", n_extra=1, tools=_TOOLS_A,
+                                        tool_choice={"type": "any"}))
+        rows = _read_rows(self._shard("sessA", "R"))
+        _assert_mirror_valid(rows)
+        self.assertEqual(rows[1]["kind"], "snapshot")
+        self.assertEqual(rows[1]["tool_choice"], {"type": "any"})
+
+    def test_mirror_rebuild_replication_with_tools(self):
+        # mirror rebuild 复刻: 基线 snapshot 的工具面 + delta 消息 ⇒ 第 2 轮
+        # 重放 payload 含工具定义（BR-4 缺口闭合后的预期形态）
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A))
+        self._turn("r2", "sessA", _body("hi", n_extra=2, tools=_TOOLS_A))
+        rows = _read_rows(self._shard("sessA", "R"))
+        snap = next(r for r in rows if r["kind"] == "snapshot")
+        payload = {"model": snap.get("model"), "system": snap.get("system"),
+                   "messages": list(snap.get("messages", []))}
+        if snap.get("tools"):
+            payload["tools"] = snap["tools"]
+        for r in rows:
+            if r["kind"] == "delta":
+                payload["messages"] += r["messages_delta"]
+        self.assertEqual(len(payload["messages"]), 3)
+        self.assertEqual([t["name"] for t in payload["tools"]], ["bash"])
+        self.assertEqual(payload["messages"][-1]["content"], "extra-1")
+
+    def test_views_record_tools_independently(self):
+        # R=原 body 带 tools；R'=改写 body 无 tools（管线剥除形态）——双视图各自判定
+        self._turn("r1", "sessA", _body("hi", tools=_TOOLS_A),
+                   rp_body=_body("rewritten"))
+        r_rows = _read_rows(self._shard("sessA", "R"))
+        rp_rows = _read_rows(self._shard("sessA", "Rp"))
+        _assert_mirror_valid(r_rows)
+        _assert_mirror_valid(rp_rows)
+        self.assertEqual(r_rows[0]["tools"], _TOOLS_A)
+        self.assertNotIn("tools", rp_rows[0])
 
 
 class TestQuotaEviction(RequestArchiveTestBase):

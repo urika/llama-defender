@@ -1,9 +1,18 @@
 """request_archive.py — S-17/BR-4 R 期录制面（ADR-014 组件①）。
 
-逐请求档案 append-only 落盘（schema=`s17-archive/v1`，契约=
+逐请求档案 append-only 落盘（schema=`s17-archive/v1.2`，契约=
 swe-eval `docs/s17-recording-surface-design-v0-20261005.md` §六；
 消费方=`scripts/mirror_replay.py` 的校验/重建规则——本模块按其
 fail-loud 不变量反推实现，任何字段/turn 序偏差都会让镜像重放拒收）。
+
+**v1.2（2026-10-16，BR-4 tools 缺口闭合）**：snapshot 行新增可选
+`tools`/`tool_choice` 字段（R 视图=客户端原 body 的工具定义面）。此前
+v1/v1.1 档案不含 tools ⇒ mirror 重放请求无工具定义 ⇒ tool_use=0、行动
+选择退化为叙述（云端切臂重放 12/12 实证）。兼容性：legacy 行（schema
+`s17-archive/v1`，无 tools）对消费端合法（fail-soft 降级＋逐轮注记）；
+writer 侧 tools 面任一变化（含从无到有）强制落 snapshot——delta 不携带
+工具面，静默沿用旧工具集会造出假重放基线。默认关语义不变
+（PROXY_REQUEST_ARCHIVE_ENABLED=false，生效=下次代理重启窗）。
 
 红线（ADR-008 防滑坡）: 档案=被动文件——本模块只在挂点被旁路调用，
 不改管线行为、不做运行时注入、无后台线程；写失败仅 WARN 不进请求
@@ -55,7 +64,7 @@ from datetime import datetime
 import proxy_state as _ps
 from unit_model import msg_hash
 
-SCHEMA = "s17-archive/v1"
+SCHEMA = "s17-archive/v1.2"   # v1.2: snapshot 行可带 tools/tool_choice（legacy v1 行无此字段=合法）
 VIEW_R = "R"
 VIEW_RP = "R'"          # R-prime；分片文件名用 Rp（引号不进文件名）
 _SHARD_SUFFIX = {VIEW_R: ".R.jsonl", VIEW_RP: ".Rp.jsonl"}
@@ -217,13 +226,30 @@ def _archive_warn(msg):
 # ---------------------------------------------------------------------------
 
 def _view_fields(body):
-    """(model, system, messages)——snapshot 载荷三件套；body 非法返回 None。"""
+    """(model, system, messages, tools, tool_choice)——v1.2 快照载荷；
+    body 非法返回 None。tools 非 list 或为空 → None（未带工具面，合法）；
+    tool_choice 原样透传（客户端未带为 None，不落行）。"""
     if not isinstance(body, dict):
         return None
     msgs = body.get("messages")
     if not isinstance(msgs, list):
         return None
-    return body.get("model"), body.get("system"), msgs
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        tools = None
+    return body.get("model"), body.get("system"), msgs, tools, body.get("tool_choice")
+
+
+def _tools_fp(tools, tool_choice):
+    """工具面指纹——v1.2 delta 判定的附加等值条件（tools 变化 → 强制 snapshot）。
+
+    delta 行不携带 tools：若消息是严格后缀扩展而工具集已变，落 delta 会让
+    重建静默沿用旧工具面（假基线）。指纹经 msg_hash（sort_keys＋cache_control
+    归一化）——key 顺序不稳定不误判。无工具面（None）与"上轮也无"等值，
+    两轮都无工具时 delta 语义不变。"""
+    if not tools:
+        return None
+    return msg_hash({"tools": tools, "tool_choice": tool_choice})
 
 
 def _delta_or_none(prev_hashes, msgs):
@@ -283,8 +309,8 @@ def record_turn(request_id, session_key, rp_view):
             r_turn = _scan_max_turn(_shard_path(session_key, VIEW_R))
             rp_turn = _scan_max_turn(_shard_path(session_key, VIEW_RP))
             st = {"turn": max(r_turn, rp_turn),
-                  "views": {VIEW_R: {"turn": r_turn, "hashes": None},
-                            VIEW_RP: {"turn": rp_turn, "hashes": None}}}
+                  "views": {VIEW_R: {"turn": r_turn, "hashes": None, "tools_fp": None},
+                            VIEW_RP: {"turn": rp_turn, "hashes": None, "tools_fp": None}}}
             while len(_sessions) >= MAX_SESSIONS:
                 _sessions.popitem(last=False)
         st["turn"] += 1
@@ -314,10 +340,14 @@ def _write_view_row(session_key, view, turn, request_id, body, st):
         if vst["turn"] == turn:  # 该视图本轮已写过（双挂点兜底）
             return
         raise ValueError("view body not a dict with messages")
-    model, system, msgs = fields
+    model, system, msgs, tools, tool_choice = fields
     hashes = [msg_hash(m) for m in msgs]
+    tools_fp = _tools_fp(tools, tool_choice)
     delta = None
-    if vst["hashes"] is not None and vst["turn"] == turn - 1:
+    if (vst["hashes"] is not None and vst["turn"] == turn - 1
+            and tools_fp == vst.get("tools_fp")):
+        # v1.2: 工具面指纹不一致（含从无到有）即放弃 delta——tools 只在
+        # snapshot 行上，落 delta 会静默沿用旧工具集
         delta = _delta_or_none(vst["hashes"], msgs)
     if delta is not None and len(delta) == 0:
         # 视图与上轮完全一致（同轮重写场景）——delta 空数组会让重建出
@@ -331,9 +361,14 @@ def _write_view_row(session_key, view, turn, request_id, body, st):
         row["model"] = model
         row["system"] = system
         row["messages"] = msgs
+        if tools:
+            row["tools"] = tools
+        if tool_choice is not None:
+            row["tool_choice"] = tool_choice
     _append_line(path, row)
     vst["turn"] = turn
     vst["hashes"] = hashes
+    vst["tools_fp"] = tools_fp
 
 
 def build_stream_body(model, total_text, tool_calls_buffer, stop_reason,
