@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "gate": "haiku-tier-compare",
+  "note": "haiku 档分流实测金标（2026-10-15）。TC1-9 直译自 promptfooconfig.yaml 核心用例（断言改为全必须命中布尔口径，弃权重加权；TC6/TC8 用 raw 匹配防 norm 吞特殊字符）；另从 knowledge_gate_9b.json 抽 tagging/extraction/summary 三类（scorer 直接复用 gate 模块）——合计 31 条，覆盖 Claude Code haiku 档典型任务（短总结/分类/抽取/小代码/转换）。双臂：local-9b(:8084) vs glm-5.3-flash(zhipu-cn anthropic 协议直连)，temperature=0 确定性口径。",
+  "tc_cases": [
+    {
+      "id": "TC1_greeting",
+      "cat": "tc",
+      "prompt": "你好，请用一句话介绍自己。",
+      "asserts": [
+        { "type": "contains_any", "match": "norm", "values": ["你好", "智能", "AI", "人工智能", "语言模型", "Qwen", "助手", "模型"] }
+      ]
+    },
+    {
+      "id": "TC2_code_gen",
+      "cat": "tc",
+      "prompt": "请用 Python 写一个函数 `fib(n)`，返回第 n 个斐波那契数。要求：1. 使用递归或迭代均可 2. 包含类型提示 3. 包含 docstring",
+      "asserts": [
+        { "type": "contains", "match": "raw", "value": "def fib" },
+        { "type": "contains", "match": "raw", "value": "->" },
+        { "type": "contains", "match": "raw", "value": "\"\"\"" },
+        { "type": "contains_any", "match": "raw", "values": ["return", "返回"] }
+      ]
+    },
+    {
+      "id": "TC3_code_review",
+      "cat": "tc",
+      "prompt": "请阅读以下代码并指出潜在问题：\n```python\ndef read_file(path):\n    f = open(path, 'r')\n    return f.read()\n```",
+      "asserts": [
+        { "type": "contains_any", "match": "raw", "values": ["close", "with", "泄漏", "finally"] }
+      ]
+    },
+    {
+      "id": "TC4_explain",
+      "cat": "tc",
+      "prompt": "请解释什么是前缀缓存（prefix caching）及其在 LLM 推理中的作用。",
+      "asserts": [
+        { "type": "contains_any", "match": "norm", "values": ["缓存", "cache", "KV", "prefix"] }
+      ]
+    },
+    {
+      "id": "TC5_json_convert",
+      "cat": "tc",
+      "prompt": "请将以下 JSON 转换为等价的 Python 字典字面量：{\"name\": \"agent\", \"tools\": [\"Read\", \"Write\", \"Bash\"], \"timeout\": 30}",
+      "asserts": [
+        { "type": "contains_any", "match": "raw", "values": ["'name'", "\"name\""] },
+        { "type": "contains_any", "match": "raw", "values": ["'agent'", "\"agent\""] },
+        { "type": "contains_any", "match": "raw", "values": ["'tools'", "\"tools\""] }
+      ]
+    },
+    {
+      "id": "TC6_special_chars",
+      "cat": "tc",
+      "prompt": "请将以下字符串原样输出，不要解释，只输出字符串本身：Hello世界🌍 /path/to/file \"quoted\" 中文标点：，。；",
+      "asserts": [
+        { "type": "contains_any", "match": "raw", "values": ["Hello世界", "🌍", "/path/to/file", "\"quoted\"", "，。；"] }
+      ]
+    },
+    {
+      "id": "TC7_context",
+      "cat": "tc",
+      "prompt": "用户：我叫张三。助手：你好张三。用户：请重复我刚才说的名字。",
+      "min_len": 2,
+      "asserts": [
+        { "type": "contains", "match": "raw", "value": "张三" }
+      ]
+    },
+    {
+      "id": "TC8_code_edge",
+      "cat": "tc",
+      "prompt": "写一个阶乘函数 fact(n)，要求处理 n=0 和 n<0 的边界情况。",
+      "asserts": [
+        { "type": "contains", "match": "raw", "value": "def fact" },
+        { "type": "contains_any", "match": "raw", "values": ["n == 0", "n=0", "if n <= 0", "n < 0", "raise", "Error", "异常"] }
+      ]
+    },
+    {
+      "id": "TC9_summarize",
+      "cat": "tc",
+      "prompt": "请总结以下代码的主要功能（50字以内）：\n```python\nimport threading\nimport queue\nfrom collections import defaultdict\n\nclass EventBus:\n    def __init__(self):\n        self._handlers = defaultdict(list)\n        self._lock = threading.RLock()\n        self._queue = queue.Queue()\n        self._running = False\n        self._thread = None\n\n    def subscribe(self, event_type, handler):\n        with self._lock:\n            self._handlers[event_type].append(handler)\n\n    def publish(self, event_type, event_data):\n        with self._lock:\n            handlers = list(self._handlers[event_type])\n        for handler in handlers:\n            handler(event_data)\n\n    def start(self):\n        with self._lock:\n            if self._running:\n                return\n            self._running = True\n            self._thread = threading.Thread(target=self._run)\n            self._thread.daemon = True\n            self._thread.start()\n\n    def _run(self):\n        while self._running:\n            try:\n                event_type, event_data = self._queue.get(timeout=0.1)\n                self.publish(event_type, event_data)\n            except queue.Empty:\n                continue\n\n    def stop(self):\n        with self._lock:\n            self._running = False\n        if self._thread:\n            self._thread.join()\n```",
+      "asserts": [
+        { "type": "contains_any", "match": "norm", "values": ["事件", "EventBus", "发布", "订阅", "handler", "pub-sub"] }
+      ]
+    }
+  ],
+  "gate_subset": ["tagging", "extraction", "summary"],
+  "global_asserts": {
+    "min_len_default": 1,
+    "max_len": 4096,
+    "not_contains": ["[BLOCKER]"]
+  }
+}

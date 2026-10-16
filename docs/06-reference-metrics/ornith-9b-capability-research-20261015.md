@@ -91,6 +91,29 @@ Ornith-1.5 是「端到端自我改进」家族（9B / 35B-A3B / 397B，联合�
 
 - **门判词：FAIL**——唯一未达标类别仍是 summary 硬字数（既有结论：9B 不承诺硬字数摘要，应走 lenient 流水线）。**官方牌面两项（coding/tool_call）均以高分通过**，验证路线第 1 项收官。诚实门语义保持：未事后调阈值。
 
+## 五、haiku 档分流实测（2026-10-16）
+
+**动机**：models.json 中 `claude-haiku-4-5` 路由为 `prefer_local`，但 `local_model=local-default`（= 35B 主引擎）——验证「haiku 档本地兜底下沉到 9B」的可行性。
+
+**方法**：31 条金标双臂对比（TC1-9 直译自 promptfoo 核心用例 + 质量门 tagging/extraction/summary 子集 22 条，scorer 复用 gate 模块）；A 臂 9B(:8084)、B 臂 `glm-5.3-flash`（zhipu-cn anthropic 协议直连，即 haiku 路由云侧首选）；temperature=0。工具：`tools/haiku_tier_compare.py`，报告 `logs/haiku_tier/compare-20261016-225231.json`。
+
+| 维度 | local-9b (:8084) | glm-5.3-flash | 判读 |
+|------|------|------|------|
+| **总体质量** | 26/31 = 83.9% | 28/31 = 90.3% | flash +2（B06 两可 + summary 字数 2 条） |
+| tc（promptfoo 核心 9 条） | **9/9** | 9/9 | **打平**——回归基线无损 |
+| extraction | **8/8** | 7/8 | flash 失手为日期格式归一化（金标偏严类） |
+| tagging | 7/8 | **8/8** | 9B 唯一失手 B06（两可情感，金标偏严） |
+| summary | 2/6 | **4/6** | 9B 结构性短板（硬字数）在此处兑现为差距 |
+| **p50 延迟** | **3.3s** | 6.5s | 9B 快 ~2×；p95 打平（44s，长生成尾巴） |
+| 边际成本 | 0 | 0（订阅） | 打平 |
+| 引擎占用 | **独立 :8084** | 云 | 9B 不占 :8081——35B 主引擎容量全数释放 |
+
+**过程修正**：首跑 flash 5 个「失手」全为空响应 artifact——anthropic 协议下 `thinking` 块计入 max_tokens，1024 在长题被思考耗尽；修正 4096 后 flash 真实质量还原。**方法论教训：跨协议对比必须核空响应。**
+
+**结论**：**9B 可承接 haiku 档**——质量与 flash 差距仅 2 条（且全落在已知的金标偏严/硬字数两类），promptfoo 回归基线打平，p50 快 2×，零成本，且把 haiku 从 35B 主引擎剥离（现状 local-default 路由白白消耗 :8081 容量）。**建议**：haiku 路由 `local_model` 改指 ornith-9b；flash 保留为 fallback（严字数任务可按 route 敏感词升级）。切换动作 = models.json 一行 + reload（属生产变更，走批后窗口）。
+
+
+
 ## 参考来源
 
 1. HF model card（官方，benchmark 表与 serving 配方）：https://huggingface.co/ornith-ai/Ornith-1.5-9B
