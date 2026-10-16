@@ -301,11 +301,16 @@ class TestBiteSuites(unittest.TestCase):
             self.assertTrue(BY_ID[cid].get("mock_usage"),
                             "%s 需区别于估算器的后端真值" % cid)
 
-    def test_k1_pin_red_anchor_records_stage_not_wired(self):
-        """TC38 红锚＝TestStateStage 未注册进生产管线（阶段 E 前置发现）。"""
-        kr = BY_ID["TC38"]["known_red"]
-        self.assertIn("TestStateStage", kr["reason"])
-        self.assertIn("pipeline.py", kr["reason"])
+    def test_k1_pin_red_anchor_delisted_after_l95(self):
+        """TC38 红锚已销账（L-95 落地转绿，2026-10-16 按门指示移出登记册）。
+
+        原红锚断言（known_red.reason 含 TestStateStage/pipeline.py）随销账退役；
+        本测改断言销账出处注记在案——若 TestStateStage 接线回退，TC38 将以
+        普通用例身份真实失败（响亮红），known_red 豁免通道不再兜底。
+        """
+        kr = BY_ID["TC38"].get("known_red_delisted")
+        self.assertIsNotNone(kr, "TC38 销账出处注记须在案")
+        self.assertIn("L-95", kr)
 
 
 if __name__ == "__main__":

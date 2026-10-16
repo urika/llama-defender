@@ -2167,14 +2167,10 @@
  {
   "id": "TC38",
   "quick": true,
-  "known_red": {
-   "reason": "TestStateStage 未注册进生产管线（pipeline.py:2481 定义 stage 12.45，anthropic_proxy.py:1406-1439 管线无此实例）⇒ PROXY_TEST_STATE_ENABLED 旋钮不咬合、阶段 E（K1 常驻臂）按现状开批将是构造性 null",
-   "ref": "L-38 批前装配门 T-zero C1 / L-79「旋钮从未咬合」教训 / 阶段 E K1 pin",
-   "expires": "2026-11-15"
-  },
+  "known_red_delisted": "2026-10-16 L-95 全链路落地(TestStateStage 注册进生产管线+空窗重启载入 pid 93449)后转绿; ctx-case 单步门 shadow 实测 PASS(run-20261016-232253) 按门指示销账——swe-eval L-95 台账行同步",
   "suite": "teststate",
   "session": "t38",
-  "name": "K1 状态摘要 pin 旋钮咬合（ON）：测试态摘要注入发送视图（红锚：阶段未接线，见 known_red）",
+  "name": "K1 状态摘要 pin 旋钮咬合（ON）：测试态摘要注入发送视图（L-95 落地后转绿,2026-10-16 销账）",
   "body": {
    "model": "$client",
    "max_tokens": 256,
