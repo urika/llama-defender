@@ -243,7 +243,7 @@ Model ID → route preference mapping (preference only, safety always overrides;
 | `tools/memcheck.sh` | Detailed memory analysis (`vm_stat` breakdown) |
 | `tools/run_experiment.sh` | A/B experiment orchestration script |
 | `tools/semantic_search.py` | 本地语义检索（EmbeddingGemma 2 via `./manage.sh start-aux embedgemma2`，纯标准库）：`index` / `query` / `oneshot` / `info`；索引落 `.semantic/<name>/`（已建 wiki 1788 段 / finwiki 199 段 / docs 4385 段），与 MCP `wiki_search`（BM25）互补 |
-| `tools/knowledge_gate_9b.py` | 9B 知识/能力质量门（直连 :8084，批期安全）：金标 45 条 / 7 类（v2 含 coding 沙箱执行 + tool_call 真实 tools 解析），确定性评分，unanswerable 防幻觉红线；fixture `test/fixtures/knowledge_gate_9b.json`，报告落 `logs/knowledge_gate/` |
+| `tools/knowledge_gate_9b.py` | 9B 知识/能力质量门（直连 :8084，批期安全）：金标 62 条 / 7 类（v3 含 coding 沙箱执行——import 白名单+dunder/反射黑名单+RLIMIT_CPU——及 tool_call 真实 tools 解析），确定性评分，unanswerable 防幻觉红线；fixture `test/fixtures/knowledge_gate_9b.json`，报告落 `logs/knowledge_gate/` |
 | `tools/haiku_tier_compare.py` | haiku 档分流多臂对照（31 条金标，`--arm 9b/flash/splash`）：scorer 复用质量门模块；三臂实测与路由裁决见 `docs/06-reference-metrics/ornith-9b-capability-research-20261015.md` §五；fixture `test/fixtures/haiku_tier_cases.json` |
 
 ## Documentation

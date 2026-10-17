@@ -97,6 +97,8 @@ Ornith-1.5 是「端到端自我改进」家族（9B / 35B-A3B / 397B，联合�
 
 **v3 判词（`gate-20261017-153850`）：FAIL 54/62 = 87.1%**，未达标仅 summary（28.6%，结构性）。分类：extraction **13/13** · tool_call **7/7** · refine 6/6 · coding 9/10（COD04 正则词边界，真实边缘 bug 保留）· grounding 8/9（**D09 算术 88≠83 真失手**——接地算术是新暴露的弱点）· tagging 9/10（B09 只给优先级漏类型标签，真失手）· 防幻觉红线 2/2 ✓。
 
+**代码 review（同日，`a47388f`）**：沙箱执行面加固三件——①黑名单补 dunder/反射族（封 `__builtins__.open` 属性访问逃逸）；②harness 评分符号后置定义（防模型代码覆盖评分逻辑）；③`__GATE__` 取末行（防模型先印伪造行）；另补 RLIMIT_CPU=6s 使 docstring 属实。三种逃逸向量/覆盖防御/伪造行防御自测全绿 + COD01 真实执行回归。留档不修：`__GATE__` JSON 内容级伪造（威胁模型=自家模型+自家机器的意外损伤防护，非敌对）。
+
 ## 五、haiku 档分流实测（2026-10-16）
 
 **动机**：models.json 中 `claude-haiku-4-5` 路由为 `prefer_local`，但 `local_model=local-default`（= 35B 主引擎）——验证「haiku 档本地兜底下沉到 9B」的可行性。
