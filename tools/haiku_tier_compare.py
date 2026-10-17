@@ -15,6 +15,7 @@
   python3 tools/haiku_tier_compare.py --limit 2      # 冒烟
   python3 tools/haiku_tier_compare.py --arm 9b       # 只跑单臂（续跑用）
   python3 tools/haiku_tier_compare.py --arm flash
+  python3 tools/haiku_tier_compare.py --arm splash   # 第三臂: 主引擎 :8081 对照
 """
 
 import argparse
@@ -40,6 +41,8 @@ B9B = "http://127.0.0.1:8084/v1"
 MODEL_9B = "ornith-ai/Ornith-1.5-9B-MLX-4bit"
 FLASH_BASE = "https://open.bigmodel.cn/api/anthropic"
 FLASH_MODEL = "glm-5.3-flash"
+SPLASH_BASE = "http://127.0.0.1:8081/v1"
+SPLASH_MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
 TEMP = 0          # 确定性口径（promptfoo 原配 0.6，本实验统一 0）
 # 4096: glm-flash 走 anthropic 协议时 thinking 块计入 max_tokens——1024 会在长题上
 # 被思考耗尽致 text 空响应（2026-10-16 首跑 artifact，5 个 flash 失手全为此因）
@@ -63,6 +66,21 @@ def call_9b(prompt: str, timeout: int = 120):
     }).encode("utf-8")
     req = urllib.request.Request(
         B9B.rstrip("/") + "/chat/completions", data=payload,
+        headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    ms = int((time.time() - t0) * 1000)
+    return body["choices"][0]["message"].get("content") or "", ms
+
+
+def call_splash(prompt: str, timeout: int = 180):
+    payload = json.dumps({
+        "model": SPLASH_MODEL, "temperature": TEMP, "max_tokens": MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        SPLASH_BASE.rstrip("/") + "/chat/completions", data=payload,
         headers={"Content-Type": "application/json"})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -147,8 +165,9 @@ def score(case: dict, resp: str, g: dict):
 
 # ---------------------------------------------------------------- runner
 
-def run_arm(arm: str, cases, key: str):
-    caller = call_9b if arm == "9b" else (lambda p: call_flash(p, key))
+def run_arm(arm: str, cases, key: str, caller=None):
+    if caller is None:
+        caller = lambda p: call_flash(p, key)  # noqa: E731
     results = []
     for i, c in enumerate(cases, 1):
         try:
@@ -185,7 +204,7 @@ def main():
     ap = argparse.ArgumentParser(description="haiku 档分流实测（9B vs glm-flash）")
     ap.add_argument("--fixture", default=str(FIXTURE))
     ap.add_argument("--limit", type=int)
-    ap.add_argument("--arm", choices=["9b", "flash"], help="只跑单臂")
+    ap.add_argument("--arm", choices=["9b", "flash", "splash"], help="只跑单臂")
     ap.add_argument("--no-save", action="store_true")
     args = ap.parse_args()
 
@@ -205,11 +224,14 @@ def main():
     out = {"ts": datetime.now().isoformat(), "fixture": args.fixture,
            "arms": {}, "cases": {c["id"]: {"cat": c["cat"]} for c in cases}}
 
-    arms = [args.arm] if args.arm else ["9b", "flash"]
+    arms = [args.arm] if args.arm else ["9b", "flash", "splash"]
     all_results = {}
     for arm in arms:
         print(f"\n--- 臂: {arm} ---")
-        rs = run_arm(arm, cases, key)
+        if arm == "flash":
+            rs = run_arm(arm, cases, key)
+        else:
+            rs = run_arm(arm, cases, None, caller=call_9b if arm == "9b" else call_splash)
         all_results[arm] = rs
         out["arms"][arm] = stats(rs)
         for r in rs:
