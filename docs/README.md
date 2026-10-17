@@ -55,6 +55,7 @@ docs/
 | 文档 | 说明 |
 |------|------|
 | `proxy-pipeline-reference.md` | 代理层请求处理管线参考文档，逐层说明 8 层处理逻辑、Phase 0 模块架构、dual-setattr 热重载 |
+| `codebase-reference-20261017.md` | **代码库参考**（自 AGENTS.md §3/§4.3 拆出）：核心文件清单、管线 25 stage 全序、旁路系统详述、配置文件明细、工具清单、Admin API 端点表、源码构建 llama-server |
 | `proxy-context-window-design.md` | 代理层上下文窗口替换设计文档（v9），Phase 1-3 已实施 + Phase 0 模块拆分 |
 | `proxy-prefix-cache-design.md` | 代理层 Prefix Cache 稳定化设计文档 v1 |
 | `llama-defender-context-engineering-design.md` | llama-defender 上下文工程改造设计（append-only + epoch 压缩 + 动作台账） |
@@ -197,6 +198,7 @@ docs/
 | 文档 | 说明 |
 |------|------|
 | `api-and-operations-guide.md` | **对外操作与 API 手册**：面向 `agent_go` / 运维人员的命令、结构化 API、配置文件、生命周期事件速查 |
+| `config-parameters-guide-20261017.md` | **配置参数指南**（自 AGENTS.md §11 拆出）：压缩 Profile / 本地云端 / 路由 / 队列 / 诊断 / 注入 / 自调优 / 跨会话记忆 九张推荐组合表（权威默认值仍= CONFIG_REGISTRY） |
 | `BENCHMARK.md` | 本地 LLM 性能测试报告与基线 |
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
