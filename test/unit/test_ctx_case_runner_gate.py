@@ -170,7 +170,7 @@ class TestKnownRedRegistry(unittest.TestCase):
 class TestRealCaseSetRegistry(unittest.TestCase):
     def test_every_known_red_entry_is_wellformed(self):
         entries = {c["id"]: c["known_red"] for c in CASES if c.get("known_red")}
-        self.assertTrue(entries, "案例集里应至少有一条 known-red 登记")
+        # 登记册可为空（当前所有已知红锚均已转绿销账）；仅当有条目时逐条良构校验。
         for cid, kr in entries.items():
             for field in ccr.KNOWN_RED_REQUIRED:
                 self.assertTrue(str(kr.get(field) or "").strip(),
@@ -178,9 +178,9 @@ class TestRealCaseSetRegistry(unittest.TestCase):
             self.assertIsNotNone(ccr._parse_date(kr["expires"]),
                                  "%s 的 expires 不可解析" % cid)
 
-    def test_tc32_red_anchor_is_the_registered_known_red(self):
-        self.assertIn("known_red", BY_ID["TC32"])
-        self.assertIn("L-36", BY_ID["TC32"]["known_red"]["ref"])
+    def test_tc32_red_anchor_retired_after_l36(self):
+        """L-36 落地后 TC32 应已销账（红锚转绿不变量）；见 roadmap L-36。"""
+        self.assertNotIn("known_red", BY_ID["TC32"])
 
     def test_known_red_registry_has_no_stale_green_entries(self):
         """登记册不得有「已到期」条目——到期即门报错（防长期挂账）。"""

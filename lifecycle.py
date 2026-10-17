@@ -16,6 +16,10 @@ def _normalize_system_messages(messages):
     Claude Code's mid-conversation-system beta inserts system messages later,
     which breaks rapid-mlx/Qwen. We keep the first system message (if any) and
     convert subsequent ones to user messages prefixed with [System update].
+
+    L-36(2026-10-05): 首个 system 一律**前移至 index 0**（原实现只按文档序
+    保留原位——system 在数组中部时引擎仍 400 "System message must be at the
+    beginning"；CLI 内建 Agent(Task) 子代理请求即此形态）。
     """
     if not messages:
         return messages
@@ -25,7 +29,8 @@ def _normalize_system_messages(messages):
         role = msg.get("role", "")
         if role == "system":
             if not seen_system:
-                result.append(msg)
+                # L-36(2026-10-05): 前移而非原位保留（见函数 docstring）。
+                result.insert(0, msg)
                 seen_system = True
             else:
                 content = msg.get("content", "")

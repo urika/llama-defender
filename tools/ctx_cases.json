@@ -1616,11 +1616,6 @@
  {
   "id": "TC32",
   "quick": true,
-  "known_red": {
-   "reason": "中部 system 未前移至后端首位（L-36 代理侧归一化未修；红锚行为符合设计）",
-   "ref": "L-36 / L-38①「A6→TC32 就绪红锚」",
-   "expires": "2026-11-15"
-  },
   "suite": "prod",
   "session": "t32",
   "name": "system 位置归一：中部 system 前移至后端首位（L-36）",
