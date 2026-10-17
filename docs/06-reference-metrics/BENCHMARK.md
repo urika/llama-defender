@@ -487,3 +487,37 @@ TTFT:
 *文档生成时间: 2026-07-12;2026-08-15 增补 Qwen3.8-27B 基线*
 *测试工具: tools/bench_perf.py (完整模式);tools/bench_ctx_ladder.py / tools/oom_ladder_test.py (Qwen3.8)*
 *原始数据: logs/bench-ctx-ladder-20260815-190658.json, logs/oom-ladder-20260815-180529.json*
+
+---
+
+## Splash 35B + Ornith-9B 运行时聚合基线（2026-10-17 实测）
+
+> 数据源：引擎自报 Prometheus 指标（`:8081/metrics` 的 `splash_*` 族、`:8084/metrics` 的 `rapid_mlx_*` 族），
+> 非合成 benchmark——为真实生产流量的运行时聚合。9B 的 haiku 路由切换与质量门/对照评测流量混在窗口内，注意口径。
+
+### Splash 1.0.2 + Qwen3.6-35B-A3B（:8081，窗口 509 请求）
+
+| 指标 | 值 |
+|------|-----|
+| decode 吞吐（运行均值） | **90.1 tok/s**（ITL p50=11.7ms / p95=38.1ms） |
+| prefill 吞吐 | **1,129 tok/s**（累计 473 万 tokens） |
+| TTFT | p50=1.45s / p95=41.6s（长尾=长上下文冷 prefill） |
+| **KV 前缀缓存** | 请求级命中 **89.6%**（456/53）；token 级复用 1,860 万 vs 实算 473 万 = **79.7% 输入由缓存供给** |
+| DFlash2 草稿接受率 | 0.372（接受 6.9 万 / 起草 18.6 万） |
+| 健康 | 508 完成 / 0 失败；内存 25.5/43.2GB；KV 池 6,406/64,000 页 |
+
+### Ornith-1.5-9B（:8084，自 10-13 起 913 请求）
+
+| 指标 | 值 |
+|------|-----|
+| decode 吞吐 | ~100 tok/s（历史基线；无运行时 gauge） |
+| **KV 前缀缓存** | 请求级命中 19.8%（182/921）——**被窗口内金标评测流量稀释**（独立 prompt=结构性 miss），不具生产代表性；token 级节省 190 万 / 总输入 297 万 = 39% |
+| 前缀缓存池 | 2GB 上限用 1.53GB，驱逐 2,504 次（radix 常态） |
+| live 同 prompt 两连发 TTFT | 125ms → 11ms（前缀缓存生效证据） |
+
+### 观测要点
+
+1. **Splash 可观测性更正**：`splash_*` Prometheus 面完整（TTFT/ITL 分位、state 命中、KV 页、draft 接受率），
+   推翻「Splash 诊断降级无 metrics」旧认知（AGENTS.md §4.5 已同步更正）。
+2. 主引擎 80% token 级缓存复用与 EXP 批次 agentic 长前缀形态吻合，缓存体系健康。
+3. 9B 命中率需等 haiku 路由生产流量积累后重读；同前缀 TTFT 90× 收益可直接指导长文档多轮用法。

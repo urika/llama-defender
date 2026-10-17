@@ -131,7 +131,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 - **进程模型（与 rapid-mlx 关键差异）**：splash CLI spawn `server.py`（前端，持 :8081 LISTEN）+ `serve-native`（引擎子进程）后**自身退出** → manage.sh 按端口感知前端 PID；杀前端→native 连带退出，stop 兜底 `pkill serve-native`
 - **互斥单引擎**：与 Ornith（rapid-mlx）不可同跑，切换 = `switch <name> && restart`
-- **诊断降级**：rapid-mlx 的 `/metrics`（snapdown/驱逐计数）、timings、KV dtype 在 Splash 无对应物；`/api/status` 的 backend 进程匹配已加 `splash`
+- **诊断面（2026-10-17 实测更正）**：Splash 自带完整 Prometheus 指标面 `GET /metrics`（`splash_*` 族：TTFT/ITL 分位、state 命中/未中、KV 页水位、draft 接受率、内存压力等），**可观测性不弱于 rapid-mlx**；仍无对应物的是 rapid-mlx 特有计数（snapdown/驱逐计数、响应 timings 字段、KV dtype gauge）与 `/props`。`/api/status` 的 backend 进程匹配已加 `splash`
 - **性能参照**（27B/35B-A3B，M5 Pro 48GB）：代码任务 78–264 tok/s（DFlash2 接受率红利）、32K 热 TTFT 0.10–0.36s、32K 冷 prefill 611–3139 tok/s；散文受带宽极限（27B 38.8 = 上限）
 - **模型格式封闭**：仅 `incoai/*-Splash` 专有包（`splash-packed-q4[-moe]`），普通 MLX/HF 权重不加载
 - **切换纪律**：批跑期禁切（红线 1）；admin_server.py 的 splash 匹配需代理重启生效
