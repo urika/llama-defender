@@ -27,8 +27,8 @@
   python3 tools/knowledge_gate_9b.py --limit 3       # 冒烟
   python3 tools/knowledge_gate_9b.py --base http://127.0.0.1:8084/v1
 
-coding exec 安全说明: 模型代码经 import 白名单 + 危险内建黑名单扫描，再以
-`python3 -I -c` 子进程执行（隔离模式，RLIMIT_CPU=6s，wall timeout 10s），仅本机
+coding exec 安全说明: 模型代码经 import 白名单 + 危险内建/dunder 黑名单扫描，再以
+`python3 -I -c` 子进程执行（隔离模式，RLIMIT_CPU=6s，wall timeout 15s），仅本机
 质量门场景使用。
 """
 
@@ -208,11 +208,22 @@ _CODING_BAN = re.compile(
     r"(__import__|\beval\s*\(|\bexec\s*\(|\bopen\s*\(|\bcompile\s*\("
     r"|\binput\s*\(|\bos\s*\.|\bsubprocess\b|\bshutil\b|\bsocket\b"
     r"|\bpathlib\b|\bmultiprocessing\b|\bpty\b|\bwebbrowser\b"
-    r"|\bbreakpoint\s*\(|\bglobals\s*\(|\blocals\s*\()")
+    r"|\bbreakpoint\s*\(|\bglobals\s*\(|\blocals\s*\(|\bvars\s*\("
+    r"|\bgetattr\s*\(|\bsetattr\s*\(|\bdelattr\s*\(|\bhelp\s*\("
+    r"|__builtins__|__subclasses__|__globals__|__dict__)")
 # 允许的 import 白名单（其余 import 一律拒绝执行）
 _CODING_IMPORT_OK = {"re", "math", "json", "typing", "collections",
                      "itertools", "functools", "string", "heapq", "bisect",
                      "statistics", "operator", "dataclasses", "enum"}
+
+
+def _coding_limits():
+    """子进程资源上限：CPU 6s（wall timeout 15s 兜底），防死循环烧核。"""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (6, 6))
+    except Exception:
+        pass
 
 
 def _coding_extract_code(resp: str) -> str:
@@ -252,13 +263,15 @@ def score_coding(resp: str, case: dict):
             return False, detail
     try:
         import subprocess as _sp
-        # 组装沙箱脚本：模型代码 + 逐条 eval 断言，输出 JSON 行
+        # 组装沙箱脚本：模型代码先执行，harness 符号（__gate_eval/__gate_r）后定义
+        # ——顺序保证模型代码无法覆盖评分逻辑；逐条 eval 断言输出 JSON 行
         checks = "\n".join(
-            f"__r.append(_gate_eval({json.dumps(t['expr'])}, {json.dumps(t['expect'])}))"
+            f"__gate_r.append(__gate_eval({json.dumps(t['expr'])}, {json.dumps(t['expect'])}))"
             for t in case["tests"])
         script = (
             "import json as __j, math, re\n"
-            "def _gate_eval(expr, expect):\n"
+            f"{code}\n"
+            "def __gate_eval(expr, expect):\n"
             "    try:\n"
             "        got = eval(expr, globals())\n"
             "        ok = (got == expect)\n"
@@ -267,17 +280,19 @@ def score_coding(resp: str, case: dict):
             "                'expect': __j.dumps(expect, default=str)[:160]}\n"
             "    except Exception as e:\n"
             "        return {'expr': expr, 'ok': False, 'err': f'{type(e).__name__}: {e}'[:160]}\n"
-            f"{code}\n"
-            "__r = []\n"
+            "__gate_r = []\n"
             f"{checks}\n"
-            "print('__GATE__' + __j.dumps(__r, ensure_ascii=False))\n"
+            "print('__GATE__' + __j.dumps(__gate_r, ensure_ascii=False))\n"
         )
         proc = _sp.run([sys.executable, "-I", "-c", script],
-                       capture_output=True, text=True, timeout=15)
+                       capture_output=True, text=True, timeout=15,
+                       preexec_fn=_coding_limits)
     except Exception as e:  # TimeoutExpired / OSError 等
         detail["error"] = f"exec:{type(e).__name__}"
         return False, detail
-    line = next((l for l in proc.stdout.splitlines() if l.startswith("__GATE__")), None)
+    # 取最后一条 __GATE__（模型代码若伪造早印的同名行，会被 harness 的真实输出压后）
+    gate_lines = [l for l in proc.stdout.splitlines() if l.startswith("__GATE__")]
+    line = gate_lines[-1] if gate_lines else None
     if line is None:
         detail["error"] = "no_gate_output"
         detail["stderr"] = proc.stderr[-300:]

@@ -215,8 +215,9 @@ def main():
     if args.limit:
         cases = cases[:args.limit]
 
+    arms = [args.arm] if args.arm else ["9b", "flash", "splash"]
     key = load_secret_key("BIGMODEL_API_TOKEN")
-    if not key:
+    if not key and "flash" in arms:
         print("!! secret.local.conf 缺 BIGMODEL_API_TOKEN，flash 臂不可用")
         return 2
 
@@ -250,8 +251,10 @@ def main():
             sub = [r for r in rs if r["cat"] == cat]
             if sub:
                 subsets.setdefault(cat, {})[arm] = f"{sum(r['pass'] for r in sub)}/{len(sub)}"
+    arm_order = [a for a in ("9b", "flash", "splash") if a in all_results]
     for cat, by_arm in sorted(subsets.items()):
-        print(f"  {cat:<11} 9b={by_arm.get('9b', '-')}  flash={by_arm.get('flash', '-')}")
+        cells = "  ".join(f"{a}={by_arm.get(a, '-')}" for a in arm_order)
+        print(f"  {cat:<11} {cells}")
 
     if not args.no_save:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
