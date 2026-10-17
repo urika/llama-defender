@@ -201,6 +201,7 @@ docs/
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估 |
+| `ornith-9b-capability-research-20261015.md` | Ornith-1.5-9B 能力调研：官方定位/benchmark、质量门 v2（45 条含 coding/tool_call）、haiku 档分流三臂实测与路由裁决（§五/§5.1） |
 
 ---
 
