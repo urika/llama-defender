@@ -112,6 +112,8 @@ Ornith-1.5 是「端到端自我改进」家族（9B / 35B-A3B / 397B，联合�
 
 **结论**：**9B 可承接 haiku 档**——质量与 flash 差距仅 2 条（且全落在已知的金标偏严/硬字数两类），promptfoo 回归基线打平，p50 快 2×，零成本，且把 haiku 从 35B 主引擎剥离（现状 local-default 路由白白消耗 :8081 容量）。**建议**：haiku 路由 `local_model` 改指 ornith-9b；flash 保留为 fallback（严字数任务可按 route 敏感词升级）。切换动作 = models.json 一行 + reload（属生产变更，走批后窗口）。
 
+> **执行记录（2026-10-17）**：批次收官后已切换（models.json hash `24bcf509`，`/api/route/policies` preferences 确认 + :4000 实测转发 `engine=ornith-9b`）。顺带修掉实测踩坑的报头口径 bug（pipeline.py `X-Proxy-Route-Actual-Model` 此前对 local 目标无条件回显 35B，现与派发侧 openai_body_model 口径一致；生效待下次 proxy 重启）。splash-35B 第三臂对照待跑。
+
 
 
 ## 参考来源

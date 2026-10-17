@@ -442,7 +442,7 @@
         "deepseek-flash"
       ],
       "behavior": "force",
-      "local_model": "local-default",
+      "local_model": "ornith-9b",
       "threshold_factor": 2.0,
       "memory_bias": 0
     },

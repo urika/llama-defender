@@ -4142,7 +4142,15 @@ class BackendDispatcher(PipelineStage):
             actual = getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL
             cost = self._route_cost_estimate(ctx)
         else:
-            actual = _ps.MODEL_NAME
+            # 本地目标: 路由声明 local_model(如 haiku→ornith-9b)时回显真实引擎
+            # 模型码——与派发侧 openai_body_model 口径一致(否则报头谎报 35B,
+            # 2026-10-17 haiku 路由切换实测踩坑)
+            _lm = getattr(ctx, '_route_local_model', '') or ''
+            if _lm:
+                actual = (model_registry.get_model(_lm) or {}).get("model_name") \
+                    or _ps.MODEL_NAME
+            else:
+                actual = _ps.MODEL_NAME
             cost = 0.0
         display = target
         if target == 'local' and reason in ('session_force_local', 'header_override'):

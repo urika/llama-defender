@@ -1660,6 +1660,27 @@ class TestMultiProviderDispatch(unittest.TestCase):
         self.assertGreater(float(headers["X-Proxy-Route-Cost"]), 0.0)
         self.assertEqual(headers["X-Proxy-Route-Actual-Model"], "m1")
 
+    def test_r8_actual_model_reflects_local_model(self):
+        """haiku→ornith-9b: local 目标 + 路由声明 local_model 时, Actual-Model
+        必须回显声明引擎的目录 model_name, 而非默认 35B（2026-10-17 实测踩坑）。"""
+        stage = self._stage()
+        ctx = self._make_ctx(target="local")
+        ctx._route_reason = "model_forced_local(claude-haiku-4-5)"
+        ctx._route_local_model = "ornith-9b"
+        with patch("pipeline.model_registry.get_model",
+                   return_value={"model_name": "ornith-ai/Ornith-1.5-9B-MLX-4bit"}):
+            stage._set_route_headers(ctx)
+        headers = self._mock_handler._route_response_headers
+        self.assertEqual(headers["X-Proxy-Route-Actual-Model"],
+                         "ornith-ai/Ornith-1.5-9B-MLX-4bit")
+        self.assertEqual(headers["X-Proxy-Route-Target"], "local")
+        # 无 local_model 声明 → 维持 35B 默认口径
+        ctx2 = self._make_ctx(target="local")
+        ctx2._route_local_model = ""
+        stage._set_route_headers(ctx2)
+        self.assertEqual(self._mock_handler._route_response_headers[
+            "X-Proxy-Route-Actual-Model"], _ps.MODEL_NAME)
+
     def test_provider_breaker_trips_after_max_failures(self):
         """MAX_CLOUD_FAILS provider failures trip only that provider's cooldown."""
         import time
