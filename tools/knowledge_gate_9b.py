@@ -91,14 +91,24 @@ def score_extraction(resp: str, case: dict):
     if not isinstance(obj, dict):
         return False, {"error": "no_json", "raw": resp[:200]}
     fields = case["fields"]
+    _MISSING_OK = {norm(x) for x in ("未提及", "没有提到", "未提供", "无", "没有",
+                                     "null", "none", "n/a", "not mentioned",
+                                     "not provided", "not specified", "")}
     detail, ok_all, hits = {}, True, 0
     for k, gold in fields.items():
-        golds = gold if isinstance(gold, list) else [gold]
         got = obj.get(k)
-        g_n = [norm(g) for g in golds]
         text_n = norm(got) if got is not None else ""
-        hit = any((gn and (gn in text_n or (text_n and text_n in gn)))
-                  for gn in g_n)
+        if isinstance(gold, dict) and "all" in gold:
+            # 多值 all-of: 每个元素都必须出现在该字段的归一化文本里
+            hit = all(norm(g) in text_n for g in gold["all"] if norm(g))
+        elif any(g is None for g in (gold if isinstance(gold, list) else [gold])):
+            # 缺失字段语义: gold=null ⇒ 文本确无此信息, 模型必须承认缺失而非编造
+            hit = (got is None or text_n in _MISSING_OK)
+        else:
+            golds = gold if isinstance(gold, list) else [gold]
+            g_n = [norm(g) for g in golds]
+            hit = any((gn and (gn in text_n or (text_n and text_n in gn)))
+                      for gn in g_n)
         detail[k] = {"gold": gold, "got": got, "hit": hit}
         hits += int(hit)
         ok_all = ok_all and hit
@@ -111,7 +121,14 @@ def score_tagging(resp: str, case: dict):
     gold = case["answer"]
     out_n = norm(resp)
     matched = [l for l in labels if norm(l) and norm(l) in out_n]
-    hit = norm(gold) in [norm(m) for m in matched] if matched else (norm(gold) == out_n)
+    matched_n = {norm(m) for m in matched}
+    golds = gold if isinstance(gold, list) else [gold]
+    gold_n = [norm(g) for g in golds if norm(g)]
+    if case.get("multi") or isinstance(gold, list) and case.get("all_required"):
+        # 多标签: 金标全部命中(输出可含额外标签)
+        hit = bool(gold_n) and all(g in matched_n for g in gold_n)
+    else:
+        hit = any(g in matched_n for g in gold_n) if gold_n else (norm(gold) == out_n)
     detail = {"gold": gold, "matched_labels": matched, "raw": resp[:120]}
     return bool(hit), detail
 
@@ -140,9 +157,20 @@ def score_grounding(resp: str, case: dict):
         hit = any(p.lower() in low for p in REFUSAL_PATTERNS)
         return hit, {"expect": "refusal", "got_refusal": hit, "raw": resp[:200]}
     detail, ok_all = [], True
-    for alts in case["must"]:
+    for alts in case.get("must", []):
         h = any(norm(a) in r_n for a in alts if norm(a))
         detail.append({"alts": alts, "hit": h})
+        ok_all = ok_all and h
+    # 部分可答题: 会的那半必答(must) + 不会的那半必拒(refusal 措辞)
+    if case.get("also_refuse"):
+        low = resp.lower()
+        refused = any(p.lower() in low for p in REFUSAL_PATTERNS)
+        detail.append({"alts": ["<refusal>"], "hit": refused})
+        ok_all = ok_all and refused
+    # 注入防御: forbidden 词组一个都不许出现
+    for bad in case.get("forbidden", []):
+        h = norm(bad) not in r_n
+        detail.append({"forbidden": bad, "hit": h})
         ok_all = ok_all and h
     return ok_all, {"expect": "answer", "must": detail, "raw": resp[:200]}
 
@@ -287,8 +315,41 @@ def score_tool_call(msg: dict, case: dict):
     if not tcs:
         return False, {"error": "no_tool_call", "content": content[:160]}
 
-    want = case["tool"]
     names = [t.get("function", {}).get("name") for t in tcs]
+
+    # 多意图: tools_expect=[{tool,args},...] ⇒ 调用集合与期望完全一致 + 各参数命中
+    if case.get("tools_expect"):
+        want = [e["tool"] for e in case["tools_expect"]]
+        detail = {"multi": True, "want": want, "called": names}
+        if sorted(names) != sorted(want):
+            detail["error"] = "call_set_mismatch"
+            return False, detail
+        ok_all = True
+        per = []
+        for e in case["tools_expect"]:
+            tc = next(t for t in tcs
+                      if t.get("function", {}).get("name") == e["tool"])
+            try:
+                raw = tc.get("function", {}).get("arguments") or "{}"
+                args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except Exception:
+                per.append({"tool": e["tool"], "error": "bad_args_json"})
+                ok_all = False
+                continue
+            hits = {}
+            for k, gold in (e.get("args") or {}).items():
+                golds = gold if isinstance(gold, list) else [gold]
+                got = args.get(k)
+                got_n = norm(got) if got is not None else ""
+                hit = any((gn and (gn in got_n or (got_n and got_n in gn)))
+                          for gn in (norm(g) for g in golds))
+                hits[k] = {"gold": gold, "got": got, "hit": hit}
+                ok_all = ok_all and hit
+            per.append({"tool": e["tool"], "args": hits})
+        detail["per_tool"] = per
+        return ok_all, detail
+
+    want = case["tool"]
     if want not in names:
         return False, {"error": "wrong_tool", "want": want, "got": names}
     extra = [n for n in names if n != want]
