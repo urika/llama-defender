@@ -71,6 +71,13 @@ swe388be5f2 三次注入的行为曲线（台账逐轮 Read 计数）：
 
 两者均 fail-open、缺省关（冻结批不受影响）；下一验证批开启。
 
+> **冒烟验证（2026-10-18，v3）**：预算 0.2min + 内嵌 sleep 的四步任务，全链路实证——
+> 墙钟触发 → nudge POST 200 → **代理 canonical 追加并随 turn=3 请求投递**
+> （sessions.jsonl `injection_details.admin_inject{tag:"watchdog-nudge",
+> engine_persisted:true}`）→ agent 遵 wrap-up 指令在宽限窗内自终（rc=0）。
+> 投递通道与 L-30 rabbit_hole nudge 同传输，闭环无缺口。v1/v2 教训：冒烟 agent
+> 的请求时序必须与注入点对齐（任务内嵌 sleep 保证存活过触发点）。
+
 ## 4. harness 环节改进建议（未落地，按 ROI）
 
 | # | 环节 | 建议 | 依据 |
