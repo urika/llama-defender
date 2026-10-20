@@ -384,6 +384,20 @@ _format_bytes() {
 #   0 = 就绪
 #   1 = 进程退出 / 下载停滞 / 启动超时
 # ============================================================
+# ── 引擎鉴权头 ──────────────────────────────────────────────────────────
+# llama-server 会从环境变量 LLAMA_API_KEY 读取密钥并强制校验，而 manage.sh 的
+# 环境里 secret.local.conf 已导出它 → 不带该头的请求一律 401 "Invalid API Key"。
+# 就绪探针必须带上，否则 llama-server 后端会一直显示"模型加载中"直到超时
+# （2026-10-14 新增 llama-server 辅助引擎时发现）。非 llama-server 后端不会
+# 校验该头，带了也无副作用。
+_curl_engine() {
+    if [[ -n "${LLAMA_API_KEY:-}" ]]; then
+        curl -H "Authorization: Bearer $LLAMA_API_KEY" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 _wait_for_ready() {
     local pid="$1"
     local name="$2"
@@ -410,13 +424,29 @@ _wait_for_ready() {
         # 加载，此窗口内客户端请求收到 not_found_error 404 并触发 SDK 重试
         # 风暴（历史累计 8,452 次）。探针 404=加载中（下轮循环重试）、200=就绪。
         # 注意：引擎 8081 无 /api/status（R1 是代理侧端点），不能用它判就绪。
-        if curl -s --max-time 5 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
-            if curl -s --max-time 15 "http://$LLAMA_HOST:$LLAMA_PORT/v1/chat/completions" \
-                -H "Content-Type: application/json" \
-                -d "{\"model\":\"$LLAMA_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ready?\"}],\"max_tokens\":1}" \
-                2>/dev/null | grep -q '"choices"'; then
-                info "✅ $name 就绪 (PID: $pid, 模型已加载)"
-                return 0
+        if _curl_engine -s --max-time 5 "http://$LLAMA_HOST:$LLAMA_PORT/v1/models" >/dev/null 2>&1; then
+            local probe_out=""
+            if [[ "${LLAMA_EMBEDDING_PROBE:-false}" == "true" ]]; then
+                # 嵌入引擎（llama-server --embeddings）不能走 chat 探针：
+                # /v1/chat/completions 固定 500 "the current context does not
+                # support logits computation. skipping"，会永远等不到就绪。
+                # 改用 /v1/embeddings 真实嵌入一发。
+                probe_out=$(_curl_engine -s --max-time 15 "http://$LLAMA_HOST:$LLAMA_PORT/v1/embeddings" \
+                    -H "Content-Type: application/json" \
+                    -d '{"input":"ready?"}' 2>/dev/null)
+                if [[ "$probe_out" == *'"embedding"'* ]]; then
+                    info "✅ $name 就绪 (PID: $pid, 嵌入模型已加载)"
+                    return 0
+                fi
+            else
+                probe_out=$(_curl_engine -s --max-time 15 "http://$LLAMA_HOST:$LLAMA_PORT/v1/chat/completions" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"model\":\"$LLAMA_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ready?\"}],\"max_tokens\":1}" \
+                    2>/dev/null)
+                if [[ "$probe_out" == *'"choices"'* ]]; then
+                    info "✅ $name 就绪 (PID: $pid, 模型已加载)"
+                    return 0
+                fi
             fi
             info "⏳ $name HTTP 已起、模型加载中 (PID: $pid)…"
         fi
@@ -477,7 +507,7 @@ _wait_for_ready() {
 _start_llama_server() {
     _check_port "$LLAMA_PORT" || return 1
 
-    info "启动 llama-server..."
+    info "启动 llama-server (${LLAMA_SERVER_BIN:-llama-server})..."
     info "  配置: ${CYAN}$(_current_config_name)${NC}"
     info "  模型: $LLAMA_MODEL"
     info "  地址: $LLAMA_HOST:$LLAMA_PORT"
@@ -529,7 +559,7 @@ _start_llama_server() {
         args+=("${extra[@]}")
     fi
 
-    nohup llama-server "${args[@]}" >> "$LOGFILE" 2>&1 &
+    nohup "${LLAMA_SERVER_BIN:-llama-server}" "${args[@]}" >> "$LOGFILE" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PIDFILE"
 
@@ -1858,8 +1888,11 @@ cmd_start_aux() {
             dflash-mlx|dflash)
                 _start_dflash_mlx || exit 1
                 ;;
+            llama-server|llama)
+                _start_llama_server || exit 1
+                ;;
             *)
-                error "辅助引擎暂不支持后端类型: $LLAMA_BACKEND (仅 rapid-mlx/dflash-mlx)"
+                error "辅助引擎暂不支持后端类型: $LLAMA_BACKEND (仅 rapid-mlx/dflash-mlx/llama-server)"
                 exit 1
                 ;;
         esac
