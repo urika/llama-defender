@@ -256,6 +256,14 @@ git commit --no-verify               # 绕过所有钩子
 - 日期后缀使用 `YYYYMMDD`。
 - 修改架构约定后，必须同步更新 `CLAUDE.md` 与本文件。
 
+### 6.4.1 共享技能（`skills/`）
+
+- Agent 可复用技能放**顶层 `skills/<name>/`**（`SKILL.md` + 可选 `references/`），
+  不放 `docs/`（那里是固定 7 类的人类文档），也不放 `.agents/`（工具本地状态、已 ignore）。
+- 各工具的技能搜索路径（`.agents/skills/`、`.claude/skills/`）用**符号链接**指向
+  `skills/<name>`，保持单一真相源，禁止复制两份。
+- 约定与检查清单见 [`skills/README.md`](skills/README.md)。
+
 ### 6.5 无统一 linter/format 配置
 
 仓库没有 `pyproject.toml`、`.ruff.toml`、`.flake8` 或 `pytest.ini`。提交前以测试通过为准，不强制代码格式化工具。
