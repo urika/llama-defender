@@ -510,12 +510,19 @@ TTFT:
 
 | 指标 | 值 |
 |------|-----|
-| decode 吞吐 | ~100 tok/s（历史基线；无运行时 gauge） |
+| decode 吞吐 | **~55.8 tok/s**（2026-10-20 实测，300/500/900 tok 均稳定；见下方口径更正） |
 | **KV 前缀缓存** | 请求级命中 19.8%（182/921）——**被窗口内金标评测流量稀释**（独立 prompt=结构性 miss），不具生产代表性；token 级节省 190 万 / 总输入 297 万 = 39% |
 | 前缀缓存池 | 2GB 上限用 1.53GB，驱逐 2,504 次（radix 常态） |
 | live 同 prompt 两连发 TTFT | 125ms → 11ms（前缀缓存生效证据） |
 
 ### 观测要点
+
+> **9B decode 口径更正（2026-10-20）**：原文记录的 `~100 tok/s` **不可达**，已更正为 **~55.8 tok/s**。
+> 依据：该模型是 dense 9B（`pure attention, spec decode OFF`），4-bit 权重 4.7 GB，解码受内存带宽约束；
+> M5 Pro 标称带宽上限约 307 GB/s ⇒ 理论上限约 65 tok/s，实测 55.8 tok/s ≈ 理论上限的 85%。
+> 另注意：内存紧张时权重会被换出，900-token 生成可劣化至 **10.6 tok/s**（`swapped_out=4.8G`）；
+> 释放内存并重启后恢复 55.8 tok/s。详见
+> [`docs/04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md`](../04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md)。
 
 1. **Splash 可观测性更正**：`splash_*` Prometheus 面完整（TTFT/ITL 分位、state 命中、KV 页、draft 接受率），
    推翻「Splash 诊断降级无 metrics」旧认知（AGENTS.md §4.5 已同步更正）。

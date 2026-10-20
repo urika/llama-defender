@@ -1,6 +1,12 @@
 # Ornith-1.5-9B 能力调研：还能做什么（2026-10-15）
 
-> **调研范围**：本机辅助引擎 `ornith-ai/Ornith-1.5-9B-MLX-4bit`（:8084，rapid-mlx，262K ctx，`--no-mllm` 纯文本，`max-num-seqs=1` 串行，稳态 ~100 tok/s）。
+> **调研范围**：本机辅助引擎 `ornith-ai/Ornith-1.5-9B-MLX-4bit`（:8084，rapid-mlx，262K ctx，`--no-mllm` 纯文本，`max-num-seqs=1` 串行，稳态 **~55.8 tok/s**）。
+>
+> **⚠️ 口径更正（2026-10-20）**：原文此处记 `~100 tok/s`，实测不可达。该模型是 dense 9B（4-bit 权重 4.7 GB），
+> 解码受内存带宽约束；M5 Pro 标称带宽约 307 GB/s ⇒ 理论上限约 65 tok/s，实测 55.8 tok/s ≈ 上限的 85%。
+> `~100 tok/s` 疑与 35B-A3B MoE（仅 3B 激活）或不同投机解码/量化配置混淆。
+> 内存紧张时权重被换出会让 900-token 生成掉到 10.6 tok/s。详见
+> [`../04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md`](../04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md)。
 > **来源**：HF 官方 model card（ornith-ai/Ornith-1.5-9B，MIT）、Ollama registry、本仓文档（`ornith-15-integration-20260826.md` / `local-stack-and-training-feasibility-20260830.md` / `protocol-layer-ownership-review-20260902.md`）、本仓质量门实测（commit `62de9d0`）。
 > **结论先行**：我们目前只用到它「知识工人」的一面（已验收），官方真正的牌面是「**终端里的编码 agent**」——待验证的增量在 agentic 编码与 tool calling。
 
@@ -64,7 +70,7 @@ Ornith-1.5 是「端到端自我改进」家族（9B / 35B-A3B / 397B，联合�
 - embedding / rerank（另用 embedgemma2 :8083）
 - 高风险决策（留给规则 + Jev + 人）
 - 视觉/OCR（本构建无塔；上游有，见升级路径）
-- 高并发（`max-num-seqs=1` 串行，~100 tok/s；多 agent 并发须代理队列治理）
+- 高并发（`max-num-seqs=1` 串行，稳态 ~55.8 tok/s；多 agent 并发须代理队列治理）
 
 ## 三、建议验证路线（按性价比排序）
 

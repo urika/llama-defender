@@ -144,6 +144,7 @@ docs/
 | `rapid-mlx-cache-analysis-supplement.md` | 补充分析：源码级验证 4 种匹配策略 |
 | `rapidmlx-kvcache-mechanism-20260903.md` | rapid-mlx KV Cache 机制分析（**§10 增补 2026-09-20：LCP snap-down 检查点打通 ④ 路径**——机制/三处调试修复/Gate A 29.7×/生产 0.1189） |
 | `ornith-oq4e-performance-bottleneck-analysis-20260920.md` | Ornith-oQ4e 长上下文性能瓶颈分析（Metal 压力驱逐/KV dequant）+ 优化方案与预期指标 + Ornith vs Qwen3.8-27B 选型对比 + Qwen3.8/Ornith 上游优化进展（rapid-mlx 0.13/0.14、MTP 头、oMLX） |
+| `ornith-9b-memory-pressure-20261020.md` | **Ornith-1.5-9B 速度劣化诊断**：系统内存耗尽导致权重换出（`swapped_out=4.8G`），900-token 生成 10.6→55.8 tok/s（5.3×）；含测量方法学教训与 `~100 tok/s` 口径更正 |
 | `rapid-mlx-0.11.5-gemma4-chat-template-regression.md` | rapid-mlx 0.11.5 Gemma4 chat template 回归分析 |
 | `prefix-cache-analysis-20260605.md` | Prefix Cache 深度分析与 TurboQuant 测试记录 |
 | `prompt-instability-mechanism-analysis.md` | Agentic 截断策略导致 Prompt 不稳定的机制分析 |
@@ -169,6 +170,7 @@ docs/
 | 文档 | 说明 |
 |------|------|
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
+| `engines-sh-param-alignment-20261020.md` | **engines.sh 参数对齐修复（DEF-211）**：`engines.sh` 缺 `--enable-auto-tool-choice` 导致辅助引擎静默丢失 tool calling；补齐 4 项参数与 `manage.sh` 对齐 |
 | `exp9-closeout-runbook-20260920.md` | EXP-9 收官日操作手册（D5 激活/取证/LCP ladder 序列） |
 | `ornith-oq4e-optimization-runbook-post-exp9-20260920.md` | Ornith-oQ4e 优化验证 Runbook（EXP-9 收官后执行）：pin-system-prompt+gpu0.80 / HBE off+S=50K / 升 rapid-mlx 0.14.3 三步；含零影响隔离验证（T0-T3）与回退设计 |
 | `cross-session-memory-handoff-p0-20261008.md` | 跨会话记忆 + 自动交接（R-CM-1/R-CM-2）P0 落地：模块/端点/配置/启用/测试/回退 |
@@ -203,7 +205,8 @@ docs/
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估 |
-| `ornith-9b-capability-research-20261015.md` | Ornith-1.5-9B 能力调研：官方定位/benchmark、质量门 v2（45 条含 coding/tool_call）、haiku 档分流三臂实测与路由裁决（§五/§5.1） |
+| `ornith-9b-capability-research-20261015.md` | Ornith-1.5-9B 能力调研：官方定位/benchmark、质量门 v2（45 条含 coding/tool_call）、haiku 档分流三臂实测与路由裁决（§五/§5.1）；**2026-10-20 更正稳态为 ~55.8 tok/s（原 ~100 不可达）** |
+| `jev-mcp-tool.md` | Jev MCP 工具：`jev_decide`/`jev_usage` 用法、密钥与注册、使用策略；**§部署形态与本地服务解耦**（纯云端、不依赖 `:8022`）+ `rsi-jev` launchd 生命周期与持久禁用方法 |
 
 ---
 

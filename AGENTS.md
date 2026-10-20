@@ -91,6 +91,31 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 ./manage.sh fix-template <dir> # 修复 Qwen chat_template
 ```
 
+#### 辅助引擎：`tools/engines.sh`
+
+`manage.sh` 只管理 `active.conf`（主后端）；**其余引擎用 `tools/engines.sh` 独立管理**，
+各自端口/进程，与主后端共存：
+
+```bash
+tools/engines.sh list                  # 列出 configs/*.conf 中的辅助引擎
+tools/engines.sh start   <name>        # 启动（读 configs/<name>.conf）
+tools/engines.sh stop    <name>        # 优雅停止（SIGTERM → 20s → SIGKILL）
+tools/engines.sh restart <name>
+tools/engines.sh status  [name]
+tools/engines.sh supervise <name> --daemon   # 常驻守护（被误杀自动重启）
+```
+
+> ⚠️ **参数对齐约束（DEF-211）**：`engines.sh` 与 `manage.sh` 各自拼装 `rapid-mlx serve`
+> 命令行。**任何一侧新增启动参数都必须同步另一侧**，否则会出现静默降级——典型症状是
+> `--tool-call-parser` 已设但漏了 `--enable-auto-tool-choice`，`/v1/models` 的
+> `capabilities` 少掉 `tools`，tool calling 永久失效且不报错。
+> 验收辅助引擎时务必检查 `capabilities`，不要只看 `HTTP 200`。
+> 详见 [`docs/05-operations-changelog/engines-sh-param-alignment-20261020.md`](docs/05-operations-changelog/engines-sh-param-alignment-20261020.md)。
+
+> ⚠️ **内存约束**：48 GB 机器上主后端（Splash 27B 约 15–19 GB）与辅助引擎（9B 约 5.7 GB）
+> **不可同时常驻**——会触发全局换页，把两者一起拖慢（实测 900-token 生成从 55.8 掉到 10.6 tok/s）。
+> 详见 [`docs/04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md`](docs/04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md)。
+
 ### 4.2 本地/云端热切换示例
 
 ```bash

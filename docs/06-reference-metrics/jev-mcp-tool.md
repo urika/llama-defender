@@ -97,3 +97,110 @@ jev 与运营 CLI 会话**共享同一账户的两个滚动窗口**（5 小时�
 > 端点、实测台账（账户快照、单次调用 0.0000366 credit、元数据 GET 不计费）与落地细节见
 > `docs/06-reference-metrics/jev-quota.md`。`/alpha/*` 属 CLI 内部端点、**未文档化**，
 > 故实现按「不可探测」降级而非硬依赖。
+
+## 部署形态与本地服务解耦（2026-10-20 核实）
+
+**结论：`jev` MCP 是纯云端代理，与本地 `rsi-jev`（`:8022`）没有任何依赖关系。**
+停掉本地服务不影响 `jev_decide` / `jev_usage`。
+
+### 调用链
+
+```
+jev MCP (stdio)  ──HTTPS + Bearer──>  https://api.commandcode.ai/provider/v1/systemone
+                                       model: typesafe/jev
+                                       key:   CMD_API_KEY（环境变量）
+```
+
+`tools/jev_mcp_server.py` 中**没有任何 `8022` 引用**，也没有本地降级分支
+（`grep -c '8022' tools/jev_mcp_server.py` → `0`）。
+
+### 三个易混淆的组件
+
+| 组件 | 地址 | 是否依赖本地 :8022 | 说明 |
+|------|------|--------------------|------|
+| **`jev` MCP** | stdio | ❌ 否 | 直连官方云端；本项目级配置在 `~/APP/llama.cpp/.opencode/opencode.json` |
+| `jev-cascade` 网关 | `:8023` | ✅ 是 | 本地优先 → 置信度低才升级官方；本地不可用则整体降级官方 |
+| `rsi-jev` 本地模型 | `:8022` | — | 本地 MLX 推理（`v6.1-vl-4b-mlx-8bit`），零外发 |
+
+> 也就是说：**只用 `jev` MCP 时，`:8022` 与 `:8023` 都不是必需的**。
+> 只有需要「本地优先、零外发」的 cascade 路径时才需要它们。
+
+### `rsi-jev`（`:8022`）生命周期管理
+
+由 launchd 常驻管理，plist 位于
+`~/Library/LaunchAgents/com.agentgo.rsi-jev.plist`，关键项：
+
+```xml
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>   <!-- 进程退出会被自动拉起 -->
+```
+
+**因为 `KeepAlive=true`，`kill` 与 `launchctl stop` 都只是「假停」**——会被立刻重启
+（实测 `launchctl stop` 后 pid 变化、`runs` 自增）。真正的启停只有以下几种：
+
+#### 项目自带脚本（日常）
+
+```bash
+cd ~/APP/rsi-jev
+./tools/start-service.sh {start|stop|restart|status|logs}
+./start-all.sh          # 一键：8022 本地 + 8023 网关
+```
+
+> `start-service.sh start` 用 `nohup` 直接拉起，**可绕过 launchd 的 disable 状态**——
+> 排查「为什么又起来了」时先想到它。
+
+#### launchctl（真正生效）
+
+```bash
+UID_=$(id -u)
+
+# 临时停（本次登录内；KeepAlive 不会拉起）
+launchctl bootout gui/$UID_/com.agentgo.rsi-jev
+
+# 重新启用
+launchctl bootstrap gui/$UID_ ~/Library/LaunchAgents/com.agentgo.rsi-jev.plist
+
+# 跨登录持久禁用（重启后也不启动）
+launchctl disable gui/$UID_/com.agentgo.rsi-jev
+launchctl bootout gui/$UID_/com.agentgo.rsi-jev
+
+# 解除持久禁用
+launchctl enable    gui/$UID_/com.agentgo.rsi-jev
+launchctl bootstrap gui/$UID_ ~/Library/LaunchAgents/com.agentgo.rsi-jev.plist
+```
+
+`launchctl disable` 会写入 `/var/db/com.apple.xpc.launchd/disabled.<uid>.plist`，
+可用 `launchctl print-disabled gui/$UID_` 核对。
+
+#### 相关附属服务
+
+| 服务 | 作用 | 备注 |
+|------|------|------|
+| `com.agentgo.jev-cascade` | `:8023` 级联网关 | `KeepAlive=true`；本地不可用时降级官方 |
+| `com.agentgo.jev-keepalive` | 每 300s `curl /health` | **只探活保温，不会拉起服务** |
+
+`keepalive.sh` 的目的是防止 MLX 权重空闲被换出（首次调用冷启约 2.4s），
+脚本内只有两条 `curl`，无任何 `launchctl`/启动调用，因此 `bootout` 后不会被它拉回。
+
+### 当前状态（2026-10-20）
+
+本机为省内存已**跨登录持久禁用** `:8022`：
+
+```
+launchctl print-disabled gui/501  →  "com.agentgo.rsi-jev" => true
+```
+
+实测收益与影响：
+
+| 项 | 禁用前 | 禁用后 |
+|---|---|---|
+| rsi-jev footprint | 8.27 GB | 0 |
+| 系统 free | 0.1 GB | 8.1 GB |
+| 系统 compressor | 11.7 GB | 3.4 GB |
+| `jev_decide`（云端） | 正常 | **正常**（实测 `noul=0.97`） |
+| `jev-cascade` `:8023` | local ok | `local.ok=false`（仅降级官方） |
+
+> 该禁用与
+> [`../04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md`](../04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md)
+> 属同一次内存治理：48 GB 机器上同时跑 Splash 27B（15–19 GB）+ rsi-jev（8.27 GB）+ 9B（5.7 GB）
+> 会触发全局换页，拖慢所有引擎。
