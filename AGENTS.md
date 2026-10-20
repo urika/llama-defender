@@ -277,6 +277,12 @@ git commit --no-verify               # 绕过所有钩子
 - 云端模式需要真实的 `LLAMA_API_KEY`。
 - 必须存放在 `configs/secret.local.conf`，该文件已被 `.gitignore` 排除。
 - 永远不要把 key 写入任何被 git 跟踪的文件（包括配置示例、测试文件、日志）。
+- **Agent 客户端侧**（OpenCode / Claude Code / shell）遵循同一原则：密钥只存
+  `~/.zshenv`，配置里用 `{env:VAR}` / `$VAR` 引用，绝不落盘明文。
+  完整凭证映射与验收清单见
+  [`docs/06-reference-metrics/agent-client-credentials-20261020.md`](docs/06-reference-metrics/agent-client-credentials-20261020.md)。
+- `.claude/`、`.agents/`、`.commandcode/` 均为本地状态目录，已在 `.gitignore` 排除
+  （其中 `.claude/settings.local.json` 可能残留历史密钥）。
 
 ### 7.2 日志脱敏
 

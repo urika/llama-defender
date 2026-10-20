@@ -200,6 +200,7 @@ docs/
 | 文档 | 说明 |
 |------|------|
 | `api-and-operations-guide.md` | **对外操作与 API 手册**：面向 `agent_go` / 运维人员的命令、结构化 API、配置文件、生命周期事件速查 |
+| `agent-client-credentials-20261020.md` | **本机 Agent 客户端凭证与 OpenCode 配置**：凭证映射表、`~/.zshenv` vs `~/.zshrc` 放置约定、`{env:VAR}` 用法与 GUI 启动陷阱、provider/MCP 清单（含 volcengine 下线）、Claude Code 权限文件脱敏与验收清单 |
 | `config-parameters-guide-20261017.md` | **配置参数指南**（自 AGENTS.md §11 拆出）：压缩 Profile / 本地云端 / 路由 / 队列 / 诊断 / 注入 / 自调优 / 跨会话记忆 九张推荐组合表（权威默认值仍= CONFIG_REGISTRY） |
 | `BENCHMARK.md` | 本地 LLM 性能测试报告与基线 |
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
