@@ -47,3 +47,18 @@ node_modules/
 package-lock.json
 .aider*
 .manage.lock
+
+# 自建引擎二进制（如 embedgemma2 用的 llama-server）
+tools/bin/
+
+# 语义检索索引（tools/semantic_search.py 生成，向量文件较大）
+.semantic/
+
+# AI 工具本地状态/偏好（可能含明文 API key，如 .claude/settings.local.json
+# 的 SERPER_API_KEY / HF_TOKEN）——绝不入库
+.claude/
+.agents/
+.commandcode/
+
+# 生成的报告/导出产物
+output/
