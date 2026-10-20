@@ -82,12 +82,15 @@ _cmd_start() {
     if _is_alive "$pf"; then
         warn "引擎 $name 已在运行 (PID: $pf)"; return 0
     fi
-    local model port extra toolparser reasoning
+    local model port extra toolparser reasoning kvquant kvbits thinking
     model="$(_get_conf "$name" LLAMA_MODEL)"
     port="$(_get_conf "$name" LLAMA_PORT)"
     extra="$(_get_conf "$name" RAPID_MLX_EXTRA_ARGS)"
     toolparser="$(_get_conf "$name" RAPID_MLX_TOOL_PARSER)"
     reasoning="$(_get_conf "$name" RAPID_MLX_REASONING_PARSER)"
+    kvquant="$(_get_conf "$name" RAPID_MLX_KV_QUANTIZATION)"
+    kvbits="$(_get_conf "$name" RAPID_MLX_KV_QUANT_BITS)"
+    thinking="$(_get_conf "$name" LLAMA_THINKING)"
     if [[ -z "$model" || -z "$port" ]]; then
         error "$name.conf 缺少 LLAMA_MODEL/LLAMA_PORT"; return 1
     fi
@@ -97,8 +100,18 @@ _cmd_start() {
     fi
     local args=()
     [[ -n "$extra" ]] && args+=( $extra )
+    # 与 manage.sh 对齐: tool choice 必须显式开启, 否则 /v1/models 的
+    # capabilities 不含 tools, tool_calls 永远不触发。
+    args+=( --enable-auto-tool-choice )
     [[ -n "$toolparser" ]] && args+=( --tool-call-parser "$toolparser" )
     [[ -n "$reasoning" ]] && args+=( --reasoning-parser "$reasoning" )
+    # thinking 默认关闭(与 manage.sh 的 LLAMA_THINKING 语义一致)
+    [[ "$thinking" != "true" ]] && args+=( --no-thinking )
+    args+=( --log-level INFO )
+    # KV 量化(与 manage.sh 对齐; conf 里 RAPID_MLX_KV_QUANTIZATION=true 时启用)
+    if [[ "$kvquant" == "true" ]]; then
+        args+=( --kv-cache-quantization --kv-cache-quantization-bits "${kvbits:-4}" )
+    fi
     export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
     nohup "$RAPID_MLX_BIN" serve "$model" \
         --host 127.0.0.1 --port "$port" --enable-prefix-cache \

@@ -205,7 +205,7 @@
 
 ---
 
-## 三、🟡 P2-Medium (10 项)
+## 三、🟡 P2-Medium (11 项)
 
 ### DEF-201: 集成测试中 session=a309b181 出现高频 re-read 假阳性 — ✅ 已修复
 
@@ -293,6 +293,18 @@
 | **数据源** | 多文档交叉检查 |
 | **已修复** | 1) `PRD` unit test 数量更新 (28→167)<br>2) `test/README.md` 添加 `test_loop_integration.sh` |
 | **剩余** | 1) `proxy-context-window-design.md` 仍以 `rounds` 为主策略,生产跑 `fifo` (DEF-102)<br>2) `system-requirements-analysis.md` 100% 覆盖率未标注 DEF-003 修复<br>3) `AGENTS.md` 25+ 参数缺少推荐组合 |
+
+### DEF-211: `engines.sh` 启动的辅助引擎静默丢失 tool calling — ✅ 已修复
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | 2026-10-20 重启 `ornith-9b` 时实测；`/v1/models` 的 `capabilities` 从 `['text','tools']` 退化为 `['text']` |
+| **现象** | 引擎健康、无报错，但带 `tools` 参数请求时 `finish_reason` 不再返回 `tool_calls`，退化为普通文本补全 |
+| **根因** | `tools/engines.sh` 的 `_cmd_start()` 与 `manage.sh` 参数拼装分叉：装了 `--tool-call-parser` 却未加 `--enable-auto-tool-choice`，解析器形同虚设。同时漏掉 `--no-thinking`、`--log-level INFO`、`--kv-cache-quantization`（导致 conf 里 `RAPID_MLX_KV_QUANTIZATION=true` 被静默忽略） |
+| **修复** | `engines.sh` 补齐四项参数，与 `manage.sh` 语义对齐（+14/-1 行）；同时读取 `RAPID_MLX_KV_QUANTIZATION` / `_KV_QUANT_BITS` / `LLAMA_THINKING` |
+| **验证** | `capabilities` 恢复 `['text','tools']`；`finish_reason=tool_calls`、参数 JSON 正确解析 |
+| **影响面** | 所有 `engines.sh` 启动的辅助引擎（`configs/*.conf` 除 `active.conf`）；主后端走 `manage.sh` 不受影响 |
+| **剩余** | 两个启动入口仍各自维护参数列表，建议后续抽公共构造函数，避免再次腐化 |
 
 ---
 
