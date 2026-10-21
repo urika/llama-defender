@@ -2080,51 +2080,59 @@ def _build_ctx_metrics_section(session_id):
     if m2_hit: warn.append("M2 预警线")
     if kill_hit: warn.append("kill@8∧同结果")
     if collapse: warn.append("T1 塌陷")
+    # 2026-10-21 简化：chips 人话化（代号放 title 提示），Top1 同键脱敏
+    # （只显示次数与长度，不回显会话原文），原始代号/图表/方法论脚注收进折叠区。
+    top_target_display = (
+        f"<code title='原始键已脱敏'>{len(m['top_target'])} chars</code>"
+        if m["top_target"] else "—")
     chips = (
         "<div style='display:flex;gap:14px;flex-wrap:wrap;font-size:0.85em;"
         "margin:6px 0 10px'>"
         "<span>动作数 <b>%d</b></span>"
-        "<span>M2 全程 <b style='color:%s'>%.1f%%</b>%s</span>"
-        "<span>M5 streak_max <b style='color:%s'>%d</b>%s</span>"
-        "<span>同结果 streak_max <b style='color:%s'>%d</b>%s</span>"
-        "<span>Top1 同键 <b>×%d</b> <code>%s</code></span>"
-        "<span>T1 <b>%s</b></span>"
-        "<span>新息塌陷 <b style='color:%s'>%s</b>（三分段 %s）</span>"
+        "<span title='M2：滑窗输出冗余比'>输出冗余 <b style='color:%s'>%.1f%%</b>%s</span>"
+        "<span title='M5：连续读同一目标的深度'>重复读 streak <b style='color:%s'>%d</b>%s</span>"
+        "<span title='连续读同目标且同结果的深度（kill 线依据）'>同结果 streak <b style='color:%s'>%d</b>%s</span>"
+        "<span title='M5 top1：被读最多的目标'>最常读目标 <b>×%d</b> %s</span>"
+        "<span title='T1：新息枯竭点'>信息枯竭 <b>%s</b></span>"
+        "<span title='末段新息占比塌陷（需附重复证据）'>新息塌陷 <b style='color:%s'>%s</b></span>"
         "%s"
         "</div>" % (
             m["n_actions"],
             "#e9c46a" if m["m2_overall"] > 50 else "#2a9d8f", m["m2_overall"],
             " ⚠️超预警线" if m2_hit else "",
             "#d62828" if rem_hit else "#2a9d8f", m["streak_max"],
-            " ⚠️触remind@5" if rem_hit and not kill_hit else "",
+            " ⚠️触提醒线" if rem_hit and not kill_hit else "",
             "#d62828" if kill_hit else "#2a9d8f", m["streak_sr_max"],
-            " 🔴触kill线" if kill_hit else "",
-            m["top_count"], m["top_target"] or "—",
+            " 🔴触终止线" if kill_hit else "",
+            m["top_count"], top_target_display,
             ("动作 %d" % m["t1"]) if m["t1"] is not None else "未达",
             "#d62828" if collapse else "#2a9d8f",
-            "是" if collapse else "否", m["thirds"],
+            "是" if collapse else "否",
             ("<div style='margin-top:4px;color:#d62828'><b>⚠️ 预警触发: %s</b>"
              "</div>" % "、".join(warn)) if warn else ""))
     marks = ([(m["t1"], "#d62828", "T1 信息枯竭点")] if m["t1"] is not None
              else [])
     parts = ["<div class='card' style='margin-bottom:16px'>"
-             "<h2>🧭 上下文动态质量（M2/M4/M5 · V 面治理 L-85 · 调研稿 §八/§九）</h2>",
-             chips]
+             "<h2>🧭 上下文动态质量</h2>",
+             chips,
+             "<details style='margin-top:6px'><summary style='cursor:pointer;"
+             "color:#a0a0c0;font-size:12px'>指标图表与口径说明（M2/M4/M5 · "
+             "V 面治理 L-85 · 调研稿 §八/§九）</summary>"]
     if m["view_chars"]:
         parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:6px 0 3px'>"
-                     "V 面·视图逐请求尺寸（metrics.input_chars）</div>")
+                     "视图逐请求尺寸（metrics.input_chars）</div>")
         parts.append(_ctx_svg_area(m["view_chars"], "#3498db"))
     if m["n_actions"]:
         parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
-                     "M4 新息（灰=结果总字节，绿=唯一新字节；红=T1）</div>")
+                     "新息（灰=结果总字节，绿=唯一新字节；红=T1）</div>")
         parts.append(_ctx_svg_dual(m["novel"], m["totals"], m["t1"]))
         parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
-                     "M2 输出冗余比（滑窗 %d 动作，字节口径）</div>"
+                     "输出冗余比（滑窗 %d 动作，字节口径）</div>"
                      % _CTX_M2_WINDOW)
         parts.append(_ctx_svg_area(m["m2_win"], "#e9c46a", thresholds=[
             (50.0, "#d62828", "预警 50%（0/79 误报）")]))
         parts.append("<div style='color:#a0a0c0;font-size:0.85em;margin:8px 0 3px'>"
-                     "M5 streak 深度（连续同 target_hash；remind@5 已裁，kill@8∧同"
+                     "streak 深度（连续同 target_hash；remind@5 已裁，kill@8∧同"
                      "结果待 EXP-8 重裁——本线画 streak，同结果值见 chips）</div>")
         parts.append(_ctx_svg_area(m["streak"], "#264653", thresholds=[
             (5, "#e9c46a", "remind@5（7.6% 提醒率）"),
@@ -2135,6 +2143,7 @@ def _build_ctx_metrics_section(session_id):
                  "阈值裁定 2026-10-11：n=79 resolved 阴性集 0 误报（M2≥50%/"
                  "streak≥8∧同结果/塌陷，见设计稿 §5.1）；检测信号不自动定罪"
                  "（L-76）</div>")
+    parts.append("</details>")
     parts.append("</div>")
     return "".join(parts)
 
@@ -2175,6 +2184,7 @@ def _build_session_html(session_id: str) -> str:
 
     # Timeline rows
     rows_html = ""
+    prev_reason = None
     for r in timeline:
         ts_short = _fmt_ts(r["ts"])
         dur_bar_width = min(100, max(1, r["duration_ms"] / max(data["p99_duration_ms"], 1) * 100))
@@ -2203,12 +2213,21 @@ def _build_session_html(session_id: str) -> str:
             flags.append('<span style="color:#f39c12">truncate</span>')
         flag_html = ", ".join(flags) if flags else "—"
         status_color = "#e74c3c" if r["status"] not in (200, None) else "#27ae60"
+        # 2026-10-21 简化：连续相同 Reason 折叠为 〃（悬停可见全文），
+        # 异常行（非 200 / fallback / emergency）淡红高亮
+        if r["reason"] == prev_reason:
+            reason_cell = f'<td style="font-size:0.85em;color:#555" title="{r["reason"]}">〃</td>'
+        else:
+            reason_cell = f'<td style="font-size:0.85em;color:#888">{r["reason"][:40]}</td>'
+        prev_reason = r["reason"]
+        abnormal = r["status"] not in (200, None) or r["fallback"] or r["emergency"]
+        row_style = ' style="background:rgba(231,76,60,0.10)"' if abnormal else ''
         rows_html += (
-            f'<tr>'
+            f'<tr{row_style}>'
             f'<td>#{r["index"]}</td>'
             f'<td>{ts_short}</td>'
             f'<td>{_target_badge(r["target"])}</td>'
-            f'<td style="font-size:0.85em;color:#888">{r["reason"][:40]}</td>'
+            f'{reason_cell}'
             f'<td>{r["stage"]}</td>'
             f'<td>{r["input_chars"]:,}</td>'
             f'<td>{r["output_chars"]:,}</td>'
@@ -2254,6 +2273,7 @@ def _build_session_html(session_id: str) -> str:
   a:hover {{ text-decoration: underline; }}
   td, th {{ padding: 6px 8px; }}
   tr:nth-child(even) {{ background: rgba(255,255,255,0.03); }}
+  details > summary {{ cursor: pointer; }}
 </style>
 </head>
 <body>
@@ -2261,40 +2281,26 @@ def _build_session_html(session_id: str) -> str:
 <div class="subtitle">{session_id} &nbsp;•&nbsp; {data['start_ts']} → {data['end_ts']} &nbsp;•&nbsp; 时长 {duration_str}</div>
 
 <div class="grid">
-  <div class="card"><h2>总请求数</h2><div class="big">{total}</div></div>
-  <div class="card"><h2>客户端</h2>
-    <div class="row"><span>Type</span><span style="font-weight:bold">{data['client_type']}</span></div>
-    <div class="row"><span>Route</span><span>{data['session_type']}</span></div>
-    <div class="row"><span>Model</span><span style="font-size:0.85em">{data['first_model'] or '—'}</span></div>
-    {'<div class="row"><span>Models</span><span style="font-size:0.8em;color:#888">' + ', '.join(data['models']) + '</span></div>' if len(data.get('models',[])) > 1 else ''}
-  </div>
-  <div class="card"><h2>路由分布</h2>
-    <div class="row"><span>Local</span><span style="color:#27ae60;font-weight:bold">{data['local_count']}</span></div>
-    <div class="row"><span>Cloud</span><span style="color:#3498db;font-weight:bold">{data['cloud_count']}</span></div>
-    <div class="row"><span>Unknown</span><span style="color:#888">{data['unknown_count']}</span></div>
-    <div class="row"><span>Errors</span><span style="color:#e74c3c;font-weight:bold">{data['error_count']}</span></div>
+  <div class="card"><h2>基本信息</h2>
+    <div class="row"><span>客户端</span><span style="font-weight:bold">{data['client_type']}</span></div>
+    <div class="row"><span>路由</span><span>{data['session_type']}（Local {data['local_count']} / Cloud {data['cloud_count']}）</span></div>
+    <div class="row"><span>模型</span><span style="font-size:0.85em">{data['first_model'] or '—'}</span></div>
+    {'<div class="row"><span>全部模型</span><span style="font-size:0.8em;color:#888">' + ', '.join(data['models']) + '</span></div>' if len(data.get('models',[])) > 1 else ''}
     {'<div class="row"><span>Route source</span><span style="color:#e67e22">{}</span></div>'.format(data['force_source']) if data.get('force_source') else ''}
   </div>
-  <div class="card"><h2>延迟</h2>
-    <div class="row"><span>Avg</span><span>{_fmt_ms(data['avg_duration_ms'])}</span></div>
-    <div class="row"><span>P95</span><span>{_fmt_ms(data['p95_duration_ms'])}</span></div>
-    <div class="row"><span>P99</span><span>{_fmt_ms(data['p99_duration_ms'])}</span></div>
-  </div>
-  <div class="card"><h2>上下文</h2>
-    <div class="row"><span>Peak chars</span><span>{data['max_input_chars']:,}</span></div>
-    <div class="row"><span>Total out</span><span>{data['total_output_chars']:,}</span></div>
-    <div class="row"><span>Cloud cost</span><span>¥{data['cloud_cost']:.4f}</span></div>
+  <div class="card"><h2>关键指标</h2>
+    <div class="row"><span>总请求</span><span class="big" style="font-size:18px">{total}</span></div>
+    <div class="row"><span>延迟 Avg / P95 / P99</span><span>{_fmt_ms(data['avg_duration_ms'])} / {_fmt_ms(data['p95_duration_ms'])} / {_fmt_ms(data['p99_duration_ms'])}</span></div>
+    <div class="row"><span>峰值输入 / 总输出</span><span>{data['max_input_chars']:,} / {data['total_output_chars']:,} chars</span></div>
+    <div class="row"><span>云成本</span><span>¥{data['cloud_cost']:.4f}</span></div>
+    <div class="row"><span>错误</span><span style="color:{'#e74c3c' if data['error_count'] else '#27ae60'};font-weight:bold">{data['error_count']}</span></div>
   </div>
   {switch_html}
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <h2>📈 输入字符变化（绿=Local，蓝=Cloud）</h2>
+  <h2>📈 趋势（上：输入字符，绿=Local 蓝=Cloud；下：请求耗时）</h2>
   {chars_svg}
-</div>
-
-<div class="card" style="margin-bottom:16px">
-  <h2>⏱️ 请求耗时变化</h2>
   {dur_svg}
 </div>
 
