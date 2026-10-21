@@ -98,3 +98,44 @@ epoch_collapse×25、auto_recall 注入×17、manifest +53/48h 全部按设计�
 遗留摩擦点：swe-eval 客户端改写历史致 canonical_mismatch 25-82 次/会话
 （引擎以快照重建兜住，但代表客户端与 append-only 假设的摩擦，是下一个
 上下文效率杠杆）。
+
+---
+
+## 6. 追踪：45min 墙根因定位与优化（2026-10-21，Splash 1.4.0+OptiQ 代）
+
+10-20 栈换代（Splash 1.4.0 + OptiQ-4bit + thinking-on）后复测，定位「45min 墙」
+时序真凶并落地优化（conf `splash-qwen36-35b-optiq.conf`）：
+
+### 6.1 排除链（受控探针矩阵，全部实证）
+
+| 嫌疑 | 探针 | 结果 |
+|------|------|------|
+| 引擎前缀缓存失效 | 同 30K prompt 两连发 | 3337→**185ms**（18×）✗排除 |
+| OptiQ 量化形态 | 同上（即 OptiQ 引擎） | 缓存正常 ✗排除 |
+| tools 数组 | 带真实 tools 多轮两连发 | warm 35ms ✓ ✗排除 |
+| 真实会话内容 | turn87 请求原样重放 | TTFT **78ms** 命中 ✗排除 |
+| 状态驱逐 | `state_evictions` | **0** ✗排除 |
+| tools 数组漂移 | Tool filter 逐会话一次、removed 集合恒定 | 稳定 ✗排除 |
+
+### 6.2 根因（两项，均实测锚定）
+
+1. **每轮 reasoning 税（最大项）**：`--default-reasoning-effort medium
+   --thinking-token-budget 8192` ⇒ 单轮 thinking 最高 8,418 tok ≈ **60.6s**
+   （gen_ms 60,586 实证）。30-60 轮 × 每轮 10-60s 思考 = 45min 墙主消耗。
+2. **多实例交错 × idle-release 10m**：批驱动多实例交错（单槽轮转），会话轮间
+   闲置实测 **57-110min**（12 次 >10min）⇒ 状态被释放 ⇒ 回来 80-118K 全量重算
+   5-13s/轮（当日 221 个重算轮：>30K 且 eval 速率 <20K tok/s）。
+
+另：persistent-cache 本身无失效（真实请求重放 TTFT 78ms 命中）；
+代理 `hit_ratio 0.0` 为口径问题（1.4.0 usage 不再细分缓存读出 token）。
+
+### 6.3 已落地优化（conf，下次引擎重启生效）
+
+| 参数 | 旧 | 新 | 预期 |
+|------|-----|-----|------|
+| reasoning | medium + 8192 | **low + 2048** | 单轮 thinking 封顶 ≈15s（4×降） |
+| idle-release | 10m | **120m** | 状态跨轮间闲置存活，重算轮趋零 |
+
+批跑期禁重启（红线）；下个空闲窗重启引擎生效。串行化（驱动级单实例顺序）
+属 queue-dispatch 域（并行会话在建），quiet_wait 互斥已有——两层叠加后
+子代理启用前提即满足。
