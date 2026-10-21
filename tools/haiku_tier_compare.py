@@ -42,7 +42,9 @@ MODEL_9B = "ornith-ai/Ornith-1.5-9B-MLX-4bit"
 FLASH_BASE = "https://open.bigmodel.cn/api/anthropic"
 FLASH_MODEL = "glm-5.3-flash"
 SPLASH_BASE = "http://127.0.0.1:8081/v1"
-SPLASH_MODEL = "incoai/Qwen3.6-35B-A3B-Splash"
+# 2026-10-21 起主引擎 = Splash 1.4.0 + OptiQ-4bit（1.3.1 起 incoai/*-Splash 专有包不再加载，
+# 旧常量 "incoai/Qwen3.6-35B-A3B-Splash" 会 404 model_not_found）
+SPLASH_MODEL = "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit"
 TEMP = 0          # 确定性口径（promptfoo 原配 0.6，本实验统一 0）
 # 4096: glm-flash 走 anthropic 协议时 thinking 块计入 max_tokens——1024 会在长题上
 # 被思考耗尽致 text 空响应（2026-10-16 首跑 artifact，5 个 flash 失手全为此因）

@@ -152,13 +152,17 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 ### 4.5 Splash 引擎（2026-09-23 接入，runbook §29）
 
-`LLAMA_BACKEND=splash`（`configs/splash-qwen36-35b.conf` / `splash-qwen38-27b.conf`）：Inco AI 开源引擎，**DFlash 2 投机解码内置于 decode 路径**，`splash serve` 启动。
+`LLAMA_BACKEND=splash`（`configs/splash-qwen36-35b-mlx.conf` / `splash-qwen38-27b-mlx.conf`）：Inco AI 开源引擎，**DFlash 2 投机解码内置于 decode 路径**，`splash serve` 启动。
+
+> **1.3.1 breaking change**：Splash 包（`incoai/*-Splash`）**不再加载**，改为指向标准 MLX/GGUF 权重 + `incoai/*-DFlash2` 草稿。旧 `splash-qwen36-35b.conf` / `splash-qwen38-27b.conf` 已标 DEPRECATED。
+
+> **当前激活 = `splash-qwen36-35b-optiq.conf`**（Splash 1.4.0 + `mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit`，2026-10-21 重启生效）：thinking on + **reasoning low + token budget 2048**、**idle-release 120m**（45min 墙根因修复，dbcdb47）。实测 decode 132 tok/s / state 命中 94.6% / draft 接受率 0.687。配置明细见 [`docs/02-architecture-design/codebase-reference-20261017.md`](docs/02-architecture-design/codebase-reference-20261017.md) §三。
 
 - **进程模型（与 rapid-mlx 关键差异）**：splash CLI spawn `server.py`（前端，持 :8081 LISTEN）+ `serve-native`（引擎子进程）后**自身退出** → manage.sh 按端口感知前端 PID；杀前端→native 连带退出，stop 兜底 `pkill serve-native`
 - **互斥单引擎**：与 Ornith（rapid-mlx）不可同跑，切换 = `switch <name> && restart`
 - **诊断面（2026-10-17 实测更正）**：Splash 自带完整 Prometheus 指标面 `GET /metrics`（`splash_*` 族：TTFT/ITL 分位、state 命中/未中、KV 页水位、draft 接受率、内存压力等），**可观测性不弱于 rapid-mlx**；仍无对应物的是 rapid-mlx 特有计数（snapdown/驱逐计数、响应 timings 字段、KV dtype gauge）与 `/props`。`/api/status` 的 backend 进程匹配已加 `splash`
-- **性能参照**（27B/35B-A3B，M5 Pro 48GB）：代码任务 78–264 tok/s（DFlash2 接受率红利）、32K 热 TTFT 0.10–0.36s、32K 冷 prefill 611–3139 tok/s；散文受带宽极限（27B 38.8 = 上限）
-- **模型格式封闭**：仅 `incoai/*-Splash` 专有包（`splash-packed-q4[-moe]`），普通 MLX/HF 权重不加载
+- **性能参照（1.3.2 实测，M5 Pro 48GB，均 `--state-format bf16 --language-only --persistent-cache`）**：27B 稠密 冷 prefill 450–488 tok/s / decode 65–71 / 热 TTFT 30K 0.53–0.56s；35B-A3B MoE 冷 prefill **2122** tok/s / decode **123–140**（短 prompt 335）/ 热 TTFT 30K **0.27s**。DFlash2 接受率 27B 65.7% / 35B 55.9%（短 prompt 99%）。详尽对照见 [`docs/06-reference-metrics/splash-model-capability-research-20261020.md`](docs/06-reference-metrics/splash-model-capability-research-20261020.md)
+- **模型格式（1.3.1 起变更）**：Splash 包不再加载（#335）；改为直接服务 MLX/GGUF 上游权重，draft 由 `install/families.py` 的 `FAMILIES` 映射决定——**当前仅注册 Qwen3.8-27B 与 Qwen3.6-35B-A3B 两族**（Flash-Next / GLM-5.3 / Muse-Glimmer 的 DFlash2 草稿已发布但未接入）
 - **切换纪律**：批跑期禁切（红线 1）；admin_server.py 的 splash 匹配需代理重启生效
 
 > **hybrid 前缀缓存必知**：Qwen3.8-27B / Qwen3.6-35B-A3B / Ornith-1.5-35B-A3B（均 Qwen3.5/3.6/3.8 系 hybrid GatedDeltaNet）在 rapid-mlx 中对 prefix cache 条目标 `non_trimmable`（只整条精确匹配）。必须 `--hybrid-cache-entries 8`（启用 trim-free 前缀复用；0=禁用→每轮全量冷 prefill）；关 `PROXY_CTX_ENGINE_ENABLED` 配合稳定前缀可保命中。**0.14.3 起上游内置 hybrid recurrent-state checkpoint**（`RAPID_MLX_HYBRID_CHECKPOINT_MAX`=4/`_STRIDE`=2048，prefill chunk 级快照 + fetch 侧 LCP/supersequence snap），使部分前缀复用成为可能（实测冷 prefill 2.3–3.6×）；**cache 上限勿盲目调大**：`--cache-memory-mb` 12GB→16GB 实测反引入 Metal pressure（cache 上限与 Metal cap 打架），已回退；**降 `--hybrid-cache-entries` 反而三赢**（见 §11.2 表）。另：hybrid 骨干被 rapid-mlx 门控关闭投机解码（MTP/DFlash/DSpark 均不可用，见 issue #1941）。详见 `docs/05-operations-changelog/dflash-mlx-integration-20260826.md` 与 `docs/05-operations-changelog/ornith-15-integration-20260826.md`。
