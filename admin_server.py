@@ -60,6 +60,22 @@ def _get_process_info(pattern, name, fallback_port=None):
             result["name_scan_pid"] = name_pid
         return result
     return {"running": False, "name": name}
+# --- _local_backend_port ---
+def _local_backend_port():
+    """Port of the configured local backend, parsed from LLAMA_BASE.
+
+    `_build_status_json` / `_build_status_html` used to call
+    `_get_process_info(..., "Backend")` without a port, so the pid came from
+    `pgrep -f 'rapid-mlx|llama-server|dflash|splash' | head -1`. That pattern
+    matches auxiliary engines (e.g. `llama-server-eg2` for EmbeddingGemma) and
+    other stray processes, so `/api/status` reported an aux engine's pid/uptime
+    as the main backend's (DEF-315, 2026-10-21). The port holder is the unique
+    truth — see the comment in `_get_process_info`.
+    """
+    if getattr(_ps, "IS_CLOUD", False):
+        return None
+    m = re.search(r":(\d+)", getattr(_ps, "LLAMA_BASE", "") or "")
+    return m.group(1) if m else None
 # --- _current_active_profile ---
 def _current_active_profile():
     """Return the basename of the configs/active.conf symlink target, or 'default'."""
@@ -370,7 +386,9 @@ def _get_local_engines_status():
 
 def _build_status_json():
     """Build the structured JSON status payload for agent_go."""
-    backend_info = _get_process_info("rapid-mlx|llama-server|dflash|splash", "Backend")
+    backend_info = _get_process_info(
+        "rapid-mlx|llama-server|dflash|splash", "Backend",
+        fallback_port=_local_backend_port())
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
 
     proxy_alive = proxy_info.get("running", False)
@@ -2297,13 +2315,16 @@ def _build_session_html(session_id: str) -> str:
 def _get_session_trace():
     """Parse /tmp/anthropic_request_body.json and build an HTML snippet showing
     the semantic message timeline (roles, tool calls, text previews, errors).
-    Returns (html_str, tools_list) where tools_list is [(msg_idx, name, params), ...]
-    for modal popup display."""
+    Returns (summary_html, timeline_html, tools_list, errors_list) where
+    tools_list is [(msg_idx, name, params), ...] for modal popup display.
+
+    2026-10-21 简化：summary（计数行）与 timeline（消息预览，可能含会话
+    原文）分离返回——调用方将 timeline 放入折叠 <details>，默认不展示。"""
     try:
         with open("/tmp/anthropic_request_body.json", "r", encoding="utf-8") as f:
             body = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return '<div class="evt">No active request body</div>', [], []
+        return '<div class="evt">No active request body</div>', "", [], []
 
     try:
         mtime = os.path.getmtime("/tmp/anthropic_request_body.json")
@@ -2443,16 +2464,48 @@ def _get_session_trace():
             stale_badge = '<span style="color:#2ecc71;margin-left:6px">● 实时</span>'
         summary += f'<div class="row"><span class="label">Captured At</span><span class="value">{saved_at}{stale_badge}</span></div>'
 
-    return summary + "\n".join(timeline), tools_detail, errors_detail
+    return summary, "\n".join(timeline), tools_detail, errors_detail
+# --- _aggregate_alerts ---
+def _aggregate_alerts(alerts, top_n=5):
+    """同类告警聚合（status 页简化 2026-10-21）。
+
+    归一化消息中的数字/时间后分组，返回 (聚合列表[(severity, msg, count)],
+    总条数)。聚合列表按 count 降序、取前 top_n 组，每组保留最新一条原文。
+    """
+    groups = {}
+    for severity, msg in alerts:
+        key = re.sub(r"[0-9][0-9:,.%]*", "N", msg)
+        g = groups.setdefault(key, {"severity": severity, "msg": msg, "count": 0})
+        g["count"] += 1
+        g["msg"] = msg  # 保留最新一条原文
+    out = sorted(groups.values(), key=lambda g: -g["count"])
+    return out[:top_n], len(alerts)
+
+
 # --- _build_status_html ---
 def _build_status_html():
-    backend_info = _get_process_info("rapid-mlx|llama-server|dflash|splash", "Backend")
+    backend_info = _get_process_info(
+        "rapid-mlx|llama-server|dflash|splash", "Backend",
+        fallback_port=_local_backend_port())
     proxy_info = _get_process_info("anthropic_proxy.py", "Proxy", fallback_port=4000)
     mem = _get_system_memory()
     log = _get_log_stats()
     traffic = _get_traffic_stats()
-    session_trace, tools_detail, errors_detail = _get_session_trace()
+    session_trace_summary, session_trace_timeline, tools_detail, errors_detail = _get_session_trace()
+    session_trace = session_trace_summary
+    if session_trace_timeline:
+        session_trace += (
+            '<details style="margin-top:8px"><summary style="cursor:pointer;color:#a0a0c0;'
+            'font-size:12px">消息时间线（含会话内容预览，默认折叠）</summary>'
+            + session_trace_timeline + '</details>'
+        )
     recent_sessions = _load_recent_session_ids()
+    # 过滤一次性探测会话（shadow 影子代理 / swe-probe 健康探测）并限 6 条
+    _noise_prefixes = ("shadow-", "swe-probe-", "swe-eval-")
+    recent_sessions = [
+        s for s in recent_sessions
+        if not str(s.get("session_id", "")).startswith(_noise_prefixes)
+    ][:6]
     if recent_sessions:
         rs_rows = "".join(
             f'<div class="row">'
@@ -2488,18 +2541,12 @@ def _build_status_html():
     # --- Traffic Stats card ---
     s1h = traffic.get("stats_1h", {})
     s10m = traffic.get("stats_10m", {})
-    qps = round(s10m.get("count", 0) / 600, 3) if s10m.get("count") else 0
     traffic_card = f"""<div class="card">
     <h2>📊 Traffic Stats</h2>
     <div class="row"><span class="label">Requests (1h / 10m)</span><span class="value">{s1h.get("count", 0)} / {s10m.get("count", 0)}</span></div>
-    <div class="row"><span class="label">Avg Latency</span><span class="value">{s1h.get("avg_latency_ms", 0)/1000:.1f}s</span></div>
-    <div class="row"><span class="label">P95 Latency</span><span class="value">{s1h.get("p95_latency_ms", 0)/1000:.1f}s</span></div>
-    <div class="row"><span class="label">Max Latency</span><span class="value">{s1h.get("max_latency_ms", 0)/1000:.1f}s</span></div>
+    <div class="row"><span class="label">Avg / P95 Latency</span><span class="value">{s1h.get("avg_latency_ms", 0)/1000:.1f}s / {s1h.get("p95_latency_ms", 0)/1000:.1f}s</span></div>
     <div class="row"><span class="label">Avg In / Out</span><span class="value">{s1h.get("avg_input_chars", 0):.0f} / {s1h.get("avg_output_chars", 0):.0f} chars</span></div>
-    <div class="row"><span class="label">Max In / Out</span><span class="value">{s1h.get("max_input_chars", 0):,.0f} / {s1h.get("max_output_chars", 0):,.0f}</span></div>
     <div class="row"><span class="label">Success Rate</span><span class="value" style="color:{"#2ecc71" if s1h.get("success_rate", 100) >= 95 else "#f39c12" if s1h.get("success_rate", 100) >= 80 else "#e74c3c"}">{s1h.get("success_rate", 100):.1f}%</span></div>
-    <div class="row"><span class="label">Est. QPS (10m)</span><span class="value">{qps:.3f}</span></div>
-    <div class="row"><span class="label">Last Record</span><span class="value">{traffic.get("last_record_time", "—")}</span></div>
   </div>"""
 
     # --- Context Optimization card (Phase 3) ---
@@ -2669,7 +2716,16 @@ def _build_status_html():
     route_card = f"""<div class="card" style="grid-column: 1 / -1;">
     <h2>🔀 Intelligent Routing</h2>
     <div class="row"><span class="label">Status</span><span class="value">{route_status_icon} {route_status_text}</span></div>
-    <div class="row"><span class="label">API Key</span><span class="value">{api_key_badge}</span></div>
+    {route_bar}
+    <div class="row" style="margin-top:6px"><span class="label">Cloud Ratio</span><span class="value">{route["cloud_pct"]:.1f}%</span></div>
+    <div class="row"><span class="label">Daily Cost</span><span class="value">¥{route["daily_cost"]:.2f} / ¥{route["daily_budget"]:.0f}{route_budget_warn}</span></div>
+    {budget_bar}
+    <div class="row" style="margin-top:4px"><span class="label">Hard Stop</span><span class="value">{hard_stop_badge}</span></div>
+    {budget_badge and f'<div style="margin-top:6px;padding:6px 8px;border-radius:4px;background:rgba(231,76,60,0.15);font-size:0.85em">{budget_badge}</div>' or ''}
+    {last_reason_html}
+    {cooldown_html}
+    <details style="margin-top:8px"><summary style="cursor:pointer;color:#a0a0c0;font-size:12px">路由详情（配置 / 延迟 / 会话）</summary>
+    <div class="row" style="margin-top:6px"><span class="label">API Key</span><span class="value">{api_key_badge}</span></div>
     <div class="row"><span class="label">Cloud Model</span><span class="value">{route["cloud_model"]}</span></div>
     <div class="row"><span class="label">Cloud Endpoint</span><span class="value" style="font-size:0.8em">{route["cloud_base_url"]}</span></div>
     <div class="row"><span class="label">Threshold</span><span class="value">{route["threshold"]:,} chars</span></div>
@@ -2677,22 +2733,15 @@ def _build_status_html():
     <div class="row"><span class="label">Profile</span><span class="value">{route["profile"]}</span></div>
     <div class="row"><span class="label">Fallback</span><span class="value">{"✅ enabled (max " + str(route["max_cloud_fails"]) + " fails)" if route["fallback_enabled"] else "❌ disabled"}</span></div>
     <div class="row"><span class="label">Cloud Concurrent</span><span class="value">{route["cloud_concurrent"]}</span></div>
-    {route_bar}
-    <div class="row" style="margin-top:6px"><span class="label">Cloud Ratio</span><span class="value">{route["cloud_pct"]:.1f}%</span></div>
     <div class="row"><span class="label">Fallbacks</span><span class="value">{route["fallback_count"]}</span></div>
-    {last_reason_html}
     {fallbacks_html}
-    {cooldown_html}
     {tiers_html}
     <div class="row" style="margin-top:6px"><span class="label">Latency (Local)</span><span class="value">{_format_latency(route.get("local_latency", {}))}</span></div>
     <div class="row"><span class="label">Latency (Cloud)</span><span class="value">{_format_latency(route.get("cloud_latency", {}))}</span></div>
     <div class="row" style="margin-top:6px"><span class="label">Active Sessions</span><span class="value">{route.get("session_cloud", "?")} cloud / {route.get("session_local", "?")} local / {route.get("session_total", 0)} total</span></div>
-    <div class="row"><span class="label">Daily Cost</span><span class="value">¥{route["daily_cost"]:.2f} / ¥{route["daily_budget"]:.0f}{route_budget_warn}</span></div>
-    {budget_bar}
-    <div class="row" style="margin-top:4px"><span class="label">Hard Stop</span><span class="value">{hard_stop_badge}</span></div>
-    {budget_badge and f'<div style="margin-top:6px;padding:6px 8px;border-radius:4px;background:rgba(231,76,60,0.15);font-size:0.85em">{budget_badge}</div>' or ''}
     {_build_active_sessions_table(route.get("active_sessions", [])) if route.get("active_sessions") else ""}
     {_build_route_reason_legend()}
+    </details>
   </div>"""
 
     # --- Alerts card ---
@@ -2726,13 +2775,47 @@ def _build_status_html():
             ),
         )
     if alerts:
-        alerts_html = ""
-        for severity, msg in alerts:
-            color = "#e74c3c" if severity == "critical" else "#f39c12"
-            icon = "🔴" if severity == "critical" else "⚠️"
-            alerts_html += f'<div class="evt"><span style="color:{color};font-weight:600;">{icon} {msg}</span></div>'
+        # 同类告警聚合（2026-10-21 简化）：折叠重复告警，保留展开明细
+        agg, total = _aggregate_alerts(alerts)
+        alerts_html = f'<div class="evt" style="color:#888">共 {total} 条（10m），{len(agg)} 类</div>'
+        for g in agg:
+            color = "#e74c3c" if g["severity"] == "critical" else "#f39c12"
+            icon = "🔴" if g["severity"] == "critical" else "⚠️"
+            badge = f' <span style="color:#888">×{g["count"]}</span>' if g["count"] > 1 else ""
+            alerts_html += f'<div class="evt"><span style="color:{color};font-weight:600;">{icon} {g["msg"]}{badge}</span></div>'
+        if total > len(agg) or any(g["count"] > 1 for g in agg):
+            details_items = "".join(
+                f'<div class="evt"><span class="evt-ts">{"—"}</span> '
+                f'<span style="color:{"#e74c3c" if sev == "critical" else "#f39c12"}">{msg}</span></div>'
+                for sev, msg in alerts
+            )
+            alerts_html += f'<details style="margin-top:4px"><summary style="cursor:pointer;color:#a0a0c0;font-size:12px">全部明细</summary>{details_items}</details>'
     else:
         alerts_html = '<div class="evt" style="color:#2ecc71;">✅ No anomalies detected (last 10m)</div>'
+
+    # --- 总览 hero（Layer 1）: 一眼判断“服务正常吗” ---
+    all_ok = (
+        backend_info.get("running") and proxy_info.get("running")
+        and not mem_warn
+        and not any(sev == "critical" for sev, _ in alerts)
+    )
+    success_rate = s1h.get("success_rate", 100)
+    hero_color = "#2ecc71" if all_ok else "#e74c3c"
+    hero_text = "All Systems Operational" if all_ok else "Degraded / Attention Required"
+    backend_label = getattr(_ps, "PROXY_BACKEND_NAME", _ps.BACKEND_TYPE)
+    hero_line = (
+        f'Backend <b>{backend_label}</b> {"Running" if backend_info.get("running") else "DOWN"}'
+        f' · Proxy {"Running" if proxy_info.get("running") else "DOWN"}'
+        f' · Mem {mem.get("used_pct", "0")}%'
+        f' · 成功率 {success_rate:.1f}%'
+        f' · 今日云成本 ¥{route["daily_cost"]:.2f}/¥{route["daily_budget"]:.0f}'
+    )
+    hero_html = (
+        f'<div class="card" style="grid-column: 1 / -1;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">'
+        f'<span style="display:inline-flex;align-items:center;gap:8px;font-size:16px;font-weight:600;">'
+        f'<span class="status-dot" style="background:{hero_color};width:14px;height:14px;"></span>{hero_text}</span>'
+        f'<span style="color:#aaa;font-size:13px">{hero_line}</span></div>'
+    )
 
     # Cloud-backend status card (no PID/memory/uptime)
     if _ps.IS_CLOUD:
@@ -2837,6 +2920,9 @@ def _build_status_html():
   .chart-container {{ width: 100%; height: 200px; margin-top: 8px; }}
   .chart-row {{ display: flex; gap: 16px; flex-wrap: wrap; }}
   .chart-row .chart-box {{ flex: 1; min-width: 280px; }}
+  details.card > summary {{ cursor: pointer; font-size: 14px; color: #a0a0c0; text-transform: uppercase; letter-spacing: 1px; user-select: none; }}
+  details.card > summary:hover {{ color: #fff; }}
+  details > summary {{ cursor: pointer; }}
 </style>
 </head>
 <body>
@@ -2844,53 +2930,65 @@ def _build_status_html():
 <div class="ts">Updated: {now} &nbsp;•&nbsp; Auto-refresh every 5s</div>
 
 <div class="grid">
-  {backend_card}
-  {engines_card}
+  {hero_html}
 
-  <div class="card">
-    <h2>Proxy</h2>
-    <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{proxy_color}"></span>{"Running" if proxy_info.get("running") else "Stopped"}</span></div>
-    <div class="row"><span class="label">Name</span><span class="value">{proxy_info.get("name", "N/A")}</span></div>
-    <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
-    <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
-    <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
-    <div class="row"><span class="label">Backend</span><span class="value">{_ps.LLAMA_BASE}</span></div>
-  </div>
-
-  <div class="card">
-    <h2>System Memory</h2>
-    <div class="row"><span class="label">Total</span><span class="value">{mem.get("total_gb", 48):.0f} GB</span></div>
-    <div class="row"><span class="label">Used (Wired+Active)</span><span class="value" style="color:{mem_color}">{mem.get("used_gb", 0):.1f} GB ({mem.get("used_pct", "0")}%)</span></div>
-    <div class="row"><span class="label">Available</span><span class="value">{mem.get("available_gb", 0):.1f} GB (Free+Inactive)</span></div>
-    <div class="row"><span class="label">Wired</span><span class="value">{mem.get("wired_gb", 0):.1f} GB</span></div>
-    <div class="row"><span class="label">Active</span><span class="value">{mem.get("active_gb", 0):.1f} GB</span></div>
-    <div class="row"><span class="label">Inactive</span><span class="value">{mem.get("inactive_gb", 0):.1f} GB</span></div>
-    <div class="row"><span class="label">Compressed</span><span class="value">{mem.get("compress_gb", 0):.1f} GB</span></div>
-    <div class="mem-bar"><div class="mem-fill" style="width:{mem.get("used_pct", 0)}%;background:{mem_color}"></div></div>
-  </div>
-
-  <div class="card">
-    <h2>Log Stats (recent tail)</h2>
-    {oom_row}
-    {cache_row}
-    <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
-    <div class="row"><span class="label">Prefix Cache</span><span class="value" style="color:{cache_rate_color}" title="统计范围: {cache_stats['since']} (跨session累计请查看 /status 页面历史)">{cache_stats["hit"]}/{cache_stats["total"]} ({cache_stats["rate_str"]})</span></div>
-    <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if _ps.PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if _ps.PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={_ps.PROXY_MAX_CONCURRENT}</span></div>
-    <div class="row"><span class="label">Model</span><span class="value">{_ps.MODEL_NAME}</span></div>
-    {'<div class="row"><span class="label">Memory Alert</span><span class="value" style="color:#e74c3c">⚠️ Used ' + str(mem_used_pct) + '% (reject threshold ' + str(_ps.PROXY_MEMORY_REJECT_THRESHOLD) + '%)</span></div>' if mem_warn else ''}
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>🚨 Alerts (last 10m)</h2>
+    {alerts_html}
   </div>
 
   {traffic_card}
 
   {route_card}
 
-  {ctx_opt_card}
+  <details class="card" style="grid-column: 1 / -1;">
+    <summary>🔧 Services / System（进程 · 内存 · 日志）</summary>
+    <div class="grid" style="margin-top:12px">
+      {backend_card}
+      {engines_card}
 
-  {comp_card}
+      <div class="card">
+        <h2>Proxy</h2>
+        <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{proxy_color}"></span>{"Running" if proxy_info.get("running") else "Stopped"}</span></div>
+        <div class="row"><span class="label">Name</span><span class="value">{proxy_info.get("name", "N/A")}</span></div>
+        <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
+        <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
+        <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
+        <div class="row"><span class="label">Backend</span><span class="value">{_ps.LLAMA_BASE}</span></div>
+      </div>
 
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>📈 Trends (24h)</h2>
-    <div class="chart-row">
+      <div class="card">
+        <h2>System Memory</h2>
+        <div class="row"><span class="label">Total</span><span class="value">{mem.get("total_gb", 48):.0f} GB</span></div>
+        <div class="row"><span class="label">Used (Wired+Active)</span><span class="value" style="color:{mem_color}">{mem.get("used_gb", 0):.1f} GB ({mem.get("used_pct", "0")}%)</span></div>
+        <div class="row"><span class="label">Available</span><span class="value">{mem.get("available_gb", 0):.1f} GB (Free+Inactive)</span></div>
+        <div class="mem-bar"><div class="mem-fill" style="width:{mem.get("used_pct", 0)}%;background:{mem_color}"></div></div>
+      </div>
+
+      <div class="card">
+        <h2>Log Stats (recent tail)</h2>
+        {oom_row}
+        {cache_row}
+        <div class="row"><span class="label">Requests</span><span class="value req clickable" onclick="showModal('request', '📨 Requests Detail')">{log["requests"]}</span></div>
+        <div class="row"><span class="label">Prefix Cache</span><span class="value" style="color:{cache_rate_color}" title="统计范围: {cache_stats['since']} (跨session累计请查看 /status 页面历史)">{cache_stats["hit"]}/{cache_stats["total"]} ({cache_stats["rate_str"]})</span></div>
+        <div class="row"><span class="label">Config</span><span class="value">CLEAR={'on' if _ps.PROXY_CLEAR_ENABLED else 'off'}, LIMIT={'on' if _ps.PROXY_CTX_LIMIT_ENABLED else 'off'}, MAX_CONCURRENT={_ps.PROXY_MAX_CONCURRENT}</span></div>
+        <div class="row"><span class="label">Model</span><span class="value">{_ps.MODEL_NAME}</span></div>
+        {'<div class="row"><span class="label">Memory Alert</span><span class="value" style="color:#e74c3c">⚠️ Used ' + str(mem_used_pct) + '% (reject threshold ' + str(_ps.PROXY_MEMORY_REJECT_THRESHOLD) + '%)</span></div>' if mem_warn else ''}
+      </div>
+    </div>
+  </details>
+
+  <details class="card" style="grid-column: 1 / -1;">
+    <summary>🧠 Context &amp; Compression</summary>
+    <div class="grid" style="margin-top:12px">
+      {ctx_opt_card}
+      {comp_card}
+    </div>
+  </details>
+
+  <details class="card" style="grid-column: 1 / -1;">
+    <summary>📈 Trends (24h)</summary>
+    <div class="chart-row" style="margin-top:12px">
       <div class="chart-box"><canvas id="chartRequests"></canvas></div>
       <div class="chart-box"><canvas id="chartLatency"></canvas></div>
     </div>
@@ -2902,12 +3000,7 @@ def _build_status_html():
       <div class="chart-box"><canvas id="chartChars"></canvas></div>
       <div class="chart-box"><canvas id="chartMemory"></canvas></div>
     </div>
-  </div>
-
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>🚨 Alerts (last 10m)</h2>
-    {alerts_html}
-  </div>
+  </details>
 
   <div class="card" style="grid-column: 1 / -1;">
     <h2>Session Trace</h2>
@@ -2916,10 +3009,10 @@ def _build_status_html():
 
   {recent_sessions_card}
 
-  <div class="card" style="grid-column: 1 / -1;">
-    <h2>Recent Events</h2>
-    {events_html}
-  </div>
+  <details class="card" style="grid-column: 1 / -1;">
+    <summary>Recent Events</summary>
+    <div style="margin-top:8px">{events_html}</div>
+  </details>
 </div>
 
 <div class="footer">Open http://127.0.0.1:4000/status in your browser</div>
