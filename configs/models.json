@@ -442,9 +442,10 @@
         "deepseek-flash"
       ],
       "behavior": "force",
-      "local_model": "ornith-9b",
+      "local_model": "",
       "threshold_factor": 2.0,
-      "memory_bias": 0
+      "memory_bias": 0,
+      "_note": "2026-10-20: local_model 由 ornith-9b 置空——9B 引擎(:8084)未常驻时 haiku 会硬失败(connection refused)并触发计费云端兜底。改为回落主引擎(当前 35B/27B)。需要 9B 轻量分流时显式使用 ornith-9b 别名。"
     },
     "ornith-9b": {
       "route_bias": "prefer_local",
