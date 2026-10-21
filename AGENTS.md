@@ -68,7 +68,7 @@ Cloud:  Client (Anthropic SDK) → anthropic_proxy.py:4000 → DeepSeek / OpenAI
 ./manage.sh start --profile aggressive  # 压缩策略：balanced（默认）/ aggressive / conservative
 ./manage.sh start-cloud        # 仅启动代理，转发到云端 API
 ./manage.sh start-backend / stop-backend # 单独启停本地后端（优先用 stop-backend 优雅停止，避免 Metal 死锁）
-./manage.sh start-aux <name> / stop-aux <name> # 独立辅助引擎启停（configs/<name>.conf，独立端口/进程，与主后端共存；如 start-aux minicpm5-2b）
+./manage.sh start-aux <name> / stop-aux <name> # 独立辅助引擎启停（configs/<name>.conf，独立端口/进程，与主后端共存；如 start-aux embedgemma2）
 ./manage.sh stop               # 优雅停止后端和代理
 ./manage.sh restart            # stop + start
 ./manage.sh reload             # SIGHUP 热重载代理配置（不重启 proxy 进程，约 0.5s）
