@@ -1050,13 +1050,33 @@ _stop_proxy() {
 # ============================================================
 # 启动服务（主入口）
 # ============================================================
+# ------------------------------------------------------------
+# 辅助引擎默认启动（CONFIG_AUTOSTART_AUX，2026-10-21）
+# ------------------------------------------------------------
+# 激活 conf 可声明 CONFIG_AUTOSTART_AUX="embedgemma2 ..."（空格分隔；
+# 置空或删除该行可关闭默认启动）。主后端就绪后逐个拉起；单引擎失败
+# 仅告警不阻塞主服务。embedgemma2 为 CPU 引擎（-ngl 0，~0.3GB），
+# 与任何主后端共存安全。
+_autostart_aux_engines() {
+    local list="${CONFIG_AUTOSTART_AUX:-embedgemma2}"
+    [[ -z "$list" ]] && return 0
+    local name
+    for name in $list; do
+        info "自动启动辅助引擎: ${CYAN}$name${NC}"
+        cmd_start_aux "$name" \
+            || warn "辅助引擎 $name 自动启动失败（不影响主服务；稍后可: ./manage.sh start-aux $name）"
+    done
+}
+
 cmd_start() {
     local pid
     if pid=$(_get_pid 2>/dev/null); then
         # 后端已在运行，检查并启动代理
         info "后端已在运行 (PID: $pid, backend: $(_current_backend))"
         _start_proxy
-        return $?
+        local _rc=$?
+        _autostart_aux_engines
+        return $_rc
     fi
 
     case "$LLAMA_BACKEND" in
@@ -1090,6 +1110,8 @@ cmd_start() {
         error "后端进程未运行，跳过代理启动"
         return 1
     fi
+
+    _autostart_aux_engines
 }
 
 # ============================================================
@@ -1763,6 +1785,7 @@ cmd_start_backend() {
 
     info "✅ 本地后端已启动"
     _log_lifecycle_event "service_start" "profile=$(_current_config_name) backend=$LLAMA_BACKEND component=backend"
+    _autostart_aux_engines
     info "  如需代理也使用此后端，请: ./manage.sh reload"
 }
 

@@ -105,6 +105,11 @@ tools/engines.sh status  [name]
 tools/engines.sh supervise <name> --daemon   # 常驻守护（被误杀自动重启）
 ```
 
+> **默认启动（CONFIG_AUTOSTART_AUX，2026-10-21）**：激活 conf 声明
+> `CONFIG_AUTOSTART_AUX="embedgemma2"` → `manage.sh start / start-backend`
+> 就绪后自动拉起列出的辅助引擎（缺省 embedgemma2；置空关闭；单引擎失败仅告警）。
+> 当前缺省即 embedgemma2（8083，CPU 引擎可常驻）；qwen25-coder 补全档已迁 **8085** 让位。
+
 > ⚠️ **参数对齐约束（DEF-211）**：`engines.sh` 与 `manage.sh` 各自拼装 `rapid-mlx serve`
 > 命令行。**任何一侧新增启动参数都必须同步另一侧**，否则会出现静默降级——典型症状是
 > `--tool-call-parser` 已设但漏了 `--enable-auto-tool-choice`，`/v1/models` 的

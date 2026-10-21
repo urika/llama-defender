@@ -125,10 +125,12 @@ Client POST /v1/messages（Anthropic）或 POST /v1/chat/completions（OpenAI，
 | ~~`configs/splash-qwen36-35b.conf`~~ | **DEPRECATED（2026-10-20）**：Splash 1.0.2 时代的 `incoai/Qwen3.6-35B-A3B-Splash` 专有包，1.3.1+ 无法加载（#335）。历史数据：散文 117 / 代码 264 tok/s |
 | ~~`configs/splash-qwen38-27b.conf`~~ | **DEPRECATED（2026-10-20）**：`incoai/Qwen3.8-27B-Splash` 专有包，1.3.1+ 无法加载。历史数据：代码 78–86 tok/s |
 | `configs/ornith-oq4e-256k.conf` | **已于 2026-10-21 归档** → `configs/archived/ornith-oq4e-256k.conf`，35B oQ4e 权重已删除。历史（256K 非交互档）：禁头截断 + bf16 KV（5.0GiB@256K）+ 原文寄存；冷 prefill 7–11min、暖轮 10–30s；KV 量化在 0.14.3 对 hybrid fail-closed（ArraysCache） |
-| `configs/embedgemma2.conf` | llama-server + **EmbeddingGemma 2 嵌入引擎**（`ggml-org/embeddinggemma-2-GGUF:Q8_0` 310MB + 可选 `mmproj` 多模态塔）：**辅助引擎**，独立端口 8083，`start-aux/stop-aux` 独立启停、与主后端共存。LLM 无关的纯向量服务（OpenAI `/v1/embeddings`，768d，MRL 支持 512/256/128，纯文本 + 可选 图/音/视频 共用同一向量空间）；`--embeddings --pooling mean -ngl 0`（CPU，实测索引 12.4 块/s、单条 p50 14.6ms）；**必须 `LLAMA_EMBEDDING_PROBE=true`**——`--embeddings` 下 `/v1/chat/completions` 恒 500，就绪探针须改打 `/v1/embeddings`；模型与投影器已落在 `tools/bin/`（`EMBEDGEMMA2_SERVER_BIN` / `EMBEDGEMMA2_MMPROJ=1` 可覆盖，`_EG2_ROOT` 亦可） |
+| `configs/embedgemma2.conf` | llama-server + **EmbeddingGemma 2 嵌入引擎**（`ggml-org/embeddinggemma-2-GGUF:Q8_0` 310MB + 可选 `mmproj` 多模态塔）：**辅助引擎**，独立端口 8083，`start-aux/stop-aux` 独立启停、与主后端共存。LLM 无关的纯向量服务（OpenAI `/v1/embeddings`，768d，MRL 支持 512/256/128，纯文本 + 可选 图/音/视频 共用同一向量空间）；`--embeddings --pooling mean -ngl 0`（CPU，实测索引 12.4 块/s、单条 p50 14.6ms）；**必须 `LLAMA_EMBEDDING_PROBE=true`**——`--embeddings` 下 `/v1/chat/completions` 恒 500，就绪探针须改打 `/v1/embeddings`；模型与投影器已落在 `tools/bin/`（`EMBEDGEMMA2_SERVER_BIN` / `EMBEDGEMMA2_MMPROJ=1` 可覆盖，`_EG2_ROOT` 亦可）；**CONFIG_AUTOSTART_AUX 默认随 `manage.sh start` 自动拉起**（2026-10-21） |
 | `configs/qwen3.6-27b-4bit.conf` | rapid-mlx + Qwen3.6-27B dense 4bit（tool clearing 关闭） |
 | `configs/gemma4-26b.conf` | rapid-mlx + Gemma-4-26B，并发 2，数据处理优化 |
 | `configs/deepseek-chat.conf` | 云端 DeepSeek OpenAI 兼容端点（`deepseek-v4-flash`） |
+| `configs/qwen25-coder-7b-8bit.conf` | llama-server + `mlx-community/Qwen2.5-Coder-7B-Instruct-8bit`（8.5GB）：**IDE FIM 补全档**，独立 8085（8083 让位 embedgemma2 默认启动）；未常驻，按需启动 |
+| `configs/spark-x2.5-llama-server.conf` | llama-server + Spark-X2.5-4B.gguf（本地路径），独立 8082（minicpm5-2b 归档后端口已释放） |
 | `configs/models.json` | 模型目录（providers/models/routes），`model_registry.py` 加载、SIGHUP 热重载；**删除后自动合成等价目录**，新增云端模型只需加条目（Phase A+） |
 | `configs/secret.local.conf` | **git-ignored**，存放真实 API Key（含分提供商 `ZHIPU_API_KEY`/`KIMI_API_KEY`，由目录 `key_env` 引用） |
 | `configs/archived/` | 归档的历史配置（qwen3-8b、rapid-mlx-9b、rapid-mlx-35b、thinkingcap-…-mtp 等） |
