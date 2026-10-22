@@ -140,6 +140,16 @@ def normalize_target(tool_name, args):
     page_sig = ""
     if any(t in tool for t in _SEARCH_TOOLS):
         norm = re.sub(r'\s+', ' ', target.lower())
+        # L-15 同款几何（2026-10-17）：search 工具的 pattern/query 参与哈希——
+        # 不同 pattern 同路径的检索不再误计 dup（出典：EXP-18 重排批
+        # exploration_loop 6/17 假阳性，5×Grep 同路径不同 pattern 被折叠）。
+        _pat = args.get("pattern")
+        if not isinstance(_pat, str):
+            _pat = args.get("query") if isinstance(args.get("query"), str) else ""
+        if _pat:
+            page_sig = "|pat=" + hashlib.md5(
+                re.sub(r'\s+', ' ', _pat.strip().lower()).encode("utf-8")
+            ).hexdigest()[:8]
     elif any(t in tool for t in _FILE_TOOLS):
         norm = target.rstrip('/')
         off = args.get("offset")
