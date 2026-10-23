@@ -536,6 +536,14 @@ def get_route(alias):
     }
     if r.get("local_model"):
         out["local_model"] = r["local_model"]
+    # 2026-10-21: 路由级 thinking 开关。haiku 档要"快速直答"，即使引擎默认开
+    # thinking 也不应消耗预算（FormatConverter 会转成 backend 的 thinking:disabled）。
+    if r.get("thinking_disabled"):
+        out["thinking_disabled"] = True
+    # 2026-10-21: 路由级 max_tokens 下限。thinking 模型下小 max_tokens 会被思考
+    # 吃光（实测 512 以内无 tool_use，768 起才稳定），按档位保底。
+    if r.get("min_max_tokens"):
+        out["min_max_tokens"] = int(r["min_max_tokens"])
     fallbacks = [_resolve_cloud_model(c, _getter()) for c in chain[1:]]
     fallbacks = [f for f in fallbacks if f]
     if fallbacks:

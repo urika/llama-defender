@@ -48,6 +48,10 @@ import urllib.request
 
 DEFAULT_ENGINE = os.environ.get("EG2_EMBED_URL", "http://127.0.0.1:8083/v1/embeddings")
 DEFAULT_MODEL = os.environ.get("EG2_EMBED_MODEL", "embeddinggemma-2-Q8_0")
+# 超长守卫阈值（tokens，2026-10-23 起可配置）：
+#   优先级 --max-tokens > $EG2_EMBED_MAX_TOKENS > 此默认。引擎硬上限 = ctx 8192
+#   （configs/embedgemma2.conf 的 LLAMA_CTX），此处默认 7800 留出模板/余量。
+DEFAULT_EMBED_MAX_TOKENS = int(os.environ.get("EG2_EMBED_MAX_TOKENS", "7800"))
 INDEX_VERSION = 1
 
 # 任务前缀（模型卡规定；漏掉不报错但精度下降）。asymmetric=True 表示
@@ -94,9 +98,36 @@ def load_api_key(explicit=None):
     return ""
 
 
+def _est_tokens(text):
+    """粗估 gemma 分词 token 数：CJK≈1 字 1 token，其余 ≈3 字符 1 token。
+    仅用于调用前的长度守卫（DEF 借鉴：8192 ctx 超限引擎返回 500，重试无意义）。"""
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    return cjk + (len(text) - cjk) // 3 + 1
+
+
+# llama-server-eg2 的硬上限（--max-context 8192）；留 400 token 余量防模板开销
+# 兼容别名：守卫阈值现由 DEFAULT_EMBED_MAX_TOKENS 解析（env/CLI 可配）
+EMBED_MAX_TOKENS = DEFAULT_EMBED_MAX_TOKENS
+
+
 def embed(texts, engine=DEFAULT_ENGINE, model=DEFAULT_MODEL, key="", batch=16,
-          timeout=180, retries=2, verbose=False):
+          timeout=180, retries=2, verbose=False, max_tokens=None):
     """批量编码，返回 list[list[float]]（顺序与输入一致）。"""
+    # ③ 修复(2026-10-23): 超长输入引擎返回 500（提示 "too large to process"），
+    #    旧逻辑会盲重试 2 次再抛笼统 SystemExit。现改为：调用前守卫 + 把该类
+    #    500 转译为明确的客户端错误（不再重试）。
+    # 2026-10-23: 守卫阈值可配置——优先级 --max-tokens / max_tokens 形参 >
+    #   $EG2_EMBED_MAX_TOKENS（调用时读取，消费方改 env 即时生效）> 默认 7800
+    #   （引擎硬上限 = ctx 8192）。
+    limit = int(max_tokens) if max_tokens else \
+        int(os.environ.get("EG2_EMBED_MAX_TOKENS", "") or EMBED_MAX_TOKENS)
+    for j, t in enumerate(texts):
+        est = _est_tokens(t)
+        if est > limit:
+            raise ValueError(
+                f"输入第 {j} 条超长：约 {est} tokens > 上限 {limit} "
+                f"（embedgemma2 ctx=8192；文本 {len(t)} 字符，开头: {t[:60]!r}…）。"
+                f"请切分后分次嵌入。")
     out = []
     for i in range(0, len(texts), batch):
         part = texts[i:i + batch]
@@ -116,6 +147,19 @@ def embed(texts, engine=DEFAULT_ENGINE, model=DEFAULT_MODEL, key="", batch=16,
                     print(f"  [{i + len(part)}/{len(texts)}] {len(part)} 条", file=sys.stderr)
                 break
             except Exception as e:  # noqa: BLE001 - 统一重试
+                # ③: 引擎对"输入超长"回 500 + "too large to process"——这是确定性
+                # 客户端错误，重试无意义；转译为 400 语义（ValueError）直接抛出。
+                code = getattr(e, "code", None)
+                if code == 500:
+                    detail = ""
+                    try:
+                        detail = e.read().decode("utf-8", "replace")
+                    except Exception:
+                        pass
+                    if "too large to process" in detail:
+                        raise ValueError(
+                            f"嵌入输入超过 embedgemma2 上限（8192 ctx，{len(part)} 条中含超长文本）。"
+                            f"请切分后分次嵌入。引擎原文: {detail[:200]}") from e
                 last = e
                 if attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
@@ -280,7 +324,7 @@ def cmd_index(args):
         texts = [d_pfx.format(title=c["title"][:200] or "none", text=c["text"]) for _, cs in todo for c in cs]
         print(f"编码 {len(texts)} 个新片段（共 {len(files)} 个文件，复用 {reused} 段）…", file=sys.stderr)
         vecs = embed(texts, engine=args.engine, model=args.model, key=load_api_key(args.api_key),
-                     batch=args.batch, verbose=args.verbose)
+                     batch=args.batch, verbose=args.verbose, max_tokens=args.max_tokens)
         k = 0
         for rel, cs in todo:
             for c in cs:
@@ -326,13 +370,14 @@ def load_index(path):
 
 
 def search(meta, chunks, vecs, queries, k=5, task=None, engine=None, model=None,
-           api_key=None, filt=None, min_score=None):
+           api_key=None, filt=None, min_score=None, max_tokens=None):
     task = task or meta.get("task", "search")
     _, q_pfx, _ = TASKS[task]
     key = load_api_key(api_key)
     qs = [q_pfx + q for q in queries]
     qv = [l2_normalize(v) for v in embed(qs, engine=engine or meta["engine"],
-                                        model=model or meta["model"], key=key)]
+                                        model=model or meta["model"], key=key,
+                                        max_tokens=max_tokens)]
     results = []
     for q, v in zip(queries, qv):
         hits = []
@@ -355,7 +400,7 @@ def cmd_query(args):
     meta, chunks, vecs = load_index(args.index)
     res = search(meta, chunks, vecs, [args.text], k=args.k, task=args.task,
                  engine=args.engine, model=args.model, api_key=args.api_key,
-                 filt=args.filter, min_score=args.min_score)
+                 filt=args.filter, min_score=args.min_score, max_tokens=args.max_tokens)
     if args.json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
@@ -380,8 +425,10 @@ def cmd_oneshot(args):
         raise SystemExit("没有切出任何片段")
     key = load_api_key(args.api_key)
     dv = [l2_normalize(v) for v in embed([d_pfx.format(title=c["title"][:200] or "none", text=c["text"])
-                                          for c in chunks], engine=args.engine, model=args.model, key=key)]
-    qv = l2_normalize(embed([q_pfx + args.text], engine=args.engine, model=args.model, key=key)[0])
+                                          for c in chunks], engine=args.engine, model=args.model, key=key,
+                                         max_tokens=args.max_tokens)]
+    qv = l2_normalize(embed([q_pfx + args.text], engine=args.engine, model=args.model, key=key,
+                            max_tokens=args.max_tokens)[0])
     hits = heapq.nlargest(args.k, ((dot(d, qv), i) for i, d in enumerate(dv)))
     print(f"问：{args.text}   （一次性，{len(chunks)} 段）")
     for n, (s, i) in enumerate(hits, 1):
@@ -417,6 +464,9 @@ def build_parser():
         sp.add_argument("--model", default=DEFAULT_MODEL)
         sp.add_argument("--api-key", default=None, help="默认 $LLAMA_API_KEY 或 secret.local.conf")
         sp.add_argument("--task", default="search", choices=sorted(TASKS), help="任务前缀（默认 search）")
+        sp.add_argument("--max-tokens", type=int, default=None,
+                        help=f"超长守卫阈值 tokens（默认 {DEFAULT_EMBED_MAX_TOKENS}，"
+                             f"可被 $EG2_EMBED_MAX_TOKENS 覆盖；引擎硬上限 = ctx 8192）")
 
     pi = sub.add_parser("index", help="建索引（可增量）")
     pi.add_argument("--root", required=True, help="要索引的目录")

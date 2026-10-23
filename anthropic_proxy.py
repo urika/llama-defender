@@ -1521,7 +1521,10 @@ class Handler(BaseHTTPRequestHandler):
                 choice["finish_reason"] = "length"
                 log(f"  -> FORCE_STOPPED at {output_chars} chars (limit={output_chars_limit})", level="WARN")
 
-            content_summary = message.get("content", "")[:100]
+            # 2026-10-21 DEF-319: thinking 模型的 content 可能是 JSON null（全部输出
+            # 在 reasoning_content 里）。`.get("content", "")` 对"存在但为 None"
+            # 返回 None，`None[:100]` → TypeError → 整个 /v1/chat/completions 500。
+            content_summary = (message.get("content") or "")[:100]
             for tc in message.get("tool_calls") or []:
                 content_summary += f"[tool_call: {tc.get('function', {}).get('name', '')}] "
             _jsonl_output_map[self._last_jsonl_token] = output_chars
@@ -1666,6 +1669,14 @@ class Handler(BaseHTTPRequestHandler):
         input_tokens = 0
         output_tokens = 0
         text_block_started = False
+        # 2026-10-21: thinking 块（PROXY_EMIT_THINKING_BLOCKS，默认开）。
+        # 块索引动态分配，保持 Anthropic 要求的从 0 连续递增：
+        #   thinking(若有) → text(若有) → tool_use…
+        _emit_thinking = bool(getattr(_ps, "PROXY_EMIT_THINKING_BLOCKS", False))
+        _next_block_idx = 0
+        _thinking_idx = None      # 已开启的 thinking 块索引；None=未开启
+        _thinking_closed = False
+        _text_idx = 0             # text 块索引，延迟到首个文本增量时分配
         tools_extractor = _StreamingToolsExtractor()
         content_tools_pending = []
         _first_token_time = None
@@ -1709,21 +1720,80 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             return False
 
+        def _emit_thinking_delta(t):
+            """Emit a thinking delta SSE event, opening the thinking block lazily.
+
+            2026-10-21: 后端的 reasoning_content 走这里，不再并入 text 增量
+            （旧路径把思考当正文发，客户端无法区分，截断时还会冒充答案）。
+            """
+            nonlocal _thinking_idx, _next_block_idx
+            if not t or not _emit_thinking:
+                return
+            try:
+                if _thinking_idx is None:
+                    _thinking_idx = _next_block_idx
+                    _next_block_idx += 1
+                    _ev = {"type": "content_block_start", "index": _thinking_idx,
+                           "content_block": {"type": "thinking", "thinking": "",
+                                             "signature": ""}}
+                    self.wfile.write(
+                        f"event: content_block_start\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
+                    )
+                _ev = {"type": "content_block_delta", "index": _thinking_idx,
+                       "delta": {"type": "thinking_delta", "thinking": t}}
+                self.wfile.write(
+                    f"event: content_block_delta\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+
+        def _close_thinking_block():
+            """Close the thinking block (signature_delta + content_block_stop)."""
+            nonlocal _thinking_closed
+            if _thinking_idx is None or _thinking_closed:
+                return
+            _thinking_closed = True
+            try:
+                _ev = {"type": "content_block_delta", "index": _thinking_idx,
+                       "delta": {"type": "signature_delta",
+                                 "signature": "proxy-thinking"}}
+                self.wfile.write(
+                    f"event: content_block_delta\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
+                )
+                _ev = {"type": "content_block_stop", "index": _thinking_idx}
+                self.wfile.write(
+                    f"event: content_block_stop\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+
         def _flush_text_delta(t):
             """Emit a text delta SSE event, opening the text block lazily."""
             nonlocal text_block_started, total_text, output_char_count, output_force_stopped
+            nonlocal _next_block_idx, _text_idx
             if not t:
                 return
             try:
                 if not text_block_started:
                     text_block_started = True
+                    # thinking 块（若已开启）必须先收尾，块索引才保持连续递增
+                    _close_thinking_block()
+                    _text_idx = _next_block_idx
+                    _next_block_idx += 1
+                    _ev = {"type": "content_block_start", "index": _text_idx,
+                           "content_block": {"type": "text", "text": ""}}
                     self.wfile.write(
-                        b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                        f"event: content_block_start\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
                     )
                 total_text += t
                 output_char_count += len(t)
-                ev = f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(t)}}}}}\n\n'
-                self.wfile.write(ev.encode("utf-8"))
+                _ev = {"type": "content_block_delta", "index": _text_idx,
+                       "delta": {"type": "text_delta", "text": t}}
+                self.wfile.write(
+                    f"event: content_block_delta\ndata: {json.dumps(_ev)}\n\n".encode("utf-8")
+                )
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 # 2026-08-27 修复: 原为 `pass`——吞掉后读循环继续消费后端流,
@@ -1900,7 +1970,14 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
             # Handle content text — pass through state machine that strips <tools> blocks
-            text = delta.get("content", "") or delta.get("reasoning_content", "")
+            # 2026-10-21: reasoning_content 走独立 thinking 块（PROXY_EMIT_THINKING_BLOCKS）。
+            # 旧路径是 `content or reasoning_content` 直接并进 text 增量——客户端
+            # 分不清思考与答案，截断时还会把半截思考当正文返回。
+            _reasoning_delta = delta.get("reasoning_content") or ""
+            if _reasoning_delta:
+                _emit_thinking_delta(_reasoning_delta)
+            text = ((delta.get("content", "") or "") if _emit_thinking
+                    else (delta.get("content", "") or delta.get("reasoning_content", "")))
             if not text:
                 continue
             for kind, value in tools_extractor.feed(text):
@@ -2042,7 +2119,9 @@ class Handler(BaseHTTPRequestHandler):
         # text_block_started 保持 False, 门槛对"文本+ctx_recall"响应同样可过;
         # 持有的文本随 follow-up 的 assistant 消息交给模型(客户端不可见, 与
         # 工具调用本身同口径), 判不通过时在下面统一补发。
-        if (not text_block_started and not content_tools_pending
+        # 2026-10-21: 已经发出 thinking 增量也算"已向客户端发射内容块"，
+        # 微轮重派不得再触发（否则思考流会被 ctx_recall 的 follow-up 截断）
+        if (not text_block_started and _thinking_idx is None and not content_tools_pending
                 and tool_calls_buffer
                 and getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
             _dispatch = getattr(self, '_micro_recall_dispatch', None)
@@ -2098,12 +2177,15 @@ class Handler(BaseHTTPRequestHandler):
         # Send content_block_stop for text (only if text was output)
         if text_block_started:
             self.wfile.write(
-                f'event: content_block_stop\ndata: {{"type":"content_block_stop","index":0}}\n\n'
+                f'event: content_block_stop\ndata: {{"type":"content_block_stop","index":{_text_idx}}}\n\n'
                 .encode("utf-8")
             )
 
         # Send tool_use blocks if any
-        tool_call_idx = 1 if not text_block_started else 1
+        # 2026-10-21: thinking/text 块收尾后，tool_use 的索引用连续计数器
+        # （旧实现固定从 1 起，无文本时索引 0 空缺，不符合 Anthropic 连续递增约定）
+        _close_thinking_block()
+        tool_call_idx = _next_block_idx
         for idx in sorted(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
             if not tc["function"].get("name"):

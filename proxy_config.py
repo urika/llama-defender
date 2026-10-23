@@ -595,6 +595,18 @@ CONFIG_REGISTRY = {
         "type": "int", "scope": "reloadable",
         "doc": "Tools used ≥ this many times in a session auto-promote to keep set (DEF-104). 0 disables.",
     },
+    "PROXY_TOOLS_STABLE_SESSION": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "DEF-313 P1: freeze the emitted tool set per session on the first "
+               "request and replay it byte-identically afterwards (definitions "
+               "refreshed from the current request when still present, cached "
+               "otherwise). Qwen renders the tools block at the head of the "
+               "prompt, so any set/order change invalidates the whole prefix "
+               "cache; dynamic keep-set churn (auto-promote/recent) otherwise "
+               "forces full cold prefill. Pair with PROXY_TOOL_AUTO_PROMOTE_THRESHOLD=0 "
+               "and PROXY_TOOL_FILTER_RECENT=0 for a deterministic first snapshot.",
+    },
     "PROXY_BLOCK_CUT_TOOL_CALLS": {
         "defaults": {"all": "true"},
         "type": "bool", "scope": "reloadable",
@@ -1170,6 +1182,23 @@ CONFIG_REGISTRY = {
                "ctx_recall hints (passive) and AutoRecallStage proxy-answers "
                "dangling calls from manifest deposits (active). Off = bare "
                "tombstones. Independent of PROXY_AUTO_RECALL_ENABLED.",
+    },
+    # ---- L-80 诚实计量（2026-10-09 移植；读 os.environ，仅重启生效）----
+    "PROXY_HONEST_METERING": {
+        "defaults": {"all": "0"},
+        "type": "bool", "scope": "module",
+        "doc": "L-80 诚实计量：message_start.usage.input_tokens 改用引擎记录的"
+               "上一轮真实用量，而非 chars/ratio 估算。实现直接读 os.environ"
+               "（anthropic_proxy._honest_metering_on），reload 不生效，"
+               "仅进程重启生效。默认 0=保持旧估算回填（安全行为）。",
+    },
+    # ---- 响应侧 thinking 块（2026-10-21）----
+    "PROXY_EMIT_THINKING_BLOCKS": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "把后端 reasoning_content 作为 Anthropic `thinking` 块回传（非流式与流式）。"
+               "开＝客户端可见思考过程，且截断时不会把半截思考冒充正文；"
+               "关＝旧行为（非流式丢 reasoning、content 为空时顶替正文；流式并入 text 增量）。",
     },
     # ---- R-CM-5 预取/推送披露（2026-10-08 需求；默认关）----
     "PROXY_PD_PREFETCH_ENABLED": {

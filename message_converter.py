@@ -812,11 +812,22 @@ def convert_openai_response_to_anthropic(openai_resp, anthropic_model):
     content_text = msg.get("content", "") or ""
     reasoning = msg.get("reasoning_content", "")
 
-    # Qwen3.6 fix: if content is empty but reasoning exists, use reasoning as content
-    if not content_text.strip() and reasoning:
-        content_text = reasoning.strip()
-
     content = []
+    # 2026-10-21: reasoning_content → Anthropic `thinking` 块
+    # （PROXY_EMIT_THINKING_BLOCKS，默认开）。旧行为只在 content 为空时把
+    # reasoning 顶替正文——截断（stop_reason=max_tokens）时会把半截思考
+    # 冒充答案。开关关闭时保留旧行为。
+    if reasoning and getattr(proxy_state, "PROXY_EMIT_THINKING_BLOCKS", False):
+        content.append({
+            "type": "thinking",
+            "thinking": reasoning.strip(),
+            # 历史消息里的 thinking 块会被 _strip_thinking_from_msg 清掉，
+            # 因此 signature 只作形状占位，无真实校验语义。
+            "signature": "proxy-thinking",
+        })
+    elif not content_text.strip() and reasoning:
+        # Qwen3.6 fix: if content is empty but reasoning exists, use reasoning as content
+        content_text = reasoning.strip()
     existing_tool_calls = msg.get("tool_calls") or []
     synthesized = False
 

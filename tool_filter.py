@@ -45,10 +45,81 @@ def _apply_tool_denylist(tools):
     return kept, len(tools) - len(kept)
 
 
+# --- DEF-313 P1: per-(session, tool-profile) freeze -----------------------
+# Qwen renders the tools block at the head of the prompt, so any change to the
+# emitted set/order invalidates the whole prefix cache (30-90 s cold prefill at
+# 40-70K context). Dynamic keep-set churn (auto-promote growing, recent-window
+# sliding) rewrote the set every few turns, leaving no stable cached entry.
+#
+# Freeze the FILTERED OUTPUT per (session_id, client tool-name set):
+#   - the same profile always emits byte-identical tools -> one stable cache
+#     entry per profile (splash keeps several, so 28-tool and 22-tool profiles
+#     can both stay warm);
+#   - different profiles (sub-agents with a restricted toolset) never bleed
+#     into each other, so we never offer a child a tool its parent had.
+# Snapshot is taken before ctx_recall injection; ctx_recall is re-appended on
+# replay so its schema stays current.
+_SESSION_TOOL_FREEZE = {}          # (session_id, profile) -> [tool dict]
+_SESSION_TOOL_FREEZE_MAX = 512
+
+
+def _tool_profile(tools):
+    return tuple(sorted(
+        t.get("name", "") for t in tools
+        if isinstance(t, dict) and t.get("name")))
+
+
+def _freeze_tools(session_id, profile, tools):
+    if not session_id or not profile:
+        return
+    _SESSION_TOOL_FREEZE[(session_id, profile)] = [
+        dict(t) for t in tools if isinstance(t, dict)]
+    while len(_SESSION_TOOL_FREEZE) > _SESSION_TOOL_FREEZE_MAX:
+        try:
+            _SESSION_TOOL_FREEZE.pop(next(iter(_SESSION_TOOL_FREEZE)))
+        except (StopIteration, KeyError):
+            break
+
+
+def _replay_frozen(session_id, profile, tools):
+    """Frozen output for this profile, or None. Definitions are refreshed from
+    the current request when the tool is still offered."""
+    frozen = _SESSION_TOOL_FREEZE.get((session_id, profile))
+    if not frozen:
+        return None
+    by_name = {t.get("name", ""): t for t in tools if isinstance(t, dict)}
+    out = []
+    for f in frozen:
+        cur = by_name.get(f.get("name", ""))
+        out.append(cur if cur is not None else dict(f))
+    return out
+
+
 def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, session_id=""):
     # L-26: denylist 先于一切早退分支(含 below_max)——黑名单剥离无条件生效
     tools, _denied = _apply_tool_denylist(tools)
+
+    # DEF-313 P1: replay this profile's frozen set before any dynamic logic.
+    _stable = getattr(_ps, "PROXY_TOOLS_STABLE_SESSION", False)
+    _profile = _tool_profile(tools) if (_stable and session_id and tools) else ()
+    if _profile:
+        _frozen = _replay_frozen(session_id, _profile, tools)
+        if _frozen is not None:
+            # re-apply: PROXY_TOOLS_DENYLIST is reloadable and a frozen set may
+            # predate the current denylist
+            _frozen, _denied_frozen = _apply_tool_denylist(_frozen)
+            _denied += _denied_frozen
+            _out = _inject_ctx_recall(_frozen)
+            return _out, {
+                "filtered": False, "reason": "session_frozen", "denied": _denied,
+                "frozen": True, "kept": len(_out), "original": len(tools),
+                "always_keep": 0, "recent_only": 0, "recent_tools": [],
+                "scanned_assistant": 0, "filtered_out": [], "auto_promoted": [],
+            }
+
     if not tools or len(tools) <= _ps.PROXY_TOOL_FILTER_MAX:
+        if _profile:
+            _freeze_tools(session_id, _profile, tools)
         return _inject_ctx_recall(tools), {"filtered": False, "reason": "below_max",
                                            "denied": _denied}
 
@@ -124,6 +195,10 @@ def _filter_tools(tools, messages, recent_rounds=5, tool_choice_name=None, sessi
 
     all_names = {t.get("name", "") for t in tools if isinstance(t, dict)}
     filtered_out = sorted(all_names - kept_names)
+
+    # DEF-313 P1: freeze the filtered set for this profile (ctx_recall excluded)
+    if _profile:
+        _freeze_tools(session_id, _profile, kept)
 
     # P4 Recall(MVP): 注入 ctx_recall 工具——渐进披露的拉取接口。
     # 无论过滤与否都追加到列表末尾(不占 PROXY_TOOL_FILTER_MAX 名额)。

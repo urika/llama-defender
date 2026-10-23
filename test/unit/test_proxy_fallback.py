@@ -886,42 +886,57 @@ class TestReasoningExtraction(unittest.TestCase):
             "usage": {"prompt_tokens": 5, "completion_tokens": 10},
         }
 
-    def test_empty_content_promotes_reasoning_to_text(self):
-        """R4.5: when content='' but reasoning='...' is present, the
-        reasoning is surfaced as the response's text block (otherwise
-        the model would appear to have said nothing)."""
+    def test_empty_content_emits_thinking_block(self):
+        """2026-10-21（PROXY_EMIT_THINKING_BLOCKS 默认开）：content='' 且
+        reasoning 存在时，reasoning 作为 `thinking` 块回传，不再冒充正文。
+
+        旧契约 R4.5 是"顶替为 text 块"——那会在 stop_reason=max_tokens 时把
+        半截思考当成答案返回。旧行为由 test_emit_thinking_off_* 覆盖。
+        """
         r = proxy.convert_openai_response_to_anthropic(
             self._openai_resp(content="", reasoning="Let me think about this..."),
             anthropic_model="claude-sonnet-4-6",
         )
+        thinking = [b for b in r["content"] if b["type"] == "thinking"]
         text_blocks = [b for b in r["content"] if b["type"] == "text"]
-        self.assertEqual(len(text_blocks), 1)
-        self.assertIn("Let me think", text_blocks[0]["text"])
+        self.assertEqual(len(thinking), 1)
+        self.assertIn("Let me think", thinking[0]["thinking"])
+        self.assertEqual(text_blocks, [])
 
-    def test_content_wins_when_both_present(self):
-        """R4.5: when BOTH content and reasoning are populated, content
-        is the visible text and reasoning is dropped (it's an internal
-        scratchpad, not meant to be shown to the user)."""
+    def test_content_and_reasoning_become_two_blocks(self):
+        """2026-10-21：两者都有时输出 thinking + text 两个块。
+
+        旧契约 R4.5 是丢弃 reasoning（"internal scratchpad"）；现在改为独立
+        thinking 块回传，客户端可分辨思考与答案。
+        """
         r = proxy.convert_openai_response_to_anthropic(
             self._openai_resp(content="The answer is 42.",
                               reasoning="internal scratchpad"),
             anthropic_model="claude-sonnet-4-6",
         )
-        text_blocks = [b for b in r["content"] if b["type"] == "text"]
-        self.assertEqual(len(text_blocks), 1)
-        self.assertEqual(text_blocks[0]["text"], "The answer is 42.")
-        self.assertNotIn("scratchpad", r["content"][0]["text"])
+        self.assertEqual([b["type"] for b in r["content"]], ["thinking", "text"])
+        self.assertIn("scratchpad", r["content"][0]["thinking"])
+        self.assertEqual(r["content"][1]["text"], "The answer is 42.")
 
-    def test_whitespace_only_content_still_promotes_reasoning(self):
-        """R4.5: content='\\n  ' (whitespace only) is treated as empty
-        — the `.strip()` check means reasoning is promoted."""
-        r = proxy.convert_openai_response_to_anthropic(
-            self._openai_resp(content="\n   ", reasoning="actual answer"),
-            anthropic_model="claude-sonnet-4-6",
-        )
-        text_blocks = [b for b in r["content"] if b["type"] == "text"]
-        self.assertEqual(len(text_blocks), 1)
-        self.assertEqual(text_blocks[0]["text"], "actual answer")
+    def test_emit_thinking_off_restores_legacy_contract(self):
+        """开关关闭时恢复旧行为：reasoning 不出现在响应里；只有 content
+        为空（或纯空白）时才顶替正文。"""
+        with patch.object(proxy_state, "PROXY_EMIT_THINKING_BLOCKS", False):
+            r = proxy.convert_openai_response_to_anthropic(
+                self._openai_resp(content="The answer is 42.",
+                                  reasoning="internal scratchpad"),
+                anthropic_model="claude-sonnet-4-6",
+            )
+            self.assertEqual([b["type"] for b in r["content"]], ["text"])
+            self.assertEqual(r["content"][0]["text"], "The answer is 42.")
+            self.assertNotIn("scratchpad", json.dumps(r["content"]))
+
+            r2 = proxy.convert_openai_response_to_anthropic(
+                self._openai_resp(content="\n   ", reasoning="actual answer"),
+                anthropic_model="claude-sonnet-4-6",
+            )
+            self.assertEqual([b["type"] for b in r2["content"]], ["text"])
+            self.assertEqual(r2["content"][0]["text"], "actual answer")
 
     def test_no_reasoning_no_special_handling(self):
         """R4.5 baseline: when reasoning is absent, the function

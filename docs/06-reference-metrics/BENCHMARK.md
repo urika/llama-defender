@@ -20,6 +20,7 @@
 - [并发性能](#并发性能)
 - [历史对比 (2026-05-10 vs 2026-07-12)](#历史对比-2026-05-10-vs-2026-07-12)
 - [端到端测试（代理层）](#端到端测试代理层)
+- [Splash 1.3.2 双档基线（2026-10-20）](#splash-132-双档基线2026-10-20)
 - [已知问题](#已知问题)
 - [配置切换指南](#配置切换指南)
 - [推荐配置](#推荐配置)
@@ -528,3 +529,42 @@ TTFT:
    推翻「Splash 诊断降级无 metrics」旧认知（AGENTS.md §4.5 已同步更正）。
 2. 主引擎 80% token 级缓存复用与 EXP 批次 agentic 长前缀形态吻合，缓存体系健康。
 3. 9B 命中率需等 haiku 路由生产流量积累后重读；同前缀 TTFT 90× 收益可直接指导长文档多轮用法。
+
+---
+
+## Splash 1.3.2 双档基线（2026-10-20）
+
+环境：M5 Pro 48GB，splash 1.3.2，MLX 上游权重 + Inco DFlash2 草稿，两档统一
+`--max-context 256K --state-format bf16 --language-only --persistent-cache`，
+并已启用 DEF-313 工具集恒定化与上调后的上下文生命周期阈值。
+
+### 双档对比
+
+| 指标 | Qwen3.8-27B（稠密） | Qwen3.6-35B-A3B（MoE 3B 激活） |
+|------|--------------------|-------------------------------|
+| 冷 prefill 30.4K | 450–488 tok/s | **2122 tok/s（4.4×）** |
+| 热 TTFT 30.4K | 0.53–0.56 s | **0.27 s** |
+| Decode @30K | 65–71 tok/s | **123–140 tok/s** |
+| Decode 短 prompt | — | **335 tok/s** |
+| DFlash2 接受率 | 65.7% | 55.9%（短 prompt 99%） |
+| Metal 占用 / peak | 19.0 GB | 21.9 GB / 22.0 GB |
+| state/条（bf16） | 80.6 MiB | **34 MiB** |
+| 内存压力 / headroom | normal / 24.2 GB | normal / 21.3 GB |
+
+### 原始测量（35B-A3B）
+
+```
+COLD-1 30.4K: wall=14.58s  cache_n=0      prompt_ms=14331  prefill=2122.6  decode=133.5  draft=56/22
+COLD-2 30.4K: wall=14.60s  cache_n=0      prompt_ms=14329  prefill=2122.9  decode=123.7  draft=63/21
+WARM-1 30.4K: wall= 0.27s  cache_n=30400  prompt_ms=50.0   decode=137.2    draft=56/22
+WARM-2 30.4K: wall= 0.27s  cache_n=30400  prompt_ms=50.3   decode=140.2    draft=56/22
+SHORT decode: wall=0.37s  pred=112  decode=335.0  ttft=38ms  draft=98/97
+```
+
+### 选型结论
+
+- **日常/快速迭代** → `splash-qwen36-35b-mlx`（335 tok/s，热 TTFT 0.27s）
+- **复杂重构/多文件调试** → `splash-qwen38-27b-mlx`（agentic 强一档，65–71 tok/s）
+- 二者**不可同时常驻**（40.9 GB / limit 44 GB，且内存紧张时会触发换页），切换须 `switch + restart`（约 60–90 s）
+- 能力/速度的平台期与选型依据详见
+  [`splash-model-capability-research-20261020.md`](splash-model-capability-research-20261020.md)

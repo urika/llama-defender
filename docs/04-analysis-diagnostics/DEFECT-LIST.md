@@ -107,7 +107,7 @@
 
 ---
 
-## 二、🟠 P1-High (8 项)
+## 二、🟠 P1-High (12 项)
 
 ### DEF-101: Broken Pipe 错误 (65 次) — ✅ 已修复
 
@@ -205,7 +205,7 @@
 
 ---
 
-## 三、🟡 P2-Medium (11 项)
+## 三、🟡 P2-Medium (15 项)
 
 ### DEF-201: 集成测试中 session=a309b181 出现高频 re-read 假阳性 — ✅ 已修复
 
@@ -417,6 +417,117 @@
 | **修复** | `PROXY_AUX_ISOLATION_STRICT`（默认关）：aux 判别从「haiku 且 tools=0」扩展为「**tools=0 即分域**」（主对话恒有 52 工具，tools=0 的子请求无论 tier 一律 `::aux` 域）；配套**系统钉扎**——`::aux` 分域后子请求的 154B 系统永不触碰主 canonical 的 29310B 系统（位置 0 的字节稳定由分域保证，与轨道①同族） |
 | **影响** | 污染指令被模型服从（3 次搜索浪费轮次）——seq4 failed 的混淆变量，判读时单列；公平性无碍（子请求泄漏与旗标无关，两臂同概率） |
 
+---
+
+### DEF-313: 工具列表非平稳——tools 块位于 prompt 头部，工具集抖动击穿整条前缀缓存（splash TTFT 长尾主因，P1） — ✅ 已修复（2026-10-20，P0+P1）
+
+| 项 | 内容 |
+|------|------|
+| **数据源** | 生产值守（splash-qwen36-35b，2026-10-20 14:xx）+ 直连 :8081 最小探针（`tools/probe_tool_prefix_cache.py`）+ `logs/anthropic_proxy.log` + `logs/llama-server.log` + `chat_template.jinja` |
+| **现象** | TTFT 长尾：命中态 0.4–0.9s，未命中态 30–90s（`splash_ttft_p95` 39.5s）。后端 prefill 786 tok/s，50K 冷启 ≈ 64s，与实测吻合。工具数在 15↔19 间反复横跳（`28->19` 21 次 / `22->15` 44 次） |
+| **根因（新机制）** | Qwen3.6 chat template 把 **tools 块渲染在 prompt 最前**：`<im_start>system\n# Tools\n...<tools>{tool json}...</tools>` 之后才接真实 system + messages。tools 块是**前缀头部**，工具集/顺序/数量任一变化 → 整条前缀失效 → 全额冷 prefill。稳定视图 `PROXY_CTX_VIEW_STABLE_ENABLED` 只处理**消息视图**（SDK tombstone 改写副本），**不触碰 `body["tools"]`**，无法覆盖此段 |
+| **探针实证** | 直连 :8081，同一 prompt + 15 工具（tools 块 ≈ 1191 token）：同集重发 **0.22s**（命中）；换名 / 多一个工具 **1.73–2.01s**（全冷）。tools 块确在缓存键内 |
+| **工具集非平稳四因** | a) 客户端送来的工具数就在变（`tools=28` 1317× / 26 / 22 / 15 / 11 / 0）<br>b) `keep_set = TOOL_ALWAYS_KEEP ∩ 客户端工具 ∪ recent ∪ auto_promoted`——客户端未送全 always-keep（22/15/11）时数量下降<br>c) `auto_promoted` 随会话工具频率增长（阈值 3）——同会话内也增长<br>d) `PROXY_TOOL_FILTER_MAX=14` 仅**下限**（`if len(kept) < MAX: pad`），**从不裁剪** → 实际发出 15~20 个 |
+| **DEF-203 修复为何不足** | DEF-203 只做了 ①按稳定序排序 ②向下填充到 MAX；二者都只稳定**顺序**，不恒定**集合**；且 `MAX` 是下限非上限 |
+| **稳定视图排查结论** | `PROXY_CTX_VIEW_STABLE_ENABLED=true` 已加载，但 `view-stable: skipped` 日志 **0 次**；消息视图靠 `absorb()` 的 `sent_set` 去重已稳（prefix ratio 99%+），view-stable 属冗余且**不覆盖 tools** |
+| **与 DEF-308 关系** | DEF-308 三因（hybrid `non_trimmable` / 发送视图回写 / Metal 驱逐）针对 rapid-mlx；本条是 splash 模板 **tools 头部**这一**独立**击穿源，机制不同、可单独治理 |
+| **修复方向** | 在 `_filter_tools` 层把工具集做成**常量**：① 固定 `TOOL_ALWAYS_KEEP` 白名单 + 关 `auto_promote`/`recent` 动态扩充；或 ② 把 `PROXY_TOOL_FILTER_MAX` 改为**硬上限**（裁剪而非仅填充）；或 ③ tools 块与消息块分离缓存键（需后端配合） |
+| **修复落地（2026-10-20）** | **P0（配置）**：`PROXY_TOOL_AUTO_PROMOTE_THRESHOLD=0` + `PROXY_TOOL_FILTER_RECENT=0`，关闭动态扩充，使首次快照确定。<br>**P1（代码）**：新增 `PROXY_TOOLS_STABLE_SESSION`（CONFIG_REGISTRY + proxy_state + 可热重载），`tool_filter.py` 增加 `_SESSION_TOOL_FREEZE`，按 **`(session_id, 客户端工具名集合)`** 冻结过滤输出：同 profile 后续请求逐字节复用（定义从当前请求刷新、客户端缺失时回退快照），不同 profile（受限子 agent）互不污染；`ctx_recall` 不进快照、replay 时重注入。容量上限 512，FIFO 淘汰。<br>**为何不做全局 union**：同 session 内客户端会在 28↔22 工具间切换（实测 `always=9` vs `always=5`，子任务/只读子 agent），union 会把父 agent 的 Write/Edit 塞给受限子任务。 |
+| **验收（2026-10-20 22:40）** | 探针（经代理 :4000）：同会话 15 工具连发 + 中途切 22 工具再切回，`cached` 除首条外**恒为 1632/1651 = 98.8%**；生产会话 27B：`cached 38,784/39,718`，后端工具 hash 恒为 `15·0fff7128`，TTFT 从 30–90s 降到 **2–7s**。剩余冷启动仅来自后端重启清缓存 / 新会话 / EPOCH。 |
+| **附带观察（同批值守）** | ① **EPOCH 全量重建**：本轮 50 分钟触发 4 次（14:19:51 / 14:24:44 / 14:29:35 / 14:31:15），`Common prefix ratio 0.00%`，#3→#4 仅隔 1.5 分钟（抖动）<br>② **Metal 压力**：`splash_memory_pressure=warning`，headroom 8.77→6.20GB，`state_evictions` 139→175，命中率 99.7%→24.2%<br>③ aux `embedgemma2` 为 `-ngl 0`（纯 CPU），**非** Metal 竞争者 |
+| **影响** | 周期性 30–90s 冷 prefill 尖峰，agentic 吞吐较缓存有效时下降 3–5×；每次工具集跳变即触发 |
+| **剩余** | 修复方向 ①/② 实现 + 批后探针复测（tools 块恒定 → 冷 prefill 尖峰消失） |
+
+### DEF-314: 云端兜底不认 anthropic 协议 provider，且只试候选链首个（P1） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | `POST /v1/messages` 请求 `claude-haiku-4-5` 返回 503：`Local failed: <urlopen error [Errno 61] Connection refused>; cloud fallback failed: 'choices'` |
+| **数据源** | 2026-10-20 23:53 生产值守（`logs/anthropic_proxy.log`）+ `configs/models.json` 路由表 |
+| **根因 A（协议）** | local 失败后兜底路径（`pipeline.py` 原 4553-4577）一律走 `_do_dispatch`（OpenAI 解析器）。`zhipu-cn` 是 **anthropic 协议** provider，返回 `{"content":[...]}`，`message_converter.py:810` 读 `openai_resp["choices"][0]` → `KeyError: 'choices'`。正常云端分派（`pipeline.py:4333`）有协议分支，**兜底路径漏了** |
+| **根因 B（不遍历）** | 兜底只取**第一个**可用候选即返回，候选 #1 失败（如 zhipu-cn 401）后不会继续尝试链上其余 provider |
+| **触发条件** | ① `claude-haiku-4-5` 路由声明 `local_model: ornith-9b`，而 9B 引擎 (:8084) 未常驻 → local 必失败；② 候选链首位为 anthropic-protocol provider |
+| **修复（2026-10-21）** | 兜底改为遍历 `_usable()` 过滤后的**完整候选链**（与正常云端分派同口径：跳过冷却/无 key/provider 协议与客户端不兼容）；按 `cand["protocol"] == "anthropic"` 分支走 `_do_dispatch_anthropic`；单个候选 HTTPError/异常记录后 `continue`，全链失败才返回 503（错误含最后失败原因） |
+| **验收（2026-10-21 00:00）** | 不带 header 请求 haiku → **HTTP 200**（日志：`zhipu-cn` 401 → `trying next...` → `zhipu/glm-5.3-flash` 200），耗时 19.6s；`test_proxy_fallback` **275 passed**；`run_tests.sh --unit` **2066 passed** |
+| **关联变更（同一修复窗口）** | `configs/models.json` 的 `claude-haiku-4-5.local_model` 由 `ornith-9b` 置空 → 9B 未常驻时回落**主引擎**（当时 35B:8081），实测 0.09s / HTTP 200。需要 9B 分流时显式使用 `ornith-9b` 别名 |
+| **影响** | 任何 anthropic-protocol provider（zhipu / zhipu-cn / z.ai / kimi）在 local 失败时都不可用，等于本地引擎一挂即整条请求失败 |
+
+### DEF-315: `/api/status` 的 backend.pid 归属错误——pgrep 命中辅助引擎（P2） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | `GET /api/status` 的 `backend.pid = 90927`、`uptime_sec ≈ 178716`（2 天），而真实主后端是 PID 97610 / uptime 19 分钟。`backend.name` 显示 `splash`、`model_name` 正确，仅 **pid/uptime 错位** |
+| **数据源** | 2026-10-21 00:1x 生产（`splash-qwen38-27b-mlx`）+ `ps`/`lsof` 交叉校验 |
+| **根因** | `admin_server._build_status_json()`（及 `_build_status_html()`）调用 `_get_process_info("rapid-mlx\|llama-server\|dflash\|splash", "Backend")` **未传 `fallback_port`**，于是走 `pgrep -f ... \| head -1`。该正则同时匹配辅助引擎 `tools/bin/llama-server-eg2`（EmbeddingGemma，PID 90927，常驻 2 天）与其它杂项进程，先命中者被当成主后端 |
+| **为何危险** | 消费方（agent_go / 告警 / 值守脚本）依赖 `backend.pid` + `uptime_sec` 判断主后端存活；aux 常驻时**主后端挂了也会显示 alive**，且 uptime 完全失真 |
+| **修复（2026-10-21）** | 新增 `admin_server._local_backend_port()`：从 `_ps.LLAMA_BASE` 解析端口（`IS_CLOUD` 时返回 `None`）。两处 `_get_process_info(... "Backend")` 均传 `fallback_port=_local_backend_port()`，使 **端口持有者成为唯一权威**——与 `_get_process_info` 自身 2026-09-27 注释（"Port holder first: it is the unique truth"）一致；同款做法此前只用在 proxy（`:4000`）上 |
+| **验收（2026-10-21 00:3x）** | 重启代理后 `/api/status` → `backend.pid = 4697`，与 `manage.sh status` 的 PID、`lsof -iTCP:8081` 的持有者**三者一致**；aux `90927` 不再被误报；`state: healthy`、`ready: true`、`name: splash`；`run_tests.sh --unit` **2066 passed**；`--signature` preserved |
+| **覆盖范围** | 所有本地后端（rapid-mlx / llama-server / dflash-mlx / splash）统一受益；云模式不受影响（无本地 PID） |
+
+### DEF-316: 动态并发开关标 reloadable 但 `_RELOAD_SPEC` 漏登记（P2） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 配置写入 `PROXY_DYNAMIC_CONCURRENT_ENABLED=false` 后执行 `./manage.sh reload`，`/status` 仍显示 `Max Concurrent 1 (dynamic)`，`_adjust_concurrency()` 继续把本地并发从 1 抬到 4 |
+| **根因 A** | `proxy_config.CONFIG_REGISTRY` 声明这 5 个 `PROXY_DYNAMIC_CONCURRENT_*` 项 `scope=reloadable`，但 `proxy_state._RELOAD_SPEC`（`reload_config` 唯一应用的清单）**未登记**。reload 只遍历 `_RELOAD_SPEC`，未登记 = 不应用 |
+| **根因 B（易误判）** | `manage.sh reload` 只重载**配置常量**，不重载**模块代码**。即使补登记 `_RELOAD_SPEC`，运行中的进程仍持有旧模块 → 必须重启进程才生效 |
+| **危害** | 48GB 机器上动态并发按 p95<30s 放行，可绕过 AGENTS.md §8.1「本地并发恒 1」红线；实测 prefill 与 decode 抢 GPU，decode 52.9→23.2 tok/s、冷 48K TTFT 259s |
+| **修复（2026-10-21）** | `_RELOAD_SPEC` 补登记 `PROXY_DYNAMIC_CONCURRENT_{ENABLED,MIN,MAX,LATENCY_P95_MS,ERROR_RATE}`，默认值与 CONFIG_REGISTRY 对齐（local ENABLED=true / MAX=4；cloud ENABLED=false / MAX=8） |
+| **关联配置** | `configs/splash-qwen38-27b-mlx.conf` 与 `splash-qwen36-35b-mlx.conf` 均加 `PROXY_MAX_CONCURRENT=1` + `PROXY_DYNAMIC_CONCURRENT_ENABLED=false` + `PROXY_DYNAMIC_CONCURRENT_MAX=1` |
+| **验收（2026-10-21 00:48）** | 重启后启动日志 `Dynamic concurrency: disabled (min=1, max=1)`；`/status` → `Max Concurrent 1`（无 `(dynamic)` 后缀）；`run_tests.sh --unit` **2066 passed** |
+| **附带观察** | 同一窗口重启后 ANE 重新校准，`share` 从 0.47 掉到 **0.03**、`minimum_rows` 512→1759、数值偏差 1.5%→**8.2%**、ANE 78.6ms vs GPU 83.9ms（GPU 基线从 48.6ms 升到 83.9ms）。推测为系统级内存压力（swap 3.46GB / 空闲页 ~300MB）拖慢 GPU 基线，ANE 优势随之消失——说明 ANE 收益**依赖机器状态**，需在干净状态下重新校准 |
+
+### DEF-317: `manage.sh` 把 splash 后端误判为 rapid-mlx（P2） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | `./manage.sh status` 显示 `后端: rapid-mlx`（实际 Splash 1.4.0 + 35B OptiQ），且 `内存(Splash)` 行消失、`进程 RSS` 显示的是无关进程 |
+| **数据源** | 2026-10-21 21:1x（`splash-qwen36-35b-optiq`，PID 49192） |
+| **根因 A（正则）** | `_current_backend()` 对 splash 的判别是 `grep -q 'splash.*server.py'`，而 1.3.x 起的实际启动形态是 `python3 -m server.server ...`（**不是** `server.py`）→ 0 命中，掉进回退 |
+| **根因 B（回退过宽）** | 回退第一条是 `pgrep -f "rapid-mlx"`，会命中**任何命令行里含该字符串**的进程。实测命中 PID 56541——一个正在 `cat > configs/archived/README-20261021.md` 的 zsh（heredoc 正文里含 "rapid-mlx" 字样），且该分支排在 `splash serve` 之前 |
+| **修复（2026-10-21）** | ① 抽出 `_classify_backend_pid()`，PID 文件路径与端口路径共用；splash 判别改为 `splash.*(server\.py\|-m server\.server)`，两种形态都认。<br>② 回退顺序改为「**先取 `$LLAMA_PORT` 的 lsof 端口持有者**」（唯一权威，与 `admin_server._local_backend_port` 同口径），再退到收紧后的 pattern（`rapid-mlx serve` / `splash serve-native\|splash serve `），**去掉裸 `rapid-mlx` 与裸 `mlx_vlm`** |
+| **验收（2026-10-21 21:15）** | `status` → `后端: splash`、`内存(Splash): 22.4 GB` 行恢复；`current` → `后端: splash`；`start` → `后端已在运行 (PID: 49192, backend: splash)`（不再重启后端）；`bash -n manage.sh` 通过 |
+| **影响** | 仅观测面。但会误导运维/告警（误以为在跑 rapid-mlx），并让 `内存(Splash)` 等条件分支失效 |
+
+### DEF-318: reasoning_content 未回传为 thinking 块——截断时半截思考冒充正文（P2） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | ① 非流式 Anthropic 响应里**没有** `thinking` 块，思考过程被丢弃（`reasoning_tokens` 计入 usage 但内容不可见）<br>② `max_tokens` 小于思考开销时（如 32），`stop_reason: max_tokens` 且 `text` 块内容是**半截思考**（"Here's a thinking process…"），客户端误以为这是答案<br>③ 流式把 `reasoning_content` 直接并入 `text_delta`，客户端无法区分思考与答案 |
+| **数据源** | 2026-10-21 22:xx–23:xx（`splash-qwen36-35b-optiq`，thinking on + effort low） |
+| **根因 A（非流式）** | `message_converter.convert_openai_response_to_anthropic` 只在 `content` 为空时把 `reasoning_content` 顶替成 text，**从不生成 thinking 块** |
+| **根因 B（流式）** | `anthropic_proxy.py` 流式主循环 `text = delta.get("content","") or delta.get("reasoning_content","")`——思考被当作正文增量发出 |
+| **根因 C（引擎侧）** | Splash 1.4.0 **无视** `thinking:{"type":"disabled"}`（后端日志仍是 `effort absent → low · thinking on`），只认 `reasoning_effort:"none"`（→ `effort none · thinking off`） |
+| **修复（2026-10-21）** | ① 新增 `PROXY_EMIT_THINKING_BLOCKS`（CONFIG_REGISTRY + proxy_state + `_RELOAD_SPEC`，reloadable，默认 **true**）。<br>② 非流式：`reasoning_content` → `{"type":"thinking","thinking":...,"signature":"proxy-thinking"}`，不再顶替正文；关闭开关恢复旧行为。<br>③ 流式：reasoning 走独立 thinking 块（`content_block_start` + `thinking_delta` + `signature_delta` + `content_block_stop`），块索引改为动态连续 `thinking(0) → text → tool_use`；同时修复旧实现 tool_use 固定从 index 1 起、无文本时 index 0 空缺的问题。<br>④ 流式微轮门槛增加 `_thinking_idx is None` 条件，避免发过思考后被 ctx_recall follow-up 截断。<br>⑤ 路由级 `thinking_disabled`（`models.json` → `get_route` → `SmartRouter` → `FormatConverter`）：同时发 `thinking:{"type":"disabled"}` 与 `reasoning_effort:"none"`，兼顾 deepseek 类与 splash 类后端 |
+| **关联配置** | ① `claude-haiku-4-5` 路由加 `"thinking_disabled": true`；`--thinking-token-budget` 2048 → **512**。<br>② `claude-sonnet-4-6` 路由加 `"min_max_tokens": 3000`（2026-10-22，初值 1600）——thinking 与 tool_use 共享同一预算，实测 `max_tokens` ≤512 时思考吃光预算、**拿不到 tool_use**，768 起稳定；单轮委派峰值 839，1600 够用，但**多轮回传后终答会重新思考整段上下文**（实测 think 1952 字符 + 长答案把 1600 打满，`stop=max_tokens` 截断），故提到 3000。实现为**路由级**下限（`get_route` → `SmartRouter._route_min_max_tokens` → `FormatConverter`），同时改写 `openai_body` 与 Anthropic `body`——否则输出截断阈值仍按客户端原值 ×2 计算，会把刚放宽的 tool_call 又截掉。haiku 档不设下限（thinking off，100 足够）。 |
+| **验收（2026-10-21 23:15）** | sonnet 非流式 → `["thinking","text"]`（thinking 内容 + 答案 391）；sonnet 流式 → index 0 `thinking_delta` 序列；sonnet + 工具 → 块索引 **0(thinking) → 1(tool_use)** 连续；haiku → 仅 text 块、`output_tokens 4`、后端日志 `effort none · thinking off`；`--unit` **2066 passed**、`--signature` 185 preserved、`--snapshot` 57 cases 全绿 |
+| **影响** | 思考对客户端可见且可计量；截断不再把半截思考当答案；haiku 档恢复"快速直答" |
+
+### DEF-319: OpenAI 端点遇 `content: null` 整端点 500（thinking 模型触发，P1） — ✅ 已修复（2026-10-21）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | `POST /v1/chat/completions`（OpenAI 协议）返回 500：`{"error":{"message":"Proxy error: RuntimeError: Pipeline stage 'backend_dispatcher' failed: TypeError: 'NoneType' object is not subscriptable"}}`，**所有请求必现**（含无 tools 的最小请求） |
+| **数据源** | 2026-10-21 23:39–23:41（`splash-qwen36-35b-optiq`，thinking on） |
+| **根因** | `anthropic_proxy._handle_non_streaming_response`（OpenAI 分支）`content_summary = message.get("content", "")[:100]`。thinking 模型的 `content` 是 JSON **null**（全部输出在 `reasoning_content` 里），而 `dict.get(k, default)` 在"键存在但值为 null"时返回 **None**，`None[:100]` → TypeError |
+| **为何现在才暴露** | 之前生产配置 `LLAMA_THINKING=false`，`content` 恒为字符串；切到 `--default-reasoning-effort low` 后 `content` 变成 null。属**潜伏缺陷被 thinking 模式激活** |
+| **修复（2026-10-21）** | ① `(message.get("content") or "")[:100]`。<br>② `pipeline.py` 的 `PIPELINE FAILURE` 处补一条压缩 traceback（`PIPELINE TRACEBACK (stage)`，WARN 级，截断 1200 字符）——此前只有异常消息，`'NoneType' object is not subscriptable` 无法定位，本次靠临时插桩才找到行号 |
+| **验收（2026-10-21 23:42）** | OpenAI 端点无 tools → **200**（`content: null` + `reasoning_content`）；带 `task` tool → **200** + `tool_calls[0].function.name="task"` + 正确参数 + `finish_reason: tool_calls`；Anthropic 端点 `Task` 工具 → `stop_reason: tool_use` + `tool_use` 块 |
+| **影响** | OpenAI 协议客户端（含任何走 `/v1/chat/completions` 的 agent）在 thinking 模型下完全不可用 |
+
+### DEF-320: 重启留下孤儿引擎 → 内存准入失败 → 服务停摆 5 分钟（P1） — ✅ 已修复（2026-10-22）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 01:08–01:13 服务完全不可用（`:8081`/`:4000` 均无监听）。Splash 连续 3 次 bootstrap 失败：`error: runtime bootstrap failed [resource_assembly/model_loading]: not enough free memory to start (1500 MiB reclaimable, 2048 MiB protected for macOS, system pressure warning)`，每次以 `Error · native protocol reached EOF` 收尾。 |
+| **影响** | **3 个生产请求被 Cancelled**（`input 59,609` TTFT 252.5s / `input 59,981` TTFT 255.9s / `input 108,706 · cached 0 · tools 54`），其中 108K 那次是重上下文 agent 会话。停服前已有 250s+ 排队积压。 |
+| **根因 1（孤儿）** | 01:07:23 `Stopping · releasing engine resources` 后，旧的 `server.server`(97817) 与 `serve-native`(97850，RSS 1.6GB、Metal ~21GB) **没有退出**。新实例启动后把 PID 文件从 97817 改写成 98880 → 旧进程成孤儿。`manage.sh stop` 只按 PID 文件杀一个进程；`_check_port` 也因旧前端已不监听而放行。 |
+| **根因 2（内存）** | 两个引擎各需 ~21GB，合计 42GB 逼近 44GB limit，Splash 内存准入直接拒绝（reclaimable 仅 1500 MiB）。 |
+| **放大因素** | 系统 swap 已用 7.5GB / 8GB，加大失败概率。 |
+| **修复（2026-10-22）** | 新增 `manage.sh:_reap_splash_orphans()`：扫描**不在 PID 文件里**的 Splash 进程（`splash serve-native` + `splash/.*-m server\.server`），SIGTERM → 10s 等待 → SIGKILL 兜底。两处调用：① `_start_splash()` 启动前（先清孤儿再查端口）；② `cmd_stop_backend()` 正常停止后的兜底分支。 |
+| **验收（2026-10-22 01:15）** | `stop` → `start` 一轮：发现并清理孤儿 461/482，最终仅剩 1063(前端)/1138(引擎) 单实例；`:8081` 正常监听；`memory_pressure=normal`、headroom 19.46GB、`denied=0`；持久缓存恢复 462 个 restore point；健康请求 `stop=end_turn` / `OK`。 |
+| **残留风险** | swap 仍 7.0GB/8GB；`PROXY_MAX_CONCURRENT=1` 下 59–108K 长上下文会排队数分钟。建议择机重启系统释放 swap。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）
@@ -424,19 +535,19 @@
 | 严重度 | 总数 | ✅ 已修复 | 🟡 部分修复 | 🔴 未修复 |
 |--------|------|----------|------------|----------|
 | 🔴 P0-Critical | 7 | 7 | 0 | 0 |
-| 🟠 P1-High | 8 | 8 | 0 | 0 |
-| 🟡 P2-Medium | 11 | 8 | 1 | 2 |
+| 🟠 P1-High | 12 | 12 | 0 | 0 |
+| 🟡 P2-Medium | 15 | 12 | 1 | 2 |
 | 🔵 P3-Low | 5 | 4 | 0 | 0 |
-| **合计** | **31** | **27** | **1** | **2** |（DEF-312 治理三侧已落地待量测）
+| **合计** | **39** | **35** | **1** | **2** |（DEF-312 治理三侧已落地待量测）
 
 ### 5.1a 按修复状态汇总
 
 | 状态 | 数量 | 占比 | 缺陷编号 |
 |------|------|------|----------|
-| ✅ 已修复/已验证 | 27 | 90% | DEF-001~DEF-004, DEF-007, DEF-101~DEF-102, DEF-104~DEF-109, DEF-201~DEF-205, DEF-207~DEF-210, DEF-301~DEF-305 |
+| ✅ 已修复/已验证 | 34 | 87% | DEF-001~DEF-004, DEF-007, DEF-101~DEF-102, DEF-104~DEF-109, DEF-201~DEF-205, DEF-207~DEF-210, DEF-301~DEF-305, DEF-313~DEF-320 |
 | 🟡 部分修复/已缓解 | 1 | 3% | DEF-005 (OOM 缓解, 代码审计确认完整) |
 | 🔴 未修复/待治理 | 2 | 6% | DEF-306 (fail-closed——两处裸int已补防, 主修复完成), DEF-312 (模型层幻觉, 治理三侧已落地待量测) |
-| ⚪ 设计限制 | 2 | 7% | DEF-103 (fifo 与 compression 功能重叠), DEF-206 (A/B 实验为一次性决策工具) |
+| ⚪ 设计限制 | 2 | 6% | DEF-103 (fifo 与 compression 功能重叠), DEF-206 (A/B 实验为一次性决策工具) |
 
 ### 5.2 按类别
 

@@ -169,6 +169,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| `splash-132-migration-20261020.md` | **Splash 1.0.2 → 1.3.2 迁移 Runbook**：1.3.0/1.3.1/1.3.2 三版新特性逐项对照（ANE prefill、Splash 包作废 breaking change、NVFP4/FP8、`--state-format bf16`、SSD 缓存默认开、thinking budget、延迟优化）、可复现迁移步骤、验收基线、回退与已知限制 |
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
 | `engines-sh-param-alignment-20261020.md` | **engines.sh 参数对齐修复（DEF-211）**：`engines.sh` 缺 `--enable-auto-tool-choice` 导致辅助引擎静默丢失 tool calling；补齐 4 项参数与 `manage.sh` 对齐 |
 | `exp9-closeout-runbook-20260920.md` | EXP-9 收官日操作手册（D5 激活/取证/LCP ladder 序列） |
@@ -203,6 +204,8 @@ docs/
 | `agent-client-credentials-20261020.md` | **本机 Agent 客户端凭证与 OpenCode 配置**：凭证映射表、`~/.zshenv` vs `~/.zshrc` 放置约定、`{env:VAR}` 用法与 GUI 启动陷阱、provider/MCP 清单（含 volcengine 下线）、Claude Code 权限文件脱敏与验收清单 |
 | `config-parameters-guide-20261017.md` | **配置参数指南**（自 AGENTS.md §11 拆出）：压缩 Profile / 本地云端 / 路由 / 队列 / 诊断 / 注入 / 自调优 / 跨会话记忆 九张推荐组合表（权威默认值仍= CONFIG_REGISTRY） |
 | `BENCHMARK.md` | 本地 LLM 性能测试报告与基线 |
+| `splash-model-capability-research-20261020.md` | **Splash 引擎与模型能力调研**：澄清「Inco 是否训练了更强模型」——`incoai` 12 仓库全量构成、DFlash2 是唯一训练产物、官方只有速度基准无能力基准、质量证据（perplexity 高于 llama.cpp 0.1–0.9%）、本机 27B vs 35B-A3B 双档实测、48GB「能力 vs 速度」两难选型表 |
+| `ane-ecosystem-survey-20261022.md` | **ANE 目标场景与应用生态调研**：设计哲学（固定 shape+高频+低功耗协处理器）、能力边界（decode/concat 不可行）、四层开源生态（Apple 官方 → WhisperKit 12M 下载级生产栈 → 逆向训练/驱动 → 社区 runtime）、社区三方共识（decode 上 ANE 是死路）、对本栈七条借鉴点（含 embedgemma2 迁 ANE 的可行性评估） |
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估 |

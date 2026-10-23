@@ -436,6 +436,9 @@ PROXY_TOOL_FILTER_ENABLED = os.environ.get("PROXY_TOOL_FILTER_ENABLED", "true" i
 PROXY_TOOL_FILTER_MAX = int(os.environ.get("PROXY_TOOL_FILTER_MAX", "20"))
 PROXY_TOOL_FILTER_RECENT = int(os.environ.get("PROXY_TOOL_FILTER_RECENT", "5"))
 PROXY_TOOL_AUTO_PROMOTE_THRESHOLD = int(os.environ.get("PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "3"))
+# DEF-313 P1: per-session tool set freeze (tools block is the prefix head on Qwen)
+PROXY_TOOLS_STABLE_SESSION = os.environ.get(
+    "PROXY_TOOLS_STABLE_SESSION", get_default("PROXY_TOOLS_STABLE_SESSION")).lower() in ("1", "true", "yes")
 TOOL_ALWAYS_KEEP = (
     "Read", "Write", "Edit", "Bash", "Glob", "Grep",
     "LS", "Task", "WebFetch", "WebSearch",
@@ -635,6 +638,8 @@ PROXY_CTX_VIEW_STABLE_ENABLED = os.environ.get(
 # 悬空调用→manifest 寄存→代答注入（主动）。默认关，与 dup 触发解耦。
 PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
     "PROXY_TOMBSTONE_RECALL_ENABLED", get_default("PROXY_TOMBSTONE_RECALL_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_EMIT_THINKING_BLOCKS = os.environ.get(
+    "PROXY_EMIT_THINKING_BLOCKS", get_default("PROXY_EMIT_THINKING_BLOCKS")).lower() in ("1", "true", "yes")
 
 # R-CM-4 符号级检索增强（2026-10-08；默认关，ctx_recall.py 符号索引层）：
 # query 命中符号名 → 在召回结果追加定义/引用位置（外部 grep/ctags via subprocess）。
@@ -1329,6 +1334,7 @@ _RELOAD_SPEC = [
     ("PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_MAX", "int", "20", "20"),
     ("PROXY_TOOL_FILTER_RECENT", "PROXY_TOOL_FILTER_RECENT", "int", "5", "5"),
     ("PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "int", "3", "3"),
+    ("PROXY_TOOLS_STABLE_SESSION", "PROXY_TOOLS_STABLE_SESSION", "bool", "false", "false"),
     # History index
     ("PROXY_HISTORY_INDEX", "PROXY_HISTORY_INDEX", "str", "rule", "rule"),
     ("PROXY_HISTORY_TOP_K", "PROXY_HISTORY_TOP_K", "int", "5", "5"),
@@ -1366,6 +1372,15 @@ _RELOAD_SPEC = [
     # L-73 / R-CM-6: 工具轮次输出下限兜底 + 长载荷工具不降压（reloadable）
     ("PROXY_DYNAMIC_MAX_TOKENS_FLOOR", "PROXY_DYNAMIC_MAX_TOKENS_FLOOR", "int", "32768", "32768"),
     ("PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", "PROXY_DYNAMIC_MAX_TOKENS_WRITE_NO_REDUCE", "bool", "true", "true"),
+    # 动态并发（2026-10-21 DEF-316：CONFIG_REGISTRY 标 reloadable，但 _RELOAD_SPEC
+    # 漏登记 → SIGHUP 无法关闭本地动态并发，_adjust_concurrency 仍可把 1 抬到 4。
+    # 48GB 机器上这就是 AGENTS.md §8.1 红线被绕过：prefill 与 decode 抢同一块 GPU，
+    # 实测 decode 52.9→23.2 tok/s、冷 48K TTFT 259s。补登记后 reload 生效。）
+    ("PROXY_DYNAMIC_CONCURRENT_ENABLED", "PROXY_DYNAMIC_CONCURRENT_ENABLED", "bool", "false", "true"),
+    ("PROXY_DYNAMIC_CONCURRENT_MIN", "PROXY_DYNAMIC_CONCURRENT_MIN", "int", "1", "1"),
+    ("PROXY_DYNAMIC_CONCURRENT_MAX", "PROXY_DYNAMIC_CONCURRENT_MAX", "int", "8", "4"),
+    ("PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS", "PROXY_DYNAMIC_CONCURRENT_LATENCY_P95_MS", "float", "30000", "30000"),
+    ("PROXY_DYNAMIC_CONCURRENT_ERROR_RATE", "PROXY_DYNAMIC_CONCURRENT_ERROR_RATE", "float", "0.2", "0.2"),
     # 请求优先级队列（Phase 1，默认关闭）
     ("PROXY_QUEUE_ENABLED", "PROXY_QUEUE_ENABLED", "bool", "false", "false"),
     ("PROXY_QUEUE_TIMEOUT_SECONDS", "PROXY_QUEUE_TIMEOUT_SECONDS", "int", "300", "300"),
@@ -1418,6 +1433,7 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_MAX_CHARS", "int", "4000", "4000"),
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
+    ("PROXY_EMIT_THINKING_BLOCKS", "PROXY_EMIT_THINKING_BLOCKS", "bool", "true", "true"),
     # K1 状态摘要 pin(2026-10-10, 分层契约 context-layered-contract §3/§5; SIGHUP 可热开)
     ("PROXY_TEST_STATE_ENABLED", "PROXY_TEST_STATE_ENABLED", "bool", "false", "false"),
     # S1 脚手架路由(2026-10-10, multi-agent-architecture §五建议1; SIGHUP 可热开)
@@ -1646,7 +1662,7 @@ __all__ = [
     "_BLOCKER_ERROR_MARKERS",
     # Tool filter
     "PROXY_TOOL_FILTER_ENABLED", "PROXY_TOOL_FILTER_MAX", "PROXY_TOOL_FILTER_RECENT",
-    "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD",
+    "PROXY_TOOL_AUTO_PROMOTE_THRESHOLD", "PROXY_TOOLS_STABLE_SESSION",
     "TOOL_ALWAYS_KEEP",
     # Fold dense (fifo A 路加密折叠)
     "PROXY_FOLD_DENSE_ENABLED", "PROXY_FOLD_DENSE_MAX_FILES", "PROXY_FOLD_DENSE_MAX_CHARS",
@@ -1654,6 +1670,7 @@ __all__ = [
     "PROXY_AUTO_RECALL_ENABLED", "PROXY_AUTO_RECALL_DUP_THRESHOLD",
     "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
     "PROXY_TOMBSTONE_RECALL_ENABLED",
+    "PROXY_EMIT_THINKING_BLOCKS",
     "PROXY_CTX_VIEW_STABLE_ENABLED",
     "PROXY_AUX_ISOLATION_STRICT",
     "PROXY_CLOUD_CM_ENABLED",

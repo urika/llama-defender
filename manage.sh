@@ -198,46 +198,57 @@ _current_config_name() {
 # ============================================================
 # 获取当前运行的后端类型
 # ============================================================
+_classify_backend_pid() {
+    # 按 pid 的进程名/命令行判定后端类型（PID 文件路径与端口持有者路径共用）
+    local pid="$1" comm
+    [[ -z "$pid" ]] && return 1
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
+    case "$comm" in
+        llama-server) echo "llama-server"; return 0 ;;
+        rapid-mlx|vllm-mlx) echo "rapid-mlx"; return 0 ;;
+        mlx_vlm) echo "mlx_vlm"; return 0 ;;
+        dflash) echo "dflash-mlx"; return 0 ;;
+        python3|python|python3.1)
+            # Splash: PID 文件里是 python 前端。1.3.x 起 CLI 以 `-m server.server`
+            # 启动；更早/直跑路径是 `server.py`。两种写法都要认——只匹配
+            # `server.py` 会让 1.4.0 掉进 pgrep 回退并被误判为 rapid-mlx
+            # （DEF-317, 2026-10-21）。
+            if ps -p "$pid" -o command= 2>/dev/null \
+                    | grep -Eq 'splash.*(server\.py|-m server\.server)'; then
+                echo "splash"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
 _current_backend() {
+    local pid
     if [[ -f "$PIDFILE" ]]; then
-        local pid
-        pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
-        if kill -0 "$pid" 2>/dev/null; then
-            local comm
-            comm=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
-            if [[ "$comm" == "llama-server" ]]; then
-                echo "llama-server"
+        pid=$(cat "$PIDFILE" 2>/dev/null) || pid=""
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            if _classify_backend_pid "$pid"; then
                 return 0
-            elif [[ "$comm" == "rapid-mlx" || "$comm" == "vllm-mlx" ]]; then
-                echo "rapid-mlx"
-                return 0
-            elif [[ "$comm" == "mlx_vlm" ]]; then
-                echo "mlx_vlm"
-                return 0
-            elif [[ "$comm" == "dflash" ]]; then
-                echo "dflash-mlx"
-                return 0
-            elif [[ "$comm" == "python3" || "$comm" == "python" || "$comm" == "python3.1" ]]; then
-                # Splash: PID 文件里是 server.py 前端(python), 用完整命令行判别
-                if ps -p "$pid" -o command= 2>/dev/null | grep -q 'splash.*server.py'; then
-                    echo "splash"
-                    return 0
-                fi
             fi
         fi
     fi
-    # fallback: search process
-    if pgrep -f "rapid-mlx" >/dev/null 2>&1; then
-        echo "rapid-mlx"
+    # 回退 1：监听 $LLAMA_PORT 的进程（唯一权威）。比 pgrep -f 可靠——
+    # 后者会命中任何命令行里"提到"目标字符串的进程（编辑器/shell/写文档的
+    # heredoc），实测把一个含 "rapid-mlx" 字样的 zsh 误判成后端。
+    pid=$(lsof -nP -iTCP:"${LLAMA_PORT:-8081}" -sTCP:LISTEN -t 2>/dev/null | head -1)
+    if [[ -n "$pid" ]] && _classify_backend_pid "$pid"; then
         return 0
-    elif pgrep -f "splash serve" >/dev/null 2>&1; then
+    fi
+    # 回退 2：收紧到真实 CLI 形态（`rapid-mlx` 裸串不再匹配）
+    if pgrep -f "splash serve-native|splash serve " >/dev/null 2>&1; then
         echo "splash"
+        return 0
+    elif pgrep -f "rapid-mlx serve" >/dev/null 2>&1; then
+        echo "rapid-mlx"
         return 0
     elif pgrep -f "dflash serve" >/dev/null 2>&1; then
         echo "dflash-mlx"
-        return 0
-    elif pgrep -f "mlx_vlm" >/dev/null 2>&1; then
-        echo "mlx_vlm"
         return 0
     elif pgrep -x "llama-server" >/dev/null 2>&1; then
         echo "llama-server"
@@ -726,7 +737,46 @@ _start_dflash_mlx() {
 # ============================================================
 # 启动 Inco Splash（engine built around the model; DFlash2 内置 decode 路径）
 # ============================================================
+_reap_splash_orphans() {
+    # 清理不在 PID 文件里的 Splash 残留（前端 `-m server.server` + 引擎 `serve-native`）。
+    #
+    # 事故背景（2026-10-22 01:07–01:13）：重启时旧的 serve-native 仍持有约 21GB
+    # Metal 内存，新实例拿不到内存 → 连续 bootstrap 失败
+    # （"not enough free memory to start (1500 MiB reclaimable ... system pressure
+    # warning)"），服务不可用约 5 分钟，3 个 59K/108K 上下文的生产请求被 Cancelled。
+    # 触发点是 PID 文件被新实例覆盖后，旧进程成了无人认领的孤儿：`stop` 只按
+    # PID 文件杀一个进程，端口检查也因旧前端已退出而放行。
+    local pids=() cur="" p
+    [[ -f "$PIDFILE" ]] && cur=$(cat "$PIDFILE" 2>/dev/null)
+    while read -r p; do
+        [[ -z "$p" ]] && continue
+        [[ "$p" == "$cur" ]] && continue
+        pids+=("$p")
+    done < <(pgrep -f 'splash serve-native' 2>/dev/null
+             pgrep -f 'splash/.*-m server\.server' 2>/dev/null)
+    [[ ${#pids[@]} -eq 0 ]] && return 0
+    warn "发现 ${#pids[@]} 个无人认领的 Splash 进程，清理中: ${pids[*]}"
+    for p in "${pids[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+    local i alive
+    for i in {1..10}; do
+        alive=0
+        for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [[ $alive -eq 0 ]] && break
+        sleep 1
+    done
+    for p in "${pids[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then
+            warn "PID $p 未响应 SIGTERM，强制终止"
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
+    sleep 2
+    return 0
+}
+
 _start_splash() {
+    # 先清孤儿再查端口：孤儿可能已不监听端口、但仍占着 Metal 内存
+    if [[ "$LLAMA_BACKEND" == "splash" ]]; then _reap_splash_orphans; fi
     _check_port "$LLAMA_PORT" || return 1
 
     command -v splash >/dev/null 2>&1 || {
@@ -1824,6 +1874,8 @@ cmd_stop_backend() {
                 pkill -f 'splash serve-native' 2>/dev/null || true
                 sleep 2
             fi
+            # 兜底：清掉所有不在 PID 文件里的 Splash 进程（见 _reap_splash_orphans 头注）
+            if [[ "$backend" == "splash" ]]; then _reap_splash_orphans; fi
             info "✅ 本地后端已停止 (GPU 内存已释放)"
             rm -f "$PIDFILE"
             _log_lifecycle_event "service_stop" "profile=$(_current_config_name) backend=$backend component=backend"

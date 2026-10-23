@@ -416,6 +416,16 @@ class InstrumentedPipeline(Pipeline):
             except Exception as e:
                 trace_context.finish_span(span, status="error", error=e)
                 log(f"  -> PIPELINE FAILURE at stage '{stage.name}': {type(e).__name__}: {e}")
+                # 2026-10-21: 只记异常消息时无法定位（如 'NoneType' object is not
+                # subscriptable 不带位置）。补一条压缩 traceback，便于值守直接判读。
+                try:
+                    import traceback
+                    _tb = "".join(traceback.format_exception(
+                        type(e), e, e.__traceback__))[-1200:]
+                    log(f"  -> PIPELINE TRACEBACK ({stage.name}): {_tb}",
+                        level="WARN")
+                except Exception:
+                    pass
                 raise RuntimeError(f"Pipeline stage '{stage.name}' failed: {type(e).__name__}: {e}") from e
             elapsed = (time.monotonic() - t0) * 1000
             trace_ctx_after = _trace_unit_map(ctx.messages)
@@ -1380,6 +1390,15 @@ class SmartRouter(PipelineStage):
         # 本地引擎选择: 路由可声明 local_model(如 haiku→ornith-9b 轻量引擎),
         # 空则默认 35B(LLAMA_BASE)
         ctx._route_local_model = pref.get("local_model", "")
+        # 路由级 thinking 开关（2026-10-21）：haiku 档强制直答，不消耗思考预算。
+        # FormatConverter 在转发前把它翻成 backend 的 thinking:disabled。
+        ctx._route_thinking_disabled = bool(pref.get("thinking_disabled", False))
+        # 路由级 max_tokens 下限（2026-10-21）：thinking 模型给小 max_tokens 会
+        # 全被思考吃光、拿不到 tool_use。0=不设。
+        try:
+            ctx._route_min_max_tokens = int(pref.get("min_max_tokens") or 0)
+        except (TypeError, ValueError):
+            ctx._route_min_max_tokens = 0
         ctx._agent_model_tier = _classify_tier(requested_model)
 
         # Store model force direction in ctx, don't return yet.
@@ -3851,6 +3870,15 @@ class FormatConverter(PipelineStage):
         quirks = (sel_entry or {}).get("request_quirks", {})
         if quirks.get("force_thinking_disabled"):
             openai_body["thinking"] = {"type": "disabled"}
+        elif getattr(ctx, '_route_thinking_disabled', False):
+            # 路由级开关（如 claude-haiku-4-5）：即使模型/引擎默认开 thinking，
+            # 该别名也保持直答。2026-10-21 实测：Splash 1.4.0 **无视**
+            # `thinking:{type:disabled}`（后端日志仍是 "effort absent → low ·
+            # thinking on"），但认 `reasoning_effort:"none"`（→ "effort none ·
+            # thinking off"）。两个字段都发——前者覆盖 deepseek 类后端，后者覆盖
+            # splash/OpenAI 语义后端。
+            openai_body["thinking"] = {"type": "disabled"}
+            openai_body["reasoning_effort"] = "none"
         elif sel_entry is None and _ps.IS_CLOUD and "flash" in sel_model.lower():
             openai_body["thinking"] = {"type": "disabled"}
         # Kimi thinking-only models reject any temperature != 1
@@ -3867,6 +3895,18 @@ class FormatConverter(PipelineStage):
                 log(f"  -> [quirk] max_tokens {openai_body['max_tokens']} -> {floor} "
                     f"(thinking-only model: reserve room for text after reasoning)")
                 openai_body["max_tokens"] = floor
+        # 路由级下限（2026-10-21，如 claude-sonnet-4-6 → 1600）：thinking + tool_use
+        # 共享同一预算，实测 <768 时思考吃光预算、tool_use 不出现。
+        # 同步改 Anthropic body，否则输出截断阈值仍按客户端原值 ×2 计算，
+        # 会把本已放宽的 tool_call 再截掉。
+        _route_floor = int(getattr(ctx, "_route_min_max_tokens", 0) or 0)
+        _cur_mt = openai_body.get("max_tokens")
+        if _route_floor and isinstance(_cur_mt, int) and _cur_mt < _route_floor:
+            log(f"  -> [route quirk] max_tokens {_cur_mt} -> {_route_floor} "
+                f"(reserve room for thinking + tool_use)")
+            openai_body["max_tokens"] = _route_floor
+            if isinstance(body, dict) and isinstance(body.get("max_tokens"), int):
+                body["max_tokens"] = _route_floor
         # Reasoning-effort passthrough: map the client's Anthropic-scale
         # output_config.effort (or OpenAI reasoning_effort, or the catalog's
         # reasoning_effort_default quirk) onto the backend's accepted levels.
@@ -4548,33 +4588,60 @@ class BackendDispatcher(PipelineStage):
                 ctx._route_target = 'cloud'
                 ctx._route_reason = 'local_failure_fallback'
 
-                # Retry with cloud backend — resolve via the catalog so the
-                # correct provider endpoint/key/lock is used.
-                cloud_cand = None
-                for _c in candidates or self._cloud_candidates(ctx):
-                    if _c["api_key"] and not _ps._provider_cooldown_active(_c["provider"]):
-                        cloud_cand = _c
-                        break
-                if cloud_cand is None:
-                    cloud_cand = self._resolve_cloud_target(
-                        getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL)
-                ctx._route_cloud_model = cloud_cand["model"]
-                ctx._route_provider = cloud_cand["provider"]
-                log(f"  -> Fallback to cloud backend (provider={cloud_cand['provider']}, {cloud_cand['model']})")
-                if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
-                    ctx.openai_body["model"] = cloud_cand["model"]
-                self._set_route_headers(ctx)
-                try:
-                    with cloud_cand["lock"]:
-                        self._do_dispatch(ctx, cloud_cand["base_url"], cloud_cand["api_key"])
-                except Exception as e2:
-                    log(f"  <- Cloud fallback also failed: {e2}")
-                    self._handler._respond_json({
-                        "error": {
-                            "message": f"Local failed: {err_msg}; cloud fallback failed: {e2}",
-                            "type": "backend_unavailable",
-                        }
-                    }, 503)
+                # Retry with cloud backend — walk the catalog chain exactly like
+                # the normal cloud path (pipeline.py:4308): skip cooldown / no-key
+                # providers and, for OpenAI-protocol clients, anthropic-protocol
+                # providers. DEF-314: the fallback previously (a) took only the
+                # first candidate, so a 401 on candidate #1 never reached the rest
+                # of the chain, and (b) always dispatched through the OpenAI
+                # parser, so anthropic-protocol providers raised KeyError: 'choices'
+                # (message_converter.py:810).
+                _fb_cands = [c for c in (candidates or self._cloud_candidates(ctx))
+                             if _usable(c)]
+                if not _fb_cands:
+                    _fb_cands = [self._resolve_cloud_target(
+                        getattr(ctx, '_route_cloud_model', '') or _ps.PROXY_CLOUD_MODEL)]
+                _fb_err = None
+                for _fb in _fb_cands:
+                    ctx._route_cloud_model = _fb["model"]
+                    ctx._route_provider = _fb["provider"]
+                    log(f"  -> Fallback to cloud backend "
+                        f"(provider={_fb['provider']}, {_fb['model']}"
+                        f"{', anthropic protocol' if _fb.get('protocol') == 'anthropic' else ''})")
+                    if hasattr(ctx, 'openai_body') and isinstance(ctx.openai_body, dict):
+                        ctx.openai_body["model"] = _fb.get("api_model") or _fb["model"]
+                    self._set_route_headers(ctx)
+                    try:
+                        if _fb.get("protocol") == "anthropic":
+                            with _fb["lock"]:
+                                self._do_dispatch_anthropic(ctx, _fb)
+                        else:
+                            with _fb["lock"]:
+                                self._do_dispatch(ctx, _fb["base_url"], _fb["api_key"])
+                        _ps._record_provider_success(_fb["provider"])
+                        return ctx
+                    except urllib.error.HTTPError as _e2:
+                        _fb_err = f"HTTP {_e2.code}"
+                        log(f"  <- Cloud fallback candidate {_fb['model']} "
+                            f"failed ({_fb_err}), trying next...")
+                        try:
+                            _log_cloud_error(ctx, _e2.code,
+                                             _e2.read().decode("utf-8", "replace"))
+                        except Exception:
+                            pass
+                        continue
+                    except Exception as _e2:
+                        _fb_err = f"{type(_e2).__name__}: {_e2}"
+                        log(f"  <- Cloud fallback candidate {_fb['model']} "
+                            f"failed ({_fb_err}), trying next...")
+                        continue
+                log(f"  <- Cloud fallback exhausted: {_fb_err}")
+                self._handler._respond_json({
+                    "error": {
+                        "message": f"Local failed: {err_msg}; cloud fallback failed: {_fb_err}",
+                        "type": "backend_unavailable",
+                    }
+                }, 503)
 
         return ctx
 

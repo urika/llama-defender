@@ -170,7 +170,7 @@ PROXY_OOM_SAFE_CHARS="280000"
 ```
 SLA：暖轮 <10s；冷轮 <60s。
 
-### 4.2 coding 档（现行生产 `ornith-oq4e.conf`，不变）
+### 4.2 coding 档（历史：原生产 `ornith-oq4e.conf`，2026-10-21 归档）
 
 ```bash
 PROXY_CTX_CHARS_LIMIT="400000"         # ≈114K tokens
@@ -188,12 +188,13 @@ PROXY_CTX_LIMIT_ENABLED="true"
 PROXY_CTX_TRUNCATE_STRATEGY="fifo"
 PROXY_CTX_KEEP_MESSAGES="512"          # 事实禁头截断(200 轮会话≈300 条, 永不触发)
 PROXY_OOM_SAFE_CHARS="3200000"         # 关预截断
-PROXY_MAX_REQUEST_BYTES="1200000"      # 900KB 文本 + 结构开销
+PROXY_OOM_SAFE_TOKENS="600000"         # 必须显式抬高(默认 60000 会硬砍到 12 条)
+PROXY_MAX_REQUEST_BYTES="4194304"      # 900K chars 在中文下可达 ~2.7MB
 
-# ---- 后端: KV 空间翻倍(从 8192 起步, 验证后上探) ----
+# ---- 后端: KV 按真实账配置(2026-10-21 更正; 256K bf16 = 5.0GiB) ----
 RAPID_MLX_EXTRA_ARGS="--no-mllm --gpu-memory-utilization 0.80 \
-  --cache-memory-mb 12800 --max-num-seqs 1 \
-  --default-repetition-penalty 1.0 --hybrid-cache-entries 8 ..."
+  --cache-memory-mb 8192 --max-num-seqs 1 \
+  --default-repetition-penalty 1.0 --hybrid-cache-entries 8 --pin-system-prompt"
 
 # ---- 超时: 覆盖 256K 冷启动 ----
 PROXY_BACKEND_TIMEOUT="1200"           # 20min > 10min 冷 prefill + 生成
@@ -201,9 +202,19 @@ PROXY_BACKEND_TIMEOUT="1200"           # 20min > 10min 冷 prefill + 生成
 
 **设计要点**：
 1. **keep=512 = 事实禁头截断**。会话内前缀永不碎 → 首轮 8-10min 后每轮只付增量（10-30s）。超 900K chars 时由 PDC 路径接管：ctx_recall 折叠 + 召回（L1 指引已就位），而非无感丢弃
-2. **KV 从 12800MB 起步**（≈196K tok），实测校准 bytes/token 后再上探 16384。校准方法见 §6
+2. **`cache-memory-mb` 固定 8192**：256K 的 bf16 KV 实测账为 5.0GiB，8192 容器足够；12800/16384 已有 Metal 压力驱逐反例。校准方法见 §6
 3. **首轮 10 分钟的预期管理**：SSE 心跳已保活（#51-B1）；agent_go 侧 backend timeout 需 ≥1200s
 4. **护栏**：`manage.sh monitor` 盯 Metal 峰值；memory_pressure 拒绝路径保持开启；优雅停止（§8.6 Metal 死锁纪律）
+
+> **2026-10-21 更正（KV 账与引擎能力）**
+>
+> 本节早期的 KV 外推（12–16GB @ 256K）已作废。按 Ornith-1.5-35B 的 `text_config` 精确计算：40 层 = 30 linear_attention + 10 full_attention，`num_key_value_heads=2`，`head_dim=256` → 每 token 10,240 个 KV 元素；bf16 = 20KiB/token，**256K = 5.0GiB**；int8 ≈2.6GiB，int4 ≈1.35GiB。GDN recurrent state 固定 ~34MiB/序列，不随上下文增长。总预算 20.1（权重）+ 5.0（KV）+ 0.03（state）+ 2–3（激活/保留）≈ **27–28GB**，在实测 32.5GB 安全线内。
+>
+> 另：0.14.3 的 KV 量化在 hybrid 上 **fail-closed**——静态 safelist 虽未列 `qwen3_5_moe`，但运行期探针实测抛出 `KVCacheQuantizationUnsupportedError: ArraysCache`（2026-09-23）。因此本档 **bf16 是唯一路径**；256K 的 5.0GiB 已在预算内，不需要量化。int8/int4 需等引擎支持或换引擎。
+>
+> `cache-memory-mb` 维持 **8192**：它是多 entry 容器上限，不是单会话预算；12288 有 248 次 Metal 压力驱逐、16384 已回退的实测反例。
+>
+> **2026-10-21 归档**：本节的 `ornith-oq4e-256k.conf` 与 §4.2 的 `ornith-oq4e.conf` 均已移至 `configs/archived/`，35B oQ4e 权重已删除；Ornith 家族仅保留 9B。本节保留作为设计存档。
 
 ### 4.4 档位 ↔ 约定接口（模型与客户端的可感知性）
 

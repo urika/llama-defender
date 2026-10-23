@@ -2857,6 +2857,16 @@ def _build_status_html():
             f'PID={_e["pid"] or "—"} · {_e["model_name"] or "?"}</span></span></div>'
         )
     engines_card = f"""<div class="card"><h2>Local Engines</h2>{''.join(_eng_rows)}</div>"""
+    # 2026-10-22: Proxy 卡片独立成变量——用户要求与 Local Engines 一起置顶常显
+    proxy_card = f"""<div class="card">
+    <h2>Proxy</h2>
+    <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{proxy_color}"></span>{"Running" if proxy_info.get("running") else "Stopped"}</span></div>
+    <div class="row"><span class="label">Name</span><span class="value">{proxy_info.get("name", "N/A")}</span></div>
+    <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
+    <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
+    <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
+    <div class="row"><span class="label">Backend</span><span class="value">{_ps.LLAMA_BASE}</span></div>
+  </div>"""
 
     # Conditional log-stat rows (avoid backslashes inside f-strings)
     oom_row = ""
@@ -2936,6 +2946,10 @@ def _build_status_html():
 <div class="ts">Updated: {now} &nbsp;•&nbsp; Auto-refresh every 5s</div>
 
 <div class="grid">
+  <!-- 2026-10-22: Local Engines 与 Proxy 置顶常显（优先展示，不折叠） -->
+  {engines_card}
+  {proxy_card}
+
   {hero_html}
 
   <div class="card" style="grid-column: 1 / -1;">
@@ -2948,20 +2962,10 @@ def _build_status_html():
   {route_card}
 
   <details class="card" style="grid-column: 1 / -1;">
-    <summary>🔧 Services / System（进程 · 内存 · 日志）</summary>
+    <summary>🔧 Backend / System（后端进程 · 内存 · 日志）</summary>
     <div class="grid" style="margin-top:12px">
       {backend_card}
-      {engines_card}
-
-      <div class="card">
-        <h2>Proxy</h2>
-        <div class="row"><span class="label">Status</span><span class="value"><span class="status-dot" style="background:{proxy_color}"></span>{"Running" if proxy_info.get("running") else "Stopped"}</span></div>
-        <div class="row"><span class="label">Name</span><span class="value">{proxy_info.get("name", "N/A")}</span></div>
-        <div class="row"><span class="label">PID</span><span class="value">{proxy_info.get("pid", "N/A")}</span></div>
-        <div class="row"><span class="label">Memory</span><span class="value">{proxy_info.get("rss_mb", "N/A")} MB</span></div>
-        <div class="row"><span class="label">Listen</span><span class="value">127.0.0.1:4000</span></div>
-        <div class="row"><span class="label">Backend</span><span class="value">{_ps.LLAMA_BASE}</span></div>
-      </div>
+      <!-- Local Engines / Proxy 已置顶常显（2026-10-22） -->
 
       <div class="card">
         <h2>System Memory</h2>

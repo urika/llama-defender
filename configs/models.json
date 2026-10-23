@@ -418,7 +418,9 @@
       ],
       "behavior": "prefer",
       "threshold_factor": 1.0,
-      "memory_bias": 0
+      "memory_bias": 0,
+      "min_max_tokens": 3000,
+      "_note": "2026-10-22: min_max_tokens=3000 —— thinking on 时小 max_tokens 会被思考吃光（128/256/384/512 均无 tool_use，768 起稳定）。单轮委派峰值 839，1600 够；但多轮回传后终答会重新思考整段上下文（实测一次 think 1952 字符 + 长答案把 1600 打满，stop=max_tokens 截断），故提到 3000。"
     },
     "claude-opus-4-7": {
       "route_bias": "prefer_cloud",
@@ -442,10 +444,11 @@
         "deepseek-flash"
       ],
       "behavior": "force",
-      "local_model": "",
+      "local_model": "local-default",
+      "thinking_disabled": true,
       "threshold_factor": 2.0,
       "memory_bias": 0,
-      "_note": "2026-10-20: local_model 由 ornith-9b 置空——9B 引擎(:8084)未常驻时 haiku 会硬失败(connection refused)并触发计费云端兜底。改为回落主引擎(当前 35B/27B)。需要 9B 轻量分流时显式使用 ornith-9b 别名。"
+      "_note": "2026-10-21: local_model 显式绑定 local-default → provider=local → LLAMA_BASE(:8081) 当前主力引擎。此前为空串走隐式回落，行为等价但不可读；更早指向 ornith-9b(:8084)，9B 未常驻时 haiku 会硬失败(connection refused)并触发计费云端兜底。需要 9B 轻量分流时显式改用 ornith-9b 别名。"
     },
     "ornith-9b": {
       "route_bias": "prefer_local",
