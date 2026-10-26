@@ -26,6 +26,7 @@ cd "$ROOT"
 LOGFILE="logs/service-monitor.log"
 LATEST="logs/service-monitor.latest.json"
 STATE="logs/service-monitor.state"
+RESTART_STATE="logs/service-monitor.restart.json"
 PIDFILE="logs/service-monitor.pid"
 
 INTERVAL="${MONITOR_INTERVAL:-300}"
@@ -52,7 +53,14 @@ analyze() {
     BATCH="no"
     pgrep -f "swe_test exp _exec|run_agent.py" >/dev/null 2>&1 && BATCH="yes"
 
-    METRICS="$metrics" BATCH="$BATCH" python3 - <<'PY'
+    # 系统级内存账本：swap（2026-10-27：引擎级 denied/headroom 只是它的下游
+    # 症状，swap 近满时引擎重启救不了——真实根因必须进判据面）
+    local swap_line swap_used swap_total
+    swap_line="$(sysctl -n vm.swapusage 2>/dev/null || echo '')"
+    swap_used="$(echo "$swap_line" | sed -n 's/.*used = \([0-9.]*\)\([MG]\).*/\1 \2/p' | awk '{ if ($2=="G") printf "%d", $1*1024; else printf "%d", $1 }')"
+    swap_total="$(echo "$swap_line" | sed -n 's/.*total = \([0-9.]*\)\([MG]\).*/\1 \2/p' | awk '{ if ($2=="G") printf "%d", $1*1024; else printf "%d", $1 }')"
+
+    METRICS="$metrics" BATCH="$BATCH" SWAP_USED="${swap_used:-0}" SWAP_TOTAL="${swap_total:-0}" python3 - <<'PY'
 import json, os, sys
 
 m = {}
@@ -96,6 +104,8 @@ out = {
     "req_cancelled": int(g("requests_cancelled_total", 0)),
     "pressure": "critical" if g("pressure_critical") else ("warning" if g("pressure_warning") else "normal"),
     "active_decoding": int(g("scheduler_decoding", 0)),
+    "swap_used_mb": int(os.environ.get("SWAP_USED") or 0),
+    "swap_total_mb": int(os.environ.get("SWAP_TOTAL") or 0),
 }
 print(json.dumps(out))
 PY
@@ -205,30 +215,58 @@ elif th == "fair":
     if level == "OK": level = "INFO"
     alerts.append("热状态 fair")
 
+# 7b) 系统级 swap（2026-10-27：真实根因面——引擎级 denied 只是它的下游症状；
+#     swap 近满时**引擎重启救不了**，需重启系统，故只告警+建议，不自动执行）
+_swap_lvl, _swap_msg = mw.swap_alert(
+    snap.get("swap_used_mb"), snap.get("swap_total_mb"),
+    warn_mb=float(os.environ.get("MONITOR_SWAP_MB", 6144)))
+if _swap_lvl:
+    alerts.append(_swap_msg)
+    if _swap_lvl == "CRIT":
+        level = "CRIT"
+    else:
+        level = mw.sev_max(level, "WARN")
+    snap["swap_alert"] = _swap_lvl
+
 # 8) 建议
 recs = []
-degraded = snap["memory_denied"] > 500 or hr < float(os.environ.get("MONITOR_HEADROOM_G", 8)) or p95 > 30
+# 「当前劣化」用速率口径（degraded_now），「批跑期累计脏」另由 recycle 判据处理
+_degraded_now, _degraded_why = mw.degraded_now(
+    snap,
+    denied_rate_th=float(os.environ.get("MONITOR_DENIED_RATE", 300)),
+    headroom_g=float(os.environ.get("MONITOR_HEADROOM_G", 8)),
+    ttft_p95_s=float(os.environ.get("MONITOR_TTFT_P95_S", 60)))
+_degraded_hist = (snap["memory_denied"] > 500
+                   or hr < float(os.environ.get("MONITOR_HEADROOM_G", 8))
+                   or p95 > 30)
 if snap["batch"]:
-    if degraded:
+    if _degraded_hist or _degraded_now:
         recs.append("批跑进行中且已劣化：批跑结束后立即 restart（清 KV/state，denied 归零）")
     else:
         recs.append("批跑进行中：保持观察，批跑结束后重启一次")
 else:
-    if degraded:
-        recs.append("服务空闲但已劣化：建议立即 ./manage.sh restart")
+    if _degraded_now:
+        recs.append(f"服务当前仍在劣化（{_degraded_why}）：建议 ./manage.sh restart")
+    elif _degraded_hist:
+        recs.append("服务已无在飞负载但带批跑残留：建议 restart 清场（清 KV/state，denied 归零）")
     else:
         recs.append("服务健康，无需动作")
+# swap 根因建议（引擎重启救不了 swap → 系统重启）
+if snap.get("swap_alert"):
+    recs.append("swap 偏高：引擎重启无法释放 swap，建议择机**重启系统**释放内存账本")
 
 snap["level"] = level
 snap["alerts"] = alerts
 snap["advice"] = "; ".join(recs) if recs else "服务健康"
+snap["degraded_now"] = _degraded_now
+snap["degraded_why"] = _degraded_why
 
 # 写状态文件（供下轮差分）
 snap["ts_epoch"] = now
 tmp = state_f + ".tmp"
 _st = {k: snap.get(k) for k in
        ("ts_epoch", "memory_denied", "memory_headroom_gb", "kv_gb", "state_gb",
-        "req_completed")}
+        "req_completed", "batch")}
 # 滚动窗口历史样本：(ts, headroom_gb, denied)——外推用（相邻窗差分噪声大）
 _st["hist"] = [[round(h[0], 3), round(h[1], 3), round(h[2], 3)] for h in hist]
 json.dump(_st, open(tmp, "w"))
@@ -258,6 +296,7 @@ print(f"[{s['ts']}] {lvl} | batch={s.get('batch')} | "
       f"ttft {s.get('ttft_p50_ms')}ms/{s.get('ttft_p95_ms')}ms itl {s.get('itl_p50_ms')}ms "
       f"dec {s.get('decode_tps')} pre {s.get('prefill_tps')} draft {s.get('draft_acceptance')} | "
       f"th {s.get('thermal','—')} | "
+      f"swap {s.get('swap_used_mb','—')}MB/{s.get('swap_total_mb','—')}MB | "
       f"eta {s.get('headroom_eta_h') if s.get('headroom_eta_h') is not None else '—'}"
       f"({s.get('headroom_eta_window_min','—')}min 窗) | {s.get('advice','')}")
 for a in s.get("alerts", []):
@@ -297,17 +336,105 @@ cmd_once() {
     snap=$(report "$snap" "$STATE" 2>/dev/null) || snap="$snap"
     emit "$snap" "$mode" || true
     append_log "$snap" || true
-    # 守护模式下：批跑结束且已劣化 → 可选自动重启
+    # 守护模式下：重启决策（2026-10-27 重写）
+    #  两个判据分开：
+    #   (A) 清场 recycle：上轮在批跑、本轮不在 + 本批累计 denied 超阈 → 重启一次
+    #       （覆盖 2026-10-26 批跑收官后「denied 765 残留、TTFT p95 9.8s」空转 2h 的场景）
+    #   (B) 持续劣化 degraded_now：滚动速率/headroom/TTFT p95 → 重启（带冷却+退避+次数上限）
+    #  防风暴：冷却 MONITOR_RESTART_COOLDOWN_S（默认 900s）+ 最多 MONITOR_RESTART_MAX_ATTEMPTS
+    #          （默认 3）次；失败计入退避，不无限重试。
     if [[ "${MONITOR_AUTO_RESTART:-0}" == "1" ]] && [[ "${2:-}" == "daemon" ]]; then
-        local batch degraded
-        batch=$(python3 -c "import json,sys;print(json.loads(sys.argv[1]).get('batch'))" "$snap")
-        degraded=$(python3 -c "
-import json,sys
-s=json.loads(sys.argv[1])
-print('yes' if (s['memory_denied']>500 or s['memory_headroom_gb']<float(os.environ.get('MONITOR_HEADROOM_G',8)) or s['ttft_p95_ms']>30000) else 'no')" "$snap")
-        if [[ "$batch" == "False" && "$degraded" == "yes" ]]; then
-            warn "批跑已结束且服务劣化，执行自动重启（MONITOR_AUTO_RESTART=1）"
-            ./manage.sh restart >> "$LOGFILE" 2>&1 && info "自动重启完成"
+        _dec="$(MONITOR_TOOLS_DIR="$ROOT/tools" python3 - "$snap" "$STATE" "$RESTART_STATE" <<'PY'
+import json, os, sys, time
+
+snap = json.loads(sys.argv[1])
+state_f, rst_f = sys.argv[2], sys.argv[3]
+now = time.time()
+
+try:
+    prev = json.load(open(state_f))
+except Exception:
+    prev = {}
+try:
+    rst = json.load(open(rst_f))
+except Exception:
+    rst = {}
+
+prev_batch = prev.get("batch")
+now_batch = bool(snap.get("batch"))
+cum_denied = snap.get("memory_denied") or 0
+
+sys.path.insert(0, os.environ.get("MONITOR_TOOLS_DIR", "."))
+import monitor_window as mw
+
+recycle = mw.recycle_needed(prev_batch, now_batch, cum_denied,
+                             th=float(os.environ.get("MONITOR_RECYCLE_DENIED", 500)))
+degraded, why = mw.degraded_now(
+    snap,
+    denied_rate_th=float(os.environ.get("MONITOR_DENIED_RATE", 300)),
+    headroom_g=float(os.environ.get("MONITOR_HEADROOM_G", 8)),
+    ttft_p95_s=float(os.environ.get("MONITOR_TTFT_P95_S", 60)))
+allowed, deny_reason = mw.restart_allowed(
+    now, rst.get("last_restart_ts"), rst.get("attempts", 0),
+    cooldown_s=float(os.environ.get("MONITOR_RESTART_COOLDOWN_S", 900)),
+    max_attempts=int(os.environ.get("MONITOR_RESTART_MAX_ATTEMPTS", 3)))
+
+do_restart = False
+reason = ""
+if recycle:
+    do_restart, reason = True, "recycle:批跑收官清场（累计 denied=%d）" % cum_denied
+elif degraded and now_batch is False:
+    if allowed:
+        do_restart, reason = True, "degraded_now(%s)" % why
+    else:
+        reason = "skipped:%s" % deny_reason
+
+print(json.dumps({"do_restart": do_restart, "reason": reason,
+                  "recycle": recycle, "degraded": degraded, "why": why,
+                  "allowed": allowed, "deny": deny_reason,
+                  "attempts": rst.get("attempts", 0)}, ensure_ascii=False))
+PY
+)"
+        _do=$(echo "$_dec" | python3 -c "import json,sys;print(json.loads(sys.argv[1])['do_restart'])" 2>/dev/null || echo False)
+        _why=$(echo "$_dec" | python3 -c "import json,sys;print(json.loads(sys.argv[1])['reason'])" 2>/dev/null || echo "")
+        if [[ "$_do" == "True" ]]; then
+            warn "触发自动重启（$_why）"
+            if ./manage.sh restart >> "$LOGFILE" 2>&1; then
+                info "自动重启完成（$_why）"
+                _rs="$(python3 - "$RESTART_STATE" <<'PY'
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+d["last_restart_ts"] = time.time()
+d["attempts"] = 0
+d["last_reason"] = sys.argv[2] if len(sys.argv) > 2 else ""
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"))
+os.replace(tmp, p)
+PY
+)" 2>/dev/null
+            else
+                warn "自动重启失败，计入退避（$_why）"
+                python3 - "$RESTART_STATE" <<'PY'
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+d["attempts"] = int(d.get("attempts", 0)) + 1
+d["last_restart_ts"] = time.time()
+d["last_fail_ts"] = time.time()
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"))
+os.replace(tmp, p)
+PY
+            fi
+        elif [[ -n "$_why" ]]; then
+            info "跳过自动重启（$_why）"
         fi
     fi
 }

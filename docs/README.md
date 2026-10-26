@@ -169,6 +169,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| `monitor-auto-restart-upgrade-20261027.md` | **监控自动重启能力升级**：「2026-10-26 残留劣化/swap 膨胀能否避免」的结论与落地——清场/劣化两判据拆分、冷却与退避防重启风暴、swap 根因判据（只告警不自动重启系统）、AUTO_RESTART 经 launchd 正式启用 |
 | `system-reboot-20261027.md` | **系统重启（swap 10.4GB/11.3GB 触发）**：重启前体检留档、开机自启补齐（launchd RunAtLoad + startup_stack.sh）、重启后一键验收（post_reboot_check.sh 8 项）与开批前判定要点 |
 | `fnf-flags-activation-20261027.md` | **fnf 一期四旗标激活戳记**：F1/F2/F3'/F3 的「一次窗一次戳」落档（conf sha256 前后、代理 PID、窗前后 /metrics 快照）、空窗门（进程面＋静默面）、生产功能验证（`fnf_guided=2` 实测）与回滚步骤；供 swe-eval 按方案 §4 分段判读 |
 | `splash-132-migration-20261020.md` | **Splash 1.0.2 → 1.3.2 迁移 Runbook**：1.3.0/1.3.1/1.3.2 三版新特性逐项对照（ANE prefill、Splash 包作废 breaking change、NVFP4/FP8、`--state-format bf16`、SSD 缓存默认开、thinking budget、延迟优化）、可复现迁移步骤、验收基线、回退与已知限制 |

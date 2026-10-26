@@ -19,6 +19,11 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key><string>/Users/jinsongwang</string>
+    <key>MONITOR_AUTO_RESTART</key><string>1</string>
+    <key>MONITOR_SWAP_MB</key><string>6144</string>
+    <key>MONITOR_RECYCLE_DENIED</key><string>500</string>
+    <key>MONITOR_RESTART_COOLDOWN_S</key><string>900</string>
+    <key>MONITOR_RESTART_MAX_ATTEMPTS</key><string>3</string>
   </dict>
   <key>StandardOutPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/service-monitor.daemon.log</string>
   <key>StandardErrorPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/service-monitor.daemon.log</string>

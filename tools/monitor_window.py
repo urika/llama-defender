@@ -103,3 +103,69 @@ def denied_rate(history, min_span_min=15.0):
     if s is None or span < min_span_min:
         return {"rate_per_h": None, "span_min": round(span, 1)}
     return {"rate_per_h": round(s, 1), "span_min": round(span, 1)}
+
+
+# ---------------------------------------------------------------------------
+# 重启决策（2026-10-27：把「批跑收官清场」与「当前持续劣化」拆成两个判据）
+#
+# 背景：2026-10-26 批跑收官后服务带残留劣化（denied 765 累计、TTFT p95 9.8s、
+# decode 72.5 tok/s）空转近 2 小时无人处理，swap 一路涨到 10.4GB。旧实现
+# 只有一条判据（累计 denied>500 且 batch=False）且未启用（MONITOR_AUTO_RESTART
+# 恒 0），既没触发、也没有冷却/退避（若触发且重启失败会每 5 分钟重试＝风暴）。
+# ---------------------------------------------------------------------------
+
+def degraded_now(snap, denied_rate_th=300.0, headroom_g=8.0, ttft_p95_s=30.0):
+    """当前是否**仍在**劣化（速率口径，不用累计计数）。
+
+    返回 (bool, 原因)。累计 denied 是「历史累积」信号（批跑期必然高），
+    不能用来判「现在还坏着」——那是清场判据的事。
+    """
+    rate = snap.get("denied_rate_per_h")
+    if rate is not None and rate > denied_rate_th:
+        return True, "denied_rate"
+    hr = snap.get("memory_headroom_gb")
+    if hr is not None and hr < headroom_g:
+        return True, "headroom"
+    p95 = (snap.get("ttft_p95_ms") or 0) / 1000.0
+    if p95 > ttft_p95_s:
+        return True, "ttft_p95"
+    return False, ""
+
+
+def recycle_needed(prev_batch, now_batch, cum_denied, th=500):
+    """批跑收官**一次性清场**：上轮在批跑、本轮不在，且本批累计拒绝量超阈。
+
+    命中即重启一次（清 KV/state、denied 归零、headroom 回位）。
+    """
+    if prev_batch is True and now_batch is False and (cum_denied or 0) > th:
+        return True
+    return False
+
+
+def restart_allowed(now_ts, last_restart_ts, attempts,
+                    cooldown_s=900, max_attempts=3):
+    """重启许可闸：冷却期 + 最大尝试次数（防重启风暴）。
+
+    返回 (bool, 原因)。
+    """
+    if attempts >= max_attempts:
+        return False, "已达最大尝试次数"
+    if last_restart_ts and (now_ts - last_restart_ts) < cooldown_s:
+        return False, "冷却期内"
+    return True, ""
+
+
+def swap_alert(swap_used_mb, swap_total_mb, warn_mb=6144):
+    """系统级 swap 判据——**真实根因所在**（引擎重启救不了 swap）。
+
+    返回 (level, msg)：level ∈ {None, "WARN", "CRIT"}。
+    """
+    if not swap_used_mb:
+        return None, ""
+    if swap_total_mb and swap_used_mb >= swap_total_mb * 0.9:
+        return "CRIT", (f"swap 近满 {swap_used_mb}MB/{swap_total_mb}MB —— "
+                        f"系统内存账本已耗尽：引擎重启救不了，需重启系统")
+    if swap_used_mb > warn_mb:
+        return "WARN", (f"swap 已用 {swap_used_mb}MB（阈值 {warn_mb}MB）—— "
+                        f"内存准入拒绝(denied)的上游根因，建议择机重启系统")
+    return None, ""

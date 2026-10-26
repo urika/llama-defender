@@ -121,6 +121,56 @@ class MonitorWindowTest(unittest.TestCase):
         self.assertEqual(mw.sev_max("CRIT", "CRIT"), "CRIT")
         self.assertNotEqual(mw.sev_max("CRIT", "WARN"), max("CRIT", "WARN"))
 
+    # ---- 重启决策（清场 / 劣化 / 冷却 / swap）----
+
+    def test_degraded_now_uses_rate_not_cumulative(self):
+        """关键区分：累计 denied 高但当前速率 0 ⇒ **不算当前劣化**（那是清场判据）。"""
+        snap = {"denied_rate_per_h": 0.0, "memory_denied": 765,
+                "memory_headroom_gb": 17.7, "ttft_p95_ms": 9793.0}
+        bad, why = mw.degraded_now(snap)
+        self.assertFalse(bad)
+        self.assertEqual(why, "")
+
+    def test_degraded_now_rate_headroom_ttft(self):
+        snap = {"denied_rate_per_h": 1200.0, "memory_headroom_gb": 17.0,
+                "ttft_p95_ms": 1000.0}
+        self.assertEqual(mw.degraded_now(snap)[1], "denied_rate")
+        snap2 = {"denied_rate_per_h": 0.0, "memory_headroom_gb": 5.0,
+                 "ttft_p95_ms": 1000.0}
+        self.assertEqual(mw.degraded_now(snap2)[1], "headroom")
+        snap3 = {"denied_rate_per_h": 0.0, "memory_headroom_gb": 17.0,
+                 "ttft_p95_ms": 45000.0}
+        self.assertEqual(mw.degraded_now(snap3)[1], "ttft_p95")
+
+    def test_recycle_needed_on_batch_end(self):
+        """批跑收官一次性清场：上轮在批跑→本轮不在 + 累计拒绝超阈。"""
+        self.assertTrue(mw.recycle_needed(True, False, 765, th=500))
+        self.assertFalse(mw.recycle_needed(True, False, 100, th=500))
+        self.assertFalse(mw.recycle_needed(True, True, 765, th=500))
+        self.assertFalse(mw.recycle_needed(False, False, 765, th=500))
+
+    def test_restart_allowed_cooldown_and_cap(self):
+        """冷却 + 次数上限（防重启风暴）。"""
+        now = 100000.0
+        ok, _ = mw.restart_allowed(now, None, 0)
+        self.assertTrue(ok)
+        ok, why = mw.restart_allowed(now, now - 60, 0, cooldown_s=900)
+        self.assertFalse(ok)
+        self.assertIn("冷却", why)
+        ok, why = mw.restart_allowed(now, now - 3600, 3, max_attempts=3)
+        self.assertFalse(ok)
+        self.assertIn("最大", why)
+
+    def test_swap_alert_levels(self):
+        """swap 判据：>90% CRIT、>阈值 WARN、其余静默。"""
+        lvl, msg = mw.swap_alert(10444, 11264, warn_mb=6144)
+        self.assertEqual(lvl, "CRIT")
+        self.assertIn("重启系统", msg)
+        lvl, _ = mw.swap_alert(7000, 11264, warn_mb=6144)
+        self.assertEqual(lvl, "WARN")
+        self.assertIsNone(mw.swap_alert(3000, 11264, warn_mb=6144)[0])
+        self.assertIsNone(mw.swap_alert(0, 0, warn_mb=6144)[0])
+
 
 if __name__ == "__main__":
     unittest.main()
