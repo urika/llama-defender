@@ -133,6 +133,8 @@ tools/engines.sh supervise <name> --daemon   # 常驻守护（被误杀自动重
 ./manage.sh start-backend
 ```
 
+> **换模必跑（ADR-017 §2，2026-10-26）**：`switch` 重建 conf 后必须跑 `python3 ../swe-eval/scripts/capability_audit.py`——能力旗标清单（`capability-flags.yaml`）是跨 conf 世代的不变式，换模手工重建 conf 曾丢 `PROXY_REQUEST_ARCHIVE_ENABLED` 致 confirmatory P0 批录制失明（首扫 ABSENT 实锤）。must-have ABSENT 时审计器响亮退出（exit 3），**不得开批**；验收=复扫 PRESENT＋exit 0。
+
 ### 4.3 直接运行代理
 
 ```bash
