@@ -400,6 +400,90 @@ def _build_tool_use_map(messages):
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tool_map[b.get("id", "")] = b.get("name", "")
     return tool_map
+# --- F3'：会话级升级记忆（2026-10-26 方案 v0.1 §2；旗标缺省关=零行为变化）---
+# 修正根因（swe-eval 1025-5）：代理日志权威面证实阶梯「工作正常且已重度触发」
+# （L1=902/L2=57/L3=8；swe71877 会话 49 次干预）——原 F3「变体逃逸致零触发」
+# 前提失效。真问题=干预饱和但**无记忆无升级**：三次干预输出都不携带「你已被
+# 干预 N 次」的会话级信息（L1 每次同文、L2 摘除仅当轮、下轮恢复即重新饱和）。
+# F3' = 会话级累积计数（注入带「第 N 次」）+ L2 sticky（同错误形态 N 轮内重现
+# → 维持摘除并升级提示）。
+_LOOP_ESCALATED = {}       # (session_id, tool_name) -> 触发次数
+_LOOP_ESCALATED_MAX = 512  # DEF-313 模式：会话数上限，驱逐同 _SESSION_TOOL_FREEZE
+_LOOP_STICKY = {}          # (session_id, tool_name, shape) -> until_turn
+_LOOP_STICKY_MAX = 512
+_LOOP_STICKY_TURNS = 3     # sticky 窗（轮）
+
+
+def _f3p_enabled():
+    """F3' 总开关（缺省关 ⇒ 行为与改造前完全一致）。"""
+    return bool(getattr(_ps, "PROXY_LOOP_ESCALATION_MEMORY_ENABLED", False))
+
+
+def _f3p_now_turn(session_id):
+    """当前会话请求序号（= 轮次代理；stage 11 时已含本轮）。"""
+    try:
+        return int(_ps._SESSION_REQUEST_COUNT.get(session_id, 0))
+    except Exception:
+        return 0
+
+
+def _f3p_error_shape(consecutive, tool_name):
+    """同错误形态签名：优先 fnf 路径（Bash 变体聚合键），否则 generic。"""
+    prefix = str(tool_name) + ":"
+    for k in consecutive or {}:
+        if not str(k).startswith(prefix):
+            continue
+        if ":fnf:" in str(k):
+            return "fnf:" + str(k).split(":fnf:", 1)[1]
+    return "generic"
+
+
+def _f3p_bump(session_id, tool_name):
+    """会话级触发计数 +1（cap 512 驱逐）。"""
+    key = (session_id, tool_name)
+    n = int(_LOOP_ESCALATED.get(key, 0)) + 1
+    _LOOP_ESCALATED[key] = n
+    while len(_LOOP_ESCALATED) > _LOOP_ESCALATED_MAX:
+        try:
+            _LOOP_ESCALATED.pop(next(iter(_LOOP_ESCALATED)))
+        except (StopIteration, KeyError):
+            break
+    return n
+
+
+def _f3p_sticky_active(session_id, tool_name, shape, now_turn):
+    """sticky 是否仍在窗内（窗内 → 同形态重现维持摘除）。"""
+    key = (session_id, tool_name, shape)
+    until = _LOOP_STICKY.get(key)
+    if until is None:
+        return False
+    if now_turn > until:
+        _LOOP_STICKY.pop(key, None)
+        return False
+    return True
+
+
+def _f3p_sticky_set(session_id, tool_name, shape, now_turn):
+    """记 sticky（会话+工具+错误形态），窗宽 PROXY_LOOP_STICKY_TURNS。"""
+    turns = int(getattr(_ps, "PROXY_LOOP_STICKY_TURNS", _LOOP_STICKY_TURNS) or 3)
+    _LOOP_STICKY[(session_id, tool_name, shape)] = now_turn + turns
+    while len(_LOOP_STICKY) > _LOOP_STICKY_MAX:
+        try:
+            _LOOP_STICKY.pop(next(iter(_LOOP_STICKY)))
+        except (StopIteration, KeyError):
+            break
+
+
+def _f3p_note_text(n, sticky=False):
+    """会话级升级提示文本（确定性：同 (会话, 工具, N) 同文本）。"""
+    if not n:
+        return ""
+    txt = f"[System escalation memory: 本会话第 {n} 次对该工具触发循环干预。]"
+    if sticky:
+        txt += "[该工具已因重复失败被连续限制——同错误形态在限制窗内重现，维持限制。]"
+    return txt + " "
+
+
 # --- _apply_loop_intervention ---
 def _apply_loop_intervention(
     raw_messages, raw_tools, max_run, consecutive,
@@ -492,8 +576,23 @@ def _apply_loop_intervention(
     high_count_tools = sorted(set(k.split(":")[0] for k in loop_keys))
     tool_name = high_count_tools[0] if high_count_tools else (pattern_tool_name or "unknown")
 
+    # ---- F3'：会话级升级记忆（2026-10-26 方案 v0.1 §2；旗标缺省关=零行为变化）----
+    _f3p_on = bool(session_id) and _f3p_enabled()
+    _f3p_n = 0
+    _f3p_sticky = False
+    _f3p_shape = "generic"
+    _f3p_now = 0
+    if _f3p_on:
+        _f3p_now = _f3p_now_turn(session_id)
+        _f3p_shape = _f3p_error_shape(consecutive, tool_name)
+        _f3p_sticky = _f3p_sticky_active(session_id, tool_name, _f3p_shape, _f3p_now)
+
     if max_run >= level3_threshold:
         restricted = sorted(set(t.get("name", "") for t in (raw_tools or []) if isinstance(t, dict)))
+        _note = ""
+        if _f3p_on:
+            _f3p_n = _f3p_bump(session_id, tool_name)
+            _note = _f3p_note_text(_f3p_n)
         new_messages = list(raw_messages) + [{
             "role": "user",
             "content": [{"type": "text", "text":
@@ -501,7 +600,7 @@ def _apply_loop_intervention(
                 f"({', '.join(restricted[:5])}). ALL tools have been DISABLED for this turn. "
                 f"You MUST respond with plain text only. "
                 f"Describe the problem you are stuck on and what you have tried. "
-                f"Do NOT attempt to call any tools.]"
+                f"Do NOT attempt to call any tools. {_note}"
             }]
         }]
         return new_messages, [], 3, tool_name
@@ -511,13 +610,19 @@ def _apply_loop_intervention(
         new_tools = [t for t in (raw_tools or [])
                      if not (isinstance(t, dict) and t.get("name", "") in remove_set)]
         removed_names = ", ".join(sorted(remove_set))
+        _note = ""
+        if _f3p_on:
+            _f3p_n = _f3p_bump(session_id, tool_name)
+            # L2 sticky：记 (会话, 工具, 错误形态) + until_turn
+            _f3p_sticky_set(session_id, tool_name, _f3p_shape, _f3p_now)
+            _note = _f3p_note_text(_f3p_n, sticky=True)
         new_messages = list(raw_messages) + [{
             "role": "user",
             "content": [{"type": "text", "text":
                 f"[IMPORTANT: You have called tools {max_run} times with no progress. "
                 f"The following tools have been REMOVED: {removed_names}. "
                 f"You MUST use a completely different approach. "
-                f"If you are stuck, describe the problem and ask for guidance.]"
+                f"If you are stuck, describe the problem and ask for guidance. {_note}"
             }]
         }]
         return new_messages, new_tools, 2, tool_name
@@ -560,17 +665,43 @@ def _apply_loop_intervention(
         }]
         return new_messages, raw_tools, 1, tool_name
 
+    # F3'（2026-10-26 方案 v0.1 §2）：L1 通用提示 + 会话级升级记忆。
+    # sticky 命中 ⇒ 同错误形态在限制窗内重现 → 维持摘除（不只提示，直接受限）
+    # 并附升级说明——打破「L2 摘除仅当轮、下轮恢复、模型重试即重新饱和」循环。
+    _note = ""
+    if _f3p_on:
+        _f3p_n = _f3p_bump(session_id, tool_name)
+        if _f3p_sticky:
+            _note = _f3p_note_text(_f3p_n, sticky=True)
+            remove_set = {tool_name}
+            new_tools = [t for t in (raw_tools or [])
+                         if not (isinstance(t, dict) and t.get("name", "") in remove_set)]
+            new_messages = list(raw_messages) + [{
+                "role": "user",
+                "content": [{"type": "text", "text":
+                    f"[IMPORTANT: You have repeated the same action {max_run} times "
+                    f"(tool: {tool_name}). This is likely a loop. "
+                    f"The tool {tool_name} REMAINS DISABLED: it was already restricted "
+                    f"for repeated failures and the restriction window is still open. "
+                    f"STOP using {tool_name} immediately and try a completely different approach. "
+                    f"If file content was cleared, assume the file is unchanged and work from memory. "
+                    f"{_note}"
+                }]
+            }]
+            return new_messages, new_tools, 2, tool_name
+        _note = _f3p_note_text(_f3p_n)
+
     new_messages = list(raw_messages) + [{
         "role": "user",
         "content": [{"type": "text", "text":
             f"[System notice: You have repeated the same action {max_run} times "
             f"(tool: {tool_name}). This is likely a loop. "
             f"STOP using {tool_name} immediately and try a completely different approach. "
-            f"If file content was cleared, assume the file is unchanged and work from memory.]"
+            f"If file content was cleared, assume the file is unchanged and work from memory. "
+            f"{_note}"
         }]
     }]
     return new_messages, raw_tools, 1, tool_name
-
 __all__ = [
     "_check_dedup",
     "_compute_text_similarity",
@@ -580,6 +711,13 @@ __all__ = [
     "_build_blocker_message",
     "_build_tool_use_map",
     "_apply_loop_intervention",
+    "_f3p_enabled",
+    "_f3p_now_turn",
+    "_f3p_error_shape",
+    "_f3p_bump",
+    "_f3p_sticky_active",
+    "_f3p_sticky_set",
+    "_f3p_note_text",
     "_count_ctx_recall_calls",
     "_count_rereads_without_edit",
     "_effective_session_tier",

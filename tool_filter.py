@@ -283,6 +283,253 @@ def _inject_keyword_context(keywords, current_messages, top_k=5, max_chars=500):
     if len(result) > max_chars:
         result = result[:max_chars] + "..."
     return result
+# --- fnf 一期 F1/F2 会话账本（2026-10-25 方案定稿 §1；旗标缺省关=零行为变化）---
+_FNF_SEEN = {}        # (session_id, profile) -> {path_norm: count}
+_FNF_SEEN_MAX = 512   # 会话数上限，驱逐沿 _SESSION_TOOL_FREEZE
+_FNF_DIR_CACHE = {}   # (session_id, dir) -> 截断的 ls 输出（每会话每目录至多一次）
+_FNF_SUPPRESS = {}    # (session_id, profile) -> True（L 级注入轮次跳过升级提示）
+_FNF_TUID_PATH = {}   # tool_use_id -> 路径（F3 计数键用，转译时记账）
+_FNF_TUID_MAX = 1024
+
+# Bash 错误行窄正则（§1.2：只取错误行自报的路径，不从命令串猜）
+_FNF_BASH_RES = (
+    re.compile(r"(\S+?): No such file or directory"),
+    re.compile(r"File does not exist: (.+)"),
+)
+
+
+def _fnf_extract_paths(tool_name, tool_input, error_text):
+    """§1.2 分工具路径提取：Read/Grep/Glob 直接取 input；Bash 只认错误行。"""
+    paths = []
+    if tool_name in ("Read", "Grep", "Glob") and isinstance(tool_input, dict):
+        for k in ("file_path", "path", "pattern"):
+            v = tool_input.get(k)
+            if isinstance(v, str) and v.strip():
+                paths.append(v.strip())
+                break
+    elif tool_name == "Bash":
+        seen = set()
+        for rx in _FNF_BASH_RES:
+            for m in rx.finditer(error_text or ""):
+                p = (m.group(1) or "").strip()
+                if p and p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+    return paths
+
+
+def _fnf_workspace_roots(messages):
+    """§1.4 工作区根证明：同请求中「成功」Read 的 file_path 公共前缀（≥2 层目录）。
+
+    无成功 Read ⇒ 空集（不取候选，防会话外路径信息泄漏——量测实证存在
+    /tmp/config_copy.py 类会话外探测）。"""
+    tool_inputs = {}
+    results = {}
+    for msg in messages:
+        c = msg.get("content", "")
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("name") == "Read":
+                tool_inputs[b.get("id", "")] = b.get("input")
+            elif b.get("type") == "tool_result":
+                results[b.get("tool_use_id", "")] = str(b.get("content", ""))
+    dirs = []
+    for tid, inp in tool_inputs.items():
+        rc = results.get(tid)
+        if rc is None:
+            continue
+        if ("No such file" in rc or "File does not exist" in rc
+                or rc.startswith("[System: 文件不存在")):
+            continue  # 失败的 Read 不作数
+        fp = (inp or {}).get("file_path") if isinstance(inp, dict) else None
+        if isinstance(fp, str) and fp.strip():
+            dirs.append(os.path.dirname(fp.strip()))
+    if not dirs:
+        return set()
+    try:
+        root = os.path.commonpath(dirs)
+    except ValueError:
+        return set()
+    if root.count(os.sep) < 2:  # ≥2 层目录才算「根」
+        return set()
+    return {root}
+
+
+def _fnf_candidates(session_id, parent, messages):
+    """§1.4 候选填充器：ls 父目录（子进程 2s 超时、输出截断 512 chars）。
+
+    安全边界（1025-1⑤）：parent 必须落在已证工作区根内，否则返回 ''。"""
+    import subprocess
+    roots = _fnf_workspace_roots(messages)
+    if not roots:
+        return ""
+    if not any(parent == r or parent.startswith(r.rstrip("/") + os.sep)
+               for r in roots):
+        return ""
+    key = (session_id, parent)
+    if key in _FNF_DIR_CACHE:
+        return _FNF_DIR_CACHE[key]
+    try:
+        out = subprocess.run(["ls", "-1", parent], timeout=2,
+                             capture_output=True, text=True).stdout
+    except Exception:
+        out = ""
+    cand = (out or "").strip()[:512]
+    _FNF_DIR_CACHE[key] = cand
+    return cand
+
+
+def _fnf_hint(path, count, candidates):
+    """§1.3 提示分级（确定性文本：同 (path,count) 同文本）。count==2 同 1 文案。"""
+    cand_line = f"\n父目录实况：{candidates}" if candidates else ""
+    if count >= 3:
+        return (f"[System: 该路径已确认不存在（本会话第 {count} 次）：{path}。"
+                f"禁止再次读取此路径。{cand_line}\n"
+                f"请改用以上真实存在的文件；若确需该文件，先说明它应从何而来。]")
+    tail = f"父目录实况：{candidates}。" if candidates else ""
+    return (f"[System: 文件不存在：{path}。{tail}"
+            f"请改用以上存在的文件，或先确认路径。]")
+
+
+def _fnf_count(session_id, path_norm):
+    key = (session_id, "")
+    book = _FNF_SEEN.setdefault(key, {})
+    while len(_FNF_SEEN) > _FNF_SEEN_MAX:
+        try:
+            _FNF_SEEN.pop(next(iter(_FNF_SEEN)))
+        except (StopIteration, KeyError):
+            break
+    book[path_norm] = book.get(path_norm, 0) + 1
+    return book[path_norm]
+
+
+def _fnf_clear(session_id, path_norm):
+    """§1.1 清零口：同路径后续成功读取 → 计数清零（文件后来被创建的逃逸口）。"""
+    _FNF_SEEN.get((session_id, ""), {}).pop(path_norm, None)
+
+
+def _fnf_bash_error_paths(error_text):
+    """供 loop_detection F3 复用（§1.2 同款窄正则）。"""
+    paths = []
+    seen = set()
+    for rx in _FNF_BASH_RES:
+        for m in rx.finditer(error_text or ""):
+            p = (m.group(1) or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+    return paths
+
+
+def _fnf_tuid_path(tool_use_id):
+    """F3 计数键取路径：转译通道在 Bash fnf 命中时记账（与旗标无关）。"""
+    return _FNF_TUID_PATH.get(tool_use_id, "")
+
+
+def _translate_tool_result_errors_ex(messages, session_id="", profile=""):
+    """F1/F2 增强版转译：fnf 会话账本 + 分级升级提示 + 最近邻候选。
+
+    旗标 PROXY_FNF_GUIDE_ENABLED / PROXY_FNF_CANDIDATES_ENABLED 缺省关
+    ⇒ 行为与旧入口完全一致。账本/记账（_FNF_TUID_PATH）与旗标无关。"""
+    guide = bool(getattr(_ps, "PROXY_FNF_GUIDE_ENABLED", False))
+    cand_flag = bool(getattr(_ps, "PROXY_FNF_CANDIDATES_ENABLED", False))
+    sid = session_id or ""
+    pkey = (sid, profile or "")
+    suppress = _FNF_SUPPRESS.pop(pkey, False) if sid else False
+    # L 级互斥（方案 v0.1 §5「L 级注入轮跳过 F1 避免双注入」）：上一轮已触发
+    # 循环干预（_LOOP_SESSION_STATE.level>0）⇒ 本轮 fnf 只给基础提示，不叠加
+    # 「第 N 次＋禁止再试」升级文案（阶梯注入已承载会话级升级语言）。
+    if not suppress and sid:
+        try:
+            _lp = getattr(_ps, "_LOOP_SESSION_STATE", {}).get(sid) or {}
+            suppress = int(_lp.get("level") or 0) > 0
+        except Exception:
+            suppress = False
+
+    error_count = {"wasted": 0, "file_not_found": 0, "input_validation": 0,
+                   "fnf_guided": 0, "fnf_cand_hits": 0, "fnf_cand_misses": 0}
+
+    # tool_use 索引：id -> (name, input)
+    tu_by_id = {}
+    for msg in messages:
+        c = msg.get("content", "")
+        if msg.get("role") == "assistant" and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tu_by_id[b.get("id", "")] = (b.get("name", ""), b.get("input"))
+    if os.environ.get("FNF_DEBUG"):
+        print(f"[FNF-DBG] guide={guide} cand={cand_flag} sid={sid!r} suppress={suppress} tu_by_id={tu_by_id}")
+
+    def _old_fnf_hint():
+        return ("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，"
+                "然后使用正确的文件路径。]")
+
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                continue
+            bc = str(block.get("content", ""))
+            if "Wasted call" in bc:
+                block["content"] = (
+                    "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"
+                    "先用 ctx_recall 工具查询（query=文件路径或关键词）取回此前内容；"
+                    "ctx_recall 无结果再用 Bash cat 命令代替。]"
+                )
+                error_count["wasted"] += 1
+            elif "File does not exist" in bc or "No such file" in bc:
+                error_count["file_not_found"] += 1
+                tid = block.get("tool_use_id", "")
+                tname, tinput = tu_by_id.get(tid, ("", None))
+                paths = _fnf_extract_paths(tname, tinput, bc)
+                if not (guide and sid and paths):
+                    block["content"] = _old_fnf_hint()
+                    continue
+                path = paths[0]
+                n = _fnf_count(sid, path)
+                if tname == "Bash":
+                    _FNF_TUID_PATH[tid] = path
+                    while len(_FNF_TUID_PATH) > _FNF_TUID_MAX:
+                        _FNF_TUID_PATH.pop(next(iter(_FNF_TUID_PATH)))
+                cand = ""
+                if cand_flag:
+                    cand = _fnf_candidates(sid, os.path.dirname(path), messages)
+                    if cand:
+                        error_count["fnf_cand_hits"] += 1
+                    else:
+                        error_count["fnf_cand_misses"] += 1
+                if suppress or n < 3:
+                    block["content"] = _fnf_hint(path, 1, cand)
+                else:
+                    block["content"] = _fnf_hint(path, n, cand)
+                    error_count["fnf_guided"] += 1
+            elif "InputValidationError" in bc or "invalid x" in bc.lower():
+                block["content"] = (
+                    "[System: 工具调用参数错误。请检查工具参数格式，"
+                    "确保所有必填参数正确提供。]"
+                )
+                error_count["input_validation"] += 1
+            else:
+                # §1.1 清零口：同路径后续「成功」读取 → 计数清零（逃逸口）。
+                # 已翻译/系统注入块以 "[System:" 开头，天然不误判为成功。
+                if bc.startswith("[System:"):
+                    continue
+                tid = block.get("tool_use_id", "")
+                tname, tinput = tu_by_id.get(tid, ("", None))
+                if tname in ("Read", "Grep", "Glob") and isinstance(tinput, dict):
+                    p = tinput.get("file_path") or tinput.get("path") or ""
+                    if p:
+                        _fnf_clear(sid, p.strip())
+    return messages, error_count
+
+
 # --- _translate_tool_result_errors ---
 def _translate_tool_result_errors(messages):
     """Walk the user-side tool_result blocks and rewrite known backend
@@ -333,9 +580,14 @@ def _translate_tool_result_errors(messages):
                 error_count["input_validation"] += 1
     return messages, error_count
 
+def _translate_tool_result_errors(messages):
+    """兼容入口：转发到 F1/F2 增强版（旗标缺省关 ⇒ 行为不变）。"""
+    return _translate_tool_result_errors_ex(messages)
+
 __all__ = [
     "_filter_tools",
     "_extract_keywords",
     "_inject_keyword_context",
     "_translate_tool_result_errors",
+    "_translate_tool_result_errors_ex",
 ]

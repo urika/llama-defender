@@ -1209,6 +1209,39 @@ CONFIG_REGISTRY = {
                "开＝客户端可见思考过程，且截断时不会把半截思考冒充正文；"
                "关＝旧行为（非流式丢 reasoning、content 为空时顶替正文；流式并入 text 增量）。",
     },
+    # ---- file_not_found 循环缓解一期 F1/F2/F3'（2026-10-25 定稿 / 2026-10-26 v0.1 修正；
+    #      缺省关=零行为变化，批期可入库，激活=空窗一次戳）----
+    "PROXY_FNF_GUIDE_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "F1：file_not_found 会话账本＋分级升级提示——同路径第 N 次失败时"
+               "注入「已确认不存在（第 N 次）＋禁止再试＋替代行动」；激活=空窗一次戳。",
+    },
+    "PROXY_FNF_CANDIDATES_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "F2（F1 子旗标）：最近邻候选——fnf 首败时 ls 父目录注入真实存在的"
+               "相近文件（仅已证工作区根内，2s 超时，每会话每目录至多一次）。",
+    },
+    "PROXY_LOOP_BASH_PATH_KEYS_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "F3（2026-10-26 v0.1 起降级为兜底面）：Bash 计数键修复——从 tool_result "
+               "错误行派生 Bash:fnf:<path> 键，使同路径变体命令探测计入同一键；"
+               "注意 1025-5 实测阶梯本已重度触发（变体逃逸前提失效）。",
+    },
+    "PROXY_LOOP_ESCALATION_MEMORY_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "F3'（2026-10-26 v0.1 §2）：会话级升级记忆——阶梯触发带会话级累积计数"
+               "（注入「第 N 次」），L2 摘除 sticky（同错误形态 N 轮内重现 → 维持摘除"
+               "并升级提示），打破「干预饱和但无记忆无升级」循环。",
+    },
+    "PROXY_LOOP_STICKY_TURNS": {
+        "defaults": {"all": "3"},
+        "type": "int", "scope": "reloadable",
+        "doc": "F3' sticky 窗宽（轮）——L2 摘除后同错误形态在此轮数内重现即维持摘除。",
+    },
     # ---- R-CM-5 预取/推送披露（2026-10-08 需求；默认关）----
     "PROXY_PD_PREFETCH_ENABLED": {
         "defaults": {"all": "false"},

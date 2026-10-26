@@ -1017,7 +1017,11 @@ class TestErrorTranslation(unittest.TestCase):
             self._msg("t3", "InputValidationError: bad arg"),
         ]
         _, counts = proxy._translate_tool_result_errors(msgs)
-        self.assertEqual(counts, {"wasted": 1, "file_not_found": 1, "input_validation": 1})
+        # 2026-10-25: 新增 fnf 观测键（F1/F2 观测面）——旧三键逐项断言 + 新键为零
+        for k, v in {"wasted": 1, "file_not_found": 1, "input_validation": 1}.items():
+            self.assertEqual(counts[k], v)
+        for k in ("fnf_guided", "fnf_cand_hits", "fnf_cand_misses"):
+            self.assertEqual(counts.get(k, 0), 0)
         # Each block now starts with the [System: prefix.
         for msg in msgs:
             self.assertTrue(msg["content"][0]["content"].startswith("[System:"))

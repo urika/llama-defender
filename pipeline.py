@@ -1779,15 +1779,27 @@ class ErrorTranslator(PipelineStage):
 
     def process(self, ctx: PipelineContext) -> PipelineContext:
         tool_filter = _import_tool_filter()
-        raw_messages, error_count = tool_filter._translate_tool_result_errors(ctx.messages)
+        raw_messages, error_count = tool_filter._translate_tool_result_errors_ex(
+            ctx.messages,
+            session_id=getattr(ctx, "session_id", "") or "",
+            profile=getattr(ctx, "_agent_model_tier", "") or "")
         ctx.messages = raw_messages
         ctx.error_count = error_count
 
         total_errors = sum(error_count.values())
         if total_errors > 0:
-            log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
-                f"(wasted={error_count['wasted']}, file_not_found={error_count['file_not_found']}, "
-                f"input_validation={error_count['input_validation']})")
+            _fnf_x = ""
+            if error_count.get("fnf_guided") or error_count.get("fnf_cand_misses"):
+                _fnf_x = (f", fnf_guided={error_count.get('fnf_guided')}"
+                          f", fnf_candidates={error_count.get('fnf_cand_hits')}/"
+                          f"{error_count.get('fnf_cand_hits') + error_count.get('fnf_cand_misses')}")
+            if _fnf_x:
+                log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
+                    f"(fnf={error_count.get('file_not_found', 0)}{_fnf_x})")
+            else:
+                log(f"  -> Error translation: {total_errors} tool_result errors rewritten "
+                    f"(wasted={error_count['wasted']}, file_not_found={error_count['file_not_found']}, "
+                    f"input_validation={error_count['input_validation']})")
 
         return ctx
 
@@ -2088,6 +2100,24 @@ class ToolLoopDetector(PipelineStage):
         last_pattern = None
         pattern_tool_name = None
 
+        # F3（PROXY_LOOP_BASH_PATH_KEYS_ENABLED，2026-10-25 方案 §2）：Bash 变体逃逸
+        # 修复——从配对 tool_result 的错误行派生 `Bash:fnf:<path>` 计数键，使同路径
+        # 反复探测（变体命令串各不相同，原实现各计 1）计入同一键、确定性阶梯可达。
+        _fnf_keys_on = bool(getattr(_ps, "PROXY_LOOP_BASH_PATH_KEYS_ENABLED", False))
+        _result_by_id = {}
+        if _fnf_keys_on:
+            try:
+                _tf = _import_tool_filter()
+            except Exception:
+                _tf = None
+            for _m in ctx.messages:
+                _c = _m.get("content", "")
+                if _m.get("role") != "user" or not isinstance(_c, list):
+                    continue
+                for _b in _c:
+                    if isinstance(_b, dict) and _b.get("type") == "tool_result":
+                        _result_by_id[_b.get("id", "")] = str(_b.get("content", ""))
+
         tail_assistant = [m for m in ctx.messages if m.get("role") == "assistant"][-15:]
         for msg in tail_assistant:
             content = msg.get("content", "")
@@ -2107,6 +2137,13 @@ class ToolLoopDetector(PipelineStage):
                         key = f"{name}:{args_str}"
                         consecutive[key] = consecutive.get(key, 0) + 1
                         max_run = max(max_run, consecutive[key])
+                        # F3 派生键：同路径聚合计数（键前缀 Bash ⇒ L2 摘除仍按工具名命中）
+                        if _fnf_keys_on and name == "Bash" and _tf is not None:
+                            _pth = _tf._fnf_tuid_path(block.get("id", ""))
+                            if _pth:
+                                _fkey = f"Bash:fnf:{_pth}"
+                                consecutive[_fkey] = consecutive.get(_fkey, 0) + 1
+                                max_run = max(max_run, consecutive[_fkey])
                     elif block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                 pattern = ("".join(text_parts)[:200], tuple(sorted(set(tool_names_in_msg))))

@@ -206,6 +206,7 @@ docs/
 | `BENCHMARK.md` | 本地 LLM 性能测试报告与基线 |
 | `splash-model-capability-research-20261020.md` | **Splash 引擎与模型能力调研**：澄清「Inco 是否训练了更强模型」——`incoai` 12 仓库全量构成、DFlash2 是唯一训练产物、官方只有速度基准无能力基准、质量证据（perplexity 高于 llama.cpp 0.1–0.9%）、本机 27B vs 35B-A3B 双档实测、48GB「能力 vs 速度」两难选型表 |
 | `ane-ecosystem-survey-20261022.md` | **ANE 目标场景与应用生态调研**：设计哲学（固定 shape+高频+低功耗协处理器）、能力边界（decode/concat 不可行）、四层开源生态（Apple 官方 → WhisperKit 12M 下载级生产栈 → 逆向训练/驱动 → 社区 runtime）、社区三方共识（decode 上 ANE 是死路）、对本栈七条借鉴点（含 embedgemma2 迁 ANE 的可行性评估） |
+| `file-not-found-loop-mitigation-research-20261025.md` | **file_not_found 重复探测问题调研**：批跑单日 6,179 次 file_not_found、单会话同路径重试 22 次的实证；现有错误转译与 Blocker 注入失效的三机制；业界参照（SWE-agent ACI / OpenAI "给地图" / aider repo-map / 确定性循环检测）；A-F 六方案矩阵与推荐组合（一期提示升级+最近邻建议，二期确定性短路），预期日省数千 turn |
 | `TROUBLESHOOTING.md` | 故障排查记录（chat template、tool calling、OOM 等） |
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估 |

@@ -645,6 +645,17 @@ PROXY_TOMBSTONE_RECALL_ENABLED = os.environ.get(
     "PROXY_TOMBSTONE_RECALL_ENABLED", get_default("PROXY_TOMBSTONE_RECALL_ENABLED")).lower() in ("1", "true", "yes")
 PROXY_EMIT_THINKING_BLOCKS = os.environ.get(
     "PROXY_EMIT_THINKING_BLOCKS", get_default("PROXY_EMIT_THINKING_BLOCKS")).lower() in ("1", "true", "yes")
+PROXY_FNF_GUIDE_ENABLED = os.environ.get(
+    "PROXY_FNF_GUIDE_ENABLED", get_default("PROXY_FNF_GUIDE_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_FNF_CANDIDATES_ENABLED = os.environ.get(
+    "PROXY_FNF_CANDIDATES_ENABLED", get_default("PROXY_FNF_CANDIDATES_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_LOOP_BASH_PATH_KEYS_ENABLED = os.environ.get(
+    "PROXY_LOOP_BASH_PATH_KEYS_ENABLED", get_default("PROXY_LOOP_BASH_PATH_KEYS_ENABLED")).lower() in ("1", "true", "yes")
+# F3' 会话级升级记忆（2026-10-26 方案 v0.1 §2；缺省关=零行为变化）
+PROXY_LOOP_ESCALATION_MEMORY_ENABLED = os.environ.get(
+    "PROXY_LOOP_ESCALATION_MEMORY_ENABLED", get_default("PROXY_LOOP_ESCALATION_MEMORY_ENABLED")).lower() in ("1", "true", "yes")
+PROXY_LOOP_STICKY_TURNS = int(os.environ.get(
+    "PROXY_LOOP_STICKY_TURNS", get_default("PROXY_LOOP_STICKY_TURNS")))
 
 # R-CM-4 符号级检索增强（2026-10-08；默认关，ctx_recall.py 符号索引层）：
 # query 命中符号名 → 在召回结果追加定义/引用位置（外部 grep/ctags via subprocess）。
@@ -1442,6 +1453,11 @@ _RELOAD_SPEC = [
     ("PROXY_AUTO_RECALL_PER_SESSION", "PROXY_AUTO_RECALL_PER_SESSION", "int", "5", "5"),
     ("PROXY_TOMBSTONE_RECALL_ENABLED", "PROXY_TOMBSTONE_RECALL_ENABLED", "bool", "false", "false"),
     ("PROXY_EMIT_THINKING_BLOCKS", "PROXY_EMIT_THINKING_BLOCKS", "bool", "true", "true"),
+    ("PROXY_FNF_GUIDE_ENABLED", "PROXY_FNF_GUIDE_ENABLED", "bool", "false", "false"),
+    ("PROXY_FNF_CANDIDATES_ENABLED", "PROXY_FNF_CANDIDATES_ENABLED", "bool", "false", "false"),
+    ("PROXY_LOOP_BASH_PATH_KEYS_ENABLED", "PROXY_LOOP_BASH_PATH_KEYS_ENABLED", "bool", "false", "false"),
+    ("PROXY_LOOP_ESCALATION_MEMORY_ENABLED", "PROXY_LOOP_ESCALATION_MEMORY_ENABLED", "bool", "false", "false"),
+    ("PROXY_LOOP_STICKY_TURNS", "PROXY_LOOP_STICKY_TURNS", "int", "3", "3"),
     # K1 状态摘要 pin(2026-10-10, 分层契约 context-layered-contract §3/§5; SIGHUP 可热开)
     ("PROXY_TEST_STATE_ENABLED", "PROXY_TEST_STATE_ENABLED", "bool", "false", "false"),
     # S1 脚手架路由(2026-10-10, multi-agent-architecture §五建议1; SIGHUP 可热开)
@@ -1680,6 +1696,11 @@ __all__ = [
     "PROXY_AUTO_RECALL_MAX_CHARS", "PROXY_AUTO_RECALL_PER_SESSION",
     "PROXY_TOMBSTONE_RECALL_ENABLED",
     "PROXY_EMIT_THINKING_BLOCKS",
+    "PROXY_FNF_GUIDE_ENABLED",
+    "PROXY_FNF_CANDIDATES_ENABLED",
+    "PROXY_LOOP_BASH_PATH_KEYS_ENABLED",
+    "PROXY_LOOP_ESCALATION_MEMORY_ENABLED",
+    "PROXY_LOOP_STICKY_TURNS",
     "PROXY_CTX_VIEW_STABLE_ENABLED",
     "PROXY_AUX_ISOLATION_STRICT",
     "PROXY_CLOUD_CM_ENABLED",
