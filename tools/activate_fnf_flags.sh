@@ -72,7 +72,7 @@ show_status() {
   echo "当前激活配置: $CONF"
   for k in "${FLAG_KEYS[@]}"; do
     local v
-    v="$(grep -E "^export ${k}=" "$CONF_PATH" 2>/dev/null | tail -1 | sed 's/^export //; s/=//; s/"//g' || true)"
+    v="$(grep -E "^export ${k}=" "$CONF_PATH" 2>/dev/null | tail -1 | sed 's/^export //; s/"//g' || true)"
     printf '  %-40s %s\n' "$k" "${v:-（未在 conf 中 → 取默认值 false）}"
   done
   local pid
