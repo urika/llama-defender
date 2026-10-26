@@ -568,3 +568,27 @@ SHORT decode: wall=0.37s  pred=112  decode=335.0  ttft=38ms  draft=98/97
 - 二者**不可同时常驻**（40.9 GB / limit 44 GB，且内存紧张时会触发换页），切换须 `switch + restart`（约 60–90 s）
 - 能力/速度的平台期与选型依据详见
   [`splash-model-capability-research-20261020.md`](splash-model-capability-research-20261020.md)
+
+---
+
+## 质量门 v3 跨模型基线（2026-10-27）
+
+> 口径：`tools/knowledge_gate_9b.py` 62 条金标 / 7 类，直连引擎（不经代理），temperature=0，
+> **显式 `enable_thinking=false`**（2026-10-27 新增 `--thinking` 开关；thinking-on 引擎会把
+> 768 max_tokens 烧在 `reasoning_content` 上致 content 空/截断——optiq 实测 11/13→13/13 的
+> extraction 差异即由此产生，跨模型比较必须统一 thinking-off）。
+
+| 模型 | 判词 | overall | extraction | tagging | summary | grounding | refine | coding | tool_call | 防线 |
+|------|------|---------|-----------|---------|---------|-----------|--------|--------|-----------|------|
+| **optiq-35B**（主引擎，Splash 1.4.0） | **PASS** | **93.5%** (58/62) | 12/13 | **10/10** | **5/7** | **9/9** | **6/6** | 9/10 | 7/7 | ✓ |
+| ornith-9B（已下线） | FAIL | 87.1% (54/62) | 13/13 | 9/10 | 2/7 ✗ | 8/9 | 6/6 | 9/10 | 7/7 | ✓ |
+| minicpm-2B（已删除） | FAIL | 71.0% (44/62) | 12/13 | 8/10 ✗ | 4/7 ✗ | 7/9 | 6/6 | 7/10 | **0/7 ✗** | ✓ |
+
+要点：
+1. **主引擎是唯一通过全部类别线的模型**——summary 硬字数在 35B 上首次达标（5/7），说明该短板是
+   9B 级模型的容量限制而非任务本身不可行；tagging 10/10 全对（含 9B 栽的多标签 B09）。
+2. 残留失手：coding 1（COD04 版本正则词边界，三代模型一致栽——金标公开的难点）、extraction 1（A09
+   日期格式）、summary 2。均非类别性失守。
+3. 防幻觉红线（unanswerable 2/2）三代全守——拒答纪律不随模型规模变化。
+4. 门语义提示：thinking-on 时该门不可用（预算结构冲突），如需测量 reasoning 模式质量需另建
+   预算基准（thinking 预算单列），已记入工具注。
