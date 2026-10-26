@@ -41,8 +41,29 @@ python3 ../swe-eval/scripts/capability_audit.py   # 对端仪器：exit 0 才可
 - **capability_audit** 必须 exit 0（must-have ABSENT 时不得开批；ADR-017）。
 - 监控守护在跑且首轮快照 `denied=0`、headroom 回到 18GB+（重启清空 KV/state）。
 
-## 4. 风险与后续
+## 4. 重启后实测结果（05:54–05:56）
+
+| 项 | 重启前 | 重启后 | 判定 |
+|----|--------|--------|------|
+| swap | 10.44GB / 11.26GB | **0.00M** | ✅ 清零（重启的主要收益） |
+| 代理 :4000 | pid 39619 | pid **5196** healthy | ✅ |
+| 引擎 :8081 | Splash 1.4.0 35B-A3B | 存活，pressure=**normal** | ✅ |
+| embedgemma2 :8083 | 运行中 | 运行中（pid 5390） | ✅ |
+| fnf 四旗标 | 全 true（conf） | 全 true（重启后由 env 继承） | ✅ |
+| br4 录制面 | true | true（近 10 分钟 4 个归档文件） | ✅ |
+| capability_audit | exit 0 | exit 0，**`fnf_guide_kit` 首次 PRESENT** | ✅ |
+| 监控守护 | 运行中（手工 nohup） | **PID 6947，由 launchd 托管（KeepAlive=true）** | ✅（首次开机自启即失败，DEF-323 已修，见下） |
+
+> **重启暴露的三个自启缺陷（已当场修复，见 DEF-323）**：① launchd 登录环境 PATH 不含
+> `/opt/homebrew/bin` → `manage.sh start` 找不到 splash（rc=1，引擎未自启，最终由登录后
+> 其他会话拉起）；② 守护由 wrapper 内 `nohup &` 拉起 → launchd 作业退出时**连坐杀掉作业组
+> 子进程**（守护 PID 2726 即死）→ 拆出独立 launchd 作业 `com.llama-defender.monitor`
+> （KeepAlive=true）；③ 守护循环单周期异常可终止守护 → 加 `set +e` 包裹与单步失败保护。
+
+## 5. 风险与后续
 
 - 重启会终止在跑的 IDE/agent 会话（本仓工作树改动保留在磁盘，但并行会话的未提交上下文会丢）。
 - 重启后**先跑验收再开批**；`swap` 是本机内存账本的核心指标，长期 >6GB 即应再评估重启。
-- fnf 探针 A/B（swe-eval）以激活戳记 `2026-10-27 00:56:26` 为分段基准，判据见方案件 §4。
+- fnf 探针 A/B（swe-eval）以激活戳记 `2026-10-27 00:56:26` 为分段基准，判据见方案件 §4；
+  **本次重启构成第二个分段边界**（代理 PID 5196、引擎计数器与 KV/state 全部归零，
+  重启前后样本不可直接比——沿「按代理重启分段」先例披露）。

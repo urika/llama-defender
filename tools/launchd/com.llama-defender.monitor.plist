@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.llama-defender.monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jinsongwang/APP/llama.cpp/tools/monitor_service.sh</string>
+    <string>daemon</string>
+    <string>300</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/jinsongwang/APP/llama.cpp</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/jinsongwang</string>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/service-monitor.daemon.log</string>
+  <key>StandardErrorPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/service-monitor.daemon.log</string>
+</dict>
+</plist>

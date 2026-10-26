@@ -550,6 +550,18 @@
 | **验收（2026-10-27）** | 新增 `test/unit/test_monitor_window.py`（13 例：斜率精确性/跨度闸/窗口裁剪/等级序/退化样本）；实跑 `once` 输出 `eta —(0.0min 窗)` 且告警级别正确（WARN 而非错标 CRIT）；监控守护已重启加载新逻辑（PID 7686）。 |
 | **残留风险** | 滚动窗需 ≥15min 真实样本才有外推（守护 5min 周期 ⇒ 约 3 轮后可用）；合成/污染样本会污染窗口（本次已清空重建）。 |
 
+### DEF-323: 重启后自启链三处断裂——launchd PATH 缺 Homebrew / 作业组连坐杀守护 / 守护单周期脆弱（P1） — ✅ 已修复（2026-10-27）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 2026-10-27 05:52 系统重启后：① `logs/startup-stack.log` 报「未找到 splash 命令。安装: brew install incoai/tap/splash」，`manage.sh start` rc=1 → 引擎没被自启拉起（实测栈最终由登录后的其他会话于 05:53:56 拉起）；② 监控守护在 05:53:00 被拉起（PID 2726），但 05:54:24 验收时已死。 |
+| **根因 1（PATH）** | launchd 登录作业的默认 PATH 不含 `/opt/homebrew/bin` → `manage.sh` 找不到 splash CLI（brew 安装路径）。 |
+| **根因 2（连坐）** | 守护由 `startup_stack.sh` 用 `nohup … &` 拉起；**launchd 在主作业退出时连坐杀掉作业组内的全部子进程**（nohup 只挡 SIGHUP，挡不住作业组终止）→ 守护随 wrapper 退出被 SIGTERM。 |
+| **根因 3（脆弱）** | 守护循环内单周期异常（服务不可达时快照字段缺失 → `report()` 内 `float(None)` 抛错）可终止整个守护循环——而守护是服务唯一的眼睛，不能因一次采集失败就消失。 |
+| **修复（2026-10-27）** | ① 两个 launchd 作业拆开：`com.llama-defender.stack`（RunAtLoad、KeepAlive=false，起栈）＋ **新增 `com.llama-defender.monitor`（RunAtLoad、KeepAlive=true，托管监控守护）**；两者均注入 `EnvironmentVariables.PATH`（含 `/opt/homebrew/bin`）；② `startup_stack.sh` 显式 export PATH 并**不再**自行拉起守护（交由 launchd 托管）；③ `monitor_service.sh` 守护循环加 `set +e` 包裹 + `report/emit/append_log` 单步失败不退出（`|| snap="$snap"` / `|| true`）。 |
+| **验收（2026-10-27 05:56）** | `launchctl kickstart com.llama-defender.stack` → `manage.sh start rc=0`（PATH 修复生效）；守护 PID 6947 由 launchd 托管且首轮快照 `mem 22.13G head 18.13G denied 0`；`tools/post_reboot_check.sh` **8 项全绿**（swap 0.00M / 代理 5196 healthy / 引擎 :8081 / embedgemma2 :8083 / fnf 四旗标 / br4 / 守护 / capability_audit exit 0）。 |
+| **残留风险** | `KeepAlive=true` 的守护若被用户手动 kill 会被 launchd 重拉（预期）；守护日志 `logs/service-monitor.daemon.log` 与业务日志分离。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）

@@ -292,9 +292,11 @@ cmd_once() {
     th=$(curl -s --max-time 10 http://127.0.0.1:8081/status 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('thermal_state','—'))" 2>/dev/null || echo "—")
     snap=$(echo "$snap" | python3 -c "import json,sys;s=json.loads(sys.stdin.read());s['thermal']=sys.argv[1];print(json.dumps(s,ensure_ascii=False))" "$th")
     # 差分分析（等级/告警/建议/headroom 预测）
-    snap=$(report "$snap" "$STATE")
-    emit "$snap" "$mode"
-    append_log "$snap"
+    # 单步失败不得带死守护（守护是服务唯一的眼睛；2026-10-27 reboot 后实测
+    # 作业组连坐 + 单周期异常叠加导致守护消失）——失败即退回原快照继续。
+    snap=$(report "$snap" "$STATE" 2>/dev/null) || snap="$snap"
+    emit "$snap" "$mode" || true
+    append_log "$snap" || true
     # 守护模式下：批跑结束且已劣化 → 可选自动重启
     if [[ "${MONITOR_AUTO_RESTART:-0}" == "1" ]] && [[ "${2:-}" == "daemon" ]]; then
         local batch degraded
@@ -319,8 +321,12 @@ cmd_daemon() {
     echo "$$" > "$PIDFILE"
     info "监控守护启动 (PID $$, 间隔 ${INTERVAL}s, 日志 $LOGFILE, 自动重启=$AUTO_RESTART)"
     while true; do
+        # 守护自愈：任何单周期失败（服务不可达/快照字段缺失/python 异常）都
+        # 不得终止守护循环——它必须持续在场盯着服务。
+        set +e
         cmd_once "" "daemon" || true
-        sleep "$INTERVAL"
+        set -e
+        sleep "$INTERVAL" || true
     done
 }
 

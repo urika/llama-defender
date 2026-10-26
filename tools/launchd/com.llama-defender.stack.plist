@@ -12,6 +12,12 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
   <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/jinsongwang</string>
+  </dict>
   <key>StandardOutPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/startup-stack.out</string>
   <key>StandardErrorPath</key><string>/Users/jinsongwang/APP/llama.cpp/logs/startup-stack.out</string>
 </dict>

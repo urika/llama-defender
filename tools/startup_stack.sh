@@ -21,6 +21,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 LOG="logs/startup-stack.log"
 
+# launchd 登录环境的 PATH 不含 Homebrew（实测 reboot 后 manage.sh start 报
+# 「未找到 splash 命令」）——显式补齐，否则引擎起不来。
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export HOME="${HOME:-/Users/jinsongwang}"
+
 mkdir -p logs
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 
@@ -32,12 +37,13 @@ sleep 20
 rc=$?
 log "manage.sh start rc=$rc"
 
-# 2) 起监控守护（若未在跑）
+# 2) 监控守护交给独立 launchd 作业（com.llama-defender.monitor，KeepAlive=true）
+#    ——不可在此处 nohup 起：launchd 在本作业退出时会连坐杀掉作业组内的子进程
+#    （2026-10-27 reboot 实测：守护随 wrapper 退出被 SIGTERM，PID 2726 即死）。
 if [[ -f logs/service-monitor.pid ]] && kill -0 "$(cat logs/service-monitor.pid 2>/dev/null)" 2>/dev/null; then
     log "监控守护已在运行 (PID $(cat logs/service-monitor.pid))"
 else
-    nohup ./tools/monitor_service.sh daemon 300 >> logs/service-monitor.daemon.log 2>&1 &
-    log "监控守护已拉起 (PID $!)"
+    log "监控守护由 launchd 作业 com.llama-defender.monitor 托管（此处不重复拉起）"
 fi
 
 # 3) 状态快照
