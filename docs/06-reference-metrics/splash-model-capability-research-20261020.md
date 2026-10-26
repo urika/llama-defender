@@ -99,6 +99,17 @@ DFlash2 是一个 **5 层、block size 16 的块扩散草稿网络**：
 
 > 注：27B 的热 TTFT 0.53s / 冷 prefill 450–488 已是 DFlash2 + persistent-cache + ANE split 后的上限；再压只能降量化，收益微弱（4bit 16.1GB / oQ4 16.7 / mxfp4 15.2，带宽瓶颈不变）。
 
+> **2026-10-27 复测（splash 1.4.0 + Qwen3.6-35B-A3B-OptiQ-4bit，会话累计口径）**：
+> prefill **1101–1154 tok/s**、decode **116–117 tok/s**、DFlash2 接受率 **0.534–0.578**、
+> TTFT p50 **0.87s** / p95 **8.68s**。与上表 2026-10-20 标称相比 prefill 低约
+> 45%、decode 低约 15%——标称值来自 splash README 的 SPEED-Bench 编码题
+> （1024 输出、单请求干净计时），复测为真实 agentic 长会话混合负载
+> （热轮/冷轮/并发/DFlash 草稿混流），**口径不同不可直接对比**；S=150000 的
+> epoch 阈值安全线应按复测口径（保守）重算——结论仍是 466s 死线有 3.5× 余量。
+> 复测原始指标：`splash_prefill_tokens_per_second` / `splash_decode_tokens_per_second`
+> / `splash_draft_acceptance_ratio` / `splash_ttft_p50_milliseconds`
+> （`GET :8081/metrics`）。
+
 ---
 
 ## 七、48GB 上的「能力 vs 速度」两难

@@ -485,6 +485,19 @@ L0 内容（system prompt + 工具定义）由客户端决定，代理只能「�
 
 > 本节为外部 review 追加：以 2026-08-18/19 公开集本地臂批跑实测数据校准 §0-§8 的假设、默认参数与验收门禁。核心结论：**设计方向与结构正确，但 prefill 速度假设差 6-12 倍，且漏掉「客户端断连死线」与「pflash 96K 阈值」两个硬约束——默认参数与验收门禁须按本节重定，否则 Phase 1 验收在实测环境不可达**。原 §0-§10 文字不动，本节为修订增量。
 
+> **2026-10-27 后续复核（splash 引擎换代后）**：本节三约束**仅在 rapid-mlx 时代成立**。
+> 换到 splash 后约束三（pflash 96K）解除、约束一（prefill 130-300 tok/s）不再适用
+> ——2026-10-20 据此把 S 从 70K 调到 150000（决策出处：
+> `configs/splash-qwen38-27b-mlx.conf` L94-101）；2026-10-27 在 splash 1.4.0 +
+> Qwen3.6-35B-A3B 上复核，prefill 实测 **1101-1154 tok/s**，S=150000 冷 prefill
+> **≈130s**，相对约束二（466s 断连死线）仍有 **3.5× 余量**，且实测 epoch 折叠
+> 0 次、rerun gate 门禁 PASS ——**决策成立，不应下调**。
+> 另注：本节 S=70K 的 auto 推导公式 `min(65% × ctx_chars/4, 70000)` **不含 prefill
+> 能力输入**，表达的是"旧 ctx_max 假设下的保守值"，**不是**"当前后端最优阈值"；
+> 把它当作 auto 自适应是误用（改 0 会落到 29250，比 150000 低 5.1×）。
+> 完整证据链见
+> [`docs/05-operations-changelog/epoch-trigger-threshold-drift-20261027.md`](../../05-operations-changelog/epoch-trigger-threshold-drift-20261027.md)。
+
 ### 11.1 三个硬约束（§0 补充，参数重定的事实基础）
 
 **约束一：prefill 实测速度 ~130-300 tok/s，不是 1000-2000 tok/s。**
