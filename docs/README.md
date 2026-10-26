@@ -169,6 +169,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| `fnf-flags-activation-20261027.md` | **fnf 一期四旗标激活戳记**：F1/F2/F3'/F3 的「一次窗一次戳」落档（conf sha256 前后、代理 PID、窗前后 /metrics 快照）、空窗门（进程面＋静默面）、生产功能验证（`fnf_guided=2` 实测）与回滚步骤；供 swe-eval 按方案 §4 分段判读 |
 | `splash-132-migration-20261020.md` | **Splash 1.0.2 → 1.3.2 迁移 Runbook**：1.3.0/1.3.1/1.3.2 三版新特性逐项对照（ANE prefill、Splash 包作废 breaking change、NVFP4/FP8、`--state-format bf16`、SSD 缓存默认开、thinking budget、延迟优化）、可复现迁移步骤、验收基线、回退与已知限制 |
 | `engine-restart-coordination-20260906.md` | **引擎重启协调协议（硬规则）**：多会话共享单引擎的重启前三查/公告/冻结窗口；404 风暴归因（重启加载窗口客户端重试，`_wait_for_ready` 已改功能性探针） |
 | `engines-sh-param-alignment-20261020.md` | **engines.sh 参数对齐修复（DEF-211）**：`engines.sh` 缺 `--enable-auto-tool-choice` 导致辅助引擎静默丢失 tool calling；补齐 4 项参数与 `manage.sh` 对齐 |
