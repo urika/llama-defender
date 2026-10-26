@@ -103,14 +103,27 @@
 | `PROXY_DIAG_TIMINGS_SOURCE` | `auto` | prefill 数来源：`auto`（响应体 timings 探测，无则字段缺省）/ `off` |
 | `PROXY_CACHE_LCP_SNAPDOWN` | `1` | LCP snap-down（GDN 线性态检查点续算，Gate A 验证 29.7×）；生产画像见 `tools/lcp_trace_analyzer.py` 归档 |
 
-### 11.7 admin 注入原语参数（ADR-013 T1，reloadable）
+### 11.7 循环干预与 fnf 缓解参数（fnf 一期 F1/F2/F3'，2026-10-26，全部 reloadable，缺省关＝零行为变化）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `PROXY_FNF_GUIDE_ENABLED` | `false` | **F1**：file_not_found 会话账本＋分级升级提示——同路径第 N 次失败（默认 N≥3）注入「已确认不存在（第 N 次）＋禁止再试＋替代行动」；清零口＝同路径后续成功读取。激活=空窗一次戳（conf sha256＋窗前后 /metrics 快照）→ swe-eval 探针 A/B |
+| `PROXY_FNF_CANDIDATES_ENABLED` | `false` | **F2**（F1 子旗标）：最近邻候选——首败时 `ls -1 <父目录>`（2s 超时、512 chars、每会话每目录至多一次）注入真实存在的相近文件；安全边界＝仅**已证工作区根**内（根集＝同会话成功 Read 的 file_path 公共前缀 ≥2 层），根外不取 |
+| `PROXY_LOOP_ESCALATION_MEMORY_ENABLED` | `false` | **F3'**：会话级升级记忆——阶梯触发带会话级累积计数（注入「第 N 次」）；L2 sticky＝同错误形态在限制窗内重现 → 维持摘除并升级提示（打破「干预饱和但无记忆无升级」） |
+| `PROXY_LOOP_STICKY_TURNS` | `3` | F3' sticky 窗宽（轮）——L2 摘除后同错误形态在此轮数内重现即维持摘除 |
+| `PROXY_LOOP_BASH_PATH_KEYS_ENABLED` | `false` | **F3**（2026-10-26 v0.1 起降级为兜底面）：Bash 计数键修复——从 tool_result 错误行派生 `Bash:fnf:<path>` 键；注意 1025-5 实测阶梯本已重度触发（变体逃逸前提失效） |
+
+> 旗标名与 swe-eval `configs/capability-flags.yaml` 的 `fnf_guide_kit` 册条逐字一致
+> （`PROXY_FNF_GUIDE_ENABLED` / `PROXY_FNF_CANDIDATES_ENABLED` / `PROXY_LOOP_ESCALATION_MEMORY_ENABLED`）。
+
+### 11.8 admin 注入原语参数（ADR-013 T1，reloadable）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `PROXY_ADMIN_TOKEN` | `""` | `/admin/inject` 鉴权；默认空 = localhost-only（同既有 admin 端点） |
 | `PROXY_INJECT_MAX_CHARS` | `4000` | 注入 text 上限，超限 413（不截断） |
 
-### 11.8 BVR 自调优参数（bvr-autotune-loop-design-20260916，reloadable）
+### 11.9 BVR 自调优参数（bvr-autotune-loop-design-20260916，reloadable）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -120,7 +133,7 @@
 
 > **2026-10-05 裁决（hub 0925-2①，域负责人拍板"分工"）**：autotune **降格为纯提案器**——`generate/list` 保留，`apply/rollback` 冻结（提案一律进 swe-eval E 期周闸门人审，采纳后经 goal.yaml 管控的 knob 路径生效）；参数白名单唯一权威＝`configs/goal.yaml`（version 递增），白名单外提案拒绝。**批期禁 autotune apply**（同批期红线 1 族）。生效链路（overrides.conf/reload 钩子）如需接通，先按契约 §六登记（roadmap #15）。
 
-### 11.9 跨会话记忆 + 自动交接（R-CM-1/R-CM-2，2026-10-08，reloadable）
+### 11.10 跨会话记忆 + 自动交接（R-CM-1/R-CM-2，2026-10-08，reloadable）
 
 需求：[`docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md`](../../docs/01-requirements-product/context-engineering-enhancement-requirements-20261008.md)。**均默认关**。
 
