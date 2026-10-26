@@ -114,8 +114,11 @@ sev_max() {
 
 report() {
     local snap="$1" prev_file="$2"
-    python3 - "$snap" "$prev_file" <<'PY'
-import json, sys, time, os
+    MONITOR_TOOLS_DIR="$ROOT/tools" python3 - "$snap" "$prev_file" <<'PY'
+import json, os, sys, time
+
+sys.path.insert(0, os.environ.get("MONITOR_TOOLS_DIR", "."))
+import monitor_window as mw
 
 snap = json.loads(sys.argv[1])
 state_f = sys.argv[2]
@@ -134,39 +137,54 @@ level, alerts, advice = "OK", [], []
 if snap.get("pressure") == "critical":
     level = "CRIT"; alerts.append("内存压力 critical")
 elif snap.get("pressure") == "warning":
-    level = max(level, "WARN") if level != "CRIT" else level; alerts.append("内存压力 warning")
+    level = mw.sev_max(level, "WARN"); alerts.append("内存压力 warning")
 
-# 2) 内存准入拒绝速率（每小时增量）
+# 2) 滚动窗口速率外推（消「相邻 5 分钟窗」外推失真）
+#    实测两次误报（10-27 前：0.3h/0.4h 耗尽均未发生）——相邻窗斜率非单调
+#    （Splash 周期性回收使 headroom 锯齿），单窗差分噪声大。改 30 分钟滚动
+#    窗口最小二乘；样本跨度不足 MIN_SPAN_MIN 时**不外推**（只报样本不足）。
+WINDOW_MIN = float(os.environ.get("MONITOR_ETA_WINDOW_MIN", 30))
+MIN_SPAN_MIN = float(os.environ.get("MONITOR_ETA_MIN_SPAN_MIN", 15))
 denied = snap["memory_denied"]
-if prev and "memory_denied" in prev and now > prev.get("ts_epoch", 0):
-    dt_h = max((now - prev["ts_epoch"]) / 3600.0, 1e-6)
-    rate = (denied - prev["memory_denied"]) / dt_h
-    snap["denied_rate_per_h"] = round(rate, 1)
-    if rate > float(os.environ.get("MONITOR_DENIED_RATE", 300)):
-        alerts.append(f"denied 增速 {rate:.0f}/h（阈值 {os.environ.get('MONITOR_DENIED_RATE', 300)}）")
-        lvl = "CRIT" if rate > 1000 else "WARN"
-        if lvl == "CRIT": level = "CRIT"
-        elif level != "CRIT": level = "WARN"
+hr = snap["memory_headroom_gb"]
+
+hist = mw.update_history(
+    (prev or {}).get("hist") if prev else None,
+    now, hr, denied, window_min=WINDOW_MIN)
+
+# 2a) 内存准入拒绝速率（滚动窗口斜率 → 每小时增量；跨度不足不外推）
+_den = mw.denied_rate(hist, min_span_min=MIN_SPAN_MIN)
+den_slope = _den["rate_per_h"]
+den_span = _den["span_min"]
+if den_slope is not None:
+    snap["denied_rate_per_h"] = round(den_slope, 1)
+    snap["denied_window_min"] = round(den_span, 1)
+    if den_slope > float(os.environ.get("MONITOR_DENIED_RATE", 300)):
+        alerts.append(f"denied 增速 {den_slope:.0f}/h（{den_span:.0f}min 滚动窗口，"
+                      f"阈值 {os.environ.get('MONITOR_DENIED_RATE', 300)}）")
+        lvl = "CRIT" if den_slope > 1000 else "WARN"
+        level = "CRIT" if lvl == "CRIT" else mw.sev_max(level, "WARN")
 
 # 3) headroom
-hr = snap["memory_headroom_gb"]
 if hr < float(os.environ.get("MONITOR_HEADROOM_G", 8)):
     alerts.append(f"headroom 仅 {hr}GB（阈值 {os.environ.get('MONITOR_HEADROOM_G', 8)}GB）")
     if hr < 4: level = "CRIT"
-    elif level != "CRIT": level = "WARN"
+    else: level = mw.sev_max(level, "WARN")
 
-# 4) headroom 耗尽预测（用 headroom 负增长速率）
-if prev and "memory_headroom_gb" in prev and now > prev.get("ts_epoch", 0):
-    dt_h = max((now - prev["ts_epoch"]) / 3600.0, 1e-6)
-    drain = (prev["memory_headroom_gb"] - hr) / dt_h
-    if drain > 0.2:
-        snap["headroom_drain_per_h"] = round(drain, 2)
-        eta_h = hr / drain
-        snap["headroom_eta_h"] = round(eta_h, 1)
-        if eta_h < 6:
-            alerts.append(f"按当前速率 headroom 约 {eta_h:.1f}h 耗尽")
-            if eta_h < 2: level = "CRIT"
-            elif level != "CRIT": level = "WARN"
+# 4) headroom 耗尽预测（滚动窗口斜率；跨度不足 → 不外推）
+_eta = mw.headroom_eta(hist, hr, min_span_min=MIN_SPAN_MIN)
+snap["headroom_eta_window_min"] = _eta["span_min"]
+if _eta["sufficient"] and _eta["eta_h"] is not None:
+    snap["headroom_drain_per_h"] = _eta["drain_per_h"]
+    snap["headroom_eta_h"] = _eta["eta_h"]
+    eta_h = _eta["eta_h"]
+    if eta_h < 6:
+        alerts.append(f"按 {_eta['span_min']:.0f}min 滚动速率 headroom 约 {eta_h:.1f}h 耗尽")
+        if eta_h < 2: level = "CRIT"
+        else: level = mw.sev_max(level, "WARN")
+else:
+    # 样本不足：不外推（宁可不报，不误报——两次误报的教训）
+    snap["headroom_eta_h"] = None
 
 # 5) 失败请求
 if snap["req_failed"] > 0:
@@ -177,12 +195,12 @@ if snap["req_failed"] > 0:
 p95 = snap["ttft_p95_ms"] / 1000.0
 if p95 > float(os.environ.get("MONITOR_TTFT_P95_S", 60)):
     alerts.append(f"ttft_p95 {p95:.1f}s（阈值 {os.environ.get('MONITOR_TTFT_P95_S', 60)}s）")
-    if level != "CRIT": level = "WARN"
+    level = mw.sev_max(level, "WARN")
 
 # 7) 热状态（从 /status 附带，若采集了）
 th = snap.get("thermal", "")
 if th == "heavy":
-    level = "CRIT" if level != "CRIT" else level; alerts.append("热状态 heavy（GPU 降频风险）")
+    level = "CRIT"; alerts.append("热状态 heavy（GPU 降频风险）")
 elif th == "fair":
     if level == "OK": level = "INFO"
     alerts.append("热状态 fair")
@@ -208,9 +226,12 @@ snap["advice"] = "; ".join(recs) if recs else "服务健康"
 # 写状态文件（供下轮差分）
 snap["ts_epoch"] = now
 tmp = state_f + ".tmp"
-json.dump({k: snap.get(k) for k in
-           ("ts_epoch", "memory_denied", "memory_headroom_gb", "kv_gb", "state_gb",
-            "req_completed")}, open(tmp, "w"))
+_st = {k: snap.get(k) for k in
+       ("ts_epoch", "memory_denied", "memory_headroom_gb", "kv_gb", "state_gb",
+        "req_completed")}
+# 滚动窗口历史样本：(ts, headroom_gb, denied)——外推用（相邻窗差分噪声大）
+_st["hist"] = [[round(h[0], 3), round(h[1], 3), round(h[2], 3)] for h in hist]
+json.dump(_st, open(tmp, "w"))
 os.replace(tmp, state_f)
 
 print(json.dumps(snap, ensure_ascii=False))
@@ -236,7 +257,9 @@ print(f"[{s['ts']}] {lvl} | batch={s.get('batch')} | "
       f"kv {s.get('kv_gb')}G state {s.get('state_gb')}G/{s.get('state_entries')} | "
       f"ttft {s.get('ttft_p50_ms')}ms/{s.get('ttft_p95_ms')}ms itl {s.get('itl_p50_ms')}ms "
       f"dec {s.get('decode_tps')} pre {s.get('prefill_tps')} draft {s.get('draft_acceptance')} | "
-      f"th {s.get('thermal','—')} | {s.get('advice','')}")
+      f"th {s.get('thermal','—')} | "
+      f"eta {s.get('headroom_eta_h') if s.get('headroom_eta_h') is not None else '—'}"
+      f"({s.get('headroom_eta_window_min','—')}min 窗) | {s.get('advice','')}")
 for a in s.get("alerts", []):
     print(f"    ⚠ {a}")
 PY

@@ -1,0 +1,116 @@
+"""监控滚动窗口外推数学的单测（tools/monitor_window.py）。
+
+背景：原实现用「相邻两次快照差分」外推 headroom 耗尽时间，5 分钟采样
+噪声大 → 两次误报（0.3h/0.4h 耗尽均未发生）。改 30 分钟滚动窗口最小
+二乘，且样本跨度不足时不外推。本文件锁死这些行为。
+"""
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "tools"))
+
+import monitor_window as mw
+
+
+def series(start_ts, n, step_s, headroom0, drain_per_h, denied0, denied_rate_per_h):
+    """构造线性样本序列（headroom 按 drain_per_h GB/h 下降）。"""
+    out = []
+    for i in range(n):
+        dt_h = (step_s * i) / 3600.0
+        out.append((start_ts + step_s * i,
+                    headroom0 - drain_per_h * dt_h,
+                    denied0 + denied_rate_per_h * dt_h))
+    return out
+
+
+class MonitorWindowTest(unittest.TestCase):
+
+    def test_slope_linear_series_exact(self):
+        """线性序列斜率＝真实速率（每小时）。"""
+        s = series(1000.0, 7, 300, 20.0, 0.5, 3000, 600)
+        slope, span = mw.slope(s, 1)
+        self.assertAlmostEqual(slope, -0.5, places=6)   # headroom 每小时 -0.5GB
+        self.assertAlmostEqual(span, 30.0, places=6)    # 6 段 × 5 分钟
+        slope2, _ = mw.slope(s, 2)
+        self.assertAlmostEqual(slope2, 600.0, places=3)  # denied 每小时 +600
+
+    def test_slope_insufficient_samples(self):
+        self.assertEqual(mw.slope([], 1), (None, 0.0))
+        self.assertEqual(mw.slope([(1.0, 2.0, 3.0)], 1), (None, 0.0))
+
+    def test_slope_degenerate_all_same_ts(self):
+        """同一时间戳的重复样本 → 斜率 None（不外推）。"""
+        s = [(100.0, 20.0, 100), (100.0, 20.0, 100)]
+        slope, span = mw.slope(s, 1)
+        self.assertIsNone(slope)
+
+    def test_update_history_appends_and_trims(self):
+        prev = [[0.0, 20.0, 100], [100.0, 19.9, 200]]
+        hist = mw.update_history(prev, 200.0, 19.8, 300, window_min=30)
+        self.assertEqual(len(hist), 3)
+        self.assertEqual(hist[-1][2], 300)
+
+    def test_update_history_drops_out_of_window(self):
+        now = 10_000.0
+        prev = [[now - 7200, 20.0, 100], [now - 300, 19.0, 200]]
+        hist = mw.update_history(prev, now, 18.9, 250, window_min=30)
+        self.assertEqual(len(hist), 2)   # 2h 前的样本被裁掉
+        self.assertAlmostEqual(hist[0][0], now - 300, places=3)
+
+    def test_update_history_tolerates_garbage(self):
+        hist = mw.update_history([["x", None], [1.0, 2.0, 3.0]], 10.0, 4.0, 5.0)
+        self.assertEqual(len(hist), 2)
+
+    def test_headroom_eta_insufficient_span_no_extrapolation(self):
+        """跨度不足 → 不外推（eta=None）——两次误报的教训。"""
+        s = series(1000.0, 3, 300, 20.0, 5.0, 100, 0)   # 10 分钟跨度
+        out = mw.headroom_eta(s, 18.0, min_span_min=15)
+        self.assertFalse(out["sufficient"])
+        self.assertIsNone(out["eta_h"])
+
+    def test_headroom_eta_linear_drain(self):
+        s = series(1000.0, 7, 300, 20.0, 0.5, 100, 0)
+        out = mw.headroom_eta(s, 17.5, min_span_min=15)
+        self.assertTrue(out["sufficient"])
+        self.assertAlmostEqual(out["drain_per_h"], 0.5, places=2)
+        self.assertAlmostEqual(out["eta_h"], 35.0, places=1)   # 17.5 / 0.5
+
+    def test_headroom_eta_flat_no_drain(self):
+        """基本没掉 → sufficient=True 但不报 eta（不误报）。"""
+        s = series(1000.0, 7, 300, 20.0, 0.0, 100, 0)
+        out = mw.headroom_eta(s, 20.0, min_span_min=15)
+        self.assertTrue(out["sufficient"])
+        self.assertIsNone(out["eta_h"])
+
+    def test_denied_rate(self):
+        s = series(1000.0, 7, 300, 20.0, 0.5, 3000, 1200)
+        r = mw.denied_rate(s)
+        self.assertAlmostEqual(r["rate_per_h"], 1200.0, places=3)
+        self.assertAlmostEqual(r["span_min"], 30.0, places=6)
+
+    def test_denied_rate_single_sample(self):
+        r = mw.denied_rate([(1.0, 2.0, 3.0)])
+        self.assertIsNone(r["rate_per_h"])
+
+    def test_denied_rate_short_span_no_extrapolation(self):
+        """跨度不足 → 不外推（denied 增长是突发的，短窗会算出上万/h）。"""
+        s = series(1000.0, 2, 60, 20.0, 0.0, 3000, 0)   # 1 分钟跨度
+        r = mw.denied_rate(s, min_span_min=15)
+        self.assertIsNone(r["rate_per_h"])
+        self.assertAlmostEqual(r["span_min"], 1.0, places=6)
+
+    def test_sev_max_not_lexicographic(self):
+        """等级取严重度更高者——不能用字符串 max()（CRIT 被 WARN 覆盖）。"""
+        self.assertEqual(mw.sev_max("OK", "WARN"), "WARN")
+        self.assertEqual(mw.sev_max("CRIT", "WARN"), "CRIT")
+        self.assertEqual(mw.sev_max("WARN", "CRIT"), "CRIT")
+        self.assertEqual(mw.sev_max("INFO", "OK"), "INFO")
+        self.assertEqual(mw.sev_max("CRIT", "CRIT"), "CRIT")
+        self.assertNotEqual(mw.sev_max("CRIT", "WARN"), max("CRIT", "WARN"))
+
+
+if __name__ == "__main__":
+    unittest.main()

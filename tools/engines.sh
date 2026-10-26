@@ -37,6 +37,35 @@ _pidfile()  { echo "$ENGINE_DIR/$1.pid"; }
 _spfile()   { echo "$ENGINE_DIR/$1.supervisor.pid"; }
 _logfile()  { echo "$LOG_DIR/$1.log"; }
 
+# 解析引擎实际 PID（两套 pidfile 互不可见的历史坑，2026-10-27 修）：
+#   ① 本脚本启动的引擎 → $ENGINE_DIR/<name>.pid
+#   ② manage.sh start-aux 启动的辅助引擎 → $LOG_DIR/backend-<name>.pid
+#      （embedgemma2 即此路径：manage.sh 自动拉起，PID 落在 logs/ 下；
+#        engines.sh stop 曾因此误报「未在运行」而进程仍在跑）
+# 输出：存活 PID（空 = 未运行）
+_resolve_pid() {
+    local name="$1" pf
+    pf="$(cat "$(_pidfile "$name")" 2>/dev/null)"
+    if [[ -n "$pf" ]] && _is_alive "$pf"; then
+        echo "$pf"; return 0
+    fi
+    pf="$(cat "$LOG_DIR/backend-$name.pid" 2>/dev/null)"
+    if [[ -n "$pf" ]] && _is_alive "$pf"; then
+        echo "$pf"; return 0
+    fi
+    echo ""
+}
+
+# PID 归属（用于 status 标注管理方）
+_pid_owner() {
+    local name="$1" pf
+    pf="$(cat "$(_pidfile "$name")" 2>/dev/null)"
+    if [[ -n "$pf" ]] && _is_alive "$pf"; then echo "engines.sh"; return 0; fi
+    pf="$(cat "$LOG_DIR/backend-$name.pid" 2>/dev/null)"
+    if [[ -n "$pf" ]] && _is_alive "$pf"; then echo "manage.sh"; return 0; fi
+    echo ""
+}
+
 _usage() {
     echo "用法: tools/engines.sh {list|start|stop|restart|status|supervise|unsupervise|start-all|stop-all} [name]"
 }
@@ -78,8 +107,8 @@ _cmd_start() {
         error "配置不存在: $conf"; return 1
     fi
     local pf _pidfile="$(_pidfile "$name")"
-    pf="$(cat "$_pidfile" 2>/dev/null)"
-    if _is_alive "$pf"; then
+    pf="$(_resolve_pid "$name")"
+    if [[ -n "$pf" ]]; then
         warn "引擎 $name 已在运行 (PID: $pf)"; return 0
     fi
     local model port extra toolparser reasoning kvquant kvbits thinking
@@ -134,8 +163,8 @@ _cmd_start() {
 _cmd_stop() {
     local name="$1"
     local pf _pidfile="$(_pidfile "$name")"
-    pf="$(cat "$_pidfile" 2>/dev/null)"
-    if _is_alive "$pf"; then
+    pf="$(_resolve_pid "$name")"
+    if [[ -n "$pf" ]]; then
         # 优雅 SIGTERM(rapid-mlx 会保存 prefix cache), 超时后 SIGKILL
         kill "$pf" 2>/dev/null
         for _ in $(seq 1 20); do
@@ -150,7 +179,7 @@ _cmd_stop() {
     else
         info "引擎 $name 未在运行"
     fi
-    rm -f "$_pidfile"
+    rm -f "$_pidfile" "$LOG_DIR/backend-$name.pid"
     # 连带停守护(除非守护仍被 supervisor 管理——stop 只停引擎, 守护会重生)
 }
 
@@ -168,12 +197,15 @@ _cmd_status() {
     fi
 }
 _status_one() {
-    local name="$1" pf sp port
-    pf="$(cat "$(_pidfile "$name")" 2>/dev/null)"
+    local name="$1" pf sp port owner
+    pf="$(_resolve_pid "$name")"
     sp="$(cat "$(_spfile "$name")" 2>/dev/null)"
+    owner="$(_pid_owner "$name")"
     port="$(_get_conf "$name" LLAMA_PORT)"
-    if _is_alive "$pf"; then
-        printf '  %-14s ✅ 运行中 PID=%s :%s%s\n' "$name" "$pf" "$port" "$(_is_alive "$sp" && echo " (守护)" || echo "")"
+    if [[ -n "$pf" ]]; then
+        printf '  %-14s ✅ 运行中 PID=%s :%s%s%s\n' "$name" "$pf" "$port" \
+            "$(_is_alive "$sp" && echo " (守护)" || echo "")" \
+            "$([[ -n "$owner" ]] && echo " [由 $owner 管理]" || echo "")"
     else
         printf '  %-14s ⚪ 停止\n' "$name"
     fi

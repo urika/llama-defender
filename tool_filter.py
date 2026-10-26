@@ -460,8 +460,6 @@ def _translate_tool_result_errors_ex(messages, session_id="", profile=""):
             for b in c:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tu_by_id[b.get("id", "")] = (b.get("name", ""), b.get("input"))
-    if os.environ.get("FNF_DEBUG"):
-        print(f"[FNF-DBG] guide={guide} cand={cand_flag} sid={sid!r} suppress={suppress} tu_by_id={tu_by_id}")
 
     def _old_fnf_hint():
         return ("[System: 文件不存在。请先用 Bash ls 或 find 命令确认项目结构，"

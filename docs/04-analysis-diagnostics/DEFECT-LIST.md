@@ -528,6 +528,28 @@
 | **验收（2026-10-22 01:15）** | `stop` → `start` 一轮：发现并清理孤儿 461/482，最终仅剩 1063(前端)/1138(引擎) 单实例；`:8081` 正常监听；`memory_pressure=normal`、headroom 19.46GB、`denied=0`；持久缓存恢复 462 个 restore point；健康请求 `stop=end_turn` / `OK`。 |
 | **残留风险** | swap 仍 7.0GB/8GB；`PROXY_MAX_CONCURRENT=1` 下 59–108K 长上下文会排队数分钟。建议择机重启系统释放 swap。 |
 
+### DEF-321: `tools/engines.sh` 与 `manage.sh` 两套 PID 文件互不可见 → 停止辅助引擎误报「未在运行」（P2） — ✅ 已修复（2026-10-27）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | `tools/engines.sh stop embedgemma2` 报「引擎 embedgemma2 未在运行」，但 8083 端口仍在监听、进程 49371 健在（`llama-server-eg2`，启动于 10-23 18:16）。 |
+| **根因** | 两套管理器各写各的 PID 文件：`manage.sh start-aux` 写 `logs/backend-<name>.pid`，`tools/engines.sh` 写 `.engines/<name>.pid`。embedgemma2 由 `manage.sh` 自动拉起（`CONFIG_AUTOSTART_AUX`），PID 只落在 `logs/` 下；`engines.sh` 只认 `.engines/` → 读不到 PID → 判定「未运行」且**不执行停止**。`.engines/` 目录实测为空。 |
+| **影响** | 运维误导（以为引擎已停，实际仍在跑，占 CPU/内存）；`engines.sh start` 还会因「未在运行」判定而尝试二次启动（端口冲突）。 |
+| **修复（2026-10-27）** | `tools/engines.sh` 新增 `_resolve_pid()`：先查 `.engines/<name>.pid`，再回落 `logs/backend-<name>.pid`（谁活着用谁）；`_pid_owner()` 标注归属方。`stop` 停完清理两处 PID 文件；`status` 显示 `[由 manage.sh 管理]`；`start` 改为「已运行即跳过」（不再二次拉起）。`manage.sh:cmd_stop_aux` 本身逻辑正确（读同一 PID 文件），无需改动。 |
+| **验收（2026-10-27）** | `tools/engines.sh status embedgemma2` → `✅ 运行中 PID=49371 :8083 [由 manage.sh 管理]`；`bash -n` 通过。 |
+| **残留风险** | 两套管理入口并存仍是设计债（建议长期收敛为单一入口）；`supervise` 守护仍只认 `.engines/`。 |
+
+### DEF-322: 监控外推失真——相邻窗差分算 ETA + 告警等级用字符串 `max()` 比较（P2） — ✅ 已修复（2026-10-27）
+
+| 项 | 内容 |
+|----|------|
+| **现象 A（ETA 误报 ×2）** | 10-27 前后两次报「按当前速率 headroom 约 0.3h / 0.4h 耗尽」，均未发生（headroom 实际稳定在 17–18GB）。根因：ETA 用**相邻两次快照差分**外推 5 分钟窗，headroom 因 Splash 周期性回收呈锯齿 → 单窗斜率非单调、噪声放大。 |
+| **现象 B（等级错标）** | 日志出现 `CRIT | 内存压力 warning` —— 判级用 `max(level, "WARN")`，字符串字典序下 `"CRIT" < "WARN"` 为真 → **CRIT 被 WARN 覆盖**，告警行级别与实际不符（等级取严重度更高者的语义被破坏）。 |
+| **现象 C（速率荒谬）** | 改滚动窗后首轮出现「denied 增速 79710/h（0min 窗口）」——denied 是突发计数（单分钟可 +350），1–2 个样本的差分算出上万/h。 |
+| **修复（2026-10-27）** | ① 新增 `tools/monitor_window.py`（纯函数层，可单测）：`slope()` 最小二乘、`update_history()` 窗口裁剪、`headroom_eta()`/`denied_rate()`（**最小跨度闸 15min，跨度不足不外推**）、`sev_max()` 严重度比较；② `tools/monitor_service.sh` 改用该模块，状态文件新增 `hist` 滚动历史（30min 窗）；③ 告警文本标注窗口跨度，摘要行增列 `eta X(Ymin 窗)`。 |
+| **验收（2026-10-27）** | 新增 `test/unit/test_monitor_window.py`（13 例：斜率精确性/跨度闸/窗口裁剪/等级序/退化样本）；实跑 `once` 输出 `eta —(0.0min 窗)` 且告警级别正确（WARN 而非错标 CRIT）；监控守护已重启加载新逻辑（PID 7686）。 |
+| **残留风险** | 滚动窗需 ≥15min 真实样本才有外推（守护 5min 周期 ⇒ 约 3 轮后可用）；合成/污染样本会污染窗口（本次已清空重建）。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）
