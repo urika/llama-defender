@@ -16,12 +16,27 @@ import json
 import hashlib
 import os
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 import proxy_state as _ps
 
 DIAG_SCHEMA_VERSION = 1
 JSONL_ROTATE_BYTES = 10 * 1024 * 1024  # 与 proxy_metrics.jsonl 同策略
+
+# L-28(2026-10-26): sessions.jsonl 按日归档保留策略。当日写活文件(兼容现状),
+# 日切把此前内容转存同目录 sessions-YYYYMMDD.jsonl;过期归档按
+# PROXY_DIAG_SESSIONS_RETENTION_DAYS 清理。选同目录按日后缀而非 diag/archive/
+# 子目录: 后者是 session_ledger 会话档案的家(_enforce_cap_locked 用 listdir
+# 全量计 MB cap、ctx_recall 按会话名读取), 混入会污染 cap 计量甚至误驱逐
+# 会话证据;而已知消费方全部按精确路径读 sessions.jsonl(无 glob), 同目录
+# 后缀文件对它们零扰动。
+_SESSIONS_ARCHIVE_PREFIX = "sessions-"     # 归档名: sessions-YYYYMMDD.jsonl
+_RETENTION_CHECK_INTERVAL_S = 24 * 3600.0  # 过期清理检查节流(每至多 24h 一次)
+# 节流时间戳初值 = now - interval: time.monotonic() 是进程相对时钟(Linux 上
+# 自进程启动起算), 初值置 0 会把首次清理推迟到进程运行满 24h 之后;回拨一个
+# interval 保证重启后首次写入即补查(回收停机期间过期的归档)。
+_retention_state = {"last_check": time.monotonic() - _RETENTION_CHECK_INTERVAL_S}
 
 # R9 实验前置①: 配置指纹——数据自带产生条件。信息域关键参数快照入每轮
 # 记录,治疗分派变成可查询(config.keep_messages==12)而非依赖外部记忆;
@@ -414,12 +429,103 @@ def _ensure_diag_dir():
         pass
 
 
+def _archive_file(src, dst):
+    """src 并入 dst(dst 不存在则整体改名, 已存在则追加合并)后删除 src。
+
+    纯 OSError 域: 局部失败 fail-open(最坏情形 = src 保留原状, 下次日切
+    重试), 不向上抛。
+    """
+    import shutil
+    try:
+        if not os.path.exists(dst):
+            shutil.move(src, dst)
+            return
+        with open(src, "rb") as fsrc, open(dst, "ab") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+        os.remove(src)
+    except OSError:
+        pass
+
+
+def _day_cut_sessions_locked():
+    """L-28 日切(调用方持 _diag_lock): 活文件内容写于此前日期时转存归档。
+
+    无状态检测: 每次写入都 append+close, 活文件 mtime 即末次写入时刻——
+    mtime 的本地日期 != 今天 ⟺ 文件全部内容属于此前某日。进程重启/停机
+    跨天由下一次写入自然补切, 无需进程内记忆。10MB 溢出段 `.1` 与活文件
+    同日(日内轮转先于日切发生), 一并并入同一归档保持该日完整;归档名冲突
+    (同日多段)按追加合并, 不丢数据。日切先于 10MB 轮转执行(见
+    log_session_diag), 保证轮转删除 `.1` 时它不会携带跨日内容。
+    """
+    base = _ps._DIAG_SESSIONS_PATH
+    try:
+        day = datetime.fromtimestamp(os.path.getmtime(base)).strftime("%Y%m%d")
+    except (OSError, OverflowError, ValueError):
+        return
+    if day >= datetime.now().strftime("%Y%m%d"):
+        return
+    archive = os.path.join(os.path.dirname(base),
+                           _SESSIONS_ARCHIVE_PREFIX + day + ".jsonl")
+    bak = base + ".1"
+    if os.path.exists(bak):
+        _archive_file(bak, archive)
+    _archive_file(base, archive)
+
+
+def _sessions_retention_cleanup():
+    """L-28: 删除超过保留期的 sessions-YYYYMMDD.jsonl 归档(旁路 fail-open)。
+
+    进程内节流: 每至多 24h 真正扫描一次(_retention_state, monotonic,
+    初值见模块头注释;节流时间戳先置位再扫描, 单次扫描失败最多静默一个
+    窗口)。保留天数 = PROXY_DIAG_SESSIONS_RETENTION_DAYS(reloadable),
+    0 = 无限保留(直接跳过)。只匹配 <prefix>YYYYMMDD.jsonl 形态, 活文件/
+    `.1`/手工备份(bak-*)不受影响;定宽 YYYYMMDD 字符串字典序 = 时间序。
+    恰好等于保留期边界(今天-days)的归档保留(≥N 天语义)。
+    自守护 fail-open: 本函数任何异常只记 WARN(warn_suppressed), 不上抛。
+    """
+    try:
+        now = time.monotonic()
+        if now - _retention_state["last_check"] < _RETENTION_CHECK_INTERVAL_S:
+            return
+        _retention_state["last_check"] = now
+        days = int(getattr(_ps, "PROXY_DIAG_SESSIONS_RETENTION_DAYS", 90) or 0)
+        if days <= 0:
+            return
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        base_dir = os.path.dirname(_ps._DIAG_SESSIONS_PATH)
+        for name in os.listdir(base_dir):
+            if not (name.startswith(_SESSIONS_ARCHIVE_PREFIX)
+                    and name.endswith(".jsonl")):
+                continue
+            date_part = name[len(_SESSIONS_ARCHIVE_PREFIX):-len(".jsonl")]
+            if len(date_part) != 8 or not date_part.isdigit():
+                continue
+            if date_part < cutoff:
+                try:
+                    os.remove(os.path.join(base_dir, name))
+                except OSError:
+                    pass
+    except Exception as _e:
+        warn_suppressed("sessions_retention", _e)
+
+
 def log_session_diag(record):
-    """append 一条 per-turn 记录到 sessions.jsonl(10MB 轮转,仿 log_metrics)。"""
+    """append 一条 per-turn 记录到 sessions.jsonl(10MB 轮转 + L-28 日切归档)。
+
+    L-28(2026-10-26): 写入时无状态检测日期变更(活文件 mtime 本地日期
+    != 今天), 把此前内容转存同目录 sessions-YYYYMMDD.jsonl;过期归档由
+    PROXY_DIAG_SESSIONS_RETENTION_DAYS 控制清理(写入旁路 fail-open,
+    24h 节流, 见 _sessions_retention_cleanup)。全链路 fail-open:
+    日切/清理异常只记 WARN, 不得影响请求路径。
+    """
     _ensure_diag_dir()
     line = json.dumps(record, ensure_ascii=False) + "\n"
     try:
         with _ps._diag_lock:
+            try:
+                _day_cut_sessions_locked()
+            except Exception as _e:
+                warn_suppressed("sessions_day_cut", _e)
             try:
                 if os.path.getsize(_ps._DIAG_SESSIONS_PATH) > JSONL_ROTATE_BYTES:
                     import shutil
@@ -434,6 +540,7 @@ def log_session_diag(record):
                 f.write(line)
     except OSError:
         pass
+    _sessions_retention_cleanup()  # L-28: 旁路清理(自守护 fail-open, 24h 节流)
 
 
 def log_lifecycle_event(event, **detail):

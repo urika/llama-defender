@@ -537,6 +537,11 @@ PROXY_DIAG_LEDGER_ENABLED = os.environ.get(
     "PROXY_DIAG_LEDGER_ENABLED", get_default("PROXY_DIAG_LEDGER_ENABLED")).lower() in ("1", "true", "yes")
 PROXY_DIAG_LEDGER_MAX_MB = int(os.environ.get(
     "PROXY_DIAG_LEDGER_MAX_MB", get_default("PROXY_DIAG_LEDGER_MAX_MB")))
+# L-28(2026-10-26): sessions.jsonl 按日归档(sessions-YYYYMMDD.jsonl)保留天数。
+# 0 = 无限保留;过期清理由 diagnostics 写入路径旁路执行(24h 节流)。
+PROXY_DIAG_SESSIONS_RETENTION_DAYS = int(os.environ.get(
+    "PROXY_DIAG_SESSIONS_RETENTION_DAYS",
+    get_default("PROXY_DIAG_SESSIONS_RETENTION_DAYS")))
 
 # S-17/BR-4 录制面（request_archive.py，2026-10-13）：逐请求档案 append-only，
 # 默认关 = 任何重启行为中立（批界安全模式）。激活 = conf 置 true + 重启。
@@ -1396,6 +1401,9 @@ _RELOAD_SPEC = [
     ("PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_ARCHIVE_MAX_MB", "int", "200", "200"),
     ("PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_ENABLED", "bool", "true", "true"),
     ("PROXY_DIAG_LEDGER_MAX_MB", "PROXY_DIAG_LEDGER_MAX_MB", "int", "100", "100"),
+    # L-28(2026-10-26): sessions.jsonl 日归档保留天数(0=无限,见 diagnostics.py)
+    ("PROXY_DIAG_SESSIONS_RETENTION_DAYS", "PROXY_DIAG_SESSIONS_RETENTION_DAYS",
+     "int", "90", "90"),
     # S-17/BR-4 录制面（默认关; reloadable——激活一行 conf + reload）
     ("PROXY_REQUEST_ARCHIVE_ENABLED", "PROXY_REQUEST_ARCHIVE_ENABLED", "bool", "false", "false"),
     ("PROXY_REQUEST_ARCHIVE_DIR", "PROXY_REQUEST_ARCHIVE_DIR", "str",
@@ -1568,6 +1576,7 @@ __all__ = [
     "PROXY_DIAG_SESSION_TTL_MIN", "PROXY_DIAG_SESSION_MAX", "PROXY_DIAG_ARCHIVE_ENABLED",
     "PROXY_DIAG_ARCHIVE_MAX_MB", "PROXY_DIAG_TIMINGS_SOURCE",
     "PROXY_DIAG_LEDGER_ENABLED", "PROXY_DIAG_LEDGER_MAX_MB",
+    "PROXY_DIAG_SESSIONS_RETENTION_DAYS",
     "PROXY_REQUEST_ARCHIVE_ENABLED", "PROXY_REQUEST_ARCHIVE_DIR",
     "PROXY_REQUEST_ARCHIVE_MAX_MB", "PROXY_REQUEST_ARCHIVE_RESPONSE_MAX_CHARS",
     "PROXY_HBE_ENABLED", "PROXY_HBE_MIN_CHARS", "PROXY_HBE_SAMPLE_EVERY",

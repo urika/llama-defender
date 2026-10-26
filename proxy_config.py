@@ -905,6 +905,15 @@ CONFIG_REGISTRY = {
                "protection; overflow beyond cap is accepted rather than deleting "
                "protected files).",
     },
+    "PROXY_DIAG_SESSIONS_RETENTION_DAYS": {
+        "defaults": {"all": "90"},
+        "type": "int", "scope": "reloadable",
+        "doc": "L-28: Days to keep daily sessions.jsonl archives "
+               "(logs/diag/sessions-YYYYMMDD.jsonl; the live file is day-cut "
+               "on first write after a date change). Expired archives are "
+               "deleted by a write-path side check throttled to once per 24h "
+               "(fail-open). 0 = keep forever.",
+    },
     # S-17/BR-4 录制面（request_archive.py; schema 契约 =
     # swe-eval s17-recording-surface-design-v0-20261005.md §六）
     "PROXY_REQUEST_ARCHIVE_ENABLED": {

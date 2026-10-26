@@ -26,10 +26,17 @@ class ViewDropTest(unittest.TestCase):
     def setUp(self):
         self._enabled = _ps.PROXY_DIAG_ENABLED
         _ps.PROXY_DIAG_ENABLED = True
+        # L-28: 落盘重定向到 tmp——finalize_request 写路径现含日切/保留清理,
+        # 不得让单测触碰真实 logs/diag/sessions.jsonl 及其归档。
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="l71_test_")
+        self._saved_path = _ps._DIAG_SESSIONS_PATH
+        _ps._DIAG_SESSIONS_PATH = os.path.join(self._tmp, "sessions.jsonl")
         diag.begin_request("req_l71", "sess_l71", "header")
 
     def tearDown(self):
         _ps.PROXY_DIAG_ENABLED = self._enabled
+        _ps._DIAG_SESSIONS_PATH = self._saved_path
 
     def test_accumulate_by_reason(self):
         diag.record_view_drop("epoch_collapse", msgs=8, tokens=1200)
