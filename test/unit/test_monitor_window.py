@@ -64,6 +64,16 @@ class MonitorWindowTest(unittest.TestCase):
         hist = mw.update_history([["x", None], [1.0, 2.0, 3.0]], 10.0, 4.0, 5.0)
         self.assertEqual(len(hist), 2)
 
+    def test_update_history_resets_on_counter_restart(self):
+        """引擎重启 → denied 归零 → 跨复位样本必须丢弃（否则斜率荒谬）。"""
+        now = 10_000.0
+        prev = [[now - 600, 18.0, 7000], [now - 300, 18.0, 7100]]
+        hist = mw.update_history(prev, now, 18.0, 7)      # 7100 → 7 = 复位
+        self.assertEqual(len(hist), 1)                    # 只留本轮样本
+        self.assertAlmostEqual(hist[0][2], 7.0, places=6)
+        r = mw.denied_rate(hist, min_span_min=15)
+        self.assertIsNone(r["rate_per_h"])                # 样本不足 → 不外推
+
     def test_headroom_eta_insufficient_span_no_extrapolation(self):
         """跨度不足 → 不外推（eta=None）——两次误报的教训。"""
         s = series(1000.0, 3, 300, 20.0, 5.0, 100, 0)   # 10 分钟跨度

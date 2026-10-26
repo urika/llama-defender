@@ -52,6 +52,9 @@ def update_history(prev_hist, now, headroom, denied,
 
     窗口保留 2 倍 window_min 的原始样本再按 max_samples 截尾——外推只用
     窗口内样本，多留一段是为了跨越窗口边界时仍有足够跨度。
+
+    **计数器复位处理**：denied 是引擎侧单调计数器，引擎重启即归零；旧样本
+    与复位后的新样本混算会得出荒谬斜率（实测 -26465/h）→ 检测到复位即清窗。
     """
     hist = []
     for h in (prev_hist or []):
@@ -59,6 +62,9 @@ def update_history(prev_hist, now, headroom, denied,
             hist.append((float(h[0]), float(h[1]), float(h[2])))
         except (TypeError, ValueError, IndexError):
             continue
+    hist.sort(key=lambda h: h[0])
+    if hist and float(denied) < hist[-1][2]:
+        hist = []          # 计数器复位（引擎重启）→ 丢弃跨复位样本
     hist.append((float(now), float(headroom), float(denied)))
     hist.sort(key=lambda h: h[0])
     cut = float(now) - float(window_min) * 120.0
