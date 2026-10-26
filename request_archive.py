@@ -475,7 +475,15 @@ def finalize_request(request_id, status=200):
     with _pending_lock:
         _pending.pop(request_id, None)
         rec = _recorded.pop(request_id, None)
-    if rec is None or rec["responded"] or status != 200:
+    if rec is None or rec["responded"]:
+        return
+    if status == 499:
+        # P0-4c(2026-10-27): 客户端取消与 writer 缺口在数据面永久可区分——
+        # 落 meta 行(validator 对非 epoch_fold 的 meta 无约束、重建不消费,
+        # 零风险);基线仍缺,mirror 照常降级 remote-only 但能读到取消原因。
+        _write_response_absent(request_id, rec, "client_cancelled_499")
+        return
+    if status != 200:
         return
     session_key, turn = rec["session"], rec["turn"]
     skeleton = {
@@ -494,6 +502,19 @@ def finalize_request(request_id, status=200):
             _append_line(_shard_path(session_key, view), row)
         except Exception as e:
             _archive_warn(f"skeleton {view} turn {turn} failed: {e}")
+
+
+def _write_response_absent(request_id, rec, reason):
+    """P0-4c: 无 response 轮的 meta 标注（双分片各一行, fail-open）。"""
+    session_key, turn = rec["session"], rec["turn"]
+    for view in (VIEW_R, VIEW_RP):
+        try:
+            row = _base_row(request_id, session_key, view, "meta", turn)
+            row["event"] = "response_absent"
+            row["reason"] = reason
+            _append_line(_shard_path(session_key, view), row)
+        except Exception as e:
+            _archive_warn(f"response_absent {view} turn {turn} failed: {e}")
 
 
 def stats():

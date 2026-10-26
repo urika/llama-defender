@@ -405,3 +405,36 @@ class TestQuotaEviction(RequestArchiveTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResponseAbsentMeta(RequestArchiveTestBase):
+    """P0-4c: 499 轮落 meta:response_absent——与 writer 缺口在数据面可区分."""
+
+    def test_499_writes_meta_row_both_shards(self):
+        self._turn("r1", "sessA", _body("hi"))
+        ra.finalize_request("r1", 499)
+        for view in ("R", "Rp"):
+            rows = _read_rows(self._shard("sessA", view))
+            _assert_mirror_valid(rows)
+            meta = [r for r in rows if r["kind"] == "meta"]
+            self.assertEqual(len(meta), 1)
+            self.assertEqual(meta[0]["event"], "response_absent")
+            self.assertEqual(meta[0]["reason"], "client_cancelled_499")
+            self.assertEqual(meta[0]["turn"], 1)
+            # 不落骨架 response 行（基线仍缺，mirror 降级但可读原因）
+            self.assertFalse([r for r in rows if r["kind"] == "response"])
+
+    def test_other_error_status_stays_silent(self):
+        self._turn("r1", "sessA", _body("hi"))
+        ra.finalize_request("r1", 500)
+        rows = _read_rows(self._shard("sessA", "R"))
+        self.assertFalse([r for r in rows if r["kind"] in ("meta", "response")])
+
+    def test_499_after_real_response_no_meta(self):
+        self._turn("r1", "sessA", _body("hi"))
+        ra.record_response("r1", {"stop_reason": "end_turn", "usage": {},
+                                  "content": [{"type": "text", "text": "ok"}]})
+        ra.finalize_request("r1", 499)  # 迟到的 499 记账不覆盖已落实体行
+        rows = _read_rows(self._shard("sessA", "R"))
+        self.assertFalse([r for r in rows if r["kind"] == "meta"])
+        self.assertTrue([r for r in rows if r["kind"] == "response"])
