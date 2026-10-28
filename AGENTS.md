@@ -333,6 +333,10 @@ git commit --no-verify               # 绕过所有钩子
 - **48 GB Mac 上 `PROXY_MAX_CONCURRENT=1`** 是多个本地配置（rapid-mlx / llama-server）的默认且推荐值。
 - 两个大上下文请求并行极易触发 OOM，症状为 `[METAL] Command buffer execution failed: Insufficient Memory`。
 - Rapid-MLX 的 `--gpu-memory-utilization` 是软限制，实际使用可能超出 20–40%。建议 ≤ 0.80。
+- **例外（2026-10-29 实测）**：预分配 KV 池 + admission control 的后端（Splash 1.4.0 / Kapitsa）可开 2 路并发——
+  `PROXY_MAX_CONCURRENT=2` 实测两路各 ~57-60 tok/s、聚合 113.7 tok/s（带宽共享，总吞吐不降）、内存无异常；
+  Kapitsa 侧需同步 `KAPITSA_SLOTS=2`（slots 只加会话 ring，不按 slots×ctx 预留）。**不建议 >3**（48GB 还要装 IDE/agent + embedgemma2）；
+  **swe 批跑期调回 1**（单流最快）。`PROXY_MAX_CONCURRENT` 支持 SIGHUP 热生效（reload 日志 `Semaphore rebuilt: 1 -> 2`）。
 
 ### 8.2 vllm-mlx 启动
 
