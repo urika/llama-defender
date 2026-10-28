@@ -61,6 +61,38 @@ Kapitsa 官方 `docs/benchmarks.md`（口径：4K prompt + 512 token 答案、T 
 
 **与社区差距的已知项**：我们的包**缺 MTP head**（社区包 20.2GB 含 MTP 239MB；Kapitsa 日志明示 "no MTP head … speculative decoding off"）→ MTP 快路径不可用，只剩 DFlash2；草稿器本身与模型词表一致（均 248320），"reduced draft head 98304 ids" 是 Kapitsa 的设计而非错配。即便追平社区 34.3 tok/s，也仅为现产 35B 的 1/4。
 
+### MTP head 补齐与实测（2026-10-29 03:5x，已闭环）
+
+**取源头**：MTP 张量不在 mlx-community 的 4bit/8bit 权重仓（2180 张量、0 个 `mtp.*`），而在**官方 base 仓 `Qwen/Qwen3.8-27B`**——15 个 `mtp.*` 张量（`mtp.fc`、`mtp.layers.0.*`、`mtp.norm`、`mtp.pre_fc_norm_*`）全部集中在最后一个分片 `model-00018-of-00018.safetensors`（3.39GB）。只下该分片即可（ModelScope 镜像并行 ~3.5 分钟）。
+
+**构建侧车**（Kapitsa 内置子命令，从 safetensors 抽取 mtp 张量）：
+```bash
+kapitsa mtp-sidecar <本地目录含 index+分片+config> /path/mtp.safetensors
+# → wrote ... 15 tensors, 849.4 MB, base_hidden_variant post_norm
+cp mtp.safetensors ~/.cache/kapitsa/models/qwen3.8-27b-4bit/
+```
+
+**验证**（serve 日志）：
+```
+MTP head loaded in 659 ms (dense, trunk hidden post-norm, drafts over the full vocabulary)
+DFlash2: reduced draft head, 98304 of 248320 ids … 1.61 GB resident
+KFlash: tree drafting on the DFlash2 lattice
+engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify), KFlash (DFlash2)
+```
+
+**性能（纯 decode 差分，64/1024 双跑剥离 TTFT）**：
+
+| 配置 | decode | 相对 plain |
+|------|--------|-----------|
+| plain（`--dflash none`，无 MTP） | 17.8 tok/s | — |
+| KFlash（DFlash2 only，无 MTP） | 23.2 tok/s | +30% |
+| **KFlash + MTP head（本次）** | **32.1 tok/s** | **+80%** |
+| 社区同机（M5 Pro **64GB**，含 MTP） | 34.3 tok/s | — |
+
+**结论**：MTP 侧车补齐后达到社区水平的 ~94%（我们 48GB 机、社区 64GB 机）；27B 的瓶颈是稠密 27B 的带宽（13.5GB/token ÷ ~273GB/s ≈ 20 tok/s 理论 plain 上限），投机解码把有效吞吐推到 32 tok/s 属超线性收益。**定位不变**：质量最高（95.2%）但吞吐仅为现产 35B 的 ~1/4 → 保持「质量优先 / 内存友好」降级档，不作吞吐主力。
+
+**注意事项**：`--hidden post_norm|pre_norm` 必须与模型布局匹配；本次 `post_norm` 生效且加速明显（若布局选错，表现是接受率≈0、速度回到 plain，而非答案错误——投机解码的输出仍由目标模型逐 token 验证）。
+
 **产品定位结论**：27B 是**质量最高**（95.2%）但**吞吐最低**（23 vs 116-132 tok/s）→ 定位为**内存优先的降级档**（16GB 权重 + 22GB KV room，为 IDE/agent 会话腾空间），不作吞吐型主力；生产主力维持 splash + 35B OptiQ。
 
 ## 四、后续可选动作（未做）
