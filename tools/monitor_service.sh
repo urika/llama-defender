@@ -60,7 +60,8 @@ analyze() {
     swap_used="$(echo "$swap_line" | sed -n 's/.*used = \([0-9.]*\)\([MG]\).*/\1 \2/p' | awk '{ if ($2=="G") printf "%d", $1*1024; else printf "%d", $1 }')"
     swap_total="$(echo "$swap_line" | sed -n 's/.*total = \([0-9.]*\)\([MG]\).*/\1 \2/p' | awk '{ if ($2=="G") printf "%d", $1*1024; else printf "%d", $1 }')"
 
-    METRICS="$metrics" BATCH="$BATCH" SWAP_USED="${swap_used:-0}" SWAP_TOTAL="${swap_total:-0}" python3 - <<'PY'
+    METRICS="$metrics" BATCH="$BATCH" SWAP_USED="${swap_used:-0}" SWAP_TOTAL="${swap_total:-0}" \
+    FOREIGN_TOP="$(ps -Ao rss=,command= | sort -rn | head -8)" python3 - <<'PY'
 import json, os, sys
 
 m = {}
@@ -107,6 +108,26 @@ out = {
     "swap_used_mb": int(os.environ.get("SWAP_USED") or 0),
     "swap_total_mb": int(os.environ.get("SWAP_TOTAL") or 0),
 }
+
+# 非本栈内存大户（2026-10-29：kapitsa 13.1GB 静默挤占 → 代理 90% 全拒，
+# 排查耗时长。内存账本互斥纪律见 docs/06-reference-metrics/
+# memory-ledger-arbitration-20261029.md）
+_STACK_PAT = ("splash", "llama-server", "anthropic_proxy", "serve-native",
+              "kernel_task", "WindowServer", "launchd", "monitor_service",
+              "startup_stack", "com.apple", "Google Chrome")
+_big_gb, _big_cmd = 0.0, ""
+for _line in (os.environ.get("FOREIGN_TOP") or "").splitlines():
+    try:
+        _rss, _cmd = _line.strip().split(None, 1)
+        _gb = float(_rss) / 1048576.0
+    except (ValueError, IndexError):
+        continue
+    if any(_p in _cmd for _p in _STACK_PAT):
+        continue
+    if _gb > _big_gb:
+        _big_gb, _big_cmd = _gb, _cmd[:80]
+out["foreign_big_gb"] = round(_big_gb, 2)
+out["foreign_big_cmd"] = _big_cmd
 print(json.dumps(out))
 PY
 }
@@ -227,6 +248,15 @@ if _swap_lvl:
     else:
         level = mw.sev_max(level, "WARN")
     snap["swap_alert"] = _swap_lvl
+
+# 7c) 非本栈内存大户（内存账本互斥纪律的运行时抓手）
+_foreign_gb = snap.get("foreign_big_gb") or 0
+if _foreign_gb >= float(os.environ.get("MONITOR_FOREIGN_RSS_GB", 8)):
+    alerts.append(
+        f"非本栈进程占 {_foreign_gb:.1f}GB（{snap.get('foreign_big_cmd','?')}）"
+        f"——内存账本互斥纪律：本地引擎与第二模型服务器二选一"
+        f"（见 docs/06-reference-metrics/memory-ledger-arbitration-20261029.md）")
+    level = mw.sev_max(level, "WARN")
 
 # 8) 建议
 recs = []
