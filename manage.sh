@@ -208,6 +208,7 @@ _classify_backend_pid() {
         rapid-mlx|vllm-mlx) echo "rapid-mlx"; return 0 ;;
         mlx_vlm) echo "mlx_vlm"; return 0 ;;
         dflash) echo "dflash-mlx"; return 0 ;;
+        kapitsa) echo "kapitsa"; return 0 ;;
         python3|python|python3.1)
             # Splash: PID 文件里是 python 前端。1.3.x 起 CLI 以 `-m server.server`
             # 启动；更早/直跑路径是 `server.py`。两种写法都要认——只匹配
@@ -579,10 +580,45 @@ _start_llama_server() {
 }
 
 # ============================================================
+# 启动 Kapitsa（Apple Silicon Metal 引擎；MTP + KFlash 投机解码）
+# ============================================================
+# 2026-10-29 接入。模型目录须含 dflash2/（DFlash2 草稿器）与 mtp.safetensors
+# （MTPLX 侧车，来源见 docs/05-operations-changelog/flint-kapitsa-evaluation-20261029.md §六）。
+# Kapitsa 默认忽略请求里的 model 字段（--allow-switch 才认）——代理侧 MODEL_NAME
+# 仅作归因展示，不影响实际加载的模型。
+_start_kapitsa() {
+    _check_port "$LLAMA_PORT" || return 1
+    local bin="${KAPITSA_BIN:-kapitsa}"
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        error "未找到 kapitsa（安装: brew install nace-ai/tap/kapitsa）"
+        return 1
+    fi
+    info "启动 Kapitsa..."
+    info "  配置: ${CYAN}$(_current_config_name)${NC}"
+    info "  模型: ${KAPITSA_MODEL:-}"
+    info "  地址: $LLAMA_HOST:$LLAMA_PORT"
+    info "  上下文: ${KAPITSA_CTX:-262144}  slots: ${KAPITSA_SLOTS:-4}"
+
+    local args=(serve --model "${KAPITSA_MODEL:?KAPITSA_MODEL 未设置}"
+                --host "$LLAMA_HOST" --port "$LLAMA_PORT"
+                --context "${KAPITSA_CTX:-262144}" --slots "${KAPITSA_SLOTS:-4}"
+                --local --private)
+    if [[ -n "${KAPITSA_EXTRA_ARGS:-}" ]]; then
+        read -ra extra <<< "$KAPITSA_EXTRA_ARGS"
+        args+=("${extra[@]}")
+    fi
+
+    nohup "$bin" "${args[@]}" >> "$LOGFILE" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+    info "进程已启动 (PID: $new_pid)，等待就绪..."
+    _wait_for_ready "$new_pid" "kapitsa"
+}
+
+# ============================================================
 # 启动 Rapid-MLX
 # ============================================================
-_start_rapid_mlx() {
-    _check_port "$LLAMA_PORT" || return 1
+_start_rapid_mlx() {    _check_port "$LLAMA_PORT" || return 1
 
     # DEF-006: GPU 内存安全检查 — 防止 kernel panic
     if [[ -n "${RAPID_MLX_EXTRA_ARGS:-}" ]]; then
@@ -1135,6 +1171,9 @@ cmd_start() {
             ;;
         splash)
             _start_splash || return 1
+            ;;
+        kapitsa)
+            _start_kapitsa || return 1
             ;;
         dflash-mlx|dflash)
             _start_dflash_mlx || return 1
@@ -1817,6 +1856,9 @@ cmd_start_backend() {
         splash)
             _start_splash || return 1
             ;;
+        kapitsa)
+            _start_kapitsa || return 1
+            ;;
         dflash-mlx|dflash)
             _start_dflash_mlx || return 1
             ;;
@@ -1869,6 +1911,10 @@ cmd_stop_backend() {
         if ! kill -0 "$pid" 2>/dev/null; then
             # Splash: server.py(前端) 退出后 serve-native(引擎) 已实测跟随退出;
             # 兜底清理防万一(不留 GPU 残留)
+            if [[ "$backend" == "kapitsa" ]] && pgrep -f 'kapitsa serve' >/dev/null 2>&1; then
+                warn "清理残留 kapitsa serve 进程"
+                pkill -f 'kapitsa serve' 2>/dev/null || true
+            fi
             if [[ "$backend" == "splash" ]] && pgrep -f 'serve-native' >/dev/null 2>&1; then
                 warn "Splash serve-native 残留, 兜底清理..."
                 pkill -f 'splash serve-native' 2>/dev/null || true

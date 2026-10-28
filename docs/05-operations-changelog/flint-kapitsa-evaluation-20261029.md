@@ -208,3 +208,17 @@ pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage
 - 速度优先场景（批处理/长生成）：**Kapitsa + 35B-4bit + MTP + KFlash = 148-150 tok/s**，比现产快 15-25%，质量差 1.6pp（summary 项）——按任务类型可接受
 - 质量优先（默认生产）：**splash + OptiQ 93.5% / 116-132 tok/s 保持不动**
 - 若要两全：待 Kapitsa 支持混合精度（跟踪上游）或 OptiQ 发布统一量化版本
+
+### manage.sh 集成（一等配置，2026-10-29）
+
+```bash
+./manage.sh stop-backend                                   # 先停当前主引擎（互斥）
+./manage.sh switch kapitsa-qwen36-35b-4bit                 # active.conf → kapitsa 配置
+./manage.sh start-backend                                  # 起 Kapitsa（MTP+KFlash 自动激活）
+./manage.sh reload                                         # 代理跟随新 MODEL_NAME
+# 回路：./manage.sh stop-backend && ./manage.sh switch splash-qwen36-35b-optiq && ./manage.sh start-backend && ./manage.sh reload
+```
+
+实现要点：`manage.sh` 新增 `_start_kapitsa()`（`kapitsa serve --model … --local --private`，`_wait_for_ready` 复用）+ 两个 dispatch 分支 +
+`_classify_backend_pid` 增加 `kapitsa)` 识别（否则 `stop-backend` 认不出、残留占端口 → proxy `model_drift`）+ stop 兜底 `pkill -f 'kapitsa serve'`。
+验证日志：`MTP head loaded in ~103 ms (MoE, trunk hidden pre-norm)` + `engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify)`。
