@@ -18,6 +18,32 @@ from pipeline import (
 )
 
 
+# ---------------------------------------------------------------------------
+# 宿主机内存隔离（DEF-326，2026-10-29）
+# 路由在宿主机内存超 PROXY_ROUTE_MEMORY_PCT（默认 90%）时**规则性改走云端**
+# （pipeline.py:1552 "memory_pressure(...)"）——本文件断言的是「按字符数/会话
+# 阶梯/偏好」的决策矩阵，不应受宿主机 load 影响：机器一忙（实测 92%）本文件
+# 就整片红（13 例 'cloud' != 'local'），是**非确定性门禁**。
+# 故本模块统一把内存判据顶到 100%（永不触发），把被测决策与宿主状态解耦。
+# ---------------------------------------------------------------------------
+_MEM_PATCHERS = []
+
+
+def setUpModule():
+    global _MEM_PATCHERS
+    _MEM_PATCHERS = [
+        patch.object(_ps, "PROXY_ROUTE_MEMORY_PCT", 100, create=True),
+        patch.object(_ps, "PROXY_MEMORY_REJECT_THRESHOLD", 100, create=True),
+    ]
+    for p in _MEM_PATCHERS:
+        p.start()
+
+
+def tearDownModule():
+    for p in _MEM_PATCHERS:
+        p.stop()
+
+
 class TestClassifyTier(unittest.TestCase):
     def test_opus(self):
         self.assertEqual(_classify_tier("claude-opus-4-7"), "opus")

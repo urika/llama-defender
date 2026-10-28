@@ -27,6 +27,29 @@ import anthropic_proxy as proxy
 import proxy_state
 
 
+# ---------------------------------------------------------------------------
+# 宿主机内存隔离（DEF-326，2026-10-29）：payload 上限（413）断言不应被宿主机
+# 内存压力的 fail-fast 闸（PROXY_MEMORY_REJECT_THRESHOLD，默认 90%）抢先拦成 503。
+# 实测宿主机 92% 时本文件两例 413 断言变成 503（'503 != 413'）——非确定性门禁。
+# ---------------------------------------------------------------------------
+_MEM_PATCHERS = []
+
+
+def setUpModule():
+    global _MEM_PATCHERS
+    _MEM_PATCHERS = [
+        patch.object(proxy_state, "PROXY_MEMORY_REJECT_THRESHOLD", 100, create=True),
+        patch.object(proxy, "PROXY_MEMORY_REJECT_THRESHOLD", 100, create=True),
+    ]
+    for p in _MEM_PATCHERS:
+        p.start()
+
+
+def tearDownModule():
+    for p in _MEM_PATCHERS:
+        p.stop()
+
+
 def _build_body(content_chars):
     """Return a valid JSON body for /v1/messages with given user content length."""
     return json.dumps({
