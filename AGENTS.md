@@ -120,6 +120,13 @@ tools/engines.sh supervise <name> --daemon   # 常驻守护（被误杀自动重
 > ⚠️ **内存约束**：48 GB 机器上主后端（Splash 27B 约 15–19 GB）与辅助引擎（9B 约 5.7 GB）
 > **不可同时常驻**——会触发全局换页，把两者一起拖慢（实测 900-token 生成从 55.8 掉到 10.6 tok/s）。
 > 详见 [`docs/04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md`](docs/04-analysis-diagnostics/ornith-9b-memory-pressure-20261020.md)。
+>
+> ⚠️ **内存账本互斥（2026-10-29 起，两天 4 次耗尽后成文）**：48 GB 装不下「本地 35B 引擎（约 22 GB）
+> + 第二个模型服务器（如 kapitsa `serve --model flint-iq3` 13.1 GB）+ 多 IDE/agent 会话（3–4 GB）」。
+> **本地引擎与 kapitsa 二选一**（起第二个前先 `./manage.sh stop-backend`）；**批期禁起第二模型服务器**。
+> 撞上时症状是代理 **`backend_oom`（used>90% 全拒）**——先看 `vm_stat` 空闲页与 `sysctl vm.swapusage`，
+> 别误判为引擎故障。完整纪律/恢复流程/4 例事故索引见
+> [`docs/06-reference-metrics/memory-ledger-arbitration-20261029.md`](docs/06-reference-metrics/memory-ledger-arbitration-20261029.md)。
 
 ### 4.2 本地/云端热切换示例
 

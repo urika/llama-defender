@@ -205,6 +205,7 @@ docs/
 |------|------|
 | `api-and-operations-guide.md` | **对外操作与 API 手册**：面向 `agent_go` / 运维人员的命令、结构化 API、配置文件、生命周期事件速查 |
 | `agent-client-credentials-20261020.md` | **本机 Agent 客户端凭证与 OpenCode 配置**：凭证映射表、`~/.zshenv` vs `~/.zshrc` 放置约定、`{env:VAR}` 用法与 GUI 启动陷阱、provider/MCP 清单（含 volcengine 下线）、Claude Code 权限文件脱敏与验收清单 |
+| `memory-ledger-arbitration-20261029.md` | **内存账本仲裁（48GB 多模型共存纪律）**：常驻项实测占用表（35B 引擎 22GB / kapitsa 13.1GB / IDE 3–4GB）、互斥硬规则（引擎与 kapitsa 二选一、批期禁起第二模型服务器）、三层防线症状（代理 90% 全拒 → backend_oom／路由降级走云端／监控 swap 告警）、恢复流程与 4 例事故索引 |
 | `config-parameters-guide-20261017.md` | **配置参数指南**（自 AGENTS.md §11 拆出）：压缩 Profile / 本地云端 / 路由 / 队列 / 诊断 / 注入 / 自调优 / 跨会话记忆 九张推荐组合表（权威默认值仍= CONFIG_REGISTRY） |
 | `BENCHMARK.md` | 本地 LLM 性能测试报告与基线 |
 | `splash-model-capability-research-20261020.md` | **Splash 引擎与模型能力调研**：澄清「Inco 是否训练了更强模型」——`incoai` 12 仓库全量构成、DFlash2 是唯一训练产物、官方只有速度基准无能力基准、质量证据（perplexity 高于 llama.cpp 0.1–0.9%）、本机 27B vs 35B-A3B 双档实测、48GB「能力 vs 速度」两难选型表 |
