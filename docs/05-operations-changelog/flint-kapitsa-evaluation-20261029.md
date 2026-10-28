@@ -173,3 +173,38 @@ python3 tools/bench_kapitsa.py http://127.0.0.1:8000/v1 "A" 2
 # 权威读数：grep 'chat: prompt' <日志> | tail
 pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage.sh start
 ```
+
+## 六、35B MTP head 补齐与混合精度限制（2026-10-29 执行）
+
+### ① Kapitsa + 35B-4bit + MTP + KFlash —— 完成，+29%
+
+| 配置 | 纯 decode | 质量门 v3 |
+|------|-----------|-----------|
+| DFlash2 + KFlash（无 MTP，前一阶段） | 115.2 tok/s | FAIL 91.9% |
+| **DFlash2 + KFlash + MTP（本次）** | **148-150 tok/s（+29%）** | **FAIL 91.9%（完全不变）** |
+| 现产 splash + OptiQ-4bit | 116-132 tok/s | PASS 93.5% |
+
+- 端到端含 TTFT：短 124.8-173.6 / 长 147.9-149.4 tok/s；理论带宽顶 ~160 → 利用率 93%
+- **MTP 质量无损实证**：62 条金标逐类判词与无 MTP 完全一致（57/62），投机解码按设计等价 greedy 输出
+- 91.9% 的天花板 = **4-bit 量化档位**（summary 4/7），与 MTP 无关；生产 OptiQ 93.5% 的 1.6pp 优势来自混合精度
+
+### MTP head 来源与 sideload 流程（可复用）
+
+1. **不要**用 HF base 仓（`Qwen/Qwen3.6-35B-A3B`）的 `mtp.*` 张量做 sidecar：MoE 的专家在 base 仓是**融合布局**（`mlp.experts.down_proj` / `gate_up_proj`），Kapitsa 拒绝——`MTP head …: experts not in a layout Kapitsa reads (fused Hugging Face experts?)`（27B 是 dense 所以没这个问题）
+2. 正确来源 = Kapitsa 自带的 MTPLX 发布仓（二进制 strings 可见仓名）：
+   `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed`（27B 对应 `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed`）
+3. 取三件放入模型目录：`mtp.safetensors`（**582,258,561 B**，与 Kapitsa `.part.json` 期望 size 精确一致）+ `mtplx_runtime.json` + `MTPLX_PUBLISH_MANIFEST.json`
+4. 重启 serve 后日志应出现：`MTP head loaded in 145 ms (MoE, trunk hidden pre-norm, drafts over ids < 32768 + specials)` + `KFlash: tree drafting on the DFlash2 lattice`
+5. 单件直连 HF resolve 即可（12MB/s 级），无需走 `kapitsa pull`（其对大文件会卡死，见 §三）
+
+### ② 生产候选判定：Kapitsa + OptiQ 权重 —— 被混合精度阻断
+
+`kapitsa serve --model <OptiQ 目录>` → **fatal: layer 1: experts' gate/up/down (or the shared expert's gate/up) differ in format**。
+
+原因：OptiQ 是**混合精度**（敏感层 8bit、其余 4bit），同一层内专家的 gate/up/down 量化格式不一致；Kapitsa 的 MoE 内核要求**每层专家格式统一**。⇒ 「生产质量（93.5%）+ Kapitsa 速度」的组合**当前不可得**，需等上游支持混合精度 MoE 或自建非混合的 4-bit 全量权重（质量会回落到 91.9% 档）。
+
+### 结论与选型建议
+
+- 速度优先场景（批处理/长生成）：**Kapitsa + 35B-4bit + MTP + KFlash = 148-150 tok/s**，比现产快 15-25%，质量差 1.6pp（summary 项）——按任务类型可接受
+- 质量优先（默认生产）：**splash + OptiQ 93.5% / 116-132 tok/s 保持不动**
+- 若要两全：待 Kapitsa 支持混合精度（跟踪上游）或 OptiQ 发布统一量化版本
