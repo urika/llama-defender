@@ -38,7 +38,7 @@ rc=$?
 log "manage.sh start rc=$rc"
 
 # 2) 监控守护交给独立 launchd 作业（com.llama-defender.monitor，KeepAlive=true）
-#    ——不可在此处 nohup 起：launchd 在本作业退出时会连坐杀掉作业组内的子进程
+#    ——不可在此处 nohup 起：launchd 在主作业退出时会连坐杀掉作业组内的子进程
 #    （2026-10-27 reboot 实测：守护随 wrapper 退出被 SIGTERM，PID 2726 即死）。
 if [[ -f logs/service-monitor.pid ]] && kill -0 "$(cat logs/service-monitor.pid 2>/dev/null)" 2>/dev/null; then
     log "监控守护已在运行 (PID $(cat logs/service-monitor.pid))"
@@ -46,12 +46,45 @@ else
     log "监控守护由 launchd 作业 com.llama-defender.monitor 托管（此处不重复拉起）"
 fi
 
-# 3) 状态快照
+# 3) 起栈后状态快照
 {
     echo "--- 状态 ---"
     ./manage.sh status 2>&1 | head -30
     echo "--- swap ---"
     sysctl -n vm.swapusage 2>/dev/null || true
 } >> "$LOG" 2>&1
+
+# 4) 常驻前台托住栈（DEF-324，2026-10-28）
+#    launchd 在作业主进程退出时会回收**整个作业进程组**；而引擎/代理/辅助引擎
+#    都是本 wrapper 的子进程 → wrapper 一退出它们就被连坐杀掉。
+#    实测：10-28 22:56 自启成功（引擎 1645/代理 1743/eg2 1772），wrapper 22:57:18
+#    退出 → 23:17 前栈已全灭（:4000/:8081/:8083 全无监听）。
+#    故 wrapper 必须常驻：栈在则守；栈亡则区分「人工停机」与「异常退出」——
+#    人工停机（manage.sh stop 有 service_stop 生命周期事件）→ exit 0（launchd 不再拉起）；
+#    异常退出 → exit 1（配合 plist 的 KeepAlive={"SuccessfulExit":false} 由 launchd 重启）。
+stop_count_at_start="$(grep -ac '"event": *"service_stop"' logs/lifecycle_events.jsonl 2>/dev/null || echo 0)"
+
+_stack_alive() {
+    local ppid_
+    # 引擎：端口 8081 在听；代理：PID 文件活着
+    lsof -Pi :8081 -sTCP:LISTEN -t >/dev/null 2>&1 || return 1
+    ppid_="$(cat anthropic_proxy.pid 2>/dev/null || true)"
+    [[ -n "$ppid_" ]] && kill -0 "$ppid_" 2>/dev/null || return 1
+    return 0
+}
+
+while true; do
+    sleep 30
+    if _stack_alive; then
+        continue
+    fi
+    stop_count_now="$(grep -ac '"event": *"service_stop"' logs/lifecycle_events.jsonl 2>/dev/null || echo 0)"
+    if [[ "$stop_count_now" -gt "$stop_count_at_start" ]]; then
+        log "栈已停止（检测到人工 service_stop 事件）→ 正常退出，不自动拉起"
+        exit 0
+    fi
+    log "栈异常退出（引擎或代理不在）→ 非零退出，交 launchd 重启本作业"
+    exit 1
+done
 
 log "=== 开机自启结束 ==="

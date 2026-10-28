@@ -562,6 +562,17 @@
 | **验收（2026-10-27 05:56）** | `launchctl kickstart com.llama-defender.stack` → `manage.sh start rc=0`（PATH 修复生效）；守护 PID 6947 由 launchd 托管且首轮快照 `mem 22.13G head 18.13G denied 0`；`tools/post_reboot_check.sh` **8 项全绿**（swap 0.00M / 代理 5196 healthy / 引擎 :8081 / embedgemma2 :8083 / fnf 四旗标 / br4 / 守护 / capability_audit exit 0）。 |
 | **残留风险** | `KeepAlive=true` 的守护若被用户手动 kill 会被 launchd 重拉（预期）；守护日志 `logs/service-monitor.daemon.log` 与业务日志分离。 |
 
+### DEF-324: launchd 守栈作业退出即连坐杀掉整个栈——重启后服务「起来又死」（P1） — ✅ 已修复（2026-10-28）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 10-28 22:55 重启后：launchd 自启作业 `com.llama-defender.stack` **确实把栈拉起来了**（`logs/startup-stack.log`：引擎 1645 / 代理 1743 / embedgemma2 1772，22:57:08 健康检查 Done·TTFT 0.0s），但 wrapper 22:57:18 退出后，23:17 复查时 `:4000`/`:8081`/`:8083` **全部无监听**（栈已死）。23:17:06 另有进程把栈重新拉起（ppid=1）才恢复服务。 |
+| **根因** | launchd 在作业主进程退出时回收**整个作业进程组**；引擎/代理/辅助引擎都是 wrapper（`tools/startup_stack.sh` → `manage.sh start`）的子进程 → wrapper 一退出即被连坐 SIGTERM。这与 DEF-323 根因②**同源**（当时受害者是监控守护，这次是整个栈）。 |
+| **为什么昨天没暴露** | 昨天重启时 `manage.sh start` 因 PATH 缺 Homebrew 直接失败（rc=1），栈没被自启拉起 → 后续由登录后的其他会话手工拉起（父进程非 launchd）→ 躲过了连坐。 |
+| **修复（2026-10-28）** | ① `tools/startup_stack.sh` 改为**常驻前台**：起栈后进入守栈循环（每 30s 校验 `:8081` 在听 且 代理 PID 活着），wrapper 不再退出 → 作业进程组不被回收；② 栈亡时区分「人工停机」与「异常退出」——检测到新的 `service_stop` 生命周期事件 → exit 0（不拉起，尊重人工停机），否则 exit 1；③ plist 改 `KeepAlive={"SuccessfulExit":false}`（仅异常退出时由 launchd 重启本作业）；④ `tools/post_reboot_check.sh` 增第 6b 项「守栈 wrapper 在跑」检查。 |
+| **验收（2026-10-28 23:22）** | 守栈作业 PID 5063 常驻；90s 后复核：代理 4761 / 引擎 4693 / embedgemma2 4806 **俱在**（此前 wrapper 退出即死）；`post_reboot_check.sh` **9 项全绿**（swap 0.56M / 代理 healthy / 引擎 / 辅助引擎 / fnf 四旗标 / br4 / 守护 / 守栈作业 / capability_audit exit 0）。批跑已自动恢复（swef12d2，93–96K 上下文请求在飞）。 |
+| **残留风险** | 守栈循环用「端口 + PID 文件」判活，若代理被单独 kill 而 PID 文件未清，会误判为栈亡 → exit 1 → launchd 重启整栈（可接受，但会打断在飞请求）；`manage.sh stop` 走 `service_stop` 事件路径，不会误触发拉起。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）

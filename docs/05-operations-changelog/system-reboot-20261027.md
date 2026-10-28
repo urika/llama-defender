@@ -60,7 +60,22 @@ python3 ../swe-eval/scripts/capability_audit.py   # 对端仪器：exit 0 才可
 > 子进程**（守护 PID 2726 即死）→ 拆出独立 launchd 作业 `com.llama-defender.monitor`
 > （KeepAlive=true）；③ 守护循环单周期异常可终止守护 → 加 `set +e` 包裹与单步失败保护。
 
-## 5. 风险与后续
+## 5. 第二次重启（2026-10-28 22:55）——swap 再次耗尽，同一治理面复发
+
+| 项 | 重启前 | 重启后 |
+|----|--------|--------|
+| swap | 11696MB / 12288MB（95%，自 10-27 21:29 越阈持续 CRIT 约 25h） | **0.56M**（动态 swap 收缩到 1024M 池） |
+| 在飞任务 | `run_agent.py`（swef12d2，127 turns、96K）+ `shadow_probe.py`（exp-20261027-guards-validation） | **被重启打断**，23:17 栈恢复后由对端自动续跑（swef12d2 93–96K 上下文请求在飞） |
+| 分段边界 | — | **第三个边界**（重启后代理 PID/引擎计数器/KV/state 全部归零；重启前后样本不可直接比） |
+
+> **本次重启暴露并修复 DEF-324**：launchd 守栈作业 wrapper 退出即连坐杀掉整个栈
+> （22:56 自启成功 → wrapper 22:57:18 退出 → 23:17 栈全灭）。修法＝wrapper 常驻前台守栈
+> ＋ `KeepAlive={"SuccessfulExit":false}`（异常退出才重启、人工 stop 不拉起）。
+> 验收：守栈 PID 5063，90s 后栈三端口俱在，`post_reboot_check.sh` 9 项全绿。
+> 注：昨天那次没暴露同款问题，只因 `manage.sh start` 当时因 PATH 缺 Homebrew 直接失败，
+> 栈不是 launchd 起的（父进程非 launchd）→ 躲过连坐（**故障被掩盖而非不存在**）。
+
+## 6. 风险与后续
 
 - 重启会终止在跑的 IDE/agent 会话（本仓工作树改动保留在磁盘，但并行会话的未提交上下文会丢）。
 - 重启后**先跑验收再开批**；`swap` 是本机内存账本的核心指标，长期 >6GB 即应再评估重启。

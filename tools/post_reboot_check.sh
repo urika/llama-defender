@@ -78,6 +78,15 @@ else
     bad "监控守护未运行 —— nohup ./tools/monitor_service.sh daemon 300 &"
 fi
 
+echo "[6b] 守栈作业（launchd com.llama-defender.stack）"
+# 关键：launchd 作业主进程（wrapper）必须**常驻**——它退出时 launchd 回收整个
+# 作业进程组，会连坐杀掉引擎/代理/辅助引擎（DEF-324）。
+if pgrep -f "tools/startup_stack.sh" >/dev/null 2>&1; then
+    ok "守栈 wrapper 在跑（PID $(pgrep -f 'tools/startup_stack.sh' | head -1)）"
+else
+    bad "守栈 wrapper 不在 —— launchd 作业会连坐杀掉栈（DEF-324）；重新装载：launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.llama-defender.stack.plist"
+fi
+
 echo "[7] capability_audit（对端仪器）"
 AUDIT="../swe-eval/scripts/capability_audit.py"
 if [[ -f "$AUDIT" ]]; then

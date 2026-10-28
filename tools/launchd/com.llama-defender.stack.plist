@@ -10,7 +10,14 @@
   </array>
   <key>WorkingDirectory</key><string>/Users/jinsongwang/APP/llama.cpp</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
+  <!-- KeepAlive={"SuccessfulExit":false}：仅在**异常退出**（非零）时重启本作业；
+       wrapper 检测到人工 service_stop 则 exit 0 → 不再拉起（尊重人工停机）。
+       另：wrapper 必须常驻前台（tools/startup_stack.sh 的守栈循环），否则 launchd
+       回收作业进程组会连坐杀掉引擎/代理（DEF-324）。 -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key>
   <dict>
