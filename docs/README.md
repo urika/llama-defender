@@ -206,6 +206,7 @@ docs/
 |------|------|
 | `api-and-operations-guide.md` | **对外操作与 API 手册**：面向 `agent_go` / 运维人员的命令、结构化 API、配置文件、生命周期事件速查 |
 | `agent-client-credentials-20261020.md` | **本机 Agent 客户端凭证与 OpenCode 配置**：凭证映射表、`~/.zshenv` vs `~/.zshrc` 放置约定、`{env:VAR}` 用法与 GUI 启动陷阱、provider/MCP 清单（含 volcengine 下线）、Claude Code 权限文件脱敏与验收清单 |
+| `speed-200tps-conditions-20261029.md` | **「200+ tok/s」条件定量结论**：本机 12 样本复测（上限 215.4 tok/s）＋核心定量关系 `tok/s ≈ 36 × tok/cycle`（步频恒定、唯一可调量是草稿接受率）；五条件清单、与官方 210／unsloth 220／llmcheck 68–96 逐条对齐；两个反直觉实测（关思考更慢、`reasoning_effort:none` 不透传）与生产逼近 200 的杠杆 |
 | `memory-ledger-arbitration-20261029.md` | **内存账本仲裁（48GB 多模型共存纪律）**：常驻项实测占用表（35B 引擎 22GB / kapitsa 13.1GB / IDE 3–4GB）、互斥硬规则（引擎与 kapitsa 二选一、批期禁起第二模型服务器）、三层防线症状（代理 90% 全拒 → backend_oom／路由降级走云端／监控 swap 告警）、恢复流程与 4 例事故索引 |
 | `config-parameters-guide-20261017.md` | **配置参数指南**（自 AGENTS.md §11 拆出）：压缩 Profile / 本地云端 / 路由 / 队列 / 诊断 / 注入 / 自调优 / 跨会话记忆 九张推荐组合表（权威默认值仍= CONFIG_REGISTRY） |
 | `flint-kapitsa-evaluation-20261029.md` | **Flint 与 Kapitsa 引擎评估**：四形态同口径对比（质量门 62 条 + tok/s）、Flint 无草稿器的天花板判定、KFlash 本机仅 +11.5%、HF 端点/pull 卡死/量化格式兼容等踩坑清单与后续可选动作 |
