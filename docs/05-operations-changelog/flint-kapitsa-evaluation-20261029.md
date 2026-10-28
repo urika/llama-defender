@@ -111,3 +111,65 @@ engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify), KF
 
 - 测试资产：`~/models/flint`（UD-Q4_K_XL 23GB，llama.cpp 用）、`~/.cache/kapitsa/models/`（flint-4bit 22.6GB + qwen3.6-35b 19.5GB + dflash2 1.0GB）。
 - 生产未受影响：主引擎仍是 splash + OptiQ-4bit（`configs/splash-qwen36-35b-optiq.conf`），代理 :4000 healthy，embedgemma2 :8083 常驻（CONFIG_AUTOSTART_AUX 自动拉起）。
+
+## 三·六、27B MTP 就绪后复测（2026-10-29 04:00–04:25）
+
+> 背景：§三·五 的 27B 测量时我们的包**缺 MTP head**（kapitsa 日志 `no MTP head … speculative decoding off`），
+> 只有 DFlash2 一条草稿路。2026-10-29 04:00 包更新为**含 MTP head**（`weights 16.08 GB + MTP head 239 MB + DFlash2 drafter 3.85 GB`，共 20.2GB），
+> 故按原计划重做实验。测量口径：`tools/bench_kapitsa.py`（流式，TTFT 与 decode 分列），
+> **权威读数取引擎自身的 `chat: prompt … , N tokens in M ms (X tok/s), Y tok/cycle` 行**（避免端到端时间混入 prefill）。
+
+### 1) 三配置同 prompt 对照（kapitsa + Qwen3.8-27B-4bit，M5 Pro 48GB）
+
+| 配置 | 4K prompt + 512 输出 | short prompt + 512 输出 | 强制长输出（600 tok 数字枚举） |
+|------|----------------------|--------------------------|-------------------------------|
+| **A. KFlash + DFlash2**（默认） | **41.2 / 42.6 tok/s**（tok/cycle 4.12–4.29） | 21.1 / 21.4（1.97–2.04） | **122.7 / 113.3**（**10.15 / 9.51**） |
+| **B. KFlash + MTP**（`--dflash none`，depth 4） | 29.3 / 29.3（2.55） | **32.4 / 30.8**（2.84） | — |
+| **C. plain**（`--dflash none --spec 0`） | 17.6 / 17.1 | 17.6 / 17.8 | — |
+
+判读：
+- **plain 17.5 与 §三·五 的 17.8 吻合** → 测量方法一致、数据可信。
+- **DFlash2 与 MTP 是互补而非替代**：DFlash2 强在长/可预测输出（4K 41.2 vs MTP 29.3；强制长输出 122.7），
+  MTP 强在短自由文本（32.4 vs 21.1）。**27B 应默认 DFlash2，MTP 作兜底**（DFlash2 缺失/不可用时）。
+- 短自由文本仅 21 tok/s 是 think-off 27B 的「短答 + 低接受率（1.97 tok/cycle）」所致，不是引擎故障。
+
+### 2) 同权重 1:1 对照（本次唯一干净的引擎对照）
+
+同一份 `Qwen3.8-27B-4bit` 权重、同一 prompt（600-token 数字枚举，稳态口径）：
+
+| 引擎 | decode | tok/cycle | 步频（cycles/s） | 4K+512 附带读数 |
+|------|--------|-----------|------------------|-----------------|
+| **kapitsa + KFlash + DFlash2** | **122.7 / 113.3 tok/s** | **10.15 / 9.51** | 12.1 | 41.2–42.6（tok/cycle 4.1–4.3） |
+| **splash + DFlash2（链式）** | **104.6 / 104.8 tok/s** | 7.9 | 13.2 | 53.9\*（该次输出仅 157 tok，口径不齐） |
+
+\* splash 27B 在「裸段落」prompt 上只答 157 tok（think-off），故 4K 列不可直接比；**强制长输出列才是同口径对照**。
+
+结论：
+- **KFlash 的树验证在 27B 上确有增益：+10~15%**（122.7/113.3 vs 104.6/104.8），与官方 M5 Pro 27B
+  口径 +7% 同向、本机略高。机制：树验证把 tok/cycle 从 7.9 抬到 9.5–10.2（+20~28%），
+  代价是步频略降（13.2→12.1 cycles/s），净得 +10~15%。
+- **增益随「可预测性」放大**：强制长输出（枚举）tok/cycle 10+；裸段落/自由答仅 2–4。
+  与 `speed-200tps-conditions-20261029.md` 的 `tok/s ≈ 步频 × tok/cycle` 完全一致。
+- **但绝对吞吐差仍是 3 倍**：同机 35B OptiQ（生产主力）在 4K+512 下 **130–136 tok/s**
+  （tok/cycle 3.5–3.7、步频 ~36），27B+KFlash 最好 122.7（仅枚举口径）——**生产主力维持 35B 不动**。
+
+### 3) 内存与包构成（本次实测）
+
+| 项 | 数值 |
+|----|------|
+| 包总盘占 | 20.2GB（weights 16.08 + MTP 0.239 + DFlash2 3.85） |
+| 运行时 | DFlash2 resident **1.63GB**（+0.23GB 槽环），MTP head 24ms 载入 |
+| KFlash 计划 | `~/.cache/kapitsa/kflash/qwen3.8-27b-4bit-dflash2-b4-Apple_M5_Pro.json`（按机型预调） |
+| 互斥 | 与 35B splash（22GB）二选一，实际执行了 `stop-backend` → 起 kapitsa → 测完切回 |
+
+### 4) 复现命令
+
+```bash
+cd ~/APP/llama.cpp
+./manage.sh stop-backend                       # 让出引擎（内存互斥）
+kapitsa serve --model 27b --private --port 8000 --context 32k --slots 1   # A: KFlash+DFlash2
+# B: 加 --dflash none ；C: 加 --dflash none --spec 0
+python3 tools/bench_kapitsa.py http://127.0.0.1:8000/v1 "A" 2
+# 权威读数：grep 'chat: prompt' <日志> | tail
+pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage.sh start
+```
