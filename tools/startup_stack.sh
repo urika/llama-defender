@@ -64,26 +64,49 @@ fi
 #    异常退出 → exit 1（配合 plist 的 KeepAlive={"SuccessfulExit":false} 由 launchd 重启）。
 stop_count_at_start="$(grep -ac '"event": *"service_stop"' logs/lifecycle_events.jsonl 2>/dev/null || echo 0)"
 
-_stack_alive() {
-    local ppid_
-    # 引擎：端口 8081 在听；代理：PID 文件活着
-    lsof -Pi :8081 -sTCP:LISTEN -t >/dev/null 2>&1 || return 1
-    ppid_="$(cat anthropic_proxy.pid 2>/dev/null || true)"
-    [[ -n "$ppid_" ]] && kill -0 "$ppid_" 2>/dev/null || return 1
-    return 0
+_stack_proxy_alive() {
+    local p
+    p="$(cat anthropic_proxy.pid 2>/dev/null || true)"
+    [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+
+_stack_engine_alive() {
+    lsof -Pi :8081 -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+_stop_count_now() {
+    grep -ac '"event": *"service_stop"' logs/lifecycle_events.jsonl 2>/dev/null || echo 0
 }
 
 while true; do
     sleep 30
-    if _stack_alive; then
+    if _stack_proxy_alive && _stack_engine_alive; then
         continue
     fi
-    stop_count_now="$(grep -ac '"event": *"service_stop"' logs/lifecycle_events.jsonl 2>/dev/null || echo 0)"
-    if [[ "$stop_count_now" -gt "$stop_count_at_start" ]]; then
-        log "栈已停止（检测到人工 service_stop 事件）→ 正常退出，不自动拉起"
-        exit 0
+
+    new_stop=0
+    [[ "$(_stop_count_now)" -gt "$stop_count_at_start" ]] && new_stop=1
+
+    if ! _stack_proxy_alive; then
+        # 代理不在＝整栈停机：人工 stop → exit 0（不拉起）；异常 → exit 1（launchd 重启）
+        if [[ "$new_stop" == "1" ]]; then
+            log "整栈已停止（代理不在 + 人工 service_stop）→ 正常退出，不自动拉起"
+            exit 0
+        fi
+        log "整栈异常退出（代理不在且无 service_stop）→ 非零退出，交 launchd 重启本作业"
+        exit 1
     fi
-    log "栈异常退出（引擎或代理不在）→ 非零退出，交 launchd 重启本作业"
+
+    # 走到这里＝代理在、引擎不在。
+    # 注意：`./manage.sh stop-backend`（如为释放内存/换模维护）只停引擎、代理照旧，
+    # 生命周期事件 detail 带 component=backend——**这不是整栈停机**，
+    # 不能据此退出（2026-10-29 01:21 实测误判：wrapper 退出后无人守栈）。
+    if [[ "$new_stop" == "1" ]]; then
+        log "引擎被人工停止（service_stop）→ 保持观察：不重启引擎、不退出守栈"
+        stop_count_at_start="$(_stop_count_now)"   # 消费事件，避免重复判定
+        continue
+    fi
+    log "引擎异常退出（代理在、无 service_stop 事件）→ 非零退出，交 launchd 重启本作业"
     exit 1
 done
 
