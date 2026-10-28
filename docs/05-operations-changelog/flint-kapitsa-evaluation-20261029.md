@@ -13,6 +13,7 @@
 | 形态 | decode | prefill | 内存 | 质量门 |
 |------|--------|---------|------|--------|
 | **现产 splash + Qwen3.6-35B-A3B-OptiQ-4bit** | 116-132 tok/s | 1101-1154 tok/s | 24.4GB | **PASS 93.5%** |
+| **Kapitsa + Qwen3.8-27B-4bit + KFlash** | **23-24 tok/s**（plain 17.8） | ~1500 tok/s | 21.1GB（权重 15 + 草稿器 1.6 + KV room 22.2GB） | **PASS 95.2%（最高）**（summary 7/7 全过） |
 | Kapitsa + Qwen3.6-35B-A3B-4bit + KFlash | 115.2 tok/s（纯 decode） | ~1500+ tok/s | ~22GB | FAIL 91.9%（summary 4/7 未达线） |
 | Kapitsa + Flint native 4bit | 144.0-146.8 tok/s | ~1400 tok/s | 22.6GB | PASS 88.7% |
 | llama.cpp master + Flint UD-Q4_K_XL | 69.2 tok/s | ~970 tok/s | 23.7GB | PASS 85.5% |
@@ -33,8 +34,36 @@
 5. **llama.cpp 构建缺 UI 资产会挂**：`tools/ui` gzip 步骤（缺 CSS 文件）→ 配置加 `-DLLAMA_UI_GZIP=OFF` 解决。
 6. **Kapitsa 导入需支持的专家量化格式**：仅接受 IQ1_S/IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S 或全 Q8_0/Q6_K；unsloth **UD-Q4_K_XL（IQ3_S/Q5_K 混合）不可导入** → 只能走 IQ3_XXS（3bit，质量 -3.2pp）或官方原生 4bit。
 
-## 四、后续可选动作（未做）
+## 三·五、Qwen3.8-27B 专项（2026-10-29 03:3x-04:0x，Kapitsa）
 
+**社区对照**（r/LocalLLM 同机帖，M5 Pro 64GB，Qwen3.8-27B 4-bit + 草稿器，400 输出 token、reasoning 关）：
+
+| 运行时 | decode | 备注 |
+|--------|--------|------|
+| TensorFold beta.8 | 36.0 tok/s | 14.98GiB + 3.6GB 草稿器 |
+| **Kapitsa 0.2.3** | **34.3 tok/s** | **含 MTP head + DFlash2（~20.2GB 包）** |
+| LM Studio 0.4.26+4 | 33.5 tok/s | Splash 引擎 |
+| oMLX 0.7.2 → Splash | 33.2 tok/s | |
+| Splash 1.3.2 | 30.3 tok/s | unsloth Q4_K_M |
+| MLX-Serve | 30.1 tok/s | |
+| Ollama 0.40.6 | 27.0 tok/s | |
+
+Kapitsa 官方 `docs/benchmarks.md`（口径：4K prompt + 512 token 答案、T 0.6、rate 取流中段）M5 Pro 48GB 行：27B decode 与 mlx-serve 相当（77 vs 78）。
+
+**本机实测**（M5 Pro 48GB，`mlx-community/Qwen3.8-27B-4bit` + 官方 `incoai/Qwen3.8-27B-DFlash2` 草稿器）：
+
+| 配置 | decode | 判读 |
+|------|--------|------|
+| plain（`--dflash none`） | 17.8 tok/s | 稠密 27B（64 层 × 5120，无专家）4bit 的带宽天花板 ≈ 13.5GB/token ÷ ~273GB/s ≈ 20 tok/s → **已触顶 91%** |
+| 链式 DFlash2（`NI_KFLASH=0`） | 21.5 tok/s | 投机有效但增益有限 |
+| KFlash 树验证 | 23.2-24.1 tok/s | T=0 / T=0.6 无差异 |
+| 质量门 v3 | **PASS 59/62 = 95.2%** | **所有受测模型最高**；summary 7/7 全过（optiq 5/7、Flint 4-5/7、9B 2/7） |
+
+**与社区差距的已知项**：我们的包**缺 MTP head**（社区包 20.2GB 含 MTP 239MB；Kapitsa 日志明示 "no MTP head … speculative decoding off"）→ MTP 快路径不可用，只剩 DFlash2；草稿器本身与模型词表一致（均 248320），"reduced draft head 98304 ids" 是 Kapitsa 的设计而非错配。即便追平社区 34.3 tok/s，也仅为现产 35B 的 1/4。
+
+**产品定位结论**：27B 是**质量最高**（95.2%）但**吞吐最低**（23 vs 116-132 tok/s）→ 定位为**内存优先的降级档**（16GB 权重 + 22GB KV room，为 IDE/agent 会话腾空间），不作吞吐型主力；生产主力维持 splash + 35B OptiQ。
+
+## 四、后续可选动作（未做）
 - **同权重 1:1 对照**（Kapitsa+KFlash vs splash+DFlash2，同为 OptiQ-4bit 权重）：HF 缓存已有 `mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit` 与 DFlash2 草稿器，可喂本地目录启动。**本次未做**：需独占引擎 ~12 分钟，与并行会话批期窗口相撞概率高且预期增量有限（±5%）→ 按窗口纪律不抢占。
 - **Qwen3.8-27B（Kapitsa 支持）**：weights 16.08GB + MTP head 239MB + DFlash2 草稿器 3.85GB → MTP 与 KFlash 双可用；本仓 conf 为 Qwen3.8-27B（无 28B 档）。
 - **代理层思考预算护栏已落地**（`91f7550`）：G1 分账（本地后端注入 llama.cpp 原生 `reasoning_budget_tokens` + 答案保留预算）、G2 降级重试（有 reasoning 但正文空且 `finish_reason=length` → 关思考重试一次，fail-open）——对任何后端通用，Flint 场景同样受益。
