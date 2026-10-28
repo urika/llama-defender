@@ -1,6 +1,6 @@
 # Flint 与 Kapitsa 引擎评估记录（2026-10-29）
 
-> **结论先行**：Flint（Recursive 40B-A3B MoE）在本机可跑但**不具备生产替代条件**；Kapitsa 作为引擎在**同族 35B** 上与现产 splash 打平（115.2 vs 116-132 tok/s），KFlash 增益实测仅 **+11.5%**（官方对照 339 tok/s 为别的高端机口径）——**现产 splash + DFlash2 保持不动**。
+> **结论先行**：Flint（Recursive 40B-A3B MoE）在本机可跑但**不具备生产替代条件**；Kapitsa 作为引擎在**同族 35B** 上与现产 splash 打平（115.2 vs 116-132 tok/s），KFlash（树验证策略）相对链式验证增益实测仅 **+11.5%**（官方对照 339 tok/s 为别的高端机口径）——**现产 splash + DFlash2 保持不动**。
 > 本记录留存四形态的同口径数据与踩坑清单，供后续再评估时免重复劳动。
 
 ## 一、背景与目标
@@ -21,7 +21,7 @@
 | （参照）llama.cpp + Qwen3.6-35B-A3B-4bit | — | — | — | — |
 
 关键读数：
-- **Flint 天花板 = 147 tok/s（plain decoding）**：Kapitsa 官方文档明言「Dory and Flint have none: they decode without one」——Flint **无 DFlash 草稿器、无 MTP head** → KFlash/MTP 均不可用，无投机加成空间。
+- **Flint 天花板 = 147 tok/s（plain decoding）**：Kapitsa 官方文档明言「Dory and Flint have none: they decode without one」——Flint **无任何草稿器（无 DFlash2/DFlash 草稿、无 MTP head）** → KFlash 作为验证策略没有草稿可验、MTP 亦不可用 → 无投机加成空间（术语层次见 §三·五 注）。
 - **Flint 推理质量弱于现产**：专项探针（8 题确定性答案 + 开思考 + 足额预算）现产 8/8（思考 990-1583 字有界、均 2.8s），Flint IQ3 7/8 且 **R5 自指逻辑题思考死循环**（8192 预算下思考 9211 字、答案 0 字、63s——加预算仍不收敛）。
 - **Kapitsa + KFlash 对同族 35B 只 +11.5%**：纯 decode 差分 115.2（KFlash on）vs 103.3（`NI_KFLASH=0` 链式）；官方对照「Kapitsa+KFlash 339 > Splash+DFlash2 281」为别的高端机口径，本机 M5 Pro 上不成立。
 
@@ -85,8 +85,8 @@ engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify), KF
 | 配置 | decode | 相对 plain |
 |------|--------|-----------|
 | plain（`--dflash none`，无 MTP） | 17.8 tok/s | — |
-| KFlash（DFlash2 only，无 MTP） | 23.2 tok/s | +30% |
-| **KFlash + MTP head（本次）** | **32.1 tok/s** | **+80%** |
+| DFlash2 草稿 + KFlash 树验证（无 MTP） | 23.2 tok/s | +30% |
+| DFlash2 草稿 + KFlash 树验证 + MTP head（本次） | **32.1 tok/s** | **+80%** |
 | 社区同机（M5 Pro **64GB**，含 MTP） | 34.3 tok/s | — |
 
 **结论**：MTP 侧车补齐后达到社区水平的 ~94%（我们 48GB 机、社区 64GB 机）；27B 的瓶颈是稠密 27B 的带宽（13.5GB/token ÷ ~273GB/s ≈ 20 tok/s 理论 plain 上限），投机解码把有效吞吐推到 32 tok/s 属超线性收益。**定位不变**：质量最高（95.2%）但吞吐仅为现产 35B 的 ~1/4 → 保持「质量优先 / 内存友好」降级档，不作吞吐主力。
@@ -94,6 +94,13 @@ engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify), KF
 **注意事项**：`--hidden post_norm|pre_norm` 必须与模型布局匹配；本次 `post_norm` 生效且加速明显（若布局选错，表现是接受率≈0、速度回到 plain，而非答案错误——投机解码的输出仍由目标模型逐 token 验证）。
 
 **产品定位结论**：27B 是**质量最高**（95.2%）但**吞吐最低**（23 vs 116-132 tok/s）→ 定位为**内存优先的降级档**（16GB 权重 + 22GB KV room，为 IDE/agent 会话腾空间），不作吞吐型主力；生产主力维持 splash + 35B OptiQ。
+
+> **术语层次注（2026-10-29 订正）**：**KFlash 是验证策略（树形投机验证），不是草稿器**。
+> 草稿器来源 = DFlash2 / DFlash / MTP / DSpark / LiLiCorr（`--dflash` 选源、`--spec` 控 MTP 深度）；
+> KFlash 拿草稿器的候选做一次树形验证。两者可叠加：本机 27B 实测阶梯
+> plain 17.8 → DFlash2+链式 21.5 → DFlash2+KFlash 23.2 → DFlash2+KFlash+MTP 32.1 tok/s。
+> Kapitsa README 原文：「KFlash, tree speculative decoding: one verify pass checks a tree of the
+> drafter's guesses, with a DFlash2, DFlash, MTP, DSpark or LiLiCorr drafter behind every model that ships one」。
 
 ## 四、后续可选动作（未做）
 - **同权重 1:1 对照**（Kapitsa+KFlash vs splash+DFlash2，同为 OptiQ-4bit 权重）：HF 缓存已有 `mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit` 与 DFlash2 草稿器，可喂本地目录启动。**本次未做**：需独占引擎 ~12 分钟，与并行会话批期窗口相撞概率高且预期增量有限（±5%）→ 按窗口纪律不抢占。

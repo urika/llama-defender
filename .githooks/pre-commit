@@ -145,6 +145,8 @@ echo "✅ pre-commit: ctx-case gate passed."
 # 前置条件相应改为真实后端可达(模型内容断言的依赖); 后端不可达时跳过,
 # 保持无后端时提交快速。
 BACKEND_URL="${LLAMA_BASE_URL:-http://127.0.0.1:8081}"
+# 代理地址（提示文案用；此前的 PROXY_URL 未定义，set -u 下触发 unbound 拦死提交）
+PROXY_URL="${PROXY_URL:-http://127.0.0.1:4000}"
 if pgrep -f "exp _exec" >/dev/null 2>&1 \
    || pgrep -f "run_agent.py" >/dev/null 2>&1; then
   # 2026-09-27 (swe-eval L-49, 批期保护): swe-eval 评测批次在跑时跳过本层——
