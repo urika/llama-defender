@@ -170,7 +170,7 @@ LLAMA_BASE_URL=http://127.0.0.1:8081/v1 PORT=4000 python3 anthropic_proxy.py
 
 > **1.3.1 breaking change**：Splash 包（`incoai/*-Splash`）**不再加载**，改为指向标准 MLX/GGUF 权重 + `incoai/*-DFlash2` 草稿。旧 `splash-qwen36-35b.conf` / `splash-qwen38-27b.conf` 已标 DEPRECATED。
 
-> **当前激活 = `splash-qwen36-35b-optiq.conf`**（Splash 1.4.0 + `mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit`，2026-10-21 重启生效）：thinking on + **reasoning low + token budget 2048**、**idle-release 120m**（45min 墙根因修复，dbcdb47）。实测 decode 132 tok/s / state 命中 94.6% / draft 接受率 0.687。配置明细见 [`docs/02-architecture-design/codebase-reference-20261017.md`](docs/02-architecture-design/codebase-reference-20261017.md) §三。
+> **当前激活 = `splash-qwen36-35b-optiq.conf`**（Splash 1.4.0 + `mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit`，2026-10-21 重启生效）：thinking on + **reasoning low + token budget 512**（2026-10-23 由 2048 收紧，0e35545；**文档口径以 conf 为准**）、**idle-release 120m**（45min 墙根因修复，dbcdb47）。实测 decode 132 tok/s / state 命中 94.6% / draft 接受率 0.687。配置明细见 [`docs/02-architecture-design/codebase-reference-20261017.md`](docs/02-architecture-design/codebase-reference-20261017.md) §三。
 >
 > **2026-10-27 复测**（长会话混合负载口径，非 README SPEED-Bench）：prefill **1101–1154 tok/s** / decode **116–117 tok/s** / draft 接受率 **0.534–0.578** / TTFT p50 0.87s p95 8.68s。与上条 2026-10-21 标称口径不同不可直接对比。epoch 阈值 `PROXY_CTX_EPOCH_TRIGGER_TOKENS=150000` 按复测口径复核仍成立（冷 prefill ≈130s vs 466s 客户端死线 → 3.5× 余量，epoch 折叠实测 0 次、rerun gate PASS）→ **不要改 0（auto 会落到 29250，摧毁原决策目标）**。证据链见 [`docs/05-operations-changelog/epoch-trigger-threshold-drift-20261027.md`](docs/05-operations-changelog/epoch-trigger-threshold-drift-20261027.md)。
 
