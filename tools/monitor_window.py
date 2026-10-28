@@ -132,14 +132,25 @@ def degraded_now(snap, denied_rate_th=300.0, headroom_g=8.0, ttft_p95_s=30.0):
     return False, ""
 
 
-def recycle_needed(prev_batch, now_batch, cum_denied, th=500):
-    """批跑收官**一次性清场**：上轮在批跑、本轮不在，且本批累计拒绝量超阈。
+def recycle_needed(prev_batch, now_batch, cum_denied, th=500,
+                   idle_cycles=0, min_idle_cycles=2):
+    """批跑收官**一次性清场**：批跑已连续缺席，且本批累计拒绝量超阈。
 
     命中即重启一次（清 KV/state、denied 归零、headroom 回位）。
+
+    **idle_cycles 语义**：连续「无批跑」的轮数，**含当前轮**（由 report() 落盘，
+    下一轮读回）。**为什么要有这道闸**：batch 判定是**进程级**的（pgrep
+    run_agent.py / swe_test exp）——批跑在两轮之间的间隙会瞬时翻成 False；
+    单轮翻 False 就清场会把在飞 run 打死（2026-10-28 复查时发现的风险）。
+    故要求连续缺席 ≥ min_idle_cycles 轮（默认 2 轮 ≈ 10 分钟）。
     """
-    if prev_batch is True and now_batch is False and (cum_denied or 0) > th:
-        return True
-    return False
+    if now_batch:
+        return False
+    if prev_batch:
+        return False            # 上一轮还在批跑 → 本轮只是间隙，不清场
+    if idle_cycles < min_idle_cycles:
+        return False            # 缺席时长不足 → 再观察
+    return (cum_denied or 0) > th
 
 
 def restart_allowed(now_ts, last_restart_ts, attempts,

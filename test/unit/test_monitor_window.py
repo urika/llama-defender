@@ -143,11 +143,21 @@ class MonitorWindowTest(unittest.TestCase):
         self.assertEqual(mw.degraded_now(snap3)[1], "ttft_p95")
 
     def test_recycle_needed_on_batch_end(self):
-        """批跑收官一次性清场：上轮在批跑→本轮不在 + 累计拒绝超阈。"""
-        self.assertTrue(mw.recycle_needed(True, False, 765, th=500))
-        self.assertFalse(mw.recycle_needed(True, False, 100, th=500))
-        self.assertFalse(mw.recycle_needed(True, True, 765, th=500))
-        self.assertFalse(mw.recycle_needed(False, False, 765, th=500))
+        """批跑收官一次性清场：连续缺席 ≥2 轮 + 累计拒绝超阈。"""
+        self.assertTrue(mw.recycle_needed(False, False, 765, th=500,
+                                          idle_cycles=2))
+        # 间隙误杀防护：上一轮还在批跑（idle_cycles=1）→ 不清场
+        self.assertFalse(mw.recycle_needed(True, False, 765, th=500,
+                                           idle_cycles=1))
+        # 缺席轮数不足 → 再观察
+        self.assertFalse(mw.recycle_needed(False, False, 765, th=500,
+                                           idle_cycles=1))
+        # 累计量未超阈 → 不清场
+        self.assertFalse(mw.recycle_needed(False, False, 100, th=500,
+                                           idle_cycles=3))
+        # 批跑中 → 绝不清场
+        self.assertFalse(mw.recycle_needed(False, True, 765, th=500,
+                                           idle_cycles=2))
 
     def test_restart_allowed_cooldown_and_cap(self):
         """冷却 + 次数上限（防重启风暴）。"""

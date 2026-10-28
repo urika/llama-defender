@@ -263,10 +263,12 @@ snap["degraded_why"] = _degraded_why
 
 # 写状态文件（供下轮差分）
 snap["ts_epoch"] = now
+# 批跑缺席轮数（连续，含本轮）——清场判据的闸（批跑间隙单轮翻 False 不能清场）
+snap["idle_cycles"] = 0 if snap.get("batch") else int((prev or {}).get("idle_cycles", 0) or 0) + 1
 tmp = state_f + ".tmp"
 _st = {k: snap.get(k) for k in
        ("ts_epoch", "memory_denied", "memory_headroom_gb", "kv_gb", "state_gb",
-        "req_completed", "batch")}
+        "req_completed", "batch", "idle_cycles")}
 # 滚动窗口历史样本：(ts, headroom_gb, denied)——外推用（相邻窗差分噪声大）
 _st["hist"] = [[round(h[0], 3), round(h[1], 3), round(h[2], 3)] for h in hist]
 json.dump(_st, open(tmp, "w"))
@@ -363,12 +365,17 @@ except Exception:
 prev_batch = prev.get("batch")
 now_batch = bool(snap.get("batch"))
 cum_denied = snap.get("memory_denied") or 0
+# 批跑缺席轮数（连续，含本轮）——由 report() 落盘、此处读回；
+# batch 判定是进程级的，批跑间隙会瞬时翻 False → 必须连续缺席 ≥2 轮才清场。
+idle_cycles = int(prev.get("idle_cycles", 0) or 0)
 
 sys.path.insert(0, os.environ.get("MONITOR_TOOLS_DIR", "."))
 import monitor_window as mw
 
 recycle = mw.recycle_needed(prev_batch, now_batch, cum_denied,
-                             th=float(os.environ.get("MONITOR_RECYCLE_DENIED", 500)))
+                             th=float(os.environ.get("MONITOR_RECYCLE_DENIED", 500)),
+                             idle_cycles=idle_cycles,
+                             min_idle_cycles=int(os.environ.get("MONITOR_RECYCLE_IDLE_CYCLES", 2)))
 degraded, why = mw.degraded_now(
     snap,
     denied_rate_th=float(os.environ.get("MONITOR_DENIED_RATE", 300)),
@@ -392,6 +399,7 @@ elif degraded and now_batch is False:
 print(json.dumps({"do_restart": do_restart, "reason": reason,
                   "recycle": recycle, "degraded": degraded, "why": why,
                   "allowed": allowed, "deny": deny_reason,
+                  "idle_cycles": idle_cycles,
                   "attempts": rst.get("attempts", 0)}, ensure_ascii=False))
 PY
 )"
