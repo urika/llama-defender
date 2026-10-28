@@ -222,3 +222,12 @@ pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage
 实现要点：`manage.sh` 新增 `_start_kapitsa()`（`kapitsa serve --model … --local --private`，`_wait_for_ready` 复用）+ 两个 dispatch 分支 +
 `_classify_backend_pid` 增加 `kapitsa)` 识别（否则 `stop-backend` 认不出、残留占端口 → proxy `model_drift`）+ stop 兜底 `pkill -f 'kapitsa serve'`。
 验证日志：`MTP head loaded in ~103 ms (MoE, trunk hidden pre-norm)` + `engine ready: … KFlash speculative decoding (DFlash2 lattice, tree verify)`。
+
+### 七、Kapitsa slots 设定（2026-10-29 实测订正：4 → 1）
+
+**结论：`KAPITSA_SLOTS=1`**（原 4）。
+
+- **KV 池不是按 slots×ctx 预留**：Kapitsa 的 `KV room` 按剩余内存预算一次性分配（本次 20.65GB = 916,797 tokens / 22KB per token），slots 只决定「同时保持几个会话的 ring 状态」——slots=4 与 slots=1 的内存差仅 ~0.05GB（22.59 vs 22.64GB allocated），**不存在「4 槽白占 3 份 KV」**。
+- **但 slots=1 实测量更快**：纯 decode **154.3 tok/s**（slots=4 时 148-150），且 `one conversation up to 262144 of 262144 tokens`——单个会话独占全部 KV room，无槽位竞争。
+- 代理侧 `PROXY_MAX_CONCURRENT=1` 已串行 + 批驱动单实例交错 ⇒ slots>1 无并发收益；只有「多会话轮流复用缓存」场景才需要 >1（如多个 IDE 会话直连引擎）。
+- 如需并发直连：改 slots=2 并同步放宽代理并发（48GB 内存下不推荐）。
