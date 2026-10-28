@@ -1962,6 +1962,142 @@ class TestMinMaxTokensFloor(unittest.TestCase):
         self.assertEqual(ctx.openai_body["max_tokens"], 1000)
 
 
+class TestThinkingBudgetGuard(unittest.TestCase):
+    """思考预算护栏（2026-10-29，社区标准：预算 + 强制 think-end）.
+
+    G1 分账: 引擎级 reasoning_budget_tokens + max_tokens 抬到 budget+reserve
+             （思考与答案不再共享一个池——共享池是「思考烧穿→正文空」根因）。
+    G2 降级: 非流式「有 reasoning 无正文且 finish_reason=length」→ 关思考重试一次，
+             失败/无改善 → 原样返回（fail-open）。
+    """
+
+    def _ctx(self, target="local", max_tokens=256):
+        body = {"model": "claude-haiku-4-5", "max_tokens": max_tokens}
+        ctx = PipelineContext(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            body=body, is_stream=False)
+        ctx._route_target = target
+        ctx.openai_body = {}
+        return ctx
+
+    # ---------------- G1 分账 ----------------
+
+    def test_local_injects_budget_and_raises_max_tokens(self):
+        ctx = self._ctx()
+        with patch.object(_ps, "PROXY_THINKING_BUDGET_TOKENS", 1024), \
+             patch.object(_ps, "PROXY_THINKING_ANSWER_RESERVE", 512):
+            FormatConverter().process(ctx)
+        self.assertEqual(ctx.openai_body.get("reasoning_budget_tokens"), 1024)
+        self.assertEqual(ctx.openai_body.get("max_tokens"), 1536)  # 1024+512
+
+    def test_cloud_route_not_injected(self):
+        ctx = self._ctx(target="cloud")
+        with patch.object(_ps, "PROXY_THINKING_BUDGET_TOKENS", 1024), \
+             patch.object(_ps, "PROXY_THINKING_ANSWER_RESERVE", 512):
+            FormatConverter().process(ctx)
+        self.assertNotIn("reasoning_budget_tokens", ctx.openai_body)
+
+    def test_zero_budget_no_change(self):
+        ctx = self._ctx(max_tokens=256)
+        with patch.object(_ps, "PROXY_THINKING_BUDGET_TOKENS", 0), \
+             patch.object(_ps, "PROXY_THINKING_ANSWER_RESERVE", 0):
+            FormatConverter().process(ctx)
+        self.assertNotIn("reasoning_budget_tokens", ctx.openai_body)
+        self.assertEqual(ctx.openai_body.get("max_tokens"), 256)
+
+    def test_client_budget_not_lowered(self):
+        ctx = self._ctx(max_tokens=8000)
+        with patch.object(_ps, "PROXY_THINKING_BUDGET_TOKENS", 1024), \
+             patch.object(_ps, "PROXY_THINKING_ANSWER_RESERVE", 512):
+            FormatConverter().process(ctx)
+        self.assertEqual(ctx.openai_body.get("max_tokens"), 8000)
+
+    # ---------------- G2 降级重试 ----------------
+
+    def _guard_ctx(self, target="local"):
+        ctx = self._ctx(target=target)
+        ctx.openai_body = {"model": "m", "messages": [], "max_tokens": 64}
+        return ctx
+
+    @staticmethod
+    def _mock_resp(payload):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(payload).encode("utf-8")
+        return resp
+
+    @staticmethod
+    def _empty_resp(finish="length", tool_calls=None, reasoning="思考中..."):
+        msg = {"content": "", "reasoning_content": reasoning}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return {"choices": [{"message": msg, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 64}}
+
+    @staticmethod
+    def _ok_resp():
+        return {"choices": [{"message": {"content": "答案正文"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8}}
+
+    def _run_guard(self, ctx, resp, backend_resp=None, backend_exc=None):
+        d = BackendDispatcher()
+        patches = [
+            patch.object(_ps, "PROXY_THINKING_GUARD_ENABLED", True),
+            patch.object(_ps, "PROXY_THINKING_GUARD_MAX_RETRY", 1),
+        ]
+        if backend_exc is not None:
+            patches.append(patch("pipeline.urllib.request.urlopen",
+                                 side_effect=backend_exc))
+        else:
+            patches.append(patch("pipeline.urllib.request.urlopen",
+                                 return_value=self._mock_resp(
+                                     backend_resp or self._ok_resp())))
+        with patches[0], patches[1], patches[2]:
+            return d._thinking_guard_retry(ctx, resp, "http://x/v1", "k")
+
+    def test_retries_and_uses_new_text(self):
+        ctx = self._guard_ctx()
+        out = self._run_guard(ctx, self._empty_resp())
+        self.assertEqual(out["choices"][0]["message"]["content"], "答案正文")
+        # 降级请求体必须关思考（社区三发）
+        self.assertEqual(ctx.openai_body.get("thinking"), {"type": "disabled"})
+        self.assertEqual(ctx.openai_body.get("reasoning_effort"), "none")
+        self.assertEqual(ctx.openai_body.get("reasoning_budget_tokens"), 0)
+
+    def test_no_retry_when_tool_calls_present(self):
+        ctx = self._guard_ctx()
+        resp = self._empty_resp(tool_calls=[{"id": "c1", "type": "function",
+                                             "function": {"name": "f", "arguments": "{}"}}])
+        out = self._run_guard(ctx, resp)
+        self.assertIs(out, resp)  # 原样返回（工具调用即有效输出）
+
+    def test_no_retry_when_finish_reason_stop(self):
+        ctx = self._guard_ctx()
+        resp = self._empty_resp(finish="stop")
+        out = self._run_guard(ctx, resp)
+        self.assertIs(out, resp)
+
+    def test_no_retry_when_content_present(self):
+        ctx = self._guard_ctx()
+        resp = {"choices": [{"message": {"content": "有正文",
+                                         "reasoning_content": "思考"},
+                             "finish_reason": "length"}]}
+        out = self._run_guard(ctx, resp)
+        self.assertIs(out, resp)
+
+    def test_cloud_route_not_retried(self):
+        ctx = self._guard_ctx(target="cloud")
+        resp = self._empty_resp()
+        out = self._run_guard(ctx, resp)
+        self.assertIs(out, resp)
+
+    def test_fail_open_keeps_original_on_backend_error(self):
+        ctx = self._guard_ctx()
+        resp = self._empty_resp()
+        out = self._run_guard(ctx, resp, backend_exc=RuntimeError("boom"))
+        self.assertIs(out, resp)  # fail-open：原响应保留
+
+
 class TestBackendDispatcherEffectiveTimeout(unittest.TestCase):
     """proactive 非流式超时钳制 (客户端超时−margin) 与流式宽松超时."""
 

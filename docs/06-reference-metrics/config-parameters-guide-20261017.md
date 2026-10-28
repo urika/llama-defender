@@ -157,6 +157,17 @@
 
 队列分桶：interactive（<16K chars，最高优先级）→ standard → large → huge；同 bucket FIFO。响应头带 `X-Queue-Bucket/Position/Estimated-Wait-Ms/Wait-Ms`，状态见 `GET /api/queue`。
 
+### 11.11 思考预算护栏（2026-10-29，社区标准机制：预算 + 强制 think-end，全部 reloadable）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `PROXY_THINKING_GUARD_ENABLED` | true | **G2 降级**：非流式响应「有 `reasoning_content` 但正文为空且 `finish_reason=length`（预算烧穿）」→ 关思考降级重试一次（社区三发：`thinking:{disabled}` + `reasoning_effort:"none"` + `reasoning_budget_tokens:0`）；有新正文则采用，无则原样返回（fail-open）。**只作用本地后端**——云端 thinking-only 模型空正文属常态，且未知字段有 400 风险 |
+| `PROXY_THINKING_GUARD_MAX_RETRY` | 1 | 降级重试次数上限（每请求计）。0=只检测不重试 |
+| `PROXY_THINKING_BUDGET_TOKENS` | 0 | **G1 分账·引擎级**：>0 时本地后端注入 llama.cpp 原生 `reasoning_budget_tokens`（服务端计数到预算即**强制 think-end**，思考必然终止转入作答——社区对「思考失控」的标准解法） |
+| `PROXY_THINKING_ANSWER_RESERVE` | 0 | 答案保留预算：`max_tokens` 下限保证答案有位置（与 budget 配对时下限=budget+reserve；单独使用时下限=reserve）。0=不干预 |
+
+**为什么需要**：思考与答案默认共享同一个 `max_tokens` 池——思考烧穿即正文空（本地实测：知识门 62 条里 6 条「content 空」假象；Flint IQ3 在自指逻辑题上思考 9211 字仍不收敛，答案 0 字）。社区标准解法有三层：引擎级硬预算（llama.cpp `--reasoning-budget` / vLLM `thinking_token_budget`，都是**预算耗尽强制注入 think-end**）、软预算收尾提示（llama.cpp `--reasoning-budget-message`）、effort 档位映射（OpenAI `reasoning_effort` → 预算，vLLM #55382 / Inspect 自动桥接）。本代理层取**引擎无关**的一层：本地注入 `reasoning_budget_tokens`（引擎原生强制终止）+ 空正文降级重试（覆盖不支持该字段的后端，如 Kapitsa/rapid-mlx）。
+
 > 完整参数列表及详细文档见 [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`。
 
 ---

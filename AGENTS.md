@@ -414,7 +414,7 @@ git commit --no-verify               # 绕过所有钩子
 ## 11. 关键配置参数与推荐组合
 
 > **全表已拆分** → [`docs/06-reference-metrics/config-parameters-guide-20261017.md`](docs/06-reference-metrics/config-parameters-guide-20261017.md)
-> （压缩 Profile / 本地模式 / 云端模式 / 路由 / 队列 / 诊断数据面 / 循环干预与 fnf 缓解 / admin 注入 / BVR 自调优 / 跨会话记忆 十张参数表）。
+> （压缩 Profile / 本地模式 / 云端模式 / 路由 / 队列 / 诊断数据面 / 循环干预与 fnf 缓解 / admin 注入 / BVR 自调优 / 跨会话记忆 / 思考预算护栏 十一张参数表）。
 > 权威默认值 = [`proxy_config.py`](proxy_config.py) 的 `CONFIG_REGISTRY`；新增参数必须同时登记 CONFIG_REGISTRY + manage.sh + 该指南。
 
 最常用速查：压缩档 `PROXY_COMPRESSION_PROFILE=balanced`（默认）| `aggressive`（长上下文）| `conservative`（质量敏感）；

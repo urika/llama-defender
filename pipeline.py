@@ -3944,6 +3944,24 @@ class FormatConverter(PipelineStage):
             openai_body["max_tokens"] = _route_floor
             if isinstance(body, dict) and isinstance(body.get("max_tokens"), int):
                 body["max_tokens"] = _route_floor
+        # 思考预算护栏 G1（2026-10-29，社区标准机制：思考预算 + 强制 think-end）——
+        # 引擎级 reasoning_budget_tokens（llama.cpp 原生：计数到预算即强制注入 think-end，
+        # 思考必然终止转入作答）+ max_tokens 抬到 budget+reserve（思考与答案分账，
+        # 不再共享一个池——共享池正是「思考烧穿→正文空」的根因）。
+        # 只作用本地后端：云端 thinking-only 模型空正文属常态，且未知字段有 400 风险。
+        if getattr(ctx, '_route_target', 'local') == 'local':
+            _tb = int(getattr(_ps, "PROXY_THINKING_BUDGET_TOKENS", 0) or 0)
+            _ar = int(getattr(_ps, "PROXY_THINKING_ANSWER_RESERVE", 0) or 0)
+            if _tb > 0:
+                openai_body["reasoning_budget_tokens"] = _tb
+            _need = (_tb + _ar) if (_tb > 0 or _ar > 0) else 0
+            if _need > 0 and isinstance(openai_body.get("max_tokens"), int) \
+                    and openai_body["max_tokens"] < _need:
+                log(f"  -> [thinking-guard] max_tokens {openai_body['max_tokens']} "
+                    f"-> {_need} (thinking budget {_tb} + answer reserve {_ar})")
+                openai_body["max_tokens"] = _need
+                if isinstance(body, dict) and isinstance(body.get("max_tokens"), int):
+                    body["max_tokens"] = _need
         # Reasoning-effort passthrough: map the client's Anthropic-scale
         # output_config.effort (or OpenAI reasoning_effort, or the catalog's
         # reasoning_effort_default quirk) onto the backend's accepted levels.
@@ -4724,6 +4742,89 @@ class BackendDispatcher(PipelineStage):
             log(f"  -> Message repair failed: {ex}")
             return False
 
+    def _thinking_guard_retry(self, ctx, openai_resp, base_url, api_key):
+        """思考预算护栏 G2（2026-10-29）：非流式响应「有 reasoning_content 但正文为空
+        且 finish_reason=length（预算烧穿）」→ 关思考降级重试一次。
+
+        社区标准三发（llama.cpp/vLLM 同款思路）：thinking disabled +
+        reasoning_effort none + reasoning_budget_tokens 0（强制 think-end）。
+        只作用本地后端（云端 thinking-only 空正文属常态）。失败或无新正文 →
+        原样返回（fail-open，客户端不受影响）。
+        """
+        try:
+            if not getattr(_ps, "PROXY_THINKING_GUARD_ENABLED", False):
+                return openai_resp
+            if getattr(ctx, '_route_target', 'local') != 'local':
+                return openai_resp
+            _max_retry = int(getattr(_ps, "PROXY_THINKING_GUARD_MAX_RETRY", 0) or 0)
+            if _max_retry <= 0:
+                return openai_resp
+            if int(getattr(ctx, "_thinking_guard_retries", 0) or 0) >= _max_retry:
+                return openai_resp
+            choices = openai_resp.get("choices") or []
+            if not choices:
+                return openai_resp
+            ch = choices[0] or {}
+            msg = ch.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, list):
+                text = "".join(str(b.get("text", "")) for b in content
+                               if isinstance(b, dict))
+            else:
+                text = str(content or "")
+            if text.strip():
+                return openai_resp
+            if msg.get("tool_calls"):
+                return openai_resp      # 工具调用即有效输出，不干预
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            if not str(reasoning).strip():
+                return openai_resp      # 无思考痕迹 → 正常空答，不干预
+            if ch.get("finish_reason") != "length":
+                return openai_resp      # 非预算耗尽（正常停）→ 不干预
+            # 降级重试：关思考
+            body = ctx.openai_body or {}
+            body["thinking"] = {"type": "disabled"}
+            body["reasoning_effort"] = "none"
+            body["reasoning_budget_tokens"] = 0
+            ctx._thinking_guard_retries = int(
+                getattr(ctx, "_thinking_guard_retries", 0) or 0) + 1
+            log("  -> [thinking-guard] empty content with reasoning "
+                "(finish_reason=length, reasoning=%d chars); retry with thinking disabled"
+                % len(str(reasoning)))
+            try:
+                import diagnostics
+                diagnostics.record_injection("thinking_guard_retry", detail={
+                    "reasoning_chars": len(str(reasoning)),
+                    "attempt": ctx._thinking_guard_retries,
+                })
+            except Exception as _e:
+                _warn_diag("thinking_guard_retry", _e)
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base_url}/chat/completions", data=payload,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {api_key}"},
+                method="POST")
+            resp2 = urllib.request.urlopen(
+                req, timeout=self._effective_backend_timeout(ctx, proactive=True))
+            raw = resp2.read()
+            new_resp = json.loads(raw.decode("utf-8"))
+            ch2 = (new_resp.get("choices") or [{}])[0] or {}
+            m2 = ch2.get("message") or {}
+            t2 = m2.get("content")
+            if isinstance(t2, list):
+                t2 = "".join(str(b.get("text", "")) for b in t2
+                             if isinstance(b, dict))
+            if not str(t2 or "").strip():
+                log("  -> [thinking-guard] degraded retry produced no text; keeping original")
+                return openai_resp
+            log("  -> [thinking-guard] degraded retry produced text (%d chars); using it"
+                % len(str(t2)))
+            return new_resp
+        except Exception as _e:
+            _warn_diag("thinking_guard", _e)
+            return openai_resp
+
     def _do_dispatch(self, ctx, base_url, api_key):
         """Send HTTP POST to backend and dispatch response to handler.
 
@@ -4853,6 +4954,14 @@ class BackendDispatcher(PipelineStage):
                             except Exception:
                                 pass
                             return self._do_dispatch(ctx, base_url, api_key)
+                    # 思考预算护栏 G2：非流式「有思考无正文且被预算截断」→ 关思考降级重试
+                    # （重试换响应体：usage 与 body_bytes 都取新响应）
+                    _guard_before = openai_resp
+                    openai_resp = self._thinking_guard_retry(
+                        ctx, openai_resp, base_url, api_key)
+                    if openai_resp is not _guard_before:
+                        body_bytes = json.dumps(
+                            openai_resp, ensure_ascii=False).encode("utf-8")
                     usage = openai_resp.get("usage") or {}
                     self._input_tokens = usage.get("prompt_tokens", self._input_tokens)
                     self._output_tokens = usage.get("completion_tokens", self._output_tokens)

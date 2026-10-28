@@ -1209,6 +1209,35 @@ CONFIG_REGISTRY = {
                "开＝客户端可见思考过程，且截断时不会把半截思考冒充正文；"
                "关＝旧行为（非流式丢 reasoning、content 为空时顶替正文；流式并入 text 增量）。",
     },
+    # ---- 思考预算护栏（2026-10-29，社区标准机制：预算 + 强制 think-end）----
+    "PROXY_THINKING_GUARD_ENABLED": {
+        "defaults": {"all": "true"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "思考预算护栏 G2（非流式，本地后端）：响应「有 reasoning_content 但正文为空"
+               "且 finish_reason=length（预算烧穿）」→ 关思考降级重试一次"
+               "（thinking disabled + reasoning_effort none + reasoning_budget_tokens 0 三发），"
+               "有新正文则采用、无则原样返回（fail-open）。只作用本地后端——云端 thinking-only "
+               "模型空正文属常态且未知字段有 400 风险。",
+    },
+    "PROXY_THINKING_GUARD_MAX_RETRY": {
+        "defaults": {"all": "1"},
+        "type": "int", "scope": "reloadable",
+        "doc": "思考护栏降级重试次数上限（每请求计）。0=禁用重试（仍保留检测日志）。",
+    },
+    "PROXY_THINKING_BUDGET_TOKENS": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "思考预算护栏 G1（分账·引擎级）：>0 时本地后端注入 llama.cpp 原生 "
+               "reasoning_budget_tokens（服务端计数到预算即强制 think-end，思考必然终止），"
+               "并配合 PROXY_THINKING_ANSWER_RESERVE 把 max_tokens 抬到 "
+               "budget+reserve（思考与答案分账，不再共享一个池）。0=不注入。",
+    },
+    "PROXY_THINKING_ANSWER_RESERVE": {
+        "defaults": {"all": "0"},
+        "type": "int", "scope": "reloadable",
+        "doc": "答案保留预算：max_tokens 下限保证答案有位置（与 budget 配对使用时下限="
+               "budget+reserve；单独使用时下限=reserve）。0=不干预。",
+    },
     # ---- file_not_found 循环缓解一期 F1/F2/F3'（2026-10-25 定稿 / 2026-10-26 v0.1 修正；
     #      缺省关=零行为变化，批期可入库，激活=空窗一次戳）----
     "PROXY_FNF_GUIDE_ENABLED": {
