@@ -273,3 +273,32 @@ pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage
 3. Kapitsa 35B-4bit — 91.9% @148-150 / ~22GB（MTP+KFlash 全开）→ **速度最快，但 summary 类任务不达标**
 
 **生产含义**：当前 active=kapitsa-qwen36-35b-4bit（148-150 tok/s）以 1.6pp 质量换 15-25% 吞吐；若任务含严格字数摘要，应回落 optiq 或改 Flint。
+
+## 八、Flint 草稿器展望与重评触发（2026-10-29）
+
+**现状定性**：Flint 无草稿器并非本机配置缺失，而是**模型发布尚早（2026-10-21 首发）+ 上游未提供草稿产物**：
+- 无 MTP head（unsloth GGUF 无 mtp.* 张量；RecursiveSI/flint-int4 无 mtp 侧车）
+- 无 DFlash2 草稿（Kapitsa 官方文档明言「Dory and Flint have none: they decode without one」）
+
+**预期收益（若后续提供）**，按同族实测类比：
+
+| 参照 | 增益 |
+|------|------|
+| 35B-4bit + MTP（Kapitsa） | +29%（115.2 → 148-150） |
+| 27B + MTP | +38%（23.2 → 32.1） |
+| 35B DFlash2 树验证 vs 链式 | +11.5%（103.3 → 115.2） |
+
+⇒ Flint 146-147 tok/s 若获得草稿器，**预期可达 190-230 tok/s**（且 MTP 类对质量无损，已在 35B 实证）。
+
+**重评触发条件**（满足任一即重跑 §五 流程：import/serve → 日志确认 KFlash/MTP → 同预算 4096 质量门 → SWE 小臂）：
+1. Kapitsa 目录出现 `flint` 新变体或 drafter（`kapitsa list | grep -i flint`）
+2. HF / ModelScope 出现 Flint 专用 draft（`mlx-community|RecursiveSI|unsloth` 下的 `*-DFlash*` / `*-MTPLX-*` / `mtp.safetensors`）
+3. Recursive 发布 Flint v1.1+（附草稿器或 MTP 层）
+
+**监控一行命令**（可挂 cron 或手动周检）：
+```bash
+kapitsa list 2>/dev/null | grep -io "flint[^,)]*" | sort -u; \
+curl -sI --max-time 10 "https://huggingface.co/RecursiveSI/flint-int4/resolve/main/mtp.safetensors" | head -1
+```
+
+**注意**：届时若拿到草稿器，Flint 的定位应从「质量持平的备选」升为「同质量、更快、更省内存的生产候选」，但仍须先过 SWE 臂（官方榜为 agentic coding 口径，我们尚未验证）与自指逻辑思考收敛复测（原生 4bit 未测）。
