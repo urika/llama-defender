@@ -18,10 +18,16 @@ GHOST = WS + "/ghost.py"
 HEADERS = {"Content-Type": "application/json",
            "authorization": "Bearer fnf-fixture",
            "anthropic-version": "2023-06-01"}
-def _post(messages, meta):
-    body = json.dumps({"model": "stub-model", "max_tokens": 16,
-                       "stream": False, "metadata": {"user_id": meta},
-                       "messages": messages}).encode()
+def _post(messages, meta, tools=None):
+    body = {"model": "stub-model", "max_tokens": 16,
+            "stream": False, "metadata": {"user_id": meta},
+            "messages": messages}
+    if tools:
+        body["tools"] = [
+            {"name": n, "description": n,
+             "input_schema": {"type": "object", "properties": {}}}
+            for n in tools]
+    body = json.dumps(body).encode()
     req = urllib.request.Request(PROXY + "/v1/messages", data=body,
                                  headers=HEADERS, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -122,6 +128,36 @@ def main():
     cap = _captures_since(n0)[-1]
     txt = json.dumps(cap, ensure_ascii=False)
     results.append(("A4 wasted-call 重写", "未发生变化" in txt or "ctx_recall" in txt))
+
+    # ---- D: 循环触发 L2（max_run=6>=LEVEL2 → 撤高频工具+警告注入）----
+    meta3 = "fnf-fixture-D-E"
+    TOOLS = ["Bash", "Read", "Grep"]
+    msgs3 = [_user([{"type": "text", "text": "loop"}])]
+    for i in range(6):  # 6 连相同 Bash 失败 → max_run=6>=LEVEL2(=THRESHOLD*2=6)
+        msgs3 += [_asst([{"type": "tool_use", "id": "d%d" % i, "name": "Bash",
+                          "input": {"command": "cat /nope.py"}}]),
+                  _user([_err_block("d%d" % i,
+                                    "cat: /nope.py: No such file or directory")])]
+    _post(msgs3, meta3, tools=TOOLS)
+    cap = _captures_since(n0)[-1]
+    out_tools = [t2.get("function", {}).get("name")
+                 for t2 in cap.get("tools", [])]
+    results.append(("D1 L2 撤高频工具(Bash 移除/Read 保留)",
+                    "Bash" not in out_tools and "Read" in out_tools))
+    results.append(("D2 循环警告注入(出站消息增长)",
+                    len(cap.get("messages", [])) > len(msgs3)))
+
+    # ---- E: F3' sticky 记忆 + fnf L 级互斥（紧随 D 的无重复请求）----
+    msgs4 = [_user([{"type": "text", "text": "calm turn"}]),
+             _asst([_tu_block("e1", GHOST)]),
+             _user([_err_block("e1", "File does not exist: " + GHOST)])]
+    _post(msgs4, meta3)
+    cap = _captures_since(n0)[-1]
+    txt = json.dumps(cap, ensure_ascii=False)
+    results.append(("E1 F3' sticky persistent warning",
+                    "previously looping" in txt))
+    results.append(("E2 fnf 互斥退化 basic(无禁止语)",
+                    "文件不存在：" + GHOST in txt and "禁止再次读取" not in txt))
 
     ok = 0
     print("=" * 60)

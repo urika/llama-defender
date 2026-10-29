@@ -42,6 +42,6 @@ pkill -f "anthropic_proxy.py" 2>/dev/null; pkill -f stub_backend.py  # 注意：
 
 ## 边界（如实）
 
-- F3'（LOOP_ESCALATION_MEMORY 的 sticky 升级梯度）需循环检测器先触发 level>0，fixture 直触发较重——**phase 2**（经 _LOOP_SESSION_STATE 注入或循环序列 fixture）；本门现断言其互斥面（L 级压制）的前提语义。
+- ~~F3' sticky 升级梯度~~ **已落地（phase 2，D/E 组）**：6 连相同 Bash 失败触发 L2（撤工具+警告），紧随无重复轮断言 sticky warning＋fnf 互斥退化。仍开放：L3（force plain-text，需 9 连）与 ctx_recall 连败旁路。
 - 响应契约：后端走 **OpenAI chat.completion 形状**（代理 `convert_openai_response_to_anthropic` 消费 `choices[0]`）。
 - 生产隔离：:4001/:8082/独立日志三独立；清理时按 pid 精确杀，勿 pkill 误伤 :4000。
