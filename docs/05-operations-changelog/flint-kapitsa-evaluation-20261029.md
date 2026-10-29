@@ -257,3 +257,19 @@ pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage
 - **知识类任务**：Flint 与 optiq 等价，Flint 更快、更省内存 → 可作生产候选
 - **agentic coding**：仍以现产 optiq 为准（未经对照），下一步值得跑一个小规模 SWE 臂（Flint vs optiq resolve 率）再定去留
 - **门口径教训（写进工具注）**：跨模型比较质量门**必须同预算**；768 预算只适用于"短答"类模型，reasoning 类需 4096 起
+
+### 补测：Kapitsa 35B-4bit 同预算复测（2026-10-29 08:20）
+
+| 模型（4096 预算） | 判词 | 关键差异 |
+|------|------|------|
+| **Flint 4bit（Kapitsa）** | PASS 93.5% | summary **6/7**、extraction 13/13、coding 8/10 |
+| **optiq 35B（splash，原生产）** | PASS 93.5% | summary 5/7、extraction 12/13、tagging 10/10、coding **9/10** |
+| **Kapitsa 35B-4bit（当前 production conf）** | **FAIL 91.9%（不变）** | summary **4/7 ✗**、coding 9/10、tagging 10/10、tool_call 7/7 |
+
+**结论**：35B-4bit 的 summary 短板是**真实的量化档位限制**（4096 预算下无改善），与 Flint 的预算假象不同。故同预算排序：
+
+1. Flint 4bit — 93.5% @147 tok/s / 22.6GB（无草稿器）
+2. optiq 35B — 93.5% @116-132 / 24.4GB（DFlash2 可用）
+3. Kapitsa 35B-4bit — 91.9% @148-150 / ~22GB（MTP+KFlash 全开）→ **速度最快，但 summary 类任务不达标**
+
+**生产含义**：当前 active=kapitsa-qwen36-35b-4bit（148-150 tok/s）以 1.6pp 质量换 15-25% 吞吐；若任务含严格字数摘要，应回落 optiq 或改 Flint。
