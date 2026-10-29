@@ -377,6 +377,14 @@ Claude Code -> anthropic_proxy.py:4000 -> Rapid-MLX:8081 -> Qwen3.6-35B-A3B
 
 ---
 
+
+### Splash 35B 内存构成与 KV 格式订正（2026-10-29）
+
+- 引擎账本口径：`memory_current` 35.6GB（峰值 36.7 / 软上限 44.0）——`serve-native` 的 RSS 仅 11.6GB，**Metal/MLX 分配不计入 RSS**，勿以 RSS 判断占用。
+- 拆解：权重 OptiQ-4bit ~22.8GB（磁盘 20.1GB + 嵌入/lm_head 与 8bit 敏感层展开）· KV 前缀缓存 5.96GB · 会话状态缓存 5.93GB（424 会话 × ~14MB，idle-release 120m 内不离场）· DFlash2 0.63GB · compute ~0.3GB。无泄漏（`state_pinned=0`、驱逐正常）。
+- **KV 格式订正**：`splash serve --help` 明确 **`--kv-format` 默认 int8（bf16 才更耗内存）**。实测 17,920 页 × 332.8KB = 5.69GiB，与 int8 口径吻合；若为 bf16 应约 11.4GiB。⇒ **无需显式设置 int8 KV，也没有「由 bf16 改 int8 省 3GB」的空间**（此前结论作废）。
+- 剩余可动杠杆：`--max-context 256K→128K`（约 1-2GB，牺牲 256K 定位）；`--idle-release 120m→30m`（最多 −3GB，但会破坏 45min 墙修复，**不动**）。
+
 ## 已知问题
 
 ### 1. Rapid-MLX 不遵守 max_tokens
