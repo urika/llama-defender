@@ -47,6 +47,7 @@ DEFAULT_FIXTURE = REPO_ROOT / "test" / "fixtures" / "knowledge_gate_9b.json"
 DEFAULT_BASE = "http://127.0.0.1:8084/v1"
 DEFAULT_MODEL = "ornith-ai/Ornith-1.5-9B-MLX-4bit"
 THINKING_ON = False   # --thinking 时置 True（见 chat() 注）
+MAX_TOKENS = 768      # --max-tokens 可调（开思考时必须给足，否则烧穿致正文空）
 REPORT_DIR = REPO_ROOT / "logs" / "knowledge_gate"
 
 REFUSAL_PATTERNS = [
@@ -408,7 +409,7 @@ def chat(base: str, model: str, messages: list, tools=None, timeout: int = 90,
          thinking: bool = False):
     obj = {
         "model": model, "messages": messages,
-        "temperature": 0, "max_tokens": 768,
+        "temperature": 0, "max_tokens": MAX_TOKENS,
         # 2026-10-27: 显式关思考——thinking-on 引擎会把 768 预算烧在
         # reasoning_content 上致 content 空/截断（optiq 实测），且与历史
         # thinking-off 基线（9B/minicpm）不可比。--thinking 可显式开启。
@@ -469,11 +470,15 @@ def main():
     ap.add_argument("--cat", help="只跑指定类别（extraction/tagging/summary/grounding/refine/coding/tool_call）")
     ap.add_argument("--limit", type=int, help="只跑前 N 条（冒烟）")
     ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--max-tokens", type=int, default=768,
+                    help="输出预算（缺省 768；开思考建议 4096，否则 reasoning 烧穿致正文空）")
     ap.add_argument("--thinking", action="store_true",
                     help="显式开思考（缺省关；thinking-on 会挤占 max_tokens 预算）")
     args = ap.parse_args()
     global THINKING_ON
     THINKING_ON = bool(args.thinking)
+    global MAX_TOKENS
+    MAX_TOKENS = int(args.max_tokens)
 
     fx = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     cases = fx["cases"]

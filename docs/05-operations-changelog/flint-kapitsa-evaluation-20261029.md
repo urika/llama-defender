@@ -231,3 +231,29 @@ pkill -f "kapitsa serve"; ./manage.sh switch splash-qwen36-35b-optiq && ./manage
 - **但 slots=1 实测量更快**：纯 decode **154.3 tok/s**（slots=4 时 148-150），且 `one conversation up to 262144 of 262144 tokens`——单个会话独占全部 KV room，无槽位竞争。
 - 代理侧 `PROXY_MAX_CONCURRENT=1` 已串行 + 批驱动单实例交错 ⇒ slots>1 无并发收益；只有「多会话轮流复用缓存」场景才需要 >1（如多个 IDE 会话直连引擎）。
 - 如需并发直连：改 slots=2 并同步放宽代理并发（48GB 内存下不推荐）。
+
+## 七、质量门口径订正：同预算复测（2026-10-29 08:0x）
+
+> **订正动机**：上一轮 Flint 88.7% 与 optiq 93.5% 是**不同预算口径**（Flint 跑在 768 max_tokens，长思考/长输出被截断）。给 `knowledge_gate_9b.py` 加 `--max-tokens` 后做四格同口径复测（4096 预算、temp 0）。
+
+### 四格结果（62 条 / 7 类）
+
+| 模型 | 思考 | 判词 | 各类 |
+|------|------|------|------|
+| **Flint 4bit（Kapitsa）** | off | **PASS 58/62 = 93.5%** | coding 8/10 · extraction **13/13** · grounding 9/9 · refine 6/6 · summary **6/7** · tagging 9/10 · tool_call 7/7 · 防线 2/2 |
+| **Flint 4bit（Kapitsa）** | on | **PASS 58/62 = 93.5%** | 逐类与 off 完全一致 |
+| **optiq 35B（splash）** | off | **PASS 58/62 = 93.5%** | coding **9/10** · extraction 12/13 · grounding 9/9 · refine 6/6 · summary 5/7 · tagging **10/10** · tool_call 7/7 · 防线 2/2 |
+| optiq 35B（splash） | on | FAIL 50/62 = 80.6% | summary **0/7**、extraction 10/13、refine 5/6 |
+
+### 订正后的结论
+
+1. **Flint 的知识类质量与现产 optiq 持平（同 58/62）**——此前的 88.7% 是 768 预算截断造成的方法学假象，不是能力差距。失手分布不同：Flint 胜 extraction/summary，optiq 胜 coding/tagging
+2. **Flint 对思考开关不敏感**（off/on 均 93.5%）；**optiq 开思考反而显著退化**（summary 0/7——其 512 token 思考预算叠加硬字数约束后正文失控）
+3. **速度对比**（此前实测）：Flint 147 tok/s vs optiq 116-132 → 同质量下 Flint 快 12-27%，内存 22.6 vs 24.4GB
+4. **仍存的真实约束**：① Flint **无草稿器**（KFlash/MTP 不可用）→ 147 是天花板；② 自指逻辑题思考不收敛（IQ3 探针实证，原生 4bit 待复测）；③ 未跑 agentic coding 对照（SWE 臂）——其官方强项（SWE-Bench Pro v2 / Terminal-Bench 2.1）在知识门里未被覆盖
+
+### 选型建议（更新）
+
+- **知识类任务**：Flint 与 optiq 等价，Flint 更快、更省内存 → 可作生产候选
+- **agentic coding**：仍以现产 optiq 为准（未经对照），下一步值得跑一个小规模 SWE 臂（Flint vs optiq resolve 率）再定去留
+- **门口径教训（写进工具注）**：跨模型比较质量门**必须同预算**；768 预算只适用于"短答"类模型，reasoning 类需 4096 起
