@@ -169,6 +169,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| `micro-turn-ctx-recall-fix-20261029.md` | **ctx_recall 死环修复 + micro-turn 代答启用**：根因＝注入门只看 PD_ENABLED 而代答门要 MICRO_TURN（且进程比 conf 旧 22 秒）；修法＝「不能应答就不广告」+ 重启代理载入；含端到端探针实证（[MICRO_TURN] self-answered）、治疗臂口径变化记录与回滚步骤 |
 | `monitor-auto-restart-upgrade-20261027.md` | **监控自动重启能力升级**：「2026-10-26 残留劣化/swap 膨胀能否避免」的结论与落地——清场/劣化两判据拆分、冷却与退避防重启风暴、swap 根因判据（只告警不自动重启系统）、AUTO_RESTART 经 launchd 正式启用 |
 | `system-reboot-20261027.md` | **系统重启（swap 10.4GB/11.3GB 触发）**：重启前体检留档、开机自启补齐（launchd RunAtLoad + startup_stack.sh）、重启后一键验收（post_reboot_check.sh 8 项）与开批前判定要点 |
 | `flint-model-evaluation-20261029.md` | **Flint 系列模型评估（质量门 v3）**：flint-40b/iq3/4bit 三次跑数与判词（最好 flint-4bit 88.7% PASS，仍低于现役 optiq-35B 93.5%）；thinking 预算导致 FAIL→PASS 翻转的机制说明；逐类对照、失手条目、判读边界与换模准入清单 |
