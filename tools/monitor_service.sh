@@ -61,8 +61,15 @@ analyze() {
     swap_total="$(echo "$swap_line" | sed -n 's/.*total = \([0-9.]*\)\([MG]\).*/\1 \2/p' | awk '{ if ($2=="G") printf "%d", $1*1024; else printf "%d", $1 }')"
 
     METRICS="$metrics" BATCH="$BATCH" SWAP_USED="${swap_used:-0}" SWAP_TOTAL="${swap_total:-0}" \
+    ACTIVE_CONF_PATH="$ROOT/configs/$(readlink configs/active.conf 2>/dev/null || echo active.conf)" \
+    PS_EWW="$(ps -wwE -p "$(pgrep -f anthropic_proxy.py | head -1)" 2>/dev/null || true)" \
+    MONITOR_TOOLS_DIR="$ROOT/tools" ROOT_DIR="$ROOT" \
     FOREIGN_TOP="$(ps -Ao rss=,command= | sort -rn | head -8)" python3 - <<'PY'
 import json, os, sys
+
+sys.path.insert(0, os.environ.get("ROOT_DIR", "."))
+sys.path.insert(0, os.environ.get("MONITOR_TOOLS_DIR", "tools"))
+import proxy_state as _ps_mod
 
 m = {}
 for line in os.environ["METRICS"].splitlines():
@@ -128,6 +135,21 @@ for _line in (os.environ.get("FOREIGN_TOP") or "").splitlines():
         _big_gb, _big_cmd = _gb, _cmd[:80]
 out["foreign_big_gb"] = round(_big_gb, 2)
 out["foreign_big_cmd"] = _big_cmd
+
+# conf ↔ 运行进程 旗标漂移（2026-10-29：br4 录制失明、ctx_recall 死环的共同根因
+# 都是「conf 改了但进程没生效」。capability_audit 只看 conf 面，覆盖不到运行面。）
+try:
+    import flag_drift as _fd
+    _conf = _ps_mod._parse_conf_env(os.environ.get("ACTIVE_CONF_PATH") or "")
+    _penv = _fd.parse_process_env(os.environ.get("PS_EWW") or "")
+    _reloadable = {s[0] for s in getattr(_ps_mod, "_RELOAD_SPEC", [])}
+    _drift = _fd.diff(_conf, _penv, _reloadable) if _conf and _penv else []
+    out["flag_drift_count"] = len(_drift)
+    out["flag_drift"] = _drift[:8]
+    out["flag_drift_summary"] = _fd.summarize(_drift)
+except Exception:
+    out["flag_drift_count"] = None
+    out["flag_drift_summary"] = ""
 print(json.dumps(out))
 PY
 }
@@ -256,6 +278,15 @@ if _foreign_gb >= float(os.environ.get("MONITOR_FOREIGN_RSS_GB", 8)):
         f"非本栈进程占 {_foreign_gb:.1f}GB（{snap.get('foreign_big_cmd','?')}）"
         f"——内存账本互斥纪律：本地引擎与第二模型服务器二选一"
         f"（见 docs/06-reference-metrics/memory-ledger-arbitration-20261029.md）")
+    level = mw.sev_max(level, "WARN")
+
+# 7d) conf ↔ 运行进程 旗标漂移（2026-10-29：br4 失明 / ctx_recall 死环的共同根因）
+_drift_n = snap.get("flag_drift_count")
+if _drift_n:
+    _keys = ", ".join(d["key"] for d in (snap.get("flag_drift") or [])[:4])
+    alerts.append(f"conf 与运行进程旗标漂移 {_drift_n} 项（{_keys}）——"
+                  f"reload 可修项走 ./manage.sh reload；其余需重启代理"
+                  f"（tools/flag_drift_check.sh 看全表）")
     level = mw.sev_max(level, "WARN")
 
 # 8) 建议

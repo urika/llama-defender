@@ -583,6 +583,26 @@
 | **验收** | 语法通过；服务恢复后重新装载作业（PID 24821）常驻；代理 :4000 / 引擎 :8081 / eg2 :8083 三端口在位。 |
 | **残留风险** | 「引擎静默死亡」与「stop-backend 后又被拉起」之间的判定依赖生命周期事件的消费时机；若 30s 轮询恰好跨过事件，可能误判一次（结果只是多一次 `manage.sh start`，幂等）。 |
 
+### DEF-327: `_parse_conf_env` 把无引号值的行尾注释吞进值里（P2） — ✅ 已修复（2026-10-29）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 新建的 `tools/flag_drift_check.sh` 首跑就报 `PROXY_COMPRESS_ENABLED` conf=`false` vs 进程=`# 上下文工程引擎接管 false`。 |
+| **根因** | `proxy_state._parse_conf_env` 只对**带引号**的值剥离行尾注释；无引号分支（`export K=v   # note`）原样返回整个字符串。影响面：reload 走同一解析器 → bool/int 型转型失败（保留旧值+WARN，属 fail-safe），**str 型则静默写入垃圾值**（如 `PROXY_TOOLS_DENYLIST`、路径类）。 |
+| **修复** | 无引号分支按 bash 规则剥离：`#` 前有空白才算注释起始（`abc#def` 属值本身）。 |
+| **验收** | 单测 `test_flag_drift.ConfInlineCommentTest` 4 例（无引号+注释／无引号含 `#`／带引号+注释／带引号含 `#`）；漂移检测由「误报 1 项」转为「0 漂移（比对 66 个显式声明键）」。 |
+| **残留风险** | 解析器不处理 shell 展开与续行（`\`），与既有设计一致；conf 中避免使用续行即可。 |
+
+### DEF-328: 旗标配对失配 + 「conf 改了进程没生效」无检测（P1） — ✅ 已修复（2026-10-29）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | ①`ctx_recall` 被广告给模型但代理不应答 → claude-cli 连回 `No such tool available`，模型「Context overflowed → 从 session store 恢复」路径死掉并成环（会话 88845194，4 连败）。②同一会话期间 conf（08:40:01）已置 `PROXY_PD_MICRO_TURN_ENABLED=true`，而代理（08:39:39 启动）一直是 false——**conf 面自洽、运行面陈旧**。 |
+| **根因** | ① 注入门只看 `PROXY_PD_ENABLED`，代答门要 `PROXY_PD_MICRO_TURN_ENABLED`（默认关）→ 广告一个必然失败的工具。② 无任何机制比对「conf 声明值」与「运行进程实际值」；`capability_audit.py` 只核 conf 面，故 br4 录制失明（10-22/10-27）与本次死环都逃过了检查。 |
+| **修复** | ① `tool_filter._inject_ctx_recall` 增加代答判据（**不能应答就不广告**，`522cfed`）；`anthropic_proxy.main()` 启动日志增 `ctx_recall: injected/disabled` 与显式 WARN（含「需重启、reload 不生效」提示）。② 新增 `tools/flag_drift.py`（纯函数：进程 env 解析 / 逐键比对 / 归因 reload-vs-restart）+ `tools/flag_drift_check.sh`（CLI，`--json`/`--quiet`，有漂移 exit 1）+ **监控每轮自动检测**（`flag_drift_count` 入快照并出 WARN 告警）。 |
+| **验收** | `flag_drift_check.sh` 实跑：当前「✅ 无漂移（66 个显式声明键）」；人为改 conf 造漂移 → 正确报出并给出修复路径（`./manage.sh reload`），还原后归零。单测 `test_flag_drift.py` 14 例（含「进程多出的键不算漂移」防噪声）。 |
+| **残留风险** | 漂移检测只比 conf **显式声明**的键（进程侧多出的派生键不计，避免噪声）；`_RELOAD_SPEC` 未登记的旗标只能靠重启修（本项已在告警文案里注明）。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）

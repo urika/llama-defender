@@ -1562,6 +1562,18 @@ def _parse_conf_env(path):
                         trailing = val[end + 1:].strip()
                         if trailing.startswith("#"):
                             val = val[:end + 1]
+                else:
+                    # 无引号值 + 行尾注释（2026-10-29 修）：bash 规则——`#` 前有
+                    # 空白才算注释起始（`a#b` 属值本身）。此前只处理带引号的分支，
+                    # 于是
+                    #   export PROXY_COMPRESS_ENABLED=false   # 上下文工程引擎接管
+                    # 被解析成 "false              # 上下文工程引擎接管" → reload 时
+                    # bool/int 转型失败(保留旧值+WARN)、str 型则**静默写入垃圾值**；
+                    # 进程 vs conf 漂移检测（tools/flag_drift_check.sh）首次运行时
+                    # 正是被这一行误报出来。
+                    m = re.search(r"\s+#", val)
+                    if m:
+                        val = val[:m.start()].rstrip()
                 if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
                     val = val[1:-1]
                 if key:

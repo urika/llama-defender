@@ -51,3 +51,17 @@
 sed -i '' 's/^export PROXY_PD_MICRO_TURN_ENABLED=.*/export PROXY_PD_MICRO_TURN_ENABLED=false/' configs/splash-qwen36-35b-optiq.conf
 kill -TERM $(cat anthropic_proxy.pid) && ./manage.sh start    # 不重启后端
 ```
+
+## 6. 结构性加固（同批落地，防同类复发）
+
+两个问题都是**类别性**的，不修机制就会再来。已补三道：
+
+| 加固 | 内容 | 验收 |
+|------|------|------|
+| ① 配对自检 | `anthropic_proxy.main()` 启动日志新增 `ctx_recall: injected/disabled`；PD 开而 MICRO_TURN 关时打 **WARN**，明示「模型将看不到 ctx_recall，需置 true 并重启（不在 `_RELOAD_SPEC`）」 | 启动日志可见 |
+| ② 进程 vs conf 漂移检测 | 新增 `tools/flag_drift.py`（纯函数）＋ `tools/flag_drift_check.sh`（CLI，`--json/--quiet`，有漂移 exit 1）＋ **监控每轮自动跑**（`flag_drift_count` 入快照、出 WARN 告警） | 当前「✅ 无漂移（66 键）」；人为造漂移 → 正确报出并给修复路径；单测 14 例 |
+| ③ conf 解析器修 bug | `_parse_conf_env` 无引号值的**行尾注释**此前被吞进值里（`PROXY_COMPRESS_ENABLED` 被解析成 `"false   # 上下文工程引擎接管"`）；现按 bash 规则剥离（`#` 前有空白才算注释） | 单测 4 例；漂移误报由 1 → 0 |
+
+> **本加固的判据**：以后任何「conf 改了但服务行为没变」的怀疑，先跑
+> `tools/flag_drift_check.sh`——它直接对 `ps -wwE` 与 active.conf，一眼看出是
+> 「reload 就能修」还是「必须重启」，且不依赖 capability_audit 的 conf-only 视角。

@@ -3446,6 +3446,17 @@ def main():
     log(f"Backend timeout: {PROXY_BACKEND_TIMEOUT}s, output token limit: {PROXY_OUTPUT_TOKEN_LIMIT_RATIO}x max_tokens, max_tokens override: {PROXY_MAX_TOKENS_OVERRIDE}")
     log(f"Dynamic token ratio: chinese={PROXY_TOKEN_RATIO_CHINESE}, english={PROXY_TOKEN_RATIO_ENGLISH}, code={PROXY_TOKEN_RATIO_CODE}")
     log(f"Memory reject threshold: {PROXY_MEMORY_REJECT_THRESHOLD}%")
+    # ctx_recall 能力配对自检（2026-10-29）：注入要 PD_ENABLED，代答要 MICRO_TURN_ENABLED。
+    # 两者不一致时 `_inject_ctx_recall` 会按「不能应答就不广告」自动不注入——
+    # 在启动日志里**明说**，避免运维以为召回能力在线却毫无症状地缺失。
+    if bool(getattr(_ps, "PROXY_PD_ENABLED", True)) and not bool(
+            getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False)):
+        log("[WARN] ctx_recall 不注入：PROXY_PD_MICRO_TURN_ENABLED=false（代答未开）"
+            "——模型将看不到 ctx_recall，折叠/清除过的历史内容无法召回；"
+            "需要该能力请置 true 并**重启代理**（不在 _RELOAD_SPEC，reload 不生效）",
+            level="WARN")
+    else:
+        log(f"ctx_recall: {'injected (micro-turn on)' if bool(getattr(_ps, 'PROXY_PD_MICRO_TURN_ENABLED', False)) else 'disabled'}")
     log(f"Dynamic max_tokens: {'enabled' if PROXY_DYNAMIC_MAX_TOKENS_ENABLED else 'disabled'}")
     log(f"Dynamic concurrency: {'enabled' if PROXY_DYNAMIC_CONCURRENT_ENABLED else 'disabled'} (min={PROXY_DYNAMIC_CONCURRENT_MIN}, max={PROXY_DYNAMIC_CONCURRENT_MAX})")
     log(f"Failure snapshots: {'enabled' if PROXY_SNAPSHOT_ENABLED else 'disabled'}")
