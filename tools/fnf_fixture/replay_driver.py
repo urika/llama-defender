@@ -18,7 +18,7 @@ GHOST = WS + "/ghost.py"
 HEADERS = {"Content-Type": "application/json",
            "authorization": "Bearer fnf-fixture",
            "anthropic-version": "2023-06-01"}
-def _post(messages, meta, tools=None):
+def _post(messages, meta, tools=None, sid=None):
     body = {"model": "stub-model", "max_tokens": 16,
             "stream": False, "metadata": {"user_id": meta},
             "messages": messages}
@@ -28,8 +28,11 @@ def _post(messages, meta, tools=None):
              "input_schema": {"type": "object", "properties": {}}}
             for n in tools]
     body = json.dumps(body).encode()
+    hh = dict(HEADERS)
+    if sid:
+        hh["X-Claude-Code-Session-Id"] = sid  # 会话身份正道：独立账本
     req = urllib.request.Request(PROXY + "/v1/messages", data=body,
-                                 headers=HEADERS, method="POST")
+                                 headers=hh, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         r.read()
 
@@ -158,6 +161,43 @@ def main():
                     "previously looping" in txt))
     results.append(("E2 fnf 互斥退化 basic(无禁止语)",
                     "文件不存在：" + GHOST in txt and "禁止再次读取" not in txt))
+
+    # ---- F1: sid 隔离语义（生产维度：账本按 X-Claude-Code-Session-Id 分桶）----
+    G2 = WS + "/ghost2.py"
+    def _pair(path, tag, i):
+        return [_asst([_tu_block("%s%d" % (tag, i), path)]),
+                _user([_err_block("%s%d" % (tag, i),
+                                  "File does not exist: " + path)])]
+    _post([_user([{"type": "text", "text": "sA"}])] + _pair(G2, "fa", 0),
+          "F-sidA", sid="fnf-fix-sidA")
+    _post([_user([{"type": "text", "text": "sA"}])] + _pair(G2, "fa", 1),
+          "F-sidA", sid="fnf-fix-sidA")
+    _post([_user([{"type": "text", "text": "sB"}])] + _pair(G2, "fb", 0),
+          "F-sidB", sid="fnf-fix-sidB")
+    cap = _captures_since(n0)[-1]
+    txt = json.dumps(cap, ensure_ascii=False)
+    results.append(("F1a sidB 首次=基础提示(隔离:不继承 sidA 计数)",
+                    "禁止再次读取" not in txt))
+    _post([_user([{"type": "text", "text": "sA"}])] + _pair(G2, "fa", 2),
+          "F-sidA", sid="fnf-fix-sidA")
+    cap = _captures_since(n0)[-1]
+    txt = json.dumps(cap, ensure_ascii=False)
+    results.append(("F1b sidA 第3次=升级(累积跨请求保持)",
+                    "该路径已确认不存在" in txt))
+
+    # ---- F2: 多路径交错计数（同 sid 多 path 桶互不污染）----
+    G3 = WS + "/ghost3.py"
+    seq = []
+    for i in range(3):
+        seq += _pair(G2, "x", i) + _pair(G3, "y", i)
+    _post([_user([{"type": "text", "text": "multi"}])] + seq,
+          "F-multi", sid="fnf-fix-multi")
+    cap = _captures_since(n0)[-1]
+    txt = json.dumps(cap, ensure_ascii=False)
+    results.append(("F2a G2 升级保持(独立于 G3 计数)",
+                    G2 in txt and "该路径已确认不存在" in txt))
+    results.append(("F2b G3 自行升级(不借 G2 计数)",
+                    G3 in txt and "该路径已确认不存在" in txt))
 
     ok = 0
     print("=" * 60)
