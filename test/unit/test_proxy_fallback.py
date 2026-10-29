@@ -1274,11 +1274,25 @@ class TestToolFilter(unittest.TestCase):
         """R3.3 + TC02(2026-09-05): below_max 不裁剪但仍追加 ctx_recall
         注入——召回入口不依赖裁剪是否发生（D1 裁决）。"""
         tools = self._tools(["Read", "Write", "Edit"])  # 3 < 5
-        result, stats = proxy._filter_tools(tools, [])
+        # 2026-10-29：ctx_recall 注入须同时满足代答能力（MICRO_TURN），故此处开启
+        with patch.object(proxy_state, "PROXY_PD_MICRO_TURN_ENABLED", True):
+            result, stats = proxy._filter_tools(tools, [])
         self.assertFalse(stats["filtered"])
         self.assertEqual(stats["reason"], "below_max")
         self.assertEqual(result[:-1], tools)  # 原列表逐字保留
         self.assertEqual(result[-1]["name"], "ctx_recall")  # 末尾注入
+
+    def test_no_ctx_recall_injection_without_micro_turn(self):
+        """2026-10-29（会话 88845194 实测）：代答关（MICRO_TURN=false）时
+        **不得注入** ctx_recall——否则工具被广告给模型但永远无人应答，
+        claude-cli 回 `No such tool available`，模型「从 session store 恢复」
+        的补救路径死掉并成环。不能应答就不广告。"""
+        tools = self._tools(["Read", "Write", "Edit"])
+        with patch.object(proxy_state, "PROXY_PD_ENABLED", True), \
+             patch.object(proxy_state, "PROXY_PD_MICRO_TURN_ENABLED", False):
+            result, _ = proxy._filter_tools(tools, [])
+        self.assertEqual([t["name"] for t in result],
+                         ["Read", "Write", "Edit"])
 
     def test_above_max_keeps_whitelist_and_recent(self):
         """R3.3: with 10 tools, the filter keeps TOOL_ALWAYS_KEEP
@@ -1336,7 +1350,8 @@ class TestToolFilter(unittest.TestCase):
         tools = self._tools(["Read", "Bash", "Custom1", "Custom2",
                              "Custom3", "Custom4", "Custom5"])
         recent_msgs = [self._asst(["Custom3", "Custom4"])]
-        with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist), patch.object(proxy_state, "TOOL_ALWAYS_KEEP", small_whitelist):
+        with patch.object(proxy, "TOOL_ALWAYS_KEEP", small_whitelist), patch.object(proxy_state, "TOOL_ALWAYS_KEEP", small_whitelist), \
+             patch.object(proxy_state, "PROXY_PD_MICRO_TURN_ENABLED", True):
             result, stats = proxy._filter_tools(tools, recent_msgs)
         # 2026-09-05(TC01): too_few 早退已移除——kept 不足由 filler 补足到
         # MAX（全部 7 个原始工具保留），并追加 ctx_recall 注入。
@@ -2201,7 +2216,8 @@ class TestToolFilterStableOrder(unittest.TestCase):
                 {"name": "Glob", "description": "g"},
                 {"name": "Edit", "description": "e"},
             ]
-            kept, stats = proxy._filter_tools(tools, [], recent_rounds=5)
+            with patch.object(proxy_state, "PROXY_PD_MICRO_TURN_ENABLED", True):
+                kept, stats = proxy._filter_tools(tools, [], recent_rounds=5)
             names = [t["name"] for t in kept]
             # TOOL_ALWAYS_KEEP defines the order Read, Write, Edit, Bash, Glob, ...
             # ctx_recall is appended by P4 Recall MVP (always last).
@@ -2417,7 +2433,8 @@ class TestFilterToolsSorting(unittest.TestCase):
         proxy.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         proxy_state.TOOL_ALWAYS_KEEP = ("Alpha", "Zebra", "Middle", "Beta", "Gamma", "Delta")
         try:
-            kept, stats = proxy._filter_tools(tools, messages, recent_rounds=5)
+            with patch.object(proxy_state, "PROXY_PD_MICRO_TURN_ENABLED", True):
+                kept, stats = proxy._filter_tools(tools, messages, recent_rounds=5)
             self.assertTrue(stats.get("filtered"), f"Expected filtering, got {stats}")
             names = [t["name"] for t in kept]
             # Stable order should match TOOL_ALWAYS_KEEP order for all-kept case.

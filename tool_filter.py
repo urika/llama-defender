@@ -8,10 +8,21 @@ def _inject_ctx_recall(tools_list):
     """P4 Recall(MVP): ctx_recall 工具注入——独立于任何过滤护栏。
 
     below_max / too_few_after_filter 早退分支同样注入（TC01/TC02 契约：
-    注入只依赖 PROXY_PD_ENABLED，不依赖裁剪是否发生）。幂等：已在列不
-    重复。fail-open：ctx_recall 不可导入时原样返回。
+    注入不依赖裁剪是否发生）。幂等：已在列不重复。fail-open：ctx_recall
+    不可导入时原样返回。
+
+    **必须同时满足代答能力（2026-10-29 修复）**：ctx_recall 是**代理侧**工具，
+    只有 `PROXY_PD_MICRO_TURN_ENABLED` 开时代答通道才会真正应答它
+    （anthropic_proxy.py 的三处 MICRO_TURN 门）。此前注入只看 `PROXY_PD_ENABLED`
+    （缺省 true）而代答缺省关 → 工具被广告给模型但永远无人应答：
+    实测 claude-cli 会话（88845194）连回 4 次 `No such tool available`，
+    模型「Context overflowed → 从 session store 恢复」的补救路径直接死掉并成环
+    （代码内注释记有同型先例：38/38 次零开火、死环烧 38 轮）。
+    ⇒ 不能应答就不广告：宁可模型看不见，也不要给一个必然失败的工具。
     """
     if not tools_list or not getattr(_ps, "PROXY_PD_ENABLED", True):
+        return tools_list
+    if not getattr(_ps, "PROXY_PD_MICRO_TURN_ENABLED", False):
         return tools_list
     try:
         from ctx_recall import TOOL_SCHEMA as _CTX_RECALL_TOOL
