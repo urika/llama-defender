@@ -112,9 +112,11 @@
 | `PROXY_LOOP_ESCALATION_MEMORY_ENABLED` | `false` | **F3'**：会话级升级记忆——阶梯触发带会话级累积计数（注入「第 N 次」）；L2 sticky＝同错误形态在限制窗内重现 → 维持摘除并升级提示（打破「干预饱和但无记忆无升级」） |
 | `PROXY_LOOP_STICKY_TURNS` | `3` | F3' sticky 窗宽（轮）——L2 摘除后同错误形态在此轮数内重现即维持摘除 |
 | `PROXY_LOOP_BASH_PATH_KEYS_ENABLED` | `false` | **F3**（2026-10-26 v0.1 起降级为兜底面）：Bash 计数键修复——从 tool_result 错误行派生 `Bash:fnf:<path>` 键；注意 1025-5 实测阶梯本已重度触发（变体逃逸前提失效） |
+| `PROXY_FNF_TEST_STATUS_ENABLED` | `false` | **F4-a 采集件**（IFC-9，2026-10-30）：Bash tool_result 中 pytest 摘要行（`N failed/M passed`，`counts in <秒>s` 行锚）解析入会话级 `_TEST_STATUS` 账本（最近 32 次，tool_use_id 去重——客户端全量重发历史），日志行 `test_status=failed=N,passed=M,hist=K` 暴露；**纯采集零消息改写**；errors 并入 failed（防「2 errors, 5 passed」冒充全绿）；消费方=swe-eval quality_metrics A4 首绿轮次/A5 测试状态改善率（`[sess=]` 行按 session_id[:8] 切）＋F4-a 证据流注入取数口 |
 
 > 旗标名与 swe-eval `configs/capability-flags.yaml` 的 `fnf_guide_kit` 册条逐字一致
-> （`PROXY_FNF_GUIDE_ENABLED` / `PROXY_FNF_CANDIDATES_ENABLED` / `PROXY_LOOP_ESCALATION_MEMORY_ENABLED`）。
+> （`PROXY_FNF_GUIDE_ENABLED` / `PROXY_FNF_CANDIDATES_ENABLED` / `PROXY_LOOP_ESCALATION_MEMORY_ENABLED`）；
+> F4-a 采集件单列 `fnf_test_status_kit`（同清单）。
 
 ### 11.8 admin 注入原语参数（ADR-013 T1，reloadable）
 

@@ -440,6 +440,82 @@ def _fnf_tuid_path(tool_use_id):
     return _FNF_TUID_PATH.get(tool_use_id, "")
 
 
+# --- F4-a 测试状态账本（IFC-9；swe-eval docs/fnf-f4-design-20261030.md §一）---
+# 纯采集零消息改写：Bash tool_result 中 pytest 摘要行（N failed/M passed）按会话
+# 入 _TEST_STATUS（最近 N 次摘要），日志行 test_status= 暴露——消费方=swe-eval
+# quality_metrics A4 首绿轮次 / A5 测试状态改善率（按 runs.jsonl session_id[:8]
+# 切 [sess=] 行，run_agent.verify_proxy_traffic 同款切法）。
+# 旗标 PROXY_FNF_TEST_STATUS_ENABLED 缺省关 = 零解析零日志零账本。
+_FNF_TS_HIST_MAX = 32      # 每会话保留的最近摘要条数
+_FNF_TS_SESSION_MAX = 512  # 会话数上限（驱逐沿 DEF-313：弹最早插入的会话）
+_TEST_STATUS = {}          # session_id -> [{"failed","passed","raw"}, ...]（时间序）
+_TEST_STATUS_SEEN = {}     # session_id -> set(tool_use_id)（已记账的摘要块）
+
+# pytest 摘要行锚（窄正则：只认「counts in <秒>s」整行形态，正文数字不误触）：
+#   "1 failed, 2137 passed, 3 xfailed in 12.34s" / "===== 5 passed in 0.12s ====="
+_FNF_TS_SUMMARY_RE = re.compile(
+    r"^[=\s]*((?:\d+ (?:failed|passed|errors?|xfailed|xpassed|skipped|warnings?)"
+    r"(?:, )?)+) in \d+(?:\.\d+)?s[=\s]*$", re.M)
+
+
+def _fnf_parse_pytest_summary(text):
+    """pytest 摘要行 → (failed, passed, raw)；无摘要行返回 None。
+
+    - 全绿行只有「N passed in Xs」（无 failed 记号）——记号缺席记 failed=0，
+      这正是 A4 首绿信号，不能因记号缺席而漏记。
+    - 收集错误（N errors）并入 failed：errors 同样是「非绿」状态，
+      不得让「2 errors, 5 passed」冒充全绿。"""
+    m = _FNF_TS_SUMMARY_RE.search(text or "")
+    if not m:
+        return None
+    body = m.group(1)
+    if not re.search(r"\d+ (?:failed|passed)", body):
+        return None  # 纯 skip/warning 行无绿/红信号，不入账
+    failed = (sum(int(x) for x in re.findall(r"(\d+) failed", body))
+              + sum(int(x) for x in re.findall(r"(\d+) errors?", body)))
+    passed = sum(int(x) for x in re.findall(r"(\d+) passed", body))
+    return failed, passed, body[:80]
+
+
+def _fnf_record_test_status(session_id, tool_use_id, text):
+    """记账一条测试状态（旗标开且有会话时）；返回是否新记账。
+
+    tuid 去重：客户端每请求全量重发历史，同一 tool_result 块在后续每个请求
+    重现——账本是 append-only（与 _FNF_SEEN「每请求重算」语义不同），必须按
+    块身份幂等，否则每请求重复膨胀。"""
+    if not getattr(_ps, "PROXY_FNF_TEST_STATUS_ENABLED", False):
+        return False
+    if not session_id or not tool_use_id:
+        return False
+    parsed = _fnf_parse_pytest_summary(text)
+    if parsed is None:
+        return False
+    if (len(_TEST_STATUS_SEEN) > _FNF_TS_SESSION_MAX
+            or len(_TEST_STATUS) > _FNF_TS_SESSION_MAX):
+        # 双账本同步驱逐（键集一致，异步弹会使老 tuid 复记）
+        while len(_TEST_STATUS_SEEN) > _FNF_TS_SESSION_MAX:
+            _TEST_STATUS_SEEN.pop(next(iter(_TEST_STATUS_SEEN)), None)
+        while len(_TEST_STATUS) > _FNF_TS_SESSION_MAX:
+            _TEST_STATUS.pop(next(iter(_TEST_STATUS)), None)
+    seen = _TEST_STATUS_SEEN.setdefault(session_id, set())
+    if tool_use_id in seen:
+        return False
+    seen.add(tool_use_id)
+    failed, passed, raw = parsed
+    hist = _TEST_STATUS.setdefault(session_id, [])
+    hist.append({"failed": failed, "passed": passed, "raw": raw})
+    if len(hist) > _FNF_TS_HIST_MAX:
+        del hist[:len(hist) - _FNF_TS_HIST_MAX]
+    from proxy_logging import log
+    log(f"  -> test_status=failed={failed},passed={passed},hist={len(hist)}")
+    return True
+
+
+def _fnf_test_status_history(session_id):
+    """F4-a 证据流注入（PROXY_FNF_EVIDENCE_ENABLED，未实现）的取数口；只读副本。"""
+    return list(_TEST_STATUS.get(session_id, []))
+
+
 def _translate_tool_result_errors_ex(messages, session_id="", profile=""):
     """F1/F2 增强版转译：fnf 会话账本 + 分级升级提示 + 最近邻候选。
 
@@ -486,6 +562,10 @@ def _translate_tool_result_errors_ex(messages, session_id="", profile=""):
             if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                 continue
             bc = str(block.get("content", ""))
+            # F4-a 采集（IFC-9）：Bash 结果顺带解析 pytest 摘要入测试状态账本，
+            # 与错误转译正交（自有旗标，缺省关）；须在改写前用原始文本记账。
+            if tu_by_id.get(block.get("tool_use_id", ""), ("", None))[0] == "Bash":
+                _fnf_record_test_status(sid, block.get("tool_use_id", ""), bc)
             if "Wasted call" in bc:
                 block["content"] = (
                     "[System: 该文件自上次读取后未发生变化，不要再使用 Read 工具反复读取。"

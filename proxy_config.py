@@ -1252,6 +1252,14 @@ CONFIG_REGISTRY = {
         "doc": "F2（F1 子旗标）：最近邻候选——fnf 首败时 ls 父目录注入真实存在的"
                "相近文件（仅已证工作区根内，2s 超时，每会话每目录至多一次）。",
     },
+    "PROXY_FNF_TEST_STATUS_ENABLED": {
+        "defaults": {"all": "false"},
+        "type": "bool", "scope": "reloadable",
+        "doc": "F4-a 采集件（IFC-9，2026-10-30）：Bash tool_result 中 pytest 摘要行"
+               "（N failed/M passed）解析入会话级 _TEST_STATUS 账本（最近 32 次，"
+               "tool_use_id 去重），日志行 test_status= 暴露；纯采集零消息改写，"
+               "消费方=swe-eval quality_metrics A4/A5。",
+    },
     "PROXY_LOOP_BASH_PATH_KEYS_ENABLED": {
         "defaults": {"all": "false"},
         "type": "bool", "scope": "reloadable",
