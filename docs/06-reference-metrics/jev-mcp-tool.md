@@ -1,6 +1,6 @@
 # Jev MCP 工具
 
-`tools/jev_mcp_server.py` 将 Command Code 的 `typesafe/jev` 决策 API 暴露为本地 stdio MCP 工具 `jev_decide`。它接受 `state` 和命名的 `questions`，支持 `noul`、`choice`、`score`，返回原始概率结构，不生成自由文本结论。
+`tools/jev_mcp_server.py` 将 Command Code 的 `typesafe/jev` 决策 API 暴露为本地 stdio MCP 工具 `jev_decide`。它接受 `state` 和命名的 `questions`，支持 `noul`、`choice`、`score`，返回原始概率结构，不生成自由文本结论。自 **v1.1.0（2026-10-30）** 起带**证据契约**（问题可声明 `requires_evidence`，state 缺证则契约弃权、不发模型）、每题 `answer_class` 判读标注与 `provenance` 溯源——见下文 [§证据契约与判读语义（v1.1）](#证据契约与判读语义v11)。
 
 ## 安全设置 API key
 
@@ -47,6 +47,47 @@ cmd mcp add jev -- python3 /Users/<用户名>/APP/llama.cpp/tools/jev_mcp_server
 ```
 
 该决策调用需 GOAT 或以上计划；输入按 Provider API 费率计费，输出 token 免费。模型结论是概率信号，调用方应自行设定阈值并保留业务校验。
+
+## 证据契约与判读语义（v1.1，2026-10-30）
+
+> 依据：jev 质量门正负对照校准（swe-eval 6678a14）暴露的两个接口契约缺口——
+> 「接口允许无证据作答」（答案依赖的证据不在 state 里，模型只能按参数记忆作答，
+> 正负对照不分离）与「噪声级输出可被记录为答案」（conf 0.19/0.34 的读数被记成
+> high 与 hit）。本节契约与 rsi-jev 级联网关 v0.2.0 同语义（实现为两份，勿单方改）。
+
+**① `requires_evidence`（证据契约）**：问题可声明答案依赖的证据类列表——
+
+```json
+{
+  "state": {
+    "test_source": "cm = ConfigManager(conffile='/tmp/x.cfg')",
+    "base_commit_api": {"ConfigManager.__init__": "(self, conf_file=None, defs_file=None)"}
+  },
+  "questions": {
+    "api_real": {
+      "type": "noul",
+      "instructions": "Is the kwarg name 'conffile' valid for this signature?",
+      "requires_evidence": ["base_commit_api"]
+    }
+  }
+}
+```
+
+存在性判定（机械、保守）：dict → 点路径存在（`a.b`），路径断裂退化为全包子串；
+str → 子串；list → 任一元素。**state 缺任一声明类 → 该题契约弃权：
+`answer_class=missing_evidence`、`source=contract`、无任何概率读数，不发 HTTP。**
+无证据的判读只能来自模型参数记忆——实测证据入 state 后同型问题本地 4B 即可
+p=0.957 正确判读，所以**调用方的修法是补 state，不是换模型**。
+
+**② `answer_class`（每题判读标注）**：`answer`（可直接采纳）｜`missing_evidence`
+（契约弃权）。官方直连面没有本地分布的校准阈值，故不标 `below_threshold`——
+阈值判断仍是调用方的责任；级联面（`mcp__jev-cascade__*`）才有完整的五档。
+**只有 `answer` 可计入命中/自动通过统计。**
+
+**③ `provenance`（溯源）**：每个响应附 `{server, model, ts, state_sha256}`。
+落证（写入实验记录/判定文档）时应**原样持久化**，不得转写为散文——
+手写「route=local（rsi-jev-v6.1-vl-4b）」这类散文溯源正是 6678a14 校准记录
+事后无法机器复核的原因之一。
 
 ## 使用策略与校准核验（2026-10-13 调研沉淀）
 

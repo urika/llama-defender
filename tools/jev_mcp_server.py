@@ -8,14 +8,24 @@
 工具: `jev_decide(state, questions)`，支持 `noul` / `choice` / `score`，
 返回原始概率结构，不生成自由文本结论。
 
+v1.1 证据契约（2026-10-30，6678a14 校准结论的接口化）:
+- 问题可声明 `requires_evidence: [类, ...]`——答案依赖 state 中的证据面。
+  缺任一类 → 该题契约弃权（answer_class=missing_evidence），**不调用官方 API**
+  （无证据的判读只能来自模型参数记忆，必然不可判）。存在性判定与 rsi-jev
+  gateway/jev_cascade.py 的同名实现保持同语义（两侧勿单方改）。
+- 每题答案附 `answer_class`（answer | missing_evidence）；响应附 `provenance`
+  {server, model, ts, state_sha256}——落证方应原样持久化。
+
 密钥: 从环境变量 `CMD_API_KEY` 读取，以 HTTPS Bearer token 调用
 `https://api.commandcode.ai/provider/v1/systemone`。绝不回显 key，
 错误信息中不携带响应体原文。
 """
 
+import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -23,7 +33,7 @@ API_URL = "https://api.commandcode.ai/provider/v1/systemone"
 MODEL_NAME = "typesafe/jev"
 TOOL_NAME = "jev_decide"
 SERVER_NAME = "jev"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 MAX_QUESTIONS = 16
@@ -31,7 +41,7 @@ MAX_REQUEST_BYTES = 200000
 REQUEST_TIMEOUT_S = 60
 
 ALLOWED_TYPES = ("noul", "choice", "score")
-ALLOWED_QUESTION_KEYS = frozenset({"type", "instructions", "criteria"})
+ALLOWED_QUESTION_KEYS = frozenset({"type", "instructions", "criteria", "requires_evidence"})
 
 # 额度探测（2026-09-27 落地，分析见 docs/06-reference-metrics/jev-quota.md）：
 # ① 429 时从错误体白名单提取 message——官方语义里它会点名**哪个窗口**与**何时重置**；
@@ -79,23 +89,34 @@ TOOL = {
     "name": TOOL_NAME,
     "description": (
         "Ask the typesafe/jev decision model about a state. "
-        "Returns raw probability structures (noul/choice/score), no free-text verdict."
+        "Returns raw probability structures (noul/choice/score), no free-text verdict. "
+        "Questions may declare requires_evidence: [class, ...] — if the state lacks a "
+        "declared evidence class, that question is answered answer_class=missing_evidence "
+        "without calling the model (ungrounded questions must not be answered from "
+        "parametric memory). Every response carries provenance {server, model, ts, "
+        "state_sha256}; every answer carries answer_class ('answer' | 'missing_evidence')."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "state": {
-                "description": "The state to judge (string or JSON-serializable object)."
+                "description": "The state to judge (string or JSON-serializable object). "
+                               "Declared evidence classes must be discoverable in it "
+                               "(dict key/dot-path, or the class name as a text marker)."
             },
             "questions": {
                 "type": "object",
-                "description": "Named questions: {name: {type, instructions, criteria?}}.",
+                "description": "Named questions: {name: {type, instructions, criteria?, requires_evidence?}}.",
                 "additionalProperties": {
                     "type": "object",
                     "properties": {
                         "type": {"type": "string", "enum": ["noul", "choice", "score"]},
                         "instructions": {"type": "string"},
                         "criteria": {},
+                        "requires_evidence": {
+                            "type": "array", "items": {"type": "string"}, "minItems": 1,
+                            "description": "Evidence classes this question's answer depends on.",
+                        },
                     },
                     "required": ["type", "instructions"],
                 },
@@ -119,8 +140,52 @@ USAGE_TOOL = {
 TOOLS = [TOOL, USAGE_TOOL]
 
 
+# ---------------------------------------------------------------- 证据契约（v1.1）
+
+def _evidence_present(state, marker):
+    """声明证据类在 state 中的存在性判定（保守、机械、可测试）：
+    dict→点路径存在，路径断裂时退化为全包子串；str→子串；list→任一元素；其余→False。
+    与 rsi-jev gateway/jev_cascade.py 的同名实现保持同语义（两侧勿单方改）。"""
+    if isinstance(state, dict):
+        cur = state
+        for part in str(marker).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return _substring_hit(state, marker)
+        return True
+    if isinstance(state, str):
+        return marker in state
+    if isinstance(state, list):
+        return any(_evidence_present(item, marker) for item in state)
+    return False
+
+
+def _substring_hit(obj, marker):
+    if isinstance(obj, str):
+        return marker in obj
+    if isinstance(obj, dict):
+        return any(_substring_hit(k, marker) or _substring_hit(v, marker)
+                   for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_substring_hit(item, marker) for item in obj)
+    return False
+
+
+def _missing_evidence(state, question):
+    """问题声明了 requires_evidence 而 state 缺席的证据类列表；未声明返回 []。"""
+    declared = question.get("requires_evidence")
+    if not declared:
+        return []
+    return [c for c in declared if not _evidence_present(state, c)]
+
+
 def _validate_request(args):
-    """校验工具参数并序列化为官方 API 请求体 (JSON 字符串)。"""
+    """校验工具参数并分桶；返回 (契约弃权答案, 发送题面, 官方请求体或 None)。
+
+    声明了 requires_evidence 而 state 缺证的题 → 契约弃权，不进入官方请求
+    （官方校验拒收未知键，requires_evidence 必须剥离；且无证据的判读只能来自
+    模型参数记忆）。全部缺证时 body 为 None，调用方不发 HTTP。"""
     if not isinstance(args, dict):
         raise ValueError("arguments must be an object with 'state' and 'questions'")
     if "state" not in args or "questions" not in args:
@@ -137,6 +202,7 @@ def _validate_request(args):
         raise ValueError(
             "too many questions: %d > MAX_QUESTIONS=%d" % (len(questions), MAX_QUESTIONS)
         )
+    contract_answers, send_questions = {}, {}
     for name, question in questions.items():
         if not isinstance(question, dict):
             raise ValueError("question %r must be an object" % (name,))
@@ -171,13 +237,32 @@ def _validate_request(args):
                     "question %r of type 'score' needs 'criteria' as a list of >=2 labels"
                     % (name,)
                 )
-    payload = {"model": MODEL_NAME, "state": state, "questions": questions}
-    body = json.dumps(payload, ensure_ascii=False)
-    if len(body.encode("utf-8")) > MAX_REQUEST_BYTES:
-        raise ValueError(
-            "request body exceeds MAX_REQUEST_BYTES=%d" % (MAX_REQUEST_BYTES,)
-        )
-    return body
+        declared = question.get("requires_evidence")
+        if declared is not None and (
+                not isinstance(declared, list) or not declared
+                or not all(isinstance(c, str) and c.strip() for c in declared)):
+            raise ValueError(
+                "question %r 'requires_evidence' must be a list of non-empty strings" % (name,)
+            )
+        absent = _missing_evidence(state, question)
+        if absent:
+            contract_answers[name] = {
+                "answer_class": "missing_evidence",
+                "missing_evidence": absent,
+                "source": "contract",
+            }
+        else:
+            send_questions[name] = {k: v for k, v in question.items()
+                                    if k != "requires_evidence"}
+    body = None
+    if send_questions:
+        payload = {"model": MODEL_NAME, "state": state, "questions": send_questions}
+        body = json.dumps(payload, ensure_ascii=False)
+        if len(body.encode("utf-8")) > MAX_REQUEST_BYTES:
+            raise ValueError(
+                "request body exceeds MAX_REQUEST_BYTES=%d" % (MAX_REQUEST_BYTES,)
+            )
+    return contract_answers, send_questions, body
 
 
 def _sanitize_error(message, api_key):
@@ -187,11 +272,29 @@ def _sanitize_error(message, api_key):
     return message
 
 
+def _with_provenance(result, state):
+    """附结构化溯源（v1.1）：落证方应原样持久化，不得转写为散文。"""
+    blob = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    result["provenance"] = {
+        "server": "jev-mcp-server/" + SERVER_VERSION,
+        "model": MODEL_NAME,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "state_sha256": hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+    }
+    return result
+
+
 def _call_jev(args, api_key):
-    """调用 Jev 决策 API，返回解析后的 JSON dict。"""
+    """调用 Jev 决策 API，返回解析后的 JSON dict。
+
+    缺证的题走契约弃权（不发 HTTP、不带概率读数）；有证的题正常请求，
+    答案统一附 answer_class。"""
     if not api_key:
         raise RuntimeError("CMD_API_KEY is not set; export it before calling Jev")
-    body = _validate_request(args)
+    contract_answers, send_questions, body = _validate_request(args)
+    state = args["state"]
+    if not send_questions:
+        return _with_provenance({"model": MODEL_NAME, "answers": dict(contract_answers)}, state)
     request = urllib.request.Request(
         API_URL,
         data=body.encode("utf-8"),
@@ -224,7 +327,12 @@ def _call_jev(args, api_key):
         or not result["answers"]
     ):
         raise RuntimeError("Jev API error: expected decision schema with model/answers")
-    return result
+    for ans in result["answers"].values():
+        if isinstance(ans, dict):
+            ans["answer_class"] = "answer"
+    if contract_answers:
+        result["answers"].update(contract_answers)
+    return _with_provenance(result, state)
 
 
 def _call_usage(api_key):

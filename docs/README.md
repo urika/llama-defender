@@ -219,7 +219,7 @@ docs/
 | `proxy-semantic-metrics.md` | 代理层语义优化：量化指标体系（v3） |
 | `structured-summary-impl-evaluation.md` | 结构化摘要替代占位符：代码实现评估 |
 | `ornith-9b-capability-research-20261015.md` | Ornith-1.5-9B 能力调研：官方定位/benchmark、质量门 v2（45 条含 coding/tool_call）、haiku 档分流三臂实测与路由裁决（§五/§5.1）；**2026-10-20 更正稳态为 ~55.8 tok/s（原 ~100 不可达）** |
-| `jev-mcp-tool.md` | Jev MCP 工具：`jev_decide`/`jev_usage` 用法、密钥与注册、使用策略；**§部署形态与本地服务解耦**（纯云端、不依赖 `:8022`）+ `rsi-jev` launchd 生命周期与持久禁用方法 |
+| `jev-mcp-tool.md` | Jev MCP 工具：`jev_decide`/`jev_usage` 用法、密钥与注册、**§证据契约与判读语义（v1.1：`requires_evidence` 缺证弃权/`answer_class`/`provenance`，2026-10-30）**、使用策略；**§部署形态与本地服务解耦**（纯云端、不依赖 `:8022`）+ `rsi-jev` launchd 生命周期与持久禁用方法 |
 
 ---
 

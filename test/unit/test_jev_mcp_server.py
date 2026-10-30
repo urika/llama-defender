@@ -41,7 +41,9 @@ class TestJevRequestValidation(unittest.TestCase):
                              "criteria": ["low", "medium", "high"]},
             },
         }
-        payload = json.loads(jev._validate_request(args))
+        contract, send_q, body = jev._validate_request(args)
+        payload = json.loads(body)
+        self.assertEqual(contract, {})
         self.assertEqual(payload["model"], "typesafe/jev")
         self.assertEqual(payload["state"], args["state"])
         self.assertEqual(payload["questions"], args["questions"])
@@ -111,6 +113,64 @@ class TestJevApiCall(unittest.TestCase):
                           return_value=_Response(b'{"model":"other","answers":{}}')):
             with self.assertRaisesRegex(RuntimeError, "expected decision schema"):
                 jev._call_jev(self.args, "secret-value")
+
+
+class TestEvidenceContract(unittest.TestCase):
+    """v1.1 证据契约：requires_evidence 声明 + 缺证契约弃权 + 溯源。"""
+
+    def test_evidence_present_semantics(self):
+        state = {"base_commit_api": {"ConfigManager": "(conf_file, defs_file)"},
+                 "fix_diff": "remove py3compat shim"}
+        self.assertTrue(jev._evidence_present(state, "base_commit_api"))
+        self.assertTrue(jev._evidence_present(state, "base_commit_api.ConfigManager"))
+        self.assertTrue(jev._evidence_present(state, "fix_diff"))
+        self.assertTrue(jev._evidence_present(state, "remove py3compat"))
+        self.assertFalse(jev._evidence_present(state, "api_surface"))
+        self.assertTrue(jev._evidence_present("text mentioning fix_diff", "fix_diff"))
+        self.assertTrue(jev._evidence_present([{"a": 1}, "see fix_diff"], "fix_diff"))
+        self.assertFalse(jev._evidence_present({"a": 1}, "fix_diff"))
+
+    def test_requires_evidence_shape_validation(self):
+        bad = [[], [""], [123], "fix_diff", {"fix_diff": 1}]
+        for declared in bad:
+            args = {"state": "x", "questions": {"q": {
+                "type": "noul", "instructions": "?", "requires_evidence": declared}}}
+            with self.subTest(declared=declared), self.assertRaises(ValueError):
+                jev._validate_request(args)
+
+    def test_missing_evidence_bypasses_http(self):
+        args = {"state": {"test_source": "..." ,"fix_diff": "d"},
+                "questions": {"api_ok": {"type": "noul", "instructions": "?",
+                                         "requires_evidence": ["base_commit_api"]}}}
+        # base_commit_api 不在 state → 契约弃权；绝不能发 HTTP（无证据不作答）
+        with patch.object(jev.urllib.request, "urlopen") as open_url:
+            result = jev._call_jev(args, "secret-value")
+        open_url.assert_not_called()
+        ans = result["answers"]["api_ok"]
+        self.assertEqual(ans["answer_class"], "missing_evidence")
+        self.assertEqual(ans["missing_evidence"], ["base_commit_api"])
+        self.assertEqual(ans["source"], "contract")
+        self.assertEqual(result["provenance"]["model"], "typesafe/jev")
+        self.assertIn("state_sha256", result["provenance"])
+
+    def test_partial_missing_strips_declared_key_and_annotates(self):
+        args = {"state": {"base_commit_api": {"ConfigManager": "..."}},
+                "questions": {
+                    "grounded": {"type": "noul", "instructions": "?",
+                                 "requires_evidence": ["base_commit_api"]},
+                    "plain": {"type": "noul", "instructions": "?"}}}
+        body = json.dumps({"model": "typesafe/jev", "answers": {
+            "grounded": {"type": "noul", "noul": 0.9},
+            "plain": {"type": "noul", "noul": 0.9}}}).encode()
+        with patch.object(jev.urllib.request, "urlopen",
+                          return_value=_Response(body)) as open_url:
+            result = jev._call_jev(args, "secret-value")
+        sent = json.loads(open_url.call_args.args[0].data)
+        # 官方 API 拒收未知键：requires_evidence 必须剥离后才外发
+        self.assertNotIn("requires_evidence", sent["questions"]["grounded"])
+        self.assertEqual(result["answers"]["grounded"]["answer_class"], "answer")
+        self.assertEqual(result["answers"]["plain"]["answer_class"], "answer")
+        self.assertIn("provenance", result)
 
 
 class TestJevMcpProtocol(unittest.TestCase):

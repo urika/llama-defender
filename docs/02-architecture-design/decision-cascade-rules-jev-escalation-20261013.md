@@ -208,3 +208,15 @@ max p_prog 仅 0.56–0.65，全部摸不到 0.80）——平坦非配置问题�
 - 本地降依赖臂：`~/APP/rsi-jev`（RSI-Jev v6.1-VL-4B MLX-8bit，Apache-2.0，
   `127.0.0.1:8022`，客户端 `tools/jev_local.py` 同构 `/v1/systemone`）；
   对照数据 `logs/diag/jev_shadow_local_compare.jsonl`
+
+## 8. 增补（2026-10-30）：early abstention 已部分接口化（v1.1/v0.2）
+
+本文 §3.1（arXiv:2502.09054 引文）曾记「Jev 不原生输出『我不知道』，拒答带由阈值切出」——
+**v1.1/v0.2 契约后此说法对「证据缺失型不可答」不再成立**：问题声明
+`requires_evidence` 而 state 缺证时，接口层直接返回 `answer_class=missing_evidence`
+契约弃权（不发任何模型腿、无概率读数），即 early abstention 在调用前的接口层实现。
+其余不可答形态（证据在但模型没把握）仍按双阈值切带；级联面五档 `answer_class`
+（answer/below_threshold/abstain/degraded/missing_evidence）取代裸概率读数成为
+判读一等语义，只有 `answer` 可计入命中/自动通过统计。契约详情：
+`docs/06-reference-metrics/jev-mcp-tool.md` §证据契约；实证依据：swe-eval 6678a14
+校准（缺证时正负对照不分离，证据入 state 后同型问题 p=0.957）。
