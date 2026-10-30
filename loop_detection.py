@@ -148,6 +148,20 @@ def _classify_exception(e):
     # 上下文工程引擎硬上限(§4.9): 会话该结束,而非失真压缩——413 不可重试
     if type(e).__name__ == "ContextOverflowError":
         return 413, "context_window_exceeded", False
+    # 2026-10-29 DEF-329: 阶段异常被 pipeline 包成 RuntimeError 后，原异常类型
+    # 只剩在 __cause__ 链上（raise ... from e）——分类器只看最外层类型 ⇒
+    # ContextOverflowError 落到兜底 500 unknown_error ⇒ 客户端按 5xx 无限重试
+    # （实测 699K chars 会话重试 1634 次，每次重传 70 万字符，顺带把 swap 顶到 96%）。
+    # 故：**沿 cause 链找最特异的已知类型**再分类（链上原异常优先于外层包装）。
+    for _cause in _exception_chain(e):
+        if type(_cause).__name__ == "ContextOverflowError":
+            return 413, "context_window_exceeded", False
+        if isinstance(_cause, (TimeoutError, _socket.timeout)):
+            return 504, "timeout_error", True
+        if isinstance(_cause, (BrokenPipeError, ConnectionResetError)):
+            return 499, "client_closed", False
+        if isinstance(_cause, (ConnectionError, ConnectionRefusedError)):
+            return 503, "backend_unavailable", True
     exc_name = type(e).__name__
     msg = str(e).lower()
     if isinstance(e, (TimeoutError, _socket.timeout)) or "timeout" in exc_name.lower():
@@ -166,6 +180,28 @@ def _classify_exception(e):
     if isinstance(e, (KeyError, TypeError, AttributeError, NameError, ValueError)):
         return 500, "internal_error", False
     return 500, "unknown_error", False
+
+
+def _exception_chain(e, max_depth=6):
+    """异常 cause 链（__cause__ 优先，其次 __context__），去环、限深。
+
+    用途：让错误分类能看穿 pipeline 的 RuntimeError 包装（§4.9 413 回退的
+    前提是「能识别 ContextOverflowError」）。先内后外（cause 在前）——
+    最内层通常是真正的原始异常。
+    """
+    out = []
+    seen = set()
+    cur = e
+    for _ in range(max_depth):
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        out.append(cur)
+        nxt = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+        if nxt is None:
+            break
+        cur = nxt
+    return out
 # --- _detect_blocker_pattern ---
 def _detect_blocker_pattern(messages, session_id=""):
     """

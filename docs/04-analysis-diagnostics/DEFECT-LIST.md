@@ -603,6 +603,16 @@
 | **验收** | `flag_drift_check.sh` 实跑：当前「✅ 无漂移（66 个显式声明键）」；人为改 conf 造漂移 → 正确报出并给出修复路径（`./manage.sh reload`），还原后归零。单测 `test_flag_drift.py` 14 例（含「进程多出的键不算漂移」防噪声）。 |
 | **残留风险** | 漂移检测只比 conf **显式声明**的键（进程侧多出的派生键不计，避免噪声）；`_RELOAD_SPEC` 未登记的旗标只能靠重启修（本项已在告警文案里注明）。 |
 
+### DEF-329: 上下文溢出被包成 RuntimeError ⇒ 落 500 ⇒ 客户端无限重试（1634 次×70 万字符）（P1） — ✅ 已修复（2026-10-30）
+
+| 项 | 内容 |
+|----|------|
+| **现象** | 22:00–22:01 会话 `cli_4c6f`（client=opencode，模型 claude-haiku-4-5）：请求体 **699,176 chars（≈175K tokens）**，`context_engine` 阶段抛 `ContextOverflowError: canonical history exceeds epoch budget even after collapse (K=4 + L3 halved)` → 代理返回 **HTTP 500 `unknown_error`** → 客户端按 5xx 重试，**累计 1634 次**（每次重传 70 万字符）。同时把系统 swap 顶到 **18682MB/19456MB（96%）**，加剧内存危机。 |
+| **根因** | §4.9 契约要求溢出回 **413 且不可重试**（会话该结束或提高 ctx 预算），且 `loop_detection._classify_exception` 里**已有** `ContextOverflowError → (413, context_window_exceeded, False)` 判定——但它只查**最外层**异常类型；`pipeline.py:429` 把原异常包成 `RuntimeError("Pipeline stage 'context_engine' failed: …") from e`，类型信息只在 `__cause__` 链上 ⇒ 分类器看不到 ⇒ 落兜底 `500 unknown_error`（`retryable=False` 字段客户端不认，只看 HTTP 状态码 → 5xx 即重试）。 |
+| **修复（2026-10-30）** | ① `loop_detection._classify_exception` 沿 `__cause__`/`__context__` 链（限深 6、去环）找**最特异的已知类型**再分类 ⇒ 包装后的溢出仍判 **413 / context_window_exceeded / 不可重试**（顺带让包装的 TimeoutError 仍判 504）；② `anthropic_proxy` 新增**会话级溢出闩** `_SESSION_OVERFLOW`（cap 128、TTL 300s）：同会话且请求体**未变小** ⇒ 直接 413 短路（不进管线、不占引擎队列）；请求变小（客户端裁剪历史）⇒ 自动放行，不做永久封禁。 |
+| **验收（2026-10-30）** | 新增 `test/unit/test_context_overflow.py`（12 例：包装后分类/直接分类/超时不受影响/无环链/闩的同量级拦截·请求变大拦截·变小放行·跨会话隔离·TTL 过期·空输入·会话数上限）；unit **2163 passed** / signature / snapshot / trace 全绿。 |
+| **遗留** | ① 云端回退链今日实测不可用（cloud_errors 今日 156 条：503×108「down」、DNS 类 30 条、400×20、401×6「bad key」），且「emergency fallback to local」**零命中** ⇒ 云失败时的回落路径未被验证；② 客户端侧的「Invalid 'Authorization' header or token.」**不出自本代理**（代理日志与 cloud_errors 均 0 命中）⇒ 属客户端凭据问题，另案。 |
+
 ## 五、缺陷分布与统计
 
 ### 5.1 按严重度（截至 2026-09-06）

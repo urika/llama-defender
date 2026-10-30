@@ -12,12 +12,72 @@ import re
 import signal
 import sys
 import threading
+import time as _time
 import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 from proxy_state import *
 import proxy_state as _ps
+
+# ---------------------------------------------------------------------------
+# 会话级上下文溢出闩（DEF-329，2026-10-29）
+# ctx engine 硬上限溢出（ContextOverflowError）是**终态**：§4.9 契约要求回 413
+# 且**不可重试**（会话该结束或提高 ctx 预算）。此前分类器看不到被 pipeline 包装
+# 后的原异常类型 ⇒ 落兜底 500 unknown_error ⇒ 客户端按 5xx 重试 1634 次，
+# 每次重传 70 万字符，顺带把 swap 顶到 96%（双重损失：白烧带宽 + 内存压力）。
+# 本闩：**同会话 + 请求体未变小 ⇒ 直接 413 短路**（不进管线、不占引擎队列）。
+# 会话若裁剪历史（请求变小）⇒ 自动放行，不做永久封禁。
+# ---------------------------------------------------------------------------
+_SESSION_OVERFLOW = {}        # session_id -> {"chars": int, "ts": float}
+_SESSION_OVERFLOW_MAX = 128   # 会话数上限（沿 DEF-313 模式 FIFO 驱逐）
+_SESSION_OVERFLOW_TTL = 300   # 秒（超期未复现则清除）
+
+
+def _overflow_latch_set(session_id, total_chars):
+    """记录该会话已溢出（用于后续同量级请求短路 413）。"""
+    if not session_id or not total_chars:
+        return
+    _SESSION_OVERFLOW[session_id] = {"chars": int(total_chars),
+                                     "ts": _time.time()}
+    while len(_SESSION_OVERFLOW) > _SESSION_OVERFLOW_MAX:
+        try:
+            _SESSION_OVERFLOW.pop(next(iter(_SESSION_OVERFLOW)))
+        except (StopIteration, KeyError):
+            break
+
+
+def _overflow_latch_check(session_id, total_chars, request_id=""):
+    """若该会话已溢出且本次请求**未变小** → 返回 413 响应体；否则 None。"""
+    if not session_id:
+        return None
+    rec = _SESSION_OVERFLOW.get(session_id)
+    if not rec:
+        return None
+    now = _time.time()
+    if now - float(rec.get("ts", 0)) > _SESSION_OVERFLOW_TTL:
+        _SESSION_OVERFLOW.pop(session_id, None)
+        return None
+    if int(total_chars) < int(rec.get("chars", 0)):
+        # 客户端已裁剪历史 → 放行（并更新闩：本次量级成为新基准）
+        rec["chars"] = int(total_chars)
+        rec["ts"] = now
+        return None
+    return {
+        "error": {
+            "type": "context_window_exceeded",
+            "message": (
+                f"Context overflow: this session exceeded the context epoch budget "
+                f"at {int(total_chars):,} chars (previous overflow at "
+                f"{int(rec.get('chars', 0)):,}). This is terminal — retrying with the "
+                f"same history will not help. End the session, trim the history, "
+                f"or raise the context budget."
+            ),
+            "request_id": request_id,
+            "retryable": False,
+        }
+    }
+
 import proxy_config
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1019,6 +1079,17 @@ class Handler(BaseHTTPRequestHandler):
                 tools = parsed.get("tools", [])
                 log(f"[REQ_SUMMARY] chars={total_chars} tools={len(tools)}")
 
+                # 会话级溢出闩（DEF-329）：ctx engine 硬上限溢出是**终态**——会话该结束
+                # （§4.9 契约：413 不可重试）。但客户端按 5xx 无限重试（实测 699K chars
+                # 会话重试 1634 次，每次重传 70 万字符，把 swap 顶到 96%）。
+                # ⇒ 同会话若请求体**未变小**，直接短路 413，不再进管线/引擎队列。
+                _ov_body = _overflow_latch_check(
+                    getattr(_log_ctx, "session_id", "") or "", total_chars,
+                    getattr(self, "_request_id", "") or "")
+                if _ov_body is not None:
+                    self._respond_json(_ov_body, 413)
+                    return
+
                 # 请求优先级队列（Phase 1，PROXY_QUEUE_ENABLED=false 时完全跳过）：
                 # 1) 准入控制：huge bucket 强制路由云端或 413 拒绝
                 # 2) 非 huge：入队并在 _handle_messages 前等待 worker 名额
@@ -1322,6 +1393,14 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     status_code, _, _ = _classify_exception(e)
+                    # DEF-329: 溢出是终态——记会话闩，后续同量级请求直接 413 短路
+                    # （避免客户端按 5xx 无限重试、每次重传 70 万字符）
+                    if status_code == 413:
+                        _overflow_latch_set(raw_sid, total_chars)
+                        log(f"  -> Context overflow latched for session "
+                            f"{str(raw_sid)[:16]} ({total_chars:,} chars) — "
+                            f"subsequent same-size requests short-circuit 413",
+                            level="WARN")
                     log_request(
                         model=parsed.get("model", "unknown"),
                         input_chars=total_chars,
