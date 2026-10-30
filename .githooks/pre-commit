@@ -126,7 +126,7 @@ ctx_rc=0
 CTX_CASE_QUICK=1 bash "$RUNNER" --ctx-case || ctx_rc=$?
 if [[ $ctx_rc -ne 0 ]]; then
   echo ""
-  echo "❌ pre-commit: ctx-case 门未通过（exit $ctx_rc）。" >&2
+  echo "❌ pre-commit: ctx-case 门未通过（exit ${ctx_rc:-1}）。" >&2
   echo "  • 细节: 上方 [失败]/[门错误] 行，或 logs/ctx_case_gate.log" >&2
   echo "  • exit 1(意外失败): 修 case，或在 tools/ctx_cases.json 例上加 known_red" >&2
   echo "    （须含 reason/ref/expires；到期未转绿会变成 exit 2，防长期挂账）" >&2
